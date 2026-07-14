@@ -18,6 +18,12 @@ db.version(1).stores({
   positions: 'id, symbol, side, openedAt',
 });
 
+// 개발/디버그 편의: 브라우저 콘솔에서 `db.accounts.toArray()` 등으로 직접 조회·수정.
+// (모든 데이터가 그 브라우저 로컬에만 있으므로 노출해도 보안 이슈 없음.)
+if (typeof window !== 'undefined') {
+  (window as unknown as { db: typeof db }).db = db;
+}
+
 /** 최초 실행 시 기본 계정 시드 */
 export async function ensureSeed(): Promise<void> {
   const count = await db.accounts.count();
