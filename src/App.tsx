@@ -6,6 +6,7 @@ import PositionsPanel from '@/components/PositionsPanel';
 import Login from '@/components/Login';
 import Leaderboard from '@/components/Leaderboard';
 import { useTradingStore } from '@/store/useTradingStore';
+import { useMarkPrices } from '@/hooks/useMarkPrices';
 
 export default function App() {
   const init = useTradingStore((s) => s.init);
@@ -13,6 +14,9 @@ export default function App() {
   const authed = useTradingStore((s) => s.authed);
 
   const [showRank, setShowRank] = useState(false);
+
+  // 현재 심볼 + 보유 포지션 심볼들의 가격 폴링 (다른 심볼 PnL 갱신)
+  useMarkPrices();
 
   // 앱 시작 시 세션(쿠키) 확인 (1회)
   useEffect(() => {

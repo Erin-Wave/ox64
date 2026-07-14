@@ -6,8 +6,7 @@ export default function PositionsPanel() {
   const positions = useTradingStore((s) => s.positions);
   const closePosition = useTradingStore((s) => s.closePosition);
   const busy = useTradingStore((s) => s.busy);
-  const curSymbol = useMarketStore((s) => s.symbol);
-  const lastPrice = useMarketStore((s) => s.lastPrice);
+  const prices = useMarketStore((s) => s.prices);
 
   return (
     <div className="flex h-full flex-col">
@@ -38,7 +37,7 @@ export default function PositionsPanel() {
             <tbody>
               {positions.map((p) => {
                 const dir = p.side === 'long' ? 1 : -1;
-                const live = p.symbol === curSymbol ? lastPrice : null;
+                const live = prices[p.symbol] ?? null;
                 const pnl = live != null ? (live - p.entryPrice) * p.size * dir : null;
                 const margin = (p.entryPrice * p.size) / p.leverage;
                 const roe = pnl != null && margin > 0 ? (pnl / margin) * 100 : null;

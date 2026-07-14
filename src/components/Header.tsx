@@ -1,13 +1,12 @@
-import { useMarketStore } from '@/store/useMarketStore';
+import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
+import { SYMBOLS } from '@/symbols';
 import logo from '@/resources/images/icon_256.png';
-
-const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'];
 
 export default function Header({ onOpenRank }: { onOpenRank: () => void }) {
   const symbol = useMarketStore((s) => s.symbol);
   const setSymbol = useMarketStore((s) => s.setSymbol);
-  const lastPrice = useMarketStore((s) => s.lastPrice);
+  const lastPrice = useMarketStore(selectLastPrice);
   const connected = useMarketStore((s) => s.connected);
   const balance = useTradingStore((s) => s.balance);
   const name = useTradingStore((s) => s.name);

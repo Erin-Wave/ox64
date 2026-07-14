@@ -1,106 +1,205 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   createChart,
   ColorType,
   CrosshairMode,
+  LineStyle,
   type IChartApi,
   type ISeriesApi,
+  type IPriceLine,
   type CandlestickData,
+  type LineData,
+  type SeriesMarker,
+  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
 import { fetchKlines } from '@/services/binanceRest';
 import { klineStream } from '@/services/binanceWs';
+import { ema, bollinger, rsi } from '@/services/indicators';
 import { useMarketStore } from '@/store/useMarketStore';
+import { useChartStore } from '@/store/useChartStore';
+import { useTradingStore } from '@/store/useTradingStore';
+import { INTERVAL_GROUPS, intervalSec, KST_OFFSET } from '@/symbols';
+import type { Candle } from '@/types';
 
-/**
- * TradingView Lightweight Charts (Canvas, 60fps).
- * - 초기: REST 로 과거 500봉 로드.
- * - 실시간: websocket kline 틱마다 series.update() 로 마지막 봉만 갱신.
- */
+const toChart = (t: number) => (t + KST_OFFSET) as UTCTimestamp;
+const fmtKst = (realSec: number) => {
+  const d = new Date((realSec + KST_OFFSET) * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+};
+const line = (arr: (number | null)[], times: number[]): LineData[] => {
+  const out: LineData[] = [];
+  for (let i = 0; i < arr.length; i++) if (arr[i] != null) out.push({ time: toChart(times[i]), value: arr[i]! });
+  return out;
+};
+
 export default function Chart() {
   const symbol = useMarketStore((s) => s.symbol);
   const interval = useMarketStore((s) => s.interval);
-  const setLastPrice = useMarketStore((s) => s.setLastPrice);
+  const setIntervalCode = useMarketStore((s) => s.setInterval);
+  const setPrice = useMarketStore((s) => s.setPrice);
   const setConnected = useMarketStore((s) => s.setConnected);
+
+  const opts = useChartStore();
+  const orders = useTradingStore((s) => s.orders);
+  const positions = useTradingStore((s) => s.positions);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const emaRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const bbU = useRef<ISeriesApi<'Line'> | null>(null);
+  const bbB = useRef<ISeriesApi<'Line'> | null>(null);
+  const bbL = useRef<ISeriesApi<'Line'> | null>(null);
+  const rsiRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const candlesRef = useRef<Candle[]>([]);
+  const volMap = useRef<Map<number, number>>(new Map());
+  const priceLines = useRef<IPriceLine[]>([]);
+  const hovering = useRef(false);
+  const lastCalc = useRef(0);
 
-  // 차트 인스턴스 생성 (마운트 1회)
+  const [legend, setLegend] = useState<Candle | null>(null);
+  const [countdown, setCountdown] = useState('');
+  const [showOpts, setShowOpts] = useState(false);
+
+  // ── 차트 생성 (1회) ──────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current) return;
-
     const chart = createChart(containerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: '#0b0d0f' },
         textColor: '#7c828b',
         fontFamily: 'Proxima Nova, sans-serif',
       },
-      grid: {
-        vertLines: { color: '#191c21' },
-        horzLines: { color: '#191c21' },
-      },
+      grid: { vertLines: { color: '#191c21' }, horzLines: { color: '#191c21' } },
       crosshair: { mode: CrosshairMode.Normal },
       rightPriceScale: { borderColor: '#282c33' },
       timeScale: { borderColor: '#282c33', timeVisible: true, secondsVisible: false },
       autoSize: true,
     });
-
-    const series = chart.addCandlestickSeries({
+    const candle = chart.addCandlestickSeries({
       upColor: '#00c076',
       downColor: '#f6465d',
       borderVisible: false,
       wickUpColor: '#00c076',
       wickDownColor: '#f6465d',
     });
-
     chartRef.current = chart;
-    seriesRef.current = series;
+    candleRef.current = candle;
+
+    chart.subscribeCrosshairMove((param) => {
+      const c = candleRef.current;
+      if (!c || param.time == null) {
+        hovering.current = false;
+        const l = candlesRef.current.at(-1);
+        if (l) setLegend(l);
+        return;
+      }
+      const d = param.seriesData.get(c) as CandlestickData | undefined;
+      if (!d) return;
+      hovering.current = true;
+      const real = (param.time as number) - KST_OFFSET;
+      setLegend({ time: real, open: d.open, high: d.high, low: d.low, close: d.close, volume: volMap.current.get(real) });
+    });
 
     return () => {
       chart.remove();
       chartRef.current = null;
-      seriesRef.current = null;
+      candleRef.current = null;
+      emaRef.current = bbU.current = bbB.current = bbL.current = rsiRef.current = null;
     };
   }, []);
 
-  // 심볼/인터벌 변경 시 데이터 (재)로드 + 실시간 구독
+  // ── 인디케이터 동기화 (candlesRef 기준 재계산) ────────────────
+  const syncIndicators = () => {
+    const chart = chartRef.current;
+    const candles = candlesRef.current;
+    if (!chart || candles.length === 0) return;
+    const closes = candles.map((c) => c.close);
+    const times = candles.map((c) => c.time);
+
+    // EMA(20)
+    if (opts.ema) {
+      if (!emaRef.current) emaRef.current = chart.addLineSeries({ color: '#f0b90b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+      emaRef.current.setData(line(ema(closes, 20), times));
+    } else if (emaRef.current) {
+      chart.removeSeries(emaRef.current);
+      emaRef.current = null;
+    }
+
+    // Bollinger(20,2)
+    if (opts.bb) {
+      const bands = bollinger(closes, 20, 2);
+      if (!bbU.current) bbU.current = chart.addLineSeries({ color: '#787b86', lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false });
+      if (!bbB.current) bbB.current = chart.addLineSeries({ color: '#4a90e2', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+      if (!bbL.current) bbL.current = chart.addLineSeries({ color: '#787b86', lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false });
+      bbU.current.setData(line(bands.upper, times));
+      bbB.current.setData(line(bands.basis, times));
+      bbL.current.setData(line(bands.lower, times));
+    } else {
+      for (const r of [bbU, bbB, bbL]) if (r.current) { chart.removeSeries(r.current); r.current = null; }
+    }
+
+    // RSI(14) — 하단 별도 스케일
+    if (opts.rsi) {
+      if (!rsiRef.current) {
+        rsiRef.current = chart.addLineSeries({ color: '#c77dff', lineWidth: 1, priceScaleId: 'rsi', priceLineVisible: false, lastValueVisible: false });
+        chart.priceScale('rsi').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+        rsiRef.current.createPriceLine({ price: 70, color: '#f6465d40', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
+        rsiRef.current.createPriceLine({ price: 30, color: '#00c07640', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
+      }
+      chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.28 } });
+      rsiRef.current.setData(line(rsi(closes, 14), times));
+    } else if (rsiRef.current) {
+      chart.removeSeries(rsiRef.current);
+      rsiRef.current = null;
+      chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.08 } });
+    }
+  };
+
+  // ── 데이터 로드 + WS 구독 (symbol/interval 변경 시) ───────────
   useEffect(() => {
-    const series = seriesRef.current;
-    if (!series) return;
+    const candle = candleRef.current;
+    if (!candle) return;
     let cancelled = false;
+    candlesRef.current = [];
+    volMap.current.clear();
 
     (async () => {
       try {
         const candles = await fetchKlines(symbol, interval, 500);
         if (cancelled) return;
-        series.setData(
-          candles.map((c) => ({
-            time: c.time as UTCTimestamp,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-          })) satisfies CandlestickData[],
+        candlesRef.current = candles;
+        for (const c of candles) volMap.current.set(c.time, c.volume ?? 0);
+        candle.setData(
+          candles.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
         );
         chartRef.current?.timeScale().fitContent();
+        syncIndicators();
+        const l = candles.at(-1);
+        if (l && !hovering.current) setLegend(l);
       } catch (e) {
-        console.error('[chart] initial load failed', e);
+        console.error('[chart] load failed', e);
       }
     })();
 
     const sub = klineStream(symbol, interval).subscribe({
       next: (tick) => {
         setConnected(true);
-        setLastPrice(tick.candle.close);
-        series.update({
-          time: tick.candle.time as UTCTimestamp,
-          open: tick.candle.open,
-          high: tick.candle.high,
-          low: tick.candle.low,
-          close: tick.candle.close,
-        });
+        setPrice(symbol, tick.candle.close);
+        const bar = tick.candle;
+        candle.update({ time: toChart(bar.time), open: bar.open, high: bar.high, low: bar.low, close: bar.close });
+        volMap.current.set(bar.time, bar.volume ?? 0);
+        const arr = candlesRef.current;
+        if (arr.length && arr[arr.length - 1].time === bar.time) arr[arr.length - 1] = bar;
+        else arr.push(bar);
+        if (!hovering.current) setLegend(bar);
+        const now = Date.now();
+        if (now - lastCalc.current > 700) {
+          lastCalc.current = now;
+          syncIndicators();
+        }
       },
       error: () => setConnected(false),
     });
@@ -109,7 +208,156 @@ export default function Chart() {
       cancelled = true;
       sub.unsubscribe();
     };
-  }, [symbol, interval, setLastPrice, setConnected]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, interval]);
 
-  return <div ref={containerRef} className="h-full w-full" />;
+  // 인디케이터 토글 변경 시 즉시 반영
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { syncIndicators(); }, [opts.ema, opts.bb, opts.rsi]);
+
+  // ── 매매 마커 (B/S) ──────────────────────────────────────────
+  useEffect(() => {
+    const c = candleRef.current;
+    if (!c) return;
+    if (!opts.tradeMarkers) { c.setMarkers([]); return; }
+    const markers: SeriesMarker<Time>[] = orders
+      .filter((o) => o.symbol === symbol)
+      .map((o) => {
+        const long = o.side === 'long';
+        return {
+          time: toChart(Math.floor(o.createdAt / 1000)) as Time,
+          position: (long ? 'belowBar' : 'aboveBar') as SeriesMarker<Time>['position'],
+          color: long ? '#00c076' : '#f6465d',
+          shape: (long ? 'arrowUp' : 'arrowDown') as SeriesMarker<Time>['shape'],
+          text: o.kind === 'close' ? 'C' : long ? 'B' : 'S',
+        };
+      })
+      .sort((a, b) => (a.time as number) - (b.time as number));
+    c.setMarkers(markers);
+  }, [orders, symbol, opts.tradeMarkers]);
+
+  // ── 포지션 평단 수평선 ───────────────────────────────────────
+  useEffect(() => {
+    const c = candleRef.current;
+    if (!c) return;
+    for (const pl of priceLines.current) c.removePriceLine(pl);
+    priceLines.current = [];
+    if (!opts.positionLine) return;
+    const mine = positions.filter((p) => p.symbol === symbol);
+    if (mine.length === 0) return;
+    const totSize = mine.reduce((a, p) => a + p.size, 0);
+    const avg = mine.reduce((a, p) => a + p.entryPrice * p.size, 0) / totSize;
+    const side = mine[0].side;
+    priceLines.current.push(
+      c.createPriceLine({
+        price: avg,
+        color: side === 'long' ? '#00c076' : '#f6465d',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: '평단',
+      }),
+    );
+  }, [positions, symbol, opts.positionLine]);
+
+  // ── 다음 봉 카운트다운 ───────────────────────────────────────
+  useEffect(() => {
+    if (!opts.showCountdown) { setCountdown(''); return; }
+    const sec = intervalSec(interval);
+    const tick = () => {
+      const now = Date.now() / 1000;
+      const remain = Math.max(0, Math.ceil(sec - (now % sec)));
+      const h = Math.floor(remain / 3600);
+      const m = Math.floor((remain % 3600) / 60);
+      const s = Math.floor(remain % 60);
+      const p = (n: number) => String(n).padStart(2, '0');
+      setCountdown(h > 0 ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`);
+    };
+    tick();
+    const t = window.setInterval(tick, 1000);
+    return () => window.clearInterval(t);
+  }, [interval, opts.showCountdown]);
+
+  const up = legend ? legend.close >= legend.open : true;
+  const fmt = (n?: number) => (n == null ? '—' : n.toLocaleString(undefined, { maximumFractionDigits: 4 }));
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* 툴바 */}
+      <div className="flex items-center gap-2 border-b border-border bg-panel px-2 py-1.5">
+        <select
+          value={interval}
+          onChange={(e) => setIntervalCode(e.target.value)}
+          className="cursor-pointer rounded bg-panel2 px-2 py-1 text-xs font-semibold text-text outline-none ring-1 ring-border"
+        >
+          {INTERVAL_GROUPS.map((g) => (
+            <optgroup key={g.name} label={g.name}>
+              {g.items.map((it) => (
+                <option key={it.code} value={it.code}>
+                  {it.label}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+
+        <div className="relative">
+          <button
+            onClick={() => setShowOpts((v) => !v)}
+            className="rounded bg-panel2 px-2 py-1 text-xs text-text ring-1 ring-border transition hover:bg-elevated"
+          >
+            지표 · 옵션 ▾
+          </button>
+          {showOpts && (
+            <>
+              <div className="fixed inset-0 z-20" onClick={() => setShowOpts(false)} />
+              <div className="absolute left-0 top-full z-30 mt-1 w-44 rounded-lg border border-border bg-panel p-1.5 shadow-2xl">
+                {(
+                  [
+                    ['ema', 'EMA (20)'],
+                    ['bb', 'Bollinger (20,2)'],
+                    ['rsi', 'RSI (14)'],
+                    ['showCountdown', '다음 봉 카운트다운'],
+                    ['tradeMarkers', '내 매매 표시 (B/S)'],
+                    ['positionLine', '포지션 평단선'],
+                  ] as const
+                ).map(([k, label]) => (
+                  <label
+                    key={k}
+                    className="flex cursor-pointer items-center justify-between rounded px-2 py-1.5 text-xs text-text hover:bg-panel2"
+                  >
+                    {label}
+                    <input type="checkbox" checked={opts[k]} onChange={() => opts.toggle(k)} className="accent-up" />
+                  </label>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* 차트 영역 */}
+      <div className="relative flex-1">
+        {/* OHLCV 레전드 */}
+        {legend && (
+          <div className="pointer-events-none absolute left-2 top-1.5 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px]">
+            <span className="font-semibold text-text">{symbol.replace('USDT', '')}</span>
+            <span className="text-muted">{fmtKst(legend.time)}</span>
+            <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmt(legend.open)}</span></span>
+            <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmt(legend.high)}</span></span>
+            <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmt(legend.low)}</span></span>
+            <span className="text-muted">종 <span className={up ? 'text-up' : 'text-down'}>{fmt(legend.close)}</span></span>
+            <span className="text-muted">거래량 <span className="text-text">{fmt(legend.volume)}</span></span>
+          </div>
+        )}
+        {/* 카운트다운 */}
+        {opts.showCountdown && countdown && (
+          <div className="pointer-events-none absolute right-2 top-1.5 z-10 rounded bg-panel2/80 px-2 py-0.5 text-[11px] font-semibold text-accent">
+            {countdown}
+          </div>
+        )}
+        <div ref={containerRef} className="absolute inset-0" />
+      </div>
+    </div>
+  );
 }

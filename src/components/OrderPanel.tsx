@@ -1,12 +1,12 @@
 import { useState } from 'react';
-import { useMarketStore } from '@/store/useMarketStore';
+import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import type { Side } from '@/types';
 
 /** 시장가 롱/숏 진입 패널 (OKX 스타일). 체결가는 서버가 결정. */
 export default function OrderPanel() {
   const symbol = useMarketStore((s) => s.symbol);
-  const lastPrice = useMarketStore((s) => s.lastPrice);
+  const lastPrice = useMarketStore(selectLastPrice);
   const openMarket = useTradingStore((s) => s.openMarket);
   const balance = useTradingStore((s) => s.balance);
   const busy = useTradingStore((s) => s.busy);

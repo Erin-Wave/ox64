@@ -31,9 +31,9 @@ export interface Ctx {
 }
 
 export const SEED_BALANCE = 10_000; // 신규 계정 모의 USDT
-export const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'] as const;
+// USDT 페어 형식만 검증(고정 목록 동기화 부담 제거). 실제 존재 여부는 fetchPrice 가 검증.
 export function isSymbol(s: unknown): s is string {
-  return typeof s === 'string' && (SYMBOLS as readonly string[]).includes(s);
+  return typeof s === 'string' && /^[A-Z0-9]{2,20}USDT$/.test(s);
 }
 
 const COOKIE = 'ox64_sess';

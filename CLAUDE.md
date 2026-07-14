@@ -45,19 +45,24 @@ ox64/
     ├── App.tsx             세션확인→Login 또는 트레이딩 UI(반응형) + 랭킹 모달
     ├── index.css           Tailwind + @font-face(Proxima Nova) + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position/Side)
+    ├── symbols.ts          거래 심볼 38종(바이낸스∩OKX) + 타임프레임 그룹(분/시간/일+) + KST_OFFSET(+9h 고정)
     ├── services/
     │   ├── binanceRest.ts  초기 과거봉(스팟 REST) — 차트 표시용
     │   ├── binanceWs.ts    실시간 kline(스팟 WS) — 차트/현재가 표시용
+    │   ├── indicators.ts   EMA / Bollinger / RSI 계산
     │   └── api.ts          백엔드 클라이언트(/api/*, credentials 포함)
+    ├── hooks/
+    │   └── useMarkPrices.ts  현재+포지션 심볼 가격 3초 폴링(다른 심볼 PnL 갱신)
     ├── store/
-    │   ├── useMarketStore.ts   symbol/interval/lastPrice/connected
+    │   ├── useMarketStore.ts   symbol/interval/prices(심볼별 가격맵)/connected + selectLastPrice
+    │   ├── useChartStore.ts    차트 옵션(ema/bb/rsi/카운트다운/매매마커/평단선) localStorage 영속
     │   └── useTradingStore.ts  서버 상태 캐시 + init/login/logout/openMarket/closePosition
     └── components/
         ├── Login.tsx           이름+패스코드 로그인/가입
-        ├── Header.tsx          심볼/현재가/연결/잔고/유저명/랭킹버튼/로그아웃
-        ├── Chart.tsx           Lightweight Charts (스팟 REST 초기 + WS 실시간)
+        ├── Header.tsx          심볼(38, 공용목록)/현재가/연결/잔고/유저명/랭킹버튼/로그아웃
+        ├── Chart.tsx           Lightweight Charts: 타임프레임 그룹셀렉트·KST+9·OHLCV레전드(hover/터치)·다음봉 카운트다운·EMA/BB/RSI·매매 B/S 마커·포지션 평단선 (툴바 지표·옵션 팝오버로 토글)
         ├── OrderPanel.tsx      시장가 롱/숏 (심볼/방향/수량/레버리지만 전송, 가격 X)
-        ├── PositionsPanel.tsx  포지션 + 실시간 미실현 PnL(현재 심볼 추정) + 청산
+        ├── PositionsPanel.tsx  포지션 + 실시간 미실현 PnL/ROE% (prices 맵 = 전 심볼) + 청산
         └── Leaderboard.tsx     친구 자산 순위 모달(5초 폴링)
 ```
 
@@ -84,7 +89,9 @@ ox64/
   선물(fapi/fstream)은 지역/IP 에 따라 WS 스트리밍이 막힘(소켓 OPEN 되나 데이터 0). 스팟은 전역 접근 가능 + 주요 종목 가격 사실상 동일 + 메시지 포맷 동일.
 - **클라 시세는 표시 전용**. 체결가는 서버(`functions/_shared.fetchPrice`)가 별도로 받는다 → 클라가 lastPrice 를 조작해도 체결/손익은 서버가 받은 진짜 가격으로 계산됨.
 - **⚠ 서버 시세 소스 = OKX → Coinbase → 바이낸스미러 폴백** (바이낸스 아님): **바이낸스는 Cloudflare Worker egress IP 를 전 호스트(api.binance.com·data-api.binance.vision)에서 403 차단**한다(브라우저는 되지만 서버 fetch 는 안 됨 → "price fetch 403"). 그래서 서버는 OKX(`www.okx.com`, USDT 페어 정확 일치) 우선, Coinbase(`api.exchange.coinbase.com`, USD≈USDT), 바이낸스미러 순으로 폴백. 클라 차트는 여전히 바이낸스 스팟(브라우저라 OK). 새 심볼 추가 시 OKX instId(`BASE-USDT`)·Coinbase product(`BASE-USD`) 매핑 확인.
-- **PnL 표시 divergence**: PositionsPanel 의 미실현 PnL 은 클라 lastPrice 기반 추정(현재 보는 심볼만). 실현 손익·랭킹은 서버 시세라 미세하게 다를 수 있음(정상).
+- **PnL 표시 divergence**: PositionsPanel 미실현 PnL 은 클라 시세 기반 추정, 실현 손익·랭킹은 서버 시세라 미세 차이 가능(정상).
+- **전 심볼 PnL 갱신**: `useMarketStore.prices`(심볼별 가격맵)를 (a)차트 WS(현재 심볼) + (b)`useMarkPrices` 3초 폴링(현재+보유 포지션 심볼들)으로 채운다. 예전엔 lastPrice 하나뿐이라 **다른 심볼 포지션 PnL 이 멈추던 버그** → prices 맵으로 해결. PositionsPanel 은 `prices[p.symbol]` 로 각 포지션 PnL 계산.
+- **차트(Chart.tsx)**: 시간축은 **KST(+9h) 고정** — 차트에 넣는 모든 시간값에 `KST_OFFSET` 을 더해 라벨을 한국시간으로(LWC v4 는 UTC 라벨이라 오프셋 방식). 타임프레임=`symbols.ts INTERVAL_GROUPS`(분/시간/일+, `<optgroup>`). 인디케이터=`services/indicators.ts`(EMA20/BB20·2/RSI14, RSI 는 하단 별도 priceScale). 매매마커=orders 필터(long=B 그린 arrowUp, short=S 레드 arrowDown, close=C). 평단선=현재 심볼 포지션 가중평균 `createPriceLine`. 옵션 토글은 `useChartStore`(localStorage). **바이낸스는 1년봉 미지원 → 최대 1개월봉**(1y 요청은 데이터소스 한계로 제외).
 
 ## 4. 모의 체결 로직 (서버 = `functions/api/order.ts`)
 
