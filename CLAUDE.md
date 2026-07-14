@@ -52,7 +52,7 @@ OrderPanel ──openMarket()──► useTradingStore ─┼─► IndexedDB(De
 PositionsPanel ──closePosition(mark)──────────┘     (accounts/orders/positions)
 ```
 
-- **시세 소스**: 바이낸스 USD-M 선물. REST=`fapi.binance.com`, WS=`fstream.binance.com/ws/{sym}@kline_{iv}`.
+- **시세 소스**: 바이낸스 **스팟**. REST=`api.binance.com/api/v3/klines`, WS=`stream.binance.com:9443/ws/{sym}@kline_{iv}`. (원래 USD-M 선물 `fapi`/`fstream` 이었으나 선물 스트리밍이 일부 지역/IP 에서 소켓은 열리되 데이터가 안 내려와 차트가 얼어붙음 — REST 초기봉은 엣지 캐시로 뜨는데 WS 만 막히는 패턴. 스팟은 전역 접근 가능 + 주요 종목 가격 사실상 동일 + 메시지 포맷 동일이라 스팟으로 통일. 2026-07-14.)
 - **가격 틱 리렌더 방지**: `useMarketStore` 를 selector 로만 구독(`s => s.lastPrice`). 전체 스토어 구독 금지.
 - **영속 규칙**: 스토어는 메모리 캐시, 모든 변경은 Dexie 트랜잭션에도 기록 → 새로고침에도 유지. hydrate()가 앱 마운트 시 복원.
 
@@ -81,7 +81,8 @@ npm run lint         # tsc --noEmit 타입체크
 - **Lightweight Charts v4 API**: `chart.addCandlestickSeries(...)`. v5 는 `addSeries(CandlestickSeries, ...)` 로 바뀌었으니 업그레이드 시 주의. 현재 v4 고정.
 - **time 단위 = UTC seconds**: 바이낸스는 ms 라 `/1000` 필수. 차트 `UTCTimestamp` 로 캐스팅.
 - **@types/node 필요**: vite.config.ts 의 `node:path`/`__dirname` 때문. devDependency 로 포함됨.
-- **바이낸스 지역 차단**: 일부 지역에서 fapi/fstream 이 차단될 수 있음 → 프록시/대체 소스 필요 시 services/ 만 교체.
+- **바이낸스 지역 차단**: 선물 `fapi`/`fstream` 은 지역/IP 에 따라 WS 스트리밍이 막힘(소켓은 OPEN 되나 데이터 0). 그래서 스팟(`api.binance.com`/`stream.binance.com:9443`)으로 전환함. 스팟마저 막히는 지역이면 `data-api.binance.vision`(스팟 REST 미러) 또는 프록시로 `services/` 만 교체.
+- **favicon**: `src/resources/images/icon2_256.png` 원본 → `public/favicon.png` 로 복사(=dist 루트로 그대로 배포), `index.html` 이 `/favicon.png` 참조. 아이콘 교체 시 `public/favicon.png` 를 갈아끼우면 됨(Vite public/ 은 해시 없이 그대로 복사).
 
 ## 7. 다음 작업 후보 (백로그)
 

@@ -10,9 +10,11 @@ import type { Candle, KlineTick } from '@/types';
  * - retry 로 끊김 자동 재연결.
  * - share() 로 다중 구독 시 소켓 하나만 유지.
  *
- * 참고: 바이낸스 USD-M 선물 = wss://fstream.binance.com
+ * 참고: 스팟 스트림 = wss://stream.binance.com:9443
+ *   (선물 fstream 은 일부 지역/IP 에서 소켓은 열리나 데이터가 안 내려와 실시간이 얼어붙음.
+ *    스팟은 전역 접근 가능 + 주요 종목 가격 사실상 동일 → 스팟으로 통일. 메시지 포맷은 동일.)
  */
-const FSTREAM = 'wss://fstream.binance.com/ws';
+const FSTREAM = 'wss://stream.binance.com:9443/ws';
 
 interface BinanceKlineMsg {
   e: string; // event type
