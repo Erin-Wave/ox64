@@ -83,6 +83,8 @@ npm run lint         # tsc --noEmit 타입체크
 - **@types/node 필요**: vite.config.ts 의 `node:path`/`__dirname` 때문. devDependency 로 포함됨.
 - **바이낸스 지역 차단**: 선물 `fapi`/`fstream` 은 지역/IP 에 따라 WS 스트리밍이 막힘(소켓은 OPEN 되나 데이터 0). 그래서 스팟(`api.binance.com`/`stream.binance.com:9443`)으로 전환함. 스팟마저 막히는 지역이면 `data-api.binance.vision`(스팟 REST 미러) 또는 프록시로 `services/` 만 교체.
 - **favicon**: `src/resources/images/icon2_256.png` 원본 → `public/favicon.png` 로 복사(=dist 루트로 그대로 배포), `index.html` 이 `/favicon.png` 참조. 아이콘 교체 시 `public/favicon.png` 를 갈아끼우면 됨(Vite public/ 은 해시 없이 그대로 복사).
+- **폰트 = Proxima Nova(사이트 전체)**: 원본 `src/resources/fonts/ProximaNova-{Light,Regular,Semibold,Extrabold}.ttf` → `public/fonts/` 복사, `src/index.css` 의 `@font-face` 4종(weight 300/400/600/800)이 `/fonts/*.ttf` 로드. `body` + tailwind `fontFamily.sans`/`mono` 모두 `'Proxima Nova'`. **한글 글리프는 Proxima 에 없어** 폴백(Apple SD Gothic Neo/Malgun Gothic)으로 자동 렌더 — 폴백 스택 지우지 말 것. mono 도 Proxima 라 숫자 정렬은 `body { font-variant-numeric: tabular-nums }` 로 확보(진짜 monospace 아님). 폰트 교체 시 `public/fonts/` 파일 + `@font-face` src 만 바꾸면 됨.
+- **반응형(모바일↔PC)**: `App.tsx` 루트 콘텐츠가 **모바일 기본=세로 flex 스택**(차트 `h-[45vh]` → 주문 → 포지션, 세로 스크롤) / **`md:`(≥768px)=2열 그리드**(`grid-cols-[minmax(0,1fr)_18rem] grid-rows-[minmax(0,1fr)_14rem]`, 좌: 차트 위·포지션 아래 / 우: 주문 세로 전체). Chart 컨테이너는 모바일 고정높이·데스크톱 그리드셀 stretch(autoSize 가 셀 크기 읽음). Header 는 `flex-wrap`+`sm:` 여백/크기로 좁은 화면 대응. **차트가 모바일서 좁던 원인**=옛 가로 flex 의 `aside w-72`(288px 고정)가 폭 잠식 → 그리드 전환으로 해결.
 
 ## 7. 다음 작업 후보 (백로그)
 

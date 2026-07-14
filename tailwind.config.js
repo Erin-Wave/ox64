@@ -13,7 +13,10 @@ export default {
         muted: '#848e9c',
       },
       fontFamily: {
-        mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        // 사이트 전체 Proxima Nova 통일. mono 도 Proxima 로 두되
+        // 숫자 정렬은 index.css 의 font-variant-numeric: tabular-nums 로 확보.
+        sans: ['Proxima Nova', 'Apple SD Gothic Neo', 'Malgun Gothic', 'sans-serif'],
+        mono: ['Proxima Nova', 'Apple SD Gothic Neo', 'Malgun Gothic', 'sans-serif'],
       },
     },
   },

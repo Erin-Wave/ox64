@@ -11,9 +11,9 @@ export default function Header() {
   const balance = useTradingStore((s) => s.balance);
 
   return (
-    <header className="flex items-center justify-between border-b border-border bg-panel px-4 py-2">
-      <div className="flex items-center gap-4">
-        <span className="text-base font-bold tracking-tight">ox64</span>
+    <header className="flex flex-wrap items-center justify-between gap-y-1 border-b border-border bg-panel px-3 py-2 sm:px-4">
+      <div className="flex items-center gap-2 sm:gap-4">
+        <span className="text-base font-extrabold tracking-tight">ox64</span>
         <select
           value={symbol}
           onChange={(e) => setSymbol(e.target.value)}
