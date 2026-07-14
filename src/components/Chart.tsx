@@ -8,18 +8,20 @@ import {
   type ISeriesApi,
   type IPriceLine,
   type CandlestickData,
+  type HistogramData,
   type LineData,
   type SeriesMarker,
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
-import { fetchKlines } from '@/services/binanceRest';
+import { fetchKlines, fetchPricePrecision } from '@/services/binanceRest';
 import { klineStream } from '@/services/binanceWs';
 import { ema, bollinger, rsi } from '@/services/indicators';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useChartStore } from '@/store/useChartStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { INTERVAL_GROUPS, intervalSec, KST_OFFSET } from '@/symbols';
+import { fmtPrice, fmtVol } from '@/format';
 import type { Candle } from '@/types';
 
 const toChart = (t: number) => (t + KST_OFFSET) as UTCTimestamp;
@@ -39,6 +41,7 @@ export default function Chart() {
   const interval = useMarketStore((s) => s.interval);
   const setIntervalCode = useMarketStore((s) => s.setInterval);
   const setPrice = useMarketStore((s) => s.setPrice);
+  const setPrecision = useMarketStore((s) => s.setPrecision);
   const setConnected = useMarketStore((s) => s.setConnected);
 
   const opts = useChartStore();
@@ -53,6 +56,7 @@ export default function Chart() {
   const bbB = useRef<ISeriesApi<'Line'> | null>(null);
   const bbL = useRef<ISeriesApi<'Line'> | null>(null);
   const rsiRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const volMap = useRef<Map<number, number>>(new Map());
   const priceLines = useRef<IPriceLine[]>([]);
@@ -62,6 +66,7 @@ export default function Chart() {
   const [legend, setLegend] = useState<Candle | null>(null);
   const [countdown, setCountdown] = useState('');
   const [showOpts, setShowOpts] = useState(false);
+  const [prec, setPrec] = useState(2); // 현재 심볼 가격 소수 자릿수
 
   // ── 차트 생성 (1회) ──────────────────────────────────────────
   useEffect(() => {
@@ -108,6 +113,7 @@ export default function Chart() {
       chartRef.current = null;
       candleRef.current = null;
       emaRef.current = bbU.current = bbB.current = bbL.current = rsiRef.current = null;
+      volRef.current = null;
     };
   }, []);
 
@@ -141,21 +147,42 @@ export default function Chart() {
       for (const r of [bbU, bbB, bbL]) if (r.current) { chart.removeSeries(r.current); r.current = null; }
     }
 
-    // RSI(14) — 하단 별도 스케일
+    // 거래량 히스토그램 — 최하단
+    if (opts.volume) {
+      if (!volRef.current) {
+        volRef.current = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: false });
+      }
+      volRef.current.setData(
+        candles.map((c) => ({
+          time: toChart(c.time),
+          value: c.volume ?? 0,
+          color: c.close >= c.open ? 'rgba(0,192,118,0.45)' : 'rgba(246,70,93,0.45)',
+        })) as HistogramData[],
+      );
+    } else if (volRef.current) {
+      chart.removeSeries(volRef.current);
+      volRef.current = null;
+    }
+
+    // RSI(14) — 별도 스케일
     if (opts.rsi) {
       if (!rsiRef.current) {
         rsiRef.current = chart.addLineSeries({ color: '#c77dff', lineWidth: 1, priceScaleId: 'rsi', priceLineVisible: false, lastValueVisible: false });
-        chart.priceScale('rsi').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
         rsiRef.current.createPriceLine({ price: 70, color: '#f6465d40', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
         rsiRef.current.createPriceLine({ price: 30, color: '#00c07640', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
       }
-      chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.28 } });
       rsiRef.current.setData(line(rsi(closes, 14), times));
     } else if (rsiRef.current) {
       chart.removeSeries(rsiRef.current);
       rsiRef.current = null;
-      chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.08 } });
     }
+
+    // 하단 영역 스택 배치: [캔들] / [RSI] / [거래량]
+    const volH = opts.volume ? 0.15 : 0;
+    const rsiH = opts.rsi ? 0.16 : 0;
+    chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.06, bottom: Math.max(0.04, volH + rsiH + 0.02) } });
+    if (opts.rsi) chart.priceScale('rsi').applyOptions({ scaleMargins: { top: 1 - volH - rsiH, bottom: volH } });
+    if (opts.volume) chart.priceScale('vol').applyOptions({ scaleMargins: { top: 1 - volH, bottom: 0 } });
   };
 
   // ── 데이터 로드 + WS 구독 (symbol/interval 변경 시) ───────────
@@ -165,6 +192,16 @@ export default function Chart() {
     let cancelled = false;
     candlesRef.current = [];
     volMap.current.clear();
+
+    // 심볼별 가격 정밀도 적용(우측 축·크로스헤어·레전드) — 소수점 2자리 고정 버그 수정
+    fetchPricePrecision(symbol)
+      .then(({ precision, minMove }) => {
+        if (cancelled) return;
+        setPrec(precision);
+        setPrecision(symbol, precision);
+        candle.applyOptions({ priceFormat: { type: 'price', precision, minMove } });
+      })
+      .catch(() => {});
 
     (async () => {
       try {
@@ -190,6 +227,11 @@ export default function Chart() {
         setPrice(symbol, tick.candle.close);
         const bar = tick.candle;
         candle.update({ time: toChart(bar.time), open: bar.open, high: bar.high, low: bar.low, close: bar.close });
+        volRef.current?.update({
+          time: toChart(bar.time),
+          value: bar.volume ?? 0,
+          color: bar.close >= bar.open ? 'rgba(0,192,118,0.45)' : 'rgba(246,70,93,0.45)',
+        } as HistogramData);
         volMap.current.set(bar.time, bar.volume ?? 0);
         const arr = candlesRef.current;
         if (arr.length && arr[arr.length - 1].time === bar.time) arr[arr.length - 1] = bar;
@@ -213,7 +255,7 @@ export default function Chart() {
 
   // 인디케이터 토글 변경 시 즉시 반영
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { syncIndicators(); }, [opts.ema, opts.bb, opts.rsi]);
+  useEffect(() => { syncIndicators(); }, [opts.ema, opts.bb, opts.rsi, opts.volume]);
 
   // ── 매매 마커 (B/S) ──────────────────────────────────────────
   useEffect(() => {
@@ -279,7 +321,6 @@ export default function Chart() {
   }, [interval, opts.showCountdown]);
 
   const up = legend ? legend.close >= legend.open : true;
-  const fmt = (n?: number) => (n == null ? '—' : n.toLocaleString(undefined, { maximumFractionDigits: 4 }));
 
   return (
     <div className="flex h-full flex-col">
@@ -314,6 +355,7 @@ export default function Chart() {
               <div className="absolute left-0 top-full z-30 mt-1 w-44 rounded-lg border border-border bg-panel p-1.5 shadow-2xl">
                 {(
                   [
+                    ['volume', '거래량'],
                     ['ema', 'EMA (20)'],
                     ['bb', 'Bollinger (20,2)'],
                     ['rsi', 'RSI (14)'],
@@ -343,11 +385,11 @@ export default function Chart() {
           <div className="pointer-events-none absolute left-2 top-1.5 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px]">
             <span className="font-semibold text-text">{symbol.replace('USDT', '')}</span>
             <span className="text-muted">{fmtKst(legend.time)}</span>
-            <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmt(legend.open)}</span></span>
-            <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmt(legend.high)}</span></span>
-            <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmt(legend.low)}</span></span>
-            <span className="text-muted">종 <span className={up ? 'text-up' : 'text-down'}>{fmt(legend.close)}</span></span>
-            <span className="text-muted">거래량 <span className="text-text">{fmt(legend.volume)}</span></span>
+            <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.open, prec)}</span></span>
+            <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.high, prec)}</span></span>
+            <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.low, prec)}</span></span>
+            <span className="text-muted">종 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.close, prec)}</span></span>
+            <span className="text-muted">거래량 <span className="text-text">{fmtVol(legend.volume)}</span></span>
           </div>
         )}
         {/* 카운트다운 */}

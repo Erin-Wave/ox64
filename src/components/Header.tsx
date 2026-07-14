@@ -1,12 +1,14 @@
-import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
+import { useMarketStore, selectLastPrice, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { SYMBOLS } from '@/symbols';
+import { fmtPrice } from '@/format';
 import logo from '@/resources/images/icon_256.png';
 
 export default function Header({ onOpenRank }: { onOpenRank: () => void }) {
   const symbol = useMarketStore((s) => s.symbol);
   const setSymbol = useMarketStore((s) => s.setSymbol);
   const lastPrice = useMarketStore(selectLastPrice);
+  const precisions = useMarketStore((s) => s.precisions);
   const connected = useMarketStore((s) => s.connected);
   const balance = useTradingStore((s) => s.balance);
   const name = useTradingStore((s) => s.name);
@@ -31,7 +33,7 @@ export default function Header({ onOpenRank }: { onOpenRank: () => void }) {
         </select>
         <div className="flex flex-col leading-none">
           <span className="text-[15px] font-bold text-text">
-            {lastPrice != null ? lastPrice.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—'}
+            {lastPrice != null ? fmtPrice(lastPrice, precisionOf(precisions, symbol)) : '—'}
           </span>
           <span className="mt-0.5 flex items-center gap-1 text-[10px] text-muted">
             <span className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-up' : 'bg-muted'}`} />

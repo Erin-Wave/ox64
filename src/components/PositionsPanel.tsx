@@ -1,5 +1,6 @@
-import { useMarketStore } from '@/store/useMarketStore';
+import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
+import { fmtPrice } from '@/format';
 
 /** 보유 포지션 목록 + 실시간 미실현 손익/ROE (OKX 스타일). */
 export default function PositionsPanel() {
@@ -7,6 +8,7 @@ export default function PositionsPanel() {
   const closePosition = useTradingStore((s) => s.closePosition);
   const busy = useTradingStore((s) => s.busy);
   const prices = useMarketStore((s) => s.prices);
+  const precisions = useMarketStore((s) => s.precisions);
 
   return (
     <div className="flex h-full flex-col">
@@ -54,7 +56,9 @@ export default function PositionsPanel() {
                         {p.side === 'long' ? '롱' : '숏'} {p.leverage}x
                       </span>
                     </td>
-                    <td className="px-3 py-2.5 text-right text-text">{p.entryPrice.toFixed(2)}</td>
+                    <td className="px-3 py-2.5 text-right text-text">
+                      {fmtPrice(p.entryPrice, precisionOf(precisions, p.symbol))}
+                    </td>
                     <td className="px-3 py-2.5 text-right text-text">{p.size}</td>
                     <td
                       className={`px-3 py-2.5 text-right font-medium ${

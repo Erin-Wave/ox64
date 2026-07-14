@@ -3,6 +3,7 @@ import { create } from 'zustand';
 /** 차트 표시 옵션 (localStorage 영속). */
 interface ChartState {
   showCountdown: boolean;
+  volume: boolean;
   ema: boolean;
   bb: boolean;
   rsi: boolean;
@@ -20,9 +21,9 @@ function load(): Partial<ChartState> {
   }
 }
 function persist(s: ChartState) {
-  const { showCountdown, ema, bb, rsi, tradeMarkers, positionLine } = s;
+  const { showCountdown, volume, ema, bb, rsi, tradeMarkers, positionLine } = s;
   try {
-    localStorage.setItem(KEY, JSON.stringify({ showCountdown, ema, bb, rsi, tradeMarkers, positionLine }));
+    localStorage.setItem(KEY, JSON.stringify({ showCountdown, volume, ema, bb, rsi, tradeMarkers, positionLine }));
   } catch {
     /* ignore */
   }
@@ -31,6 +32,7 @@ function persist(s: ChartState) {
 const saved = load();
 export const useChartStore = create<ChartState>((set, get) => ({
   showCountdown: saved.showCountdown ?? true,
+  volume: saved.volume ?? true,
   ema: saved.ema ?? false,
   bb: saved.bb ?? false,
   rsi: saved.rsi ?? false,

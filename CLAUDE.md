@@ -46,6 +46,7 @@ ox64/
     ├── index.css           Tailwind + @font-face(Proxima Nova) + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position/Side)
     ├── symbols.ts          거래 심볼 38종(바이낸스∩OKX) + 타임프레임 그룹(분/시간/일+) + KST_OFFSET(+9h 고정)
+    ├── format.ts           fmtPrice(심볼 정밀도)/fmtVol(K·M·B)/precisionFromTick
     ├── services/
     │   ├── binanceRest.ts  초기 과거봉(스팟 REST) — 차트 표시용
     │   ├── binanceWs.ts    실시간 kline(스팟 WS) — 차트/현재가 표시용
@@ -54,7 +55,7 @@ ox64/
     ├── hooks/
     │   └── useMarkPrices.ts  현재+포지션 심볼 가격 3초 폴링(다른 심볼 PnL 갱신)
     ├── store/
-    │   ├── useMarketStore.ts   symbol/interval/prices(심볼별 가격맵)/connected + selectLastPrice
+    │   ├── useMarketStore.ts   symbol/interval/prices(심볼별 가격맵)/precisions(심볼별 소수자릿수)/connected + selectLastPrice/precisionOf
     │   ├── useChartStore.ts    차트 옵션(ema/bb/rsi/카운트다운/매매마커/평단선) localStorage 영속
     │   └── useTradingStore.ts  서버 상태 캐시 + init/login/logout/openMarket/closePosition
     └── components/
@@ -91,6 +92,8 @@ ox64/
 - **⚠ 서버 시세 소스 = OKX → Coinbase → 바이낸스미러 폴백** (바이낸스 아님): **바이낸스는 Cloudflare Worker egress IP 를 전 호스트(api.binance.com·data-api.binance.vision)에서 403 차단**한다(브라우저는 되지만 서버 fetch 는 안 됨 → "price fetch 403"). 그래서 서버는 OKX(`www.okx.com`, USDT 페어 정확 일치) 우선, Coinbase(`api.exchange.coinbase.com`, USD≈USDT), 바이낸스미러 순으로 폴백. 클라 차트는 여전히 바이낸스 스팟(브라우저라 OK). 새 심볼 추가 시 OKX instId(`BASE-USDT`)·Coinbase product(`BASE-USD`) 매핑 확인.
 - **PnL 표시 divergence**: PositionsPanel 미실현 PnL 은 클라 시세 기반 추정, 실현 손익·랭킹은 서버 시세라 미세 차이 가능(정상).
 - **전 심볼 PnL 갱신**: `useMarketStore.prices`(심볼별 가격맵)를 (a)차트 WS(현재 심볼) + (b)`useMarkPrices` 3초 폴링(현재+보유 포지션 심볼들)으로 채운다. 예전엔 lastPrice 하나뿐이라 **다른 심볼 포지션 PnL 이 멈추던 버그** → prices 맵으로 해결. PositionsPanel 은 `prices[p.symbol]` 로 각 포지션 PnL 계산.
+- **가격 정밀도(심볼별)**: 소수점 2자리 고정은 버그(예 0.0002345→0.00). `binanceRest.fetchPricePrecision` 이 exchangeInfo `PRICE_FILTER.tickSize` 로 심볼별 자릿수를 구해 (a)차트 series `priceFormat`(우측축·크로스헤어) 적용 + (b)`useMarketStore.precisions[symbol]` 저장 → Header 현재가·PositionsPanel 진입가·차트 레전드가 `fmtPrice(v, precisionOf(...))` 로 표기. 거래량은 `fmtVol`(K/M/B). (BTC/SOL=2, ALLO=4, PEPE=8자리.)
+- **거래량 히스토그램**: 차트 하단 오버레이(반투명 그린/레드), `useChartStore.volume`(기본 ON) 토글. RSI/거래량 동시 표시 시 하단을 [캔들]/[RSI]/[거래량] 으로 스택(priceScale scaleMargins 동적 계산).
 - **차트(Chart.tsx)**: 시간축은 **KST(+9h) 고정** — 차트에 넣는 모든 시간값에 `KST_OFFSET` 을 더해 라벨을 한국시간으로(LWC v4 는 UTC 라벨이라 오프셋 방식). 타임프레임=`symbols.ts INTERVAL_GROUPS`(분/시간/일+, `<optgroup>`). 인디케이터=`services/indicators.ts`(EMA20/BB20·2/RSI14, RSI 는 하단 별도 priceScale). 매매마커=orders 필터(long=B 그린 arrowUp, short=S 레드 arrowDown, close=C). 평단선=현재 심볼 포지션 가중평균 `createPriceLine`. 옵션 토글은 `useChartStore`(localStorage). **바이낸스는 1년봉 미지원 → 최대 1개월봉**(1y 요청은 데이터소스 한계로 제외).
 
 ## 4. 모의 체결 로직 (서버 = `functions/api/order.ts`)
