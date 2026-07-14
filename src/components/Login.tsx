@@ -23,7 +23,7 @@ export default function Login() {
         onSubmit={submit}
         className="w-full max-w-xs rounded-lg border border-border bg-panel p-6"
       >
-        <img src={logo} alt="ox64" className="mb-2 h-10 w-10" />
+        <img src={logo} alt="ox64" className="mb-3 h-24 w-24" />
         <p className="mb-5 text-xs text-muted">
           이름과 패스코드로 입장. 처음 쓰는 이름이면 계정이 새로 만들어져요.
         </p>

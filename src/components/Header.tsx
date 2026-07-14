@@ -16,7 +16,7 @@ export default function Header({ onOpenRank }: { onOpenRank: () => void }) {
   return (
     <header className="flex flex-wrap items-center justify-between gap-y-1 border-b border-border bg-panel px-3 py-2 sm:px-4">
       <div className="flex items-center gap-2 sm:gap-4">
-        <img src={logo} alt="ox64" className="h-7 w-7 shrink-0" />
+        <img src={logo} alt="ox64" className="h-11 w-11 shrink-0 sm:h-12 sm:w-12" />
         <select
           value={symbol}
           onChange={(e) => setSymbol(e.target.value)}

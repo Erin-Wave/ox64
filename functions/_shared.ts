@@ -153,9 +153,22 @@ export async function getSession(request: Request, env: Env): Promise<SessionPay
 }
 
 // ── 바이낸스 서버측 시세 (스팟) — 체결가의 진실원본 ──────────────
+// Cloudflare Worker egress 는 api.binance.com 에서 403(IP 차단) 을 받는다.
+// 공개 데이터 전용 미러 data-api.binance.vision 를 우선 쓰고, 실패 시 폴백.
+const PRICE_HOSTS = ['https://data-api.binance.vision', 'https://api.binance.com'];
+async function tickerFetch(query: string): Promise<Response> {
+  let lastStatus = 0;
+  for (const host of PRICE_HOSTS) {
+    const r = await fetch(`${host}/api/v3/ticker/price?${query}`, {
+      headers: { accept: 'application/json', 'user-agent': 'ox64/1.0' },
+    });
+    if (r.ok) return r;
+    lastStatus = r.status;
+  }
+  throw new Error(`price fetch ${lastStatus}`);
+}
 export async function fetchPrice(symbol: string): Promise<number> {
-  const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
-  if (!r.ok) throw new Error(`price fetch ${r.status}`);
+  const r = await tickerFetch(`symbol=${symbol}`);
   const d = (await r.json()) as { price: string };
   const p = Number(d.price);
   if (!p || !isFinite(p)) throw new Error('bad price');
@@ -164,9 +177,7 @@ export async function fetchPrice(symbol: string): Promise<number> {
 export async function fetchPrices(symbols: string[]): Promise<Record<string, number>> {
   const uniq = [...new Set(symbols)];
   if (uniq.length === 0) return {};
-  const param = encodeURIComponent(JSON.stringify(uniq));
-  const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbols=${param}`);
-  if (!r.ok) throw new Error(`prices fetch ${r.status}`);
+  const r = await tickerFetch(`symbols=${encodeURIComponent(JSON.stringify(uniq))}`);
   const arr = (await r.json()) as { symbol: string; price: string }[];
   const out: Record<string, number> = {};
   for (const x of arr) out[x.symbol] = Number(x.price);
