@@ -22,7 +22,7 @@ export default function App() {
   if (!ready) {
     return (
       <div className="flex h-screen items-center justify-center bg-bg text-sm text-muted">
-        불러오는 중…
+        <span className="animate-pulse">불러오는 중…</span>
       </div>
     );
   }

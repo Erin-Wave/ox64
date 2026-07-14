@@ -33,25 +33,26 @@ export default function Chart() {
 
     const chart = createChart(containerRef.current, {
       layout: {
-        background: { type: ColorType.Solid, color: '#0b0e11' },
-        textColor: '#848e9c',
+        background: { type: ColorType.Solid, color: '#0b0d0f' },
+        textColor: '#7c828b',
+        fontFamily: 'Proxima Nova, sans-serif',
       },
       grid: {
-        vertLines: { color: '#1c2127' },
-        horzLines: { color: '#1c2127' },
+        vertLines: { color: '#191c21' },
+        horzLines: { color: '#191c21' },
       },
       crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: '#2b3139' },
-      timeScale: { borderColor: '#2b3139', timeVisible: true, secondsVisible: false },
+      rightPriceScale: { borderColor: '#282c33' },
+      timeScale: { borderColor: '#282c33', timeVisible: true, secondsVisible: false },
       autoSize: true,
     });
 
     const series = chart.addCandlestickSeries({
-      upColor: '#26a69a',
-      downColor: '#ef5350',
+      upColor: '#00c076',
+      downColor: '#f6465d',
       borderVisible: false,
-      wickUpColor: '#26a69a',
-      wickDownColor: '#ef5350',
+      wickUpColor: '#00c076',
+      wickDownColor: '#f6465d',
     });
 
     chartRef.current = chart;

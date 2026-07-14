@@ -14,41 +14,57 @@ export default function Header({ onOpenRank }: { onOpenRank: () => void }) {
   const logout = useTradingStore((s) => s.logout);
 
   return (
-    <header className="flex flex-wrap items-center justify-between gap-y-1 border-b border-border bg-panel px-3 py-2 sm:px-4">
-      <div className="flex items-center gap-2 sm:gap-4">
-        <img src={logo} alt="ox64" className="h-11 w-11 shrink-0 sm:h-12 sm:w-12" />
+    <header className="flex flex-wrap items-center justify-between gap-y-2 border-b border-border bg-panel px-3 py-2 sm:px-4">
+      {/* 좌: 로고 · 심볼 · 현재가 */}
+      <div className="flex items-center gap-3 sm:gap-4">
+        <img src={logo} alt="ox64" className="h-9 w-9 shrink-0 sm:h-10 sm:w-10" />
+        <div className="h-6 w-px bg-border" />
         <select
           value={symbol}
           onChange={(e) => setSymbol(e.target.value)}
-          className="rounded bg-bg px-2 py-1 text-sm outline-none ring-1 ring-border"
+          className="cursor-pointer rounded-md bg-panel2 px-2.5 py-1.5 text-sm font-semibold text-text outline-none ring-1 ring-border transition hover:ring-elevated"
         >
           {SYMBOLS.map((s) => (
             <option key={s} value={s}>
-              {s}
+              {s.replace('USDT', '/USDT')}
             </option>
           ))}
         </select>
-        <span className="text-sm">{lastPrice != null ? lastPrice.toFixed(2) : '—'}</span>
-        <span
-          className={`h-2 w-2 rounded-full ${connected ? 'bg-up' : 'bg-muted'}`}
-          title={connected ? '실시간 연결됨' : '연결 끊김'}
-        />
+        <div className="flex flex-col leading-none">
+          <span className="text-[15px] font-bold text-text">
+            {lastPrice != null ? lastPrice.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—'}
+          </span>
+          <span className="mt-0.5 flex items-center gap-1 text-[10px] text-muted">
+            <span className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-up' : 'bg-muted'}`} />
+            {connected ? '실시간' : '연결 끊김'}
+          </span>
+        </div>
       </div>
 
-      <div className="flex items-center gap-3 text-sm">
+      {/* 우: 잔고 · 랭킹 · 유저 */}
+      <div className="flex items-center gap-2 sm:gap-3">
+        <div className="flex flex-col items-end leading-none">
+          <span className="text-[10px] text-muted">잔고 (USDT)</span>
+          <span className="mt-0.5 text-sm font-bold text-text">
+            {balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </span>
+        </div>
         <button
           onClick={onOpenRank}
-          className="rounded bg-bg px-2 py-1 text-xs ring-1 ring-border hover:text-white"
+          className="rounded-md bg-panel2 px-3 py-1.5 text-xs font-semibold text-text ring-1 ring-border transition hover:bg-elevated"
         >
           🏆 랭킹
         </button>
-        <span>
-          <span className="text-muted">잔고 </span>
-          {balance.toFixed(2)} USDT
-        </span>
-        <span className="hidden text-muted sm:inline">·</span>
-        <span className="hidden font-semibold sm:inline">{name}</span>
-        <button onClick={() => logout()} className="text-xs text-muted hover:text-white">
+        <div className="hidden items-center gap-2 sm:flex">
+          <span className="flex h-7 w-7 items-center justify-center rounded-full bg-elevated text-xs font-bold text-text">
+            {name ? name.slice(0, 1).toUpperCase() : '?'}
+          </span>
+          <span className="max-w-[80px] truncate text-sm font-medium text-text">{name}</span>
+        </div>
+        <button
+          onClick={() => logout()}
+          className="rounded-md px-2 py-1.5 text-xs text-muted transition hover:text-text"
+        >
           로그아웃
         </button>
       </div>

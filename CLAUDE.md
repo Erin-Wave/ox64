@@ -29,7 +29,7 @@ ox64/
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
 ├── schema.sql              D1 스키마(users/positions/orders) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
-├── tailwind.config.js       거래소 다크 팔레트 + fontFamily(Proxima Nova)
+├── tailwind.config.js       OKX식 다크 팔레트(bg #0b0d0f/panel/panel2/elevated/border/up #00c076/down #f6465d/muted/text/accent) + fontFamily(Proxima Nova)
 ├── functions/              ── 백엔드 (Cloudflare Pages Functions, /api/*) ──
 │   ├── _shared.ts          인증(HMAC 토큰/PBKDF2)·바이낸스 서버측 시세·D1 타입·loadState
 │   └── api/

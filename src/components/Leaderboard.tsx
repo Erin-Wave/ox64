@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { api, type LeaderRow } from '@/services/api';
 
+const MEDAL = ['🥇', '🥈', '🥉'];
+
 /** 친구들 자산(equity) 순위. 열려 있는 동안 5초마다 갱신. */
 export default function Leaderboard({ onClose }: { onClose: () => void }) {
   const [rows, setRows] = useState<LeaderRow[]>([]);
@@ -23,60 +25,66 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md rounded-lg border border-border bg-panel p-5"
+        className="w-full max-w-md rounded-2xl border border-border bg-panel shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="mb-4 flex items-center justify-between">
+        <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
           <h2 className="text-base font-extrabold">🏆 랭킹</h2>
-          <button onClick={onClose} className="text-sm text-muted hover:text-white">
-            닫기
+          <button
+            onClick={onClose}
+            className="rounded-md px-2 py-1 text-sm text-muted transition hover:text-text"
+          >
+            ✕
           </button>
         </div>
 
-        {err && <p className="mb-2 text-xs text-down">{err}</p>}
+        <div className="max-h-[70vh] overflow-auto p-2">
+          {err && <p className="px-3 py-2 text-xs text-down">{err}</p>}
 
-        <table className="w-full text-sm">
-          <thead className="text-muted">
-            <tr className="text-left text-xs">
-              <th className="py-1 font-medium">#</th>
-              <th className="py-1 font-medium">이름</th>
-              <th className="py-1 text-right font-medium">자산(USDT)</th>
-              <th className="py-1 text-right font-medium">미실현</th>
-            </tr>
-          </thead>
-          <tbody>
+          {rows.length === 0 && !err && (
+            <p className="py-8 text-center text-xs text-muted">불러오는 중…</p>
+          )}
+
+          <ul className="space-y-1">
             {rows.map((r, i) => (
-              <tr
+              <li
                 key={r.name}
-                className={`border-t border-border ${r.isMe ? 'text-white' : 'text-muted'}`}
+                className={`flex items-center gap-3 rounded-lg px-3 py-2.5 ${
+                  r.isMe ? 'bg-panel2 ring-1 ring-accent/40' : 'hover:bg-panel2'
+                }`}
               >
-                <td className="py-1.5">{i + 1}</td>
-                <td className="py-1.5 font-semibold">
-                  {r.name}
-                  {r.isMe && <span className="ml-1 text-xs text-up">(나)</span>}
-                </td>
-                <td className="py-1.5 text-right">
-                  {r.equity.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                </td>
-                <td className={`py-1.5 text-right ${r.unrealized >= 0 ? 'text-up' : 'text-down'}`}>
-                  {r.unrealized >= 0 ? '+' : ''}
-                  {r.unrealized.toFixed(2)}
-                </td>
-              </tr>
+                <span className="w-6 text-center text-sm font-bold text-muted">
+                  {MEDAL[i] ?? i + 1}
+                </span>
+                <span className="flex h-8 w-8 items-center justify-center rounded-full bg-elevated text-sm font-bold">
+                  {r.name.slice(0, 1).toUpperCase()}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 truncate text-sm font-semibold text-text">
+                    {r.name}
+                    {r.isMe && <span className="text-[10px] font-normal text-accent">(나)</span>}
+                  </div>
+                  <div className="text-[11px] text-muted">
+                    포지션 {r.openCount}개
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-sm font-bold text-text">
+                    {r.equity.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  </div>
+                  <div className={`text-[11px] ${r.unrealized >= 0 ? 'text-up' : 'text-down'}`}>
+                    {r.unrealized >= 0 ? '+' : ''}
+                    {r.unrealized.toFixed(2)}
+                  </div>
+                </div>
+              </li>
             ))}
-            {rows.length === 0 && !err && (
-              <tr>
-                <td colSpan={4} className="py-3 text-center text-xs text-muted">
-                  불러오는 중…
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+          </ul>
+        </div>
       </div>
     </div>
   );
