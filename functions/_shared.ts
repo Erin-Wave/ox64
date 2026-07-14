@@ -152,35 +152,58 @@ export async function getSession(request: Request, env: Env): Promise<SessionPay
   return verifyToken(m[1], env.SESSION_SECRET);
 }
 
-// ── 바이낸스 서버측 시세 (스팟) — 체결가의 진실원본 ──────────────
-// Cloudflare Worker egress 는 api.binance.com 에서 403(IP 차단) 을 받는다.
-// 공개 데이터 전용 미러 data-api.binance.vision 를 우선 쓰고, 실패 시 폴백.
-const PRICE_HOSTS = ['https://data-api.binance.vision', 'https://api.binance.com'];
-async function tickerFetch(query: string): Promise<Response> {
-  let lastStatus = 0;
-  for (const host of PRICE_HOSTS) {
-    const r = await fetch(`${host}/api/v3/ticker/price?${query}`, {
-      headers: { accept: 'application/json', 'user-agent': 'ox64/1.0' },
-    });
-    if (r.ok) return r;
-    lastStatus = r.status;
-  }
-  throw new Error(`price fetch ${lastStatus}`);
+// ── 서버측 시세 (체결가의 진실원본) ────────────────────────────
+// ⚠ 바이낸스(api.binance.com·data-api.binance.vision)는 Cloudflare Worker egress IP 를
+//   403 으로 차단한다(브라우저는 되지만 서버에선 안 됨). 그래서 서버 시세는
+//   CF 에서 뚫리는 OKX → Coinbase → 바이낸스미러 순으로 폴백한다.
+//   심볼은 USDT 페어(BTCUSDT 등). OKX=BTC-USDT, Coinbase=BTC-USD(≈USDT).
+const HDR = { accept: 'application/json', 'user-agent': 'ox64/1.0' };
+const base = (symbol: string) => symbol.replace(/USDT$/, '');
+
+async function fromOkx(symbol: string): Promise<number> {
+  const r = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${base(symbol)}-USDT`, { headers: HDR });
+  if (!r.ok) throw new Error(`okx ${r.status}`);
+  const d = (await r.json()) as { data?: { last: string }[] };
+  return Number(d.data?.[0]?.last);
 }
-export async function fetchPrice(symbol: string): Promise<number> {
-  const r = await tickerFetch(`symbol=${symbol}`);
+async function fromCoinbase(symbol: string): Promise<number> {
+  const r = await fetch(`https://api.exchange.coinbase.com/products/${base(symbol)}-USD/ticker`, { headers: HDR });
+  if (!r.ok) throw new Error(`coinbase ${r.status}`);
+  const d = (await r.json()) as { price?: string };
+  return Number(d.price);
+}
+async function fromBinanceMirror(symbol: string): Promise<number> {
+  const r = await fetch(`https://data-api.binance.vision/api/v3/ticker/price?symbol=${symbol}`, { headers: HDR });
+  if (!r.ok) throw new Error(`binance ${r.status}`);
   const d = (await r.json()) as { price: string };
-  const p = Number(d.price);
-  if (!p || !isFinite(p)) throw new Error('bad price');
-  return p;
+  return Number(d.price);
+}
+
+export async function fetchPrice(symbol: string): Promise<number> {
+  let last = '';
+  for (const src of [fromOkx, fromCoinbase, fromBinanceMirror]) {
+    try {
+      const p = await src(symbol);
+      if (p && isFinite(p)) return p;
+      last = 'invalid price';
+    } catch (e) {
+      last = e instanceof Error ? e.message : 'error';
+    }
+  }
+  throw new Error(`시세 조회 실패 (${last})`);
 }
 export async function fetchPrices(symbols: string[]): Promise<Record<string, number>> {
   const uniq = [...new Set(symbols)];
-  if (uniq.length === 0) return {};
-  const r = await tickerFetch(`symbols=${encodeURIComponent(JSON.stringify(uniq))}`);
-  const arr = (await r.json()) as { symbol: string; price: string }[];
   const out: Record<string, number> = {};
-  for (const x of arr) out[x.symbol] = Number(x.price);
+  await Promise.all(
+    uniq.map(async (s) => {
+      try {
+        out[s] = await fetchPrice(s);
+      } catch {
+        /* 그 심볼만 스킵 */
+      }
+    }),
+  );
   return out;
 }
 
