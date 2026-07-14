@@ -1,0 +1,21 @@
+# Cloudflare Pages + Functions 설정.
+name = "ox64"
+pages_build_output_dir = "dist"
+compatibility_date = "2024-11-01"
+
+# ── D1 바인딩 ──────────────────────────────────────────────────
+# 권장(Git 연동 배포): 아래 블록은 주석 그대로 두고, Cloudflare 대시보드에서 바인딩.
+#   프로젝트 → Settings → Functions → D1 database bindings → 변수명 DB → ox64
+#
+# 로컬 개발: `npx wrangler pages dev dist --d1 DB=ox64` 로 바인딩을 넘기면 됨
+#   (또는 아래 주석을 풀고 `wrangler d1 create ox64` 로 나온 database_id 를 채운다.
+#    단 placeholder 인 채로 커밋하면 배포가 깨질 수 있으니 실제 id 없으면 주석 유지.)
+#
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "ox64"
+# database_id = "여기에-실제-D1-ID"
+
+# SESSION_SECRET(비밀값)은 여기 두지 말 것:
+#   프로덕션: 대시보드 → Settings → Variables and Secrets → SESSION_SECRET (Secret 으로 암호화)
+#   로컬:     루트에 .dev.vars 파일 →  SESSION_SECRET="아무_긴_랜덤_문자열"

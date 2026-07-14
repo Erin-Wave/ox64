@@ -1,110 +1,113 @@
 import { create } from 'zustand';
-import { db } from '@/db/db';
-import type { Order, Position, Side } from '@/types';
+import { api, type ApiOrder, type ApiPosition, type AppState } from '@/services/api';
+import type { Side } from '@/types';
 
 /**
- * 모의 트레이딩 상태 (Zustand + IndexedDB 영속).
- * 스토어는 메모리 캐시이고, 모든 변경은 Dexie 에도 기록해 새로고침에도 유지한다.
+ * 모의 트레이딩 상태 (서버 권위).
+ * 잔고/포지션/주문의 진실원본은 서버(D1)이고, 스토어는 서버 응답의 캐시일 뿐.
+ * 모든 변경은 /api/* 를 거치며 서버가 검증·계산한다 → 클라 조작 무의미.
  */
 interface TradingState {
-  accountId: string | null;
+  ready: boolean; // 초기 세션 확인 완료
+  authed: boolean;
+  name: string | null;
   balance: number;
-  positions: Position[];
-  orders: Order[];
+  positions: ApiPosition[];
+  orders: ApiOrder[];
+  busy: boolean;
+  error: string | null;
 
-  hydrate: () => Promise<void>;
-  openMarket: (params: {
-    symbol: string;
-    side: Side;
-    price: number;
-    size: number;
-    leverage: number;
-  }) => Promise<void>;
-  closePosition: (id: string, markPrice: number) => Promise<void>;
+  init: () => Promise<void>;
+  login: (name: string, passcode: string) => Promise<void>;
+  logout: () => Promise<void>;
+  refresh: () => Promise<void>;
+  openMarket: (p: { symbol: string; side: Side; size: number; leverage: number }) => Promise<void>;
+  closePosition: (id: string) => Promise<void>;
 }
 
-export const useTradingStore = create<TradingState>((set, get) => ({
-  accountId: null,
+function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
+  set({
+    authed: true,
+    name: st.name,
+    balance: st.balance,
+    positions: st.positions,
+    orders: st.orders,
+    error: null,
+  });
+}
+
+export const useTradingStore = create<TradingState>((set) => ({
+  ready: false,
+  authed: false,
+  name: null,
   balance: 0,
   positions: [],
   orders: [],
+  busy: false,
+  error: null,
 
-  // IndexedDB 에서 초기 상태 로드
-  hydrate: async () => {
-    const account = await db.accounts.orderBy('createdAt').first();
-    const positions = await db.positions.toArray();
-    const orders = await db.orders.toArray();
-    set({
-      accountId: account?.id ?? null,
-      balance: account?.balance ?? 0,
-      positions,
-      orders,
-    });
+  // 앱 시작 시 기존 세션(쿠키) 확인
+  init: async () => {
+    try {
+      const st = await api.state();
+      apply(set, st);
+    } catch {
+      set({ authed: false });
+    } finally {
+      set({ ready: true });
+    }
   },
 
-  // 시장가 진입 (단순화: 즉시 체결 + 포지션 생성)
-  openMarket: async ({ symbol, side, price, size, leverage }) => {
-    const { accountId } = get();
-    if (!accountId) return;
-
-    const now = Date.now();
-    const order: Order = {
-      id: crypto.randomUUID(),
-      symbol,
-      side,
-      price,
-      size,
-      leverage,
-      status: 'filled',
-      createdAt: now,
-    };
-    const position: Position = {
-      id: crypto.randomUUID(),
-      symbol,
-      side,
-      entryPrice: price,
-      size,
-      leverage,
-      openedAt: now,
-    };
-
-    // 증거금 차감 (명목가 / 레버리지)
-    const margin = (price * size) / leverage;
-    const newBalance = get().balance - margin;
-
-    await db.transaction('rw', db.orders, db.positions, db.accounts, async () => {
-      await db.orders.add(order);
-      await db.positions.add(position);
-      await db.accounts.update(accountId, { balance: newBalance });
-    });
-
-    set({
-      orders: [...get().orders, order],
-      positions: [...get().positions, position],
-      balance: newBalance,
-    });
+  login: async (name, passcode) => {
+    set({ busy: true, error: null });
+    try {
+      const st = await api.login(name, passcode);
+      apply(set, st);
+    } catch (e) {
+      set({ error: (e as Error).message });
+      throw e;
+    } finally {
+      set({ busy: false });
+    }
   },
 
-  // 포지션 청산 → 손익 정산 후 잔고 반영
-  closePosition: async (id, markPrice) => {
-    const { accountId, positions } = get();
-    if (!accountId) return;
-    const pos = positions.find((p) => p.id === id);
-    if (!pos) return;
+  logout: async () => {
+    try {
+      await api.logout();
+    } catch {
+      /* 무시 */
+    }
+    set({ authed: false, name: null, balance: 0, positions: [], orders: [] });
+  },
 
-    const dir = pos.side === 'long' ? 1 : -1;
-    const pnl = (markPrice - pos.entryPrice) * pos.size * dir;
-    const margin = (pos.entryPrice * pos.size) / pos.leverage;
-    const newBalance = get().balance + margin + pnl;
+  refresh: async () => {
+    try {
+      apply(set, await api.state());
+    } catch {
+      set({ authed: false });
+    }
+  },
 
-    await db.transaction('rw', db.positions, db.accounts, async () => {
-      await db.positions.delete(id);
-      await db.accounts.update(accountId, { balance: newBalance });
-    });
+  openMarket: async ({ symbol, side, size, leverage }) => {
+    set({ busy: true, error: null });
+    try {
+      // 가격은 보내지 않는다 — 서버가 체결가를 직접 받아 쓴다.
+      apply(set, await api.open({ symbol, side, size, leverage }));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
 
-    set({
-      positions: positions.filter((p) => p.id !== id),
-      balance: newBalance,
-    });
+  closePosition: async (id) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.close(id));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
   },
 }));

@@ -1,10 +1,12 @@
 import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 
-/** 보유 포지션 목록 + 실시간 미실현 손익 */
+/** 보유 포지션 목록 + 실시간 미실현 손익(현재 보는 심볼 기준 추정). */
 export default function PositionsPanel() {
   const positions = useTradingStore((s) => s.positions);
   const closePosition = useTradingStore((s) => s.closePosition);
+  const busy = useTradingStore((s) => s.busy);
+  const curSymbol = useMarketStore((s) => s.symbol);
   const lastPrice = useMarketStore((s) => s.lastPrice);
 
   if (positions.length === 0) {
@@ -24,11 +26,12 @@ export default function PositionsPanel() {
             <th className="px-3 py-2" />
           </tr>
         </thead>
-        <tbody className="font-mono">
+        <tbody>
           {positions.map((p) => {
             const dir = p.side === 'long' ? 1 : -1;
-            const mark = lastPrice ?? p.entryPrice;
-            const pnl = (mark - p.entryPrice) * p.size * dir;
+            // 현재 보는 심볼의 실시간가로만 추정(다른 심볼은 서버 청산 시 확정).
+            const live = p.symbol === curSymbol ? lastPrice : null;
+            const pnl = live != null ? (live - p.entryPrice) * p.size * dir : null;
             return (
               <tr key={p.id} className="border-t border-border">
                 <td className="px-3 py-2">{p.symbol}</td>
@@ -37,14 +40,18 @@ export default function PositionsPanel() {
                 </td>
                 <td className="px-3 py-2 text-right">{p.entryPrice.toFixed(2)}</td>
                 <td className="px-3 py-2 text-right">{p.size}</td>
-                <td className={`px-3 py-2 text-right ${pnl >= 0 ? 'text-up' : 'text-down'}`}>
-                  {pnl >= 0 ? '+' : ''}
-                  {pnl.toFixed(2)}
+                <td
+                  className={`px-3 py-2 text-right ${
+                    pnl == null ? 'text-muted' : pnl >= 0 ? 'text-up' : 'text-down'
+                  }`}
+                >
+                  {pnl == null ? '—' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`}
                 </td>
                 <td className="px-3 py-2 text-right">
                   <button
-                    onClick={() => closePosition(p.id, mark)}
-                    className="rounded bg-border px-2 py-1 text-muted hover:text-white"
+                    onClick={() => closePosition(p.id)}
+                    disabled={busy}
+                    className="rounded bg-border px-2 py-1 text-muted hover:text-white disabled:opacity-40"
                   >
                     청산
                   </button>

@@ -5,6 +5,10 @@ dist-ssr
 .vite
 *.tsbuildinfo
 
+# Cloudflare local dev
+.dev.vars
+.wrangler
+
 # Editor
 .vscode/*
 !.vscode/extensions.json
