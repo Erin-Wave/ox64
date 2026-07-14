@@ -81,6 +81,14 @@ export default function Chart() {
       crosshair: { mode: CrosshairMode.Normal },
       rightPriceScale: { borderColor: '#282c33' },
       timeScale: { borderColor: '#282c33', timeVisible: true, secondsVisible: false },
+      // 하단 크로스헤어 시간 라벨 = yyyy-MM-dd HH:mm:ss (KST, 이미 오프셋된 값이라 UTC 로 포맷)
+      localization: {
+        timeFormatter: (t: unknown) => {
+          const d = new Date((t as number) * 1000);
+          const p = (n: number) => String(n).padStart(2, '0');
+          return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+        },
+      },
       autoSize: true,
     });
     const candle = chart.addCandlestickSeries({
