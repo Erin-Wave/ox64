@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useTradingStore } from '@/store/useTradingStore';
+import logo from '@/resources/images/icon_256.png';
 
 /** 이름 + 패스코드 로그인/가입. 처음 쓰는 이름이면 자동 가입된다. */
 export default function Login() {
@@ -22,7 +23,7 @@ export default function Login() {
         onSubmit={submit}
         className="w-full max-w-xs rounded-lg border border-border bg-panel p-6"
       >
-        <h1 className="mb-1 text-xl font-extrabold tracking-tight">ox64</h1>
+        <img src={logo} alt="ox64" className="mb-2 h-10 w-10" />
         <p className="mb-5 text-xs text-muted">
           이름과 패스코드로 입장. 처음 쓰는 이름이면 계정이 새로 만들어져요.
         </p>

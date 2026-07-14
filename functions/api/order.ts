@@ -2,6 +2,8 @@ import {
   type Ctx,
   bad,
   json,
+  safe,
+  missingEnv,
   getSession,
   isSymbol,
   fetchPrice,
@@ -18,7 +20,13 @@ import {
  * 체결가는 클라이언트가 아니라 **서버가 바이낸스에서 직접** 받아 사용한다.
  * 잔고/증거금/손익 계산·검증도 전부 서버에서 → 클라 조작 무의미.
  */
-export async function onRequestPost({ request, env }: Ctx): Promise<Response> {
+export function onRequestPost({ request, env }: Ctx): Promise<Response> {
+  return safe(() => handle(request, env));
+}
+
+async function handle(request: Request, env: Ctx['env']): Promise<Response> {
+  const envErr = missingEnv(env);
+  if (envErr) return bad(envErr, 500);
   const sess = await getSession(request, env);
   if (!sess) return bad('unauthorized', 401);
   const uid = sess.uid;

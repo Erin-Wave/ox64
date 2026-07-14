@@ -1,5 +1,6 @@
 import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
+import logo from '@/resources/images/icon_256.png';
 
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'];
 
@@ -15,7 +16,7 @@ export default function Header({ onOpenRank }: { onOpenRank: () => void }) {
   return (
     <header className="flex flex-wrap items-center justify-between gap-y-1 border-b border-border bg-panel px-3 py-2 sm:px-4">
       <div className="flex items-center gap-2 sm:gap-4">
-        <span className="text-base font-extrabold tracking-tight">ox64</span>
+        <img src={logo} alt="ox64" className="h-7 w-7 shrink-0" />
         <select
           value={symbol}
           onChange={(e) => setSymbol(e.target.value)}

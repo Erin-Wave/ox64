@@ -49,6 +49,24 @@ export function json(data: unknown, status = 200, headers: Record<string, string
 }
 export const bad = (msg: string, status = 400) => json({ error: msg }, status);
 
+// 설정(바인딩/시크릿) 누락을 명확한 메시지로 노출 — 500 의 흔한 원인 진단용
+export function missingEnv(env: Env): string | null {
+  if (!env || !env.DB || typeof env.DB.prepare !== 'function')
+    return 'D1 바인딩 "DB" 가 없습니다. 대시보드 → Settings → Functions → D1 bindings 추가 후 재배포하세요.';
+  if (!env.SESSION_SECRET)
+    return 'SESSION_SECRET 이 없습니다. 대시보드 → Settings → Variables and Secrets 추가 후 재배포하세요.';
+  return null;
+}
+// 핸들러 예외를 500 + 메시지로 반환(opaque 500 방지)
+export async function safe(handler: () => Promise<Response>): Promise<Response> {
+  try {
+    return await handler();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'server error';
+    return json({ error: `서버 오류: ${msg}` }, 500);
+  }
+}
+
 // ── base64url / hex ────────────────────────────────────────────
 function b64url(bytes: Uint8Array): string {
   let bin = '';

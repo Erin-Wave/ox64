@@ -2,6 +2,8 @@ import {
   type Ctx,
   bad,
   json,
+  safe,
+  missingEnv,
   hashPasscode,
   verifyPasscode,
   signToken,
@@ -16,7 +18,14 @@ import {
  * - 이름이 없으면 신규 가입(그 패스코드로 등록, 기본 잔고 지급).
  * - 있으면 패스코드 검증. 성공 시 HMAC 서명 세션 쿠키 발급.
  */
-export async function onRequestPost({ request, env }: Ctx): Promise<Response> {
+export function onRequestPost({ request, env }: Ctx): Promise<Response> {
+  return safe(() => handle(request, env));
+}
+
+async function handle(request: Request, env: Ctx['env']): Promise<Response> {
+  const envErr = missingEnv(env);
+  if (envErr) return bad(envErr, 500);
+
   let body: { name?: unknown; passcode?: unknown };
   try {
     body = await request.json();

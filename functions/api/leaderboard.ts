@@ -1,11 +1,17 @@
-import { type Ctx, bad, json, getSession, fetchPrices, type PositionRow } from '../_shared';
+import { type Ctx, bad, json, safe, missingEnv, getSession, fetchPrices, type PositionRow } from '../_shared';
 
 /**
  * GET /api/leaderboard — 친구들 자산 순위.
  * equity = 잔고(balance) + 열린 포지션의 미실현 손익(서버 시세 기준).
  * 로그인 필요(친구 전용, 공개 스크래핑 방지).
  */
-export async function onRequestGet({ request, env }: Ctx): Promise<Response> {
+export function onRequestGet({ request, env }: Ctx): Promise<Response> {
+  return safe(() => handle(request, env));
+}
+
+async function handle(request: Request, env: Ctx['env']): Promise<Response> {
+  const envErr = missingEnv(env);
+  if (envErr) return bad(envErr, 500);
   const sess = await getSession(request, env);
   if (!sess) return bad('unauthorized', 401);
 
