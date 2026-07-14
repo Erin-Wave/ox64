@@ -26,8 +26,7 @@
 ```
 ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
-├── wrangler.toml           Pages+Functions 설정(D1 바인딩 DB, pages_build_output_dir=dist)
-├── schema.sql              D1 스키마(users/positions/orders) — wrangler d1 execute 로 적용
+├── schema.sql              D1 스키마(users/positions/orders) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       거래소 다크 팔레트 + fontFamily(Proxima Nova)
 ├── functions/              ── 백엔드 (Cloudflare Pages Functions, /api/*) ──
@@ -106,14 +105,14 @@ npm run build
 npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars 사용
 ```
 
-### Cloudflare 최초 설정 (한 번, 대시보드 or CLI)
-1. **D1 생성**: `npx wrangler d1 create ox64` (database_id 는 기록만; 바인딩은 3번 대시보드 권장 — wrangler.toml 에 placeholder 를 커밋하면 배포가 깨질 수 있음).
-2. **스키마 적용**: `npx wrangler d1 execute ox64 --remote --file=./schema.sql` (로컬은 `--local`).
-3. **Pages 프로젝트 바인딩** (대시보드 → 프로젝트 → Settings → Functions):
-   - **D1 database binding**: 변수명 `DB` → 위 D1(`ox64`).
-   - **Secret**: `SESSION_SECRET` = 아무 긴 랜덤 문자열(암호화 변수).
-4. 로컬 dev 용: 루트에 `.dev.vars` 파일 → `SESSION_SECRET="..."` (gitignore 됨).
-- **Pages 빌드 설정**(Git 연동): Build command=`npm run build`, Output dir=`dist`. Functions 는 `functions/` 를 Cloudflare 가 자동 번들(타입체크 없이 esbuild 트랜스파일).
+### Cloudflare 최초 설정 (한 번) — **대시보드로 바인딩** (wrangler.toml 없음)
+> ⚠ **wrangler.toml 을 두지 말 것**: 있으면 Pages 가 "바인딩은 wrangler.toml 로만 관리"하며 대시보드 바인딩 UI 를 잠근다("Bindings for this project are being managed through wrangler.toml"). 대시보드로 관리하려면 wrangler.toml 이 레포에 없어야 함(2026-07-14 제거).
+1. **D1 생성**: 대시보드 → Storage & Databases → **D1 SQL Database → Create** → 이름 `ox64` (또는 `npx wrangler d1 create ox64`).
+2. **스키마 적용**: 그 D1 의 **Console** 탭에 `schema.sql` 내용 붙여넣고 실행 (또는 `npx wrangler d1 execute ox64 --remote --file=./schema.sql`).
+3. **Pages 바인딩** (대시보드 → Workers & Pages → ox64 → Settings → Functions → **D1 database bindings**): 변수명 `DB` → D1 `ox64`.
+4. **Secret** (Settings → Variables and Secrets): `SESSION_SECRET` = 긴 랜덤 문자열, 타입 **Secret**.
+5. **재배포**: 바인딩/시크릿은 **새 배포부터** 적용 → Deployments → 최신 → **Retry deployment**.
+- **Pages 빌드 설정**(Git 연동): Build command=`npm run build`, Output dir=`dist`. Functions 는 `functions/` 를 Cloudflare 가 자동 번들(타입체크 없이 esbuild 트랜스파일). compat date 는 Pages 기본값 사용(우리 함수는 표준 API 만 써 무관).
 
 ## 6. 주의 / 함정
 
