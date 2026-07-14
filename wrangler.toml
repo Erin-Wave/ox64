@@ -1,0 +1,11 @@
+# Cloudflare Pages + Functions 설정 (바인딩을 코드로 관리).
+# Git 연동 배포가 이 파일을 읽어 D1 바인딩(DB)을 자동 적용한다.
+# SESSION_SECRET(비밀값)은 여기 두지 않고 `wrangler pages secret put` 으로 설정됨.
+name = "ox64"
+pages_build_output_dir = "dist"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"                 # functions 코드의 env.DB
+database_name = "ox64"
+database_id = "f32f600e-49ad-4026-843f-84f34a62df3c"

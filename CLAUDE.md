@@ -26,6 +26,7 @@
 ```
 ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
+├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
 ├── schema.sql              D1 스키마(users/positions/orders) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       거래소 다크 팔레트 + fontFamily(Proxima Nova)
@@ -105,14 +106,12 @@ npm run build
 npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars 사용
 ```
 
-### Cloudflare 최초 설정 (한 번) — **대시보드로 바인딩** (wrangler.toml 없음)
-> ⚠ **wrangler.toml 을 두지 말 것**: 있으면 Pages 가 "바인딩은 wrangler.toml 로만 관리"하며 대시보드 바인딩 UI 를 잠근다("Bindings for this project are being managed through wrangler.toml"). 대시보드로 관리하려면 wrangler.toml 이 레포에 없어야 함(2026-07-14 제거).
-1. **D1 생성**: 대시보드 → Storage & Databases → **D1 SQL Database → Create** → 이름 `ox64` (또는 `npx wrangler d1 create ox64`).
-2. **스키마 적용**: 그 D1 의 **Console** 탭에 `schema.sql` 내용 붙여넣고 실행 (또는 `npx wrangler d1 execute ox64 --remote --file=./schema.sql`).
-3. **Pages 바인딩** (대시보드 → Workers & Pages → ox64 → Settings → Functions → **D1 database bindings**): 변수명 `DB` → D1 `ox64`.
-4. **Secret** (Settings → Variables and Secrets): `SESSION_SECRET` = 긴 랜덤 문자열, 타입 **Secret**.
-5. **재배포**: 바인딩/시크릿은 **새 배포부터** 적용 → Deployments → 최신 → **Retry deployment**.
-- **Pages 빌드 설정**(Git 연동): Build command=`npm run build`, Output dir=`dist`. Functions 는 `functions/` 를 Cloudflare 가 자동 번들(타입체크 없이 esbuild 트랜스파일). compat date 는 Pages 기본값 사용(우리 함수는 표준 API 만 써 무관).
+### Cloudflare 설정 (완료 상태, 2026-07-14) — **바인딩=wrangler.toml / 시크릿=CLI**
+- **D1**: `ox64` (database_id `f32f600e-49ad-4026-843f-84f34a62df3c`), 스키마 3테이블 적용 완료. 바인딩은 `wrangler.toml` 의 `[[d1_databases]] binding="DB"` 로 코드 관리 → Git 배포가 자동 적용(대시보드 바인딩 UI 는 "managed through wrangler.toml" 로 잠기며, 이게 정상 — 코드가 진실원본).
+- **Secret**: `SESSION_SECRET` = `wrangler pages secret put SESSION_SECRET --project-name ox64` 로 production 에 설정됨(랜덤 32B hex). wrangler.toml 엔 두지 않음.
+- 재적용 명령: 스키마 `npx wrangler d1 execute ox64 --remote --file=./schema.sql` / 시크릿 `echo <값> | npx wrangler pages secret put SESSION_SECRET --project-name ox64`.
+- **Pages 빌드 설정**(Git 연동): Build command=`npm run build`, Output dir=`dist`(wrangler.toml `pages_build_output_dir`). Functions 는 `functions/` 자동 번들. 바인딩/시크릿은 **새 배포부터** 적용.
+- 상태 점검(데이터 안 건드림): `curl https://ox64.app/api/state` → `{"error":"unauthorized"}`(401)면 정상(함수+D1+시크릿 OK). 500 + missingEnv 메시지면 바인딩/시크릿 누락.
 
 ## 6. 주의 / 함정
 
