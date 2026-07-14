@@ -18,13 +18,15 @@ export async function fetchPricePrecision(symbol: string): Promise<{ precision: 
   return { precision, minMove: tick > 0 ? tick : Math.pow(10, -precision) };
 }
 
-/** 초기 차트용 과거 캔들(REST). websocket 은 이후 실시간 갱신만 담당. */
+/** 과거 캔들(REST). endTimeMs 를 주면 그 시각 이전 구간을 받아 과거 스크롤 로드에 쓴다. */
 export async function fetchKlines(
   symbol: string,
   interval = '1m',
   limit = 500,
+  endTimeMs?: number,
 ): Promise<Candle[]> {
-  const url = `${SPOT_API}/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}`;
+  let url = `${SPOT_API}/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}`;
+  if (endTimeMs) url += `&endTime=${Math.floor(endTimeMs)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`klines fetch failed: ${res.status}`);
   const rows: unknown[][] = await res.json();

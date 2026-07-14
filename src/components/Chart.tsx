@@ -150,7 +150,8 @@ export default function Chart() {
     // 거래량 히스토그램 — 최하단
     if (opts.volume) {
       if (!volRef.current) {
-        volRef.current = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: false });
+        // lastValueVisible=true → 우측 축에 최신 거래량 티커(1.23M 형식) 표시
+        volRef.current = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: true });
       }
       volRef.current.setData(
         candles.map((c) => ({
@@ -212,7 +213,9 @@ export default function Chart() {
         candle.setData(
           candles.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
         );
-        chartRef.current?.timeScale().fitContent();
+        // 기본 표시 = 최근 ~38봉 (모바일 가독성). 이후 왼쪽으로 당기면 과거봉 추가 로드.
+        const len = candles.length;
+        chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - 38), to: len + 2 });
         syncIndicators();
         const l = candles.at(-1);
         if (l && !hovering.current) setLegend(l);
@@ -220,6 +223,46 @@ export default function Chart() {
         console.error('[chart] load failed', e);
       }
     })();
+
+    // ── 과거봉 추가 로드 (왼쪽 스크롤) ──────────────────────────
+    let loadingMore = false;
+    let noMore = false;
+    const loadOlder = async () => {
+      const chart = chartRef.current;
+      const arr = candlesRef.current;
+      if (loadingMore || noMore || !chart || arr.length === 0) return;
+      loadingMore = true;
+      try {
+        const oldest = arr[0].time; // sec
+        const older = await fetchKlines(symbol, interval, 500, oldest * 1000 - 1);
+        if (cancelled) return;
+        const fresh = older.filter((c) => c.time < oldest);
+        if (fresh.length === 0) {
+          noMore = true;
+          return;
+        }
+        const ts = chart.timeScale();
+        const before = ts.getVisibleLogicalRange();
+        candlesRef.current = [...fresh, ...arr];
+        for (const c of fresh) volMap.current.set(c.time, c.volume ?? 0);
+        candle.setData(
+          candlesRef.current.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
+        );
+        syncIndicators();
+        // 프리펜드로 인덱스가 fresh.length 만큼 밀리므로 보이던 구간 그대로 유지
+        if (before) ts.setVisibleLogicalRange({ from: before.from + fresh.length, to: before.to + fresh.length });
+        if (fresh.length < 450) noMore = true; // 더 받을 게 거의 없음(과거 데이터 끝 근처)
+      } catch {
+        /* 다음 시도 때 재시도 */
+      } finally {
+        loadingMore = false;
+      }
+    };
+    const onRange = (range: { from: number; to: number } | null) => {
+      if (range && range.from < 10) loadOlder();
+    };
+    const tsApi = chartRef.current?.timeScale();
+    tsApi?.subscribeVisibleLogicalRangeChange(onRange);
 
     const sub = klineStream(symbol, interval).subscribe({
       next: (tick) => {
@@ -249,6 +292,7 @@ export default function Chart() {
     return () => {
       cancelled = true;
       sub.unsubscribe();
+      tsApi?.unsubscribeVisibleLogicalRangeChange(onRange);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, interval]);
