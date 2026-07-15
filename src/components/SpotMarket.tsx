@@ -193,12 +193,15 @@ export default function SpotMarket({ onClose }: { onClose: () => void }) {
                 <div className="mb-1 font-semibold text-muted">최근 체결</div>
                 <div className="max-h-28 space-y-0.5 overflow-auto">
                   {state.trades.length === 0 && <div className="text-muted">없음</div>}
-                  {state.trades.map((t) => (
-                    <div key={t.id} className={`flex items-center justify-between rounded px-2 py-0.5 ${t.isMe ? 'bg-panel2' : ''}`}>
-                      <span className="text-text">{fmtNum(t.price)}</span>
-                      <span className="text-muted">{fmtNum(t.size)}</span>
-                    </div>
-                  ))}
+                  {state.trades.map((t) => {
+                    const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
+                    return (
+                      <div key={t.id} className={`flex items-center justify-between rounded px-2 py-0.5 ${t.isMe ? 'bg-panel2' : ''}`}>
+                        <span className={color}>{fmtNum(t.price)}</span>
+                        <span className={color}>{fmtNum(t.size)}</span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>

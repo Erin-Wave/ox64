@@ -69,6 +69,7 @@ export interface SpotTrade {
   id: string;
   price: number;
   size: number;
+  takerSide: 'buy' | 'sell' | null;
   createdAt: number;
   isMe: boolean;
 }

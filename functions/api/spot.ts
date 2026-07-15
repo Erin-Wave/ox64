@@ -88,7 +88,14 @@ async function loadSpotState(env: Env, uid: string) {
       createdAt: o.created_at,
     })),
     book: { bids, asks },
-    trades: trades.map((t) => ({ id: t.id, price: t.price, size: t.size, createdAt: t.created_at, isMe: t.buyer_id === uid || t.seller_id === uid })),
+    trades: trades.map((t) => ({
+      id: t.id,
+      price: t.price,
+      size: t.size,
+      takerSide: t.taker_side,
+      createdAt: t.created_at,
+      isMe: t.buyer_id === uid || t.seller_id === uid,
+    })),
   };
 }
 
@@ -99,10 +106,11 @@ async function matchBuy(env: Env, uid: string, orderId: string, limitPrice: numb
   for (let i = 0; i < 200; i++) {
     const order = await env.DB.prepare('SELECT * FROM spot_orders WHERE id = ?').bind(orderId).first<SpotOrderRow>();
     if (!order || order.status !== 'open' || order.size <= EPS) return;
+    // user_id != ? : 본인이 낸 반대편 주문과는 체결되지 않는다(셀프매칭 방지).
     const maker = await env.DB.prepare(
-      "SELECT * FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open' AND price <= ? ORDER BY price ASC, created_at ASC LIMIT 1",
+      "SELECT * FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open' AND price <= ? AND user_id != ? ORDER BY price ASC, created_at ASC LIMIT 1",
     )
-      .bind(PAIR, limitPrice)
+      .bind(PAIR, limitPrice, uid)
       .first<SpotOrderRow>();
     if (!maker) return;
 
@@ -124,8 +132,8 @@ async function matchBuy(env: Env, uid: string, orderId: string, limitPrice: numb
       env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(tradePrice * tradeSize, maker.user_id),
       env.DB.prepare('UPDATE users SET ox_balance = ox_balance + ? WHERE id = ?').bind(tradeSize, uid),
       env.DB.prepare(
-        'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, created_at) VALUES (?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), PAIR, uid, maker.user_id, tradePrice, tradeSize, now),
+        'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), PAIR, uid, maker.user_id, tradePrice, tradeSize, 'buy', now),
     ]);
 
     if (buyerRemaining <= EPS) return;
@@ -138,10 +146,11 @@ async function matchSell(env: Env, uid: string, orderId: string, limitPrice: num
   for (let i = 0; i < 200; i++) {
     const order = await env.DB.prepare('SELECT * FROM spot_orders WHERE id = ?').bind(orderId).first<SpotOrderRow>();
     if (!order || order.status !== 'open' || order.size <= EPS) return;
+    // user_id != ? : 본인이 낸 반대편 주문과는 체결되지 않는다(셀프매칭 방지).
     const maker = await env.DB.prepare(
-      "SELECT * FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open' AND price >= ? ORDER BY price DESC, created_at ASC LIMIT 1",
+      "SELECT * FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open' AND price >= ? AND user_id != ? ORDER BY price DESC, created_at ASC LIMIT 1",
     )
-      .bind(PAIR, limitPrice)
+      .bind(PAIR, limitPrice, uid)
       .first<SpotOrderRow>();
     if (!maker) return;
 
@@ -161,8 +170,8 @@ async function matchSell(env: Env, uid: string, orderId: string, limitPrice: num
       env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(tradePrice * tradeSize, uid),
       env.DB.prepare('UPDATE users SET ox_balance = ox_balance + ? WHERE id = ?').bind(tradeSize, maker.user_id),
       env.DB.prepare(
-        'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, created_at) VALUES (?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), PAIR, maker.user_id, uid, tradePrice, tradeSize, now),
+        'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), PAIR, maker.user_id, uid, tradePrice, tradeSize, 'sell', now),
     ]);
 
     if (sellerRemaining <= EPS) return;

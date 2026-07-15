@@ -243,6 +243,7 @@ export interface SpotTradeRow {
   seller_id: string;
   price: number;
   size: number;
+  taker_side: string | null; // 'buy' | 'sell'
   created_at: number;
 }
 export interface PositionRow {

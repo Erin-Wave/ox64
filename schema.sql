@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS spot_trades (
   seller_id  TEXT NOT NULL,
   price      REAL NOT NULL,
   size       REAL NOT NULL,
+  taker_side TEXT,                    -- 'buy' | 'sell' — 이 체결을 발생시킨(나중에 낸) 주문 방향, 체결가 색상 표시용
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_spot_trades_pair ON spot_trades(pair, created_at);
@@ -107,3 +108,7 @@ CREATE INDEX IF NOT EXISTS idx_spot_trades_pair ON spot_trades(pair, created_at)
 -- ⚠ 일회성 마이그레이션 (2026-07-15 추가, OX 현물 거래 지원): 기존 prod DB 의
 -- users 테이블에 컬럼을 추가한다. 위와 동일한 이유로 최초 1회만 실행할 것.
 -- ALTER TABLE users ADD COLUMN ox_balance REAL NOT NULL DEFAULT 100;
+
+-- ⚠ 일회성 마이그레이션 (2026-07-15 추가, 체결 탭 매수/매도 색상 구분): 이미 spot_trades 가
+-- 생성된 prod DB 에 컬럼을 추가한다. 위와 동일한 이유로 최초 1회만 실행할 것.
+-- ALTER TABLE spot_trades ADD COLUMN taker_side TEXT;
