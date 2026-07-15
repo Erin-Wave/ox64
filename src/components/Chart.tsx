@@ -39,10 +39,11 @@ const CHART_THEME: Record<Theme, { bg: string; text: string; grid: string; borde
 type BbSeries = { upper: ISeriesApi<'Line'>; basis: ISeriesApi<'Line'>; lower: ISeriesApi<'Line'> };
 
 const toChart = (t: number) => (t + KST_OFFSET) as UTCTimestamp;
-const fmtKst = (realSec: number) => {
+const fmtKst = (realSec: number, withSeconds = false) => {
   const d = new Date((realSec + KST_OFFSET) * 1000);
   const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+  const base = `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+  return withSeconds ? `${base}:${p(d.getUTCSeconds())}` : base;
 };
 const line = (arr: (number | null)[], times: number[]): LineData[] => {
   const out: LineData[] = [];
@@ -154,6 +155,12 @@ export default function Chart() {
     });
     candle.applyOptions({ upColor: c.up, downColor: c.down, wickUpColor: c.up, wickDownColor: c.down });
   }, [theme]);
+
+  // ── 초봉(1s) 등 1분 미만 타임프레임에서는 축/레전드에 초 단위까지 표시 ──
+  const subMinute = intervalSec(interval) < 60;
+  useEffect(() => {
+    chartRef.current?.applyOptions({ timeScale: { secondsVisible: subMinute } });
+  }, [subMinute]);
 
   // ── 인디케이터 동기화 (candlesRef 기준 재계산) ────────────────
   // opts 를 직접 클로징하지 않고 optsRef 로 항상 최신 값을 읽는다.
@@ -544,7 +551,7 @@ export default function Chart() {
         {legend && (
           <div className="pointer-events-none absolute left-2 top-1.5 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px]">
             <span className="font-semibold text-text">{symbol.replace('USDT', '')}</span>
-            <span className="text-muted">{fmtKst(legend.time)}</span>
+            <span className="text-muted">{fmtKst(legend.time, subMinute)}</span>
             <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.open, prec)}</span></span>
             <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.high, prec)}</span></span>
             <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.low, prec)}</span></span>

@@ -5,6 +5,7 @@ import { create } from 'zustand';
  * prices: 심볼별 최신가 맵 — 현재 보는 심볼(차트 WS) + 보유 포지션 심볼(폴링)을 모두 담아
  *   다른 심볼 포지션의 PnL 도 실시간 갱신되게 한다.
  * 잦은 틱 리렌더를 막기 위해 selector 로만 구독한다.
+ * symbol/interval 은 마지막 선택값을 localStorage 에 저장해뒀다가 재접속 시 복원한다.
  */
 interface MarketState {
   symbol: string;
@@ -20,15 +21,38 @@ interface MarketState {
   setConnected: (c: boolean) => void;
 }
 
-export const useMarketStore = create<MarketState>((set) => ({
-  symbol: 'BTCUSDT',
-  interval: '1m',
+const KEY = 'ox64_market_opts_v1';
+function load(): Partial<Pick<MarketState, 'symbol' | 'interval'>> {
+  try {
+    return JSON.parse(localStorage.getItem(KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+function persist(s: Pick<MarketState, 'symbol' | 'interval'>) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify({ symbol: s.symbol, interval: s.interval }));
+  } catch {
+    /* ignore */
+  }
+}
+
+const saved = load();
+export const useMarketStore = create<MarketState>((set, get) => ({
+  symbol: saved.symbol ?? 'BTCUSDT',
+  interval: saved.interval ?? '1m',
   prices: {},
   precisions: {},
   connected: false,
 
-  setSymbol: (symbol) => set({ symbol }),
-  setInterval: (interval) => set({ interval }),
+  setSymbol: (symbol) => {
+    set({ symbol });
+    persist(get());
+  },
+  setInterval: (interval) => {
+    set({ interval });
+    persist(get());
+  },
   setPrice: (symbol, price) =>
     set((s) => (s.prices[symbol] === price ? s : { prices: { ...s.prices, [symbol]: price } })),
   setPrecision: (symbol, precision) =>

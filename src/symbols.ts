@@ -21,6 +21,10 @@ export interface IntervalGroup {
 // 분봉 / 시간봉 / 일봉+ 그룹. (바이낸스는 1년봉 미지원 → 최대 1개월봉)
 export const INTERVAL_GROUPS: IntervalGroup[] = [
   {
+    name: '초',
+    items: [{ code: '1s', label: '1초', sec: 1 }],
+  },
+  {
     name: '분',
     items: [
       { code: '1m', label: '1분', sec: 60 },

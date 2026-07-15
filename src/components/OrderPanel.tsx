@@ -5,6 +5,7 @@ import { useTradingStore } from '@/store/useTradingStore';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit';
+type Unit = 'coin' | 'usdt';
 
 /** 주문 패널 (OKX 스타일). 체결가는 서버가 결정.
  * Easy 모드: 시장가만. Standard 모드: 시장가 + 지정가 + SL/TP. */
@@ -19,7 +20,9 @@ export default function OrderPanel() {
   const error = useTradingStore((s) => s.error);
 
   const [tab, setTab] = useState<Tab>('market');
-  const [size, setSize] = useState('0.01');
+  const [size, setSize] = useState('0.01'); // 항상 코인 수량이 진실원본, unit 은 표시만 바꿈
+  const [unit, setUnit] = useState<Unit>('coin');
+  const [pct, setPct] = useState(0); // 수량 슬라이더(가용 잔고*레버리지 대비 비중, 0~100)
   const [leverage, setLeverage] = useState(10);
   const [limitPrice, setLimitPrice] = useState('');
   const [useSlTp, setUseSlTp] = useState(false);
@@ -59,12 +62,24 @@ export default function OrderPanel() {
   const notional = refPrice ? refPrice * Number(size || 0) : 0;
   const margin = notional / leverage;
 
-  // 가용 잔고 기준 빠른 수량 설정(pct = 증거금으로 쓸 잔고 비율)
-  const setPct = (pct: number) => {
+  // 가용 잔고 기준 수량 설정(fraction = 증거금으로 쓸 잔고 비율, 0~1)
+  const applyPct = (fraction: number) => {
     if (!refPrice) return;
-    const sz = (balance * leverage * pct) / refPrice;
-    setSize(sz > 0 ? sz.toFixed(4) : '0');
+    const sz = (balance * leverage * fraction) / refPrice;
+    setSize(sz > 0 ? sz.toFixed(6) : '0');
   };
+
+  // 수량 입력값 표시 단위 변환(코인 ↔ USDT). size(코인) 는 그대로 두고 표시만 바꾼다.
+  const displaySize = unit === 'coin' ? size : refPrice ? (Number(size || 0) * refPrice).toFixed(2) : '';
+  const onSizeInput = (v: string) => {
+    if (unit === 'coin') {
+      setSize(v);
+    } else if (refPrice) {
+      const usdt = Number(v);
+      setSize(usdt > 0 ? (usdt / refPrice).toFixed(6) : '0');
+    }
+  };
+  const toggleUnit = () => setUnit((u) => (u === 'coin' ? 'usdt' : 'coin'));
 
   return (
     <div className="flex h-full flex-col gap-3 p-3">
@@ -135,24 +150,42 @@ export default function OrderPanel() {
         <label className="mb-1.5 block text-xs text-muted">수량</label>
         <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
           <input
-            value={size}
-            onChange={(e) => setSize(e.target.value)}
+            value={displaySize}
+            onChange={(e) => onSizeInput(e.target.value)}
             inputMode="decimal"
             className="w-full bg-transparent px-3 py-2 text-sm font-semibold text-text outline-none"
           />
-          <span className="px-3 text-xs text-muted">{coin}</span>
+          <button
+            onClick={toggleUnit}
+            disabled={!refPrice}
+            title="단위 전환"
+            className="mr-1 rounded px-2 py-1 text-xs font-semibold text-muted transition hover:bg-elevated hover:text-text disabled:opacity-40"
+          >
+            {unit === 'coin' ? coin : 'USDT'} ⇄
+          </button>
         </div>
-        <div className="mt-2 grid grid-cols-4 gap-1">
-          {[0.25, 0.5, 0.75, 1].map((p) => (
-            <button
-              key={p}
-              onClick={() => setPct(p)}
-              disabled={!refPrice}
-              className="rounded bg-panel2 py-1 text-[11px] text-muted transition hover:bg-elevated hover:text-text disabled:opacity-40"
-            >
-              {p === 1 ? 'Max' : `${p * 100}%`}
-            </button>
-          ))}
+        <div className="mt-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[10px] text-muted">비중(가용 잔고 기준)</span>
+            <span className="rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold text-accent">{pct}%</span>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={pct}
+            disabled={!refPrice}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              setPct(v);
+              applyPct(v / 100);
+            }}
+            className="w-full accent-up disabled:opacity-40"
+          />
+          <div className="mt-0.5 flex justify-between text-[10px] text-muted">
+            <span>0%</span>
+            <span>100%</span>
+          </div>
         </div>
       </div>
 

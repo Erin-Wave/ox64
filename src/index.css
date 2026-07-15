@@ -69,23 +69,17 @@
 }
 [data-theme='high-contrast'] {
   --color-bg: 0 0 0;
-  --color-panel: 8 8 8;
-  --color-panel2: 20 20 20;
-  --color-elevated: 32 32 32;
+  --color-panel: 18 18 18;
+  --color-panel2: 28 28 28;
+  --color-elevated: 42 42 42;
   --color-border: 255 255 255;
-  --color-up: 0 255 128;
-  --color-upDim: 0 61 31;
-  --color-down: 255 23 68;
-  --color-downDim: 61 8 20;
-  --color-muted: 200 200 200;
+  --color-up: 0 224 122;
+  --color-upDim: 0 46 26;
+  --color-down: 255 61 90;
+  --color-downDim: 56 10 18;
+  --color-muted: 170 170 170;
   --color-text: 255 255 255;
-  --color-accent: 0 255 128;
-}
-/* 고대비: 요소 경계를 항상 눈에 띄게 */
-[data-theme='high-contrast'] *,
-[data-theme='high-contrast'] *::before,
-[data-theme='high-contrast'] *::after {
-  border-width: 2px !important;
+  --color-accent: 0 224 122;
 }
 
 html,
