@@ -13,12 +13,15 @@ interface MarketState {
   prices: Record<string, number>;
   precisions: Record<string, number>; // 심볼별 가격 소수 자릿수
   connected: boolean;
+  chartClickPrice: number | null; // 차트에서 마지막으로 클릭한 가격
+  chartClickNonce: number; // 같은 가격을 다시 클릭해도 신호가 오도록 매번 증가
 
   setSymbol: (s: string) => void;
   setInterval: (i: string) => void;
   setPrice: (symbol: string, price: number) => void;
   setPrecision: (symbol: string, precision: number) => void;
   setConnected: (c: boolean) => void;
+  setChartClickPrice: (price: number) => void;
 }
 
 const KEY = 'ox64_market_opts_v1';
@@ -44,6 +47,8 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   prices: {},
   precisions: {},
   connected: false,
+  chartClickPrice: null,
+  chartClickNonce: 0,
 
   setSymbol: (symbol) => {
     set({ symbol });
@@ -58,6 +63,7 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   setPrecision: (symbol, precision) =>
     set((s) => (s.precisions[symbol] === precision ? s : { precisions: { ...s.precisions, [symbol]: precision } })),
   setConnected: (connected) => set({ connected }),
+  setChartClickPrice: (price) => set((s) => ({ chartClickPrice: price, chartClickNonce: s.chartClickNonce + 1 })),
 }));
 
 /** 현재 보는 심볼의 최신가(선택자 헬퍼). */

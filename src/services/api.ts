@@ -70,8 +70,8 @@ export const api = {
   state: () => req<AppState>('/state'),
   open: (p: { symbol: string; side: Side; size: number; leverage: number; stopLoss?: number | null; takeProfit?: number | null }) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'open', ...p }) }),
-  close: (positionId: string) =>
-    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'close', positionId }) }),
+  close: (positionId: string, size?: number) =>
+    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'close', positionId, size }) }),
   limitOpen: (p: {
     symbol: string;
     side: Side;

@@ -17,7 +17,7 @@ import { checkTriggers } from '../_trading';
 /**
  * POST /api/order
  *   { action: 'open',       symbol, side, size, leverage, stopLoss?, takeProfit? }
- *   { action: 'close',      positionId }
+ *   { action: 'close',      positionId, size? }   // size 생략/전체수량=전량 청산, 그보다 작으면 부분 청산
  *   { action: 'limitOpen',  symbol, side, size, leverage, limitPrice, stopLoss?, takeProfit? }
  *   { action: 'cancelLimit', pendingId }
  *   { action: 'setSlTp',    positionId, stopLoss: number|null, takeProfit: number|null }
@@ -114,18 +114,30 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .first<PositionRow>();
     if (!pos) return bad('포지션을 찾을 수 없음', 404);
 
+    // 부분 청산: size 를 지정하면 그만큼만, 생략하면 전량.
+    const reqSize = num(body.size);
+    if (reqSize != null && !(reqSize > 0)) return bad('청산 수량 오류');
+    if (reqSize != null && reqSize > pos.size + 1e-9) return bad('보유 수량보다 많습니다');
+    const closeSize = reqSize == null ? pos.size : reqSize;
+    const isPartial = closeSize < pos.size - 1e-9;
+
     const price = await fetchPrice(pos.symbol); // 서버 청산가
     const dir = pos.side === 'long' ? 1 : -1;
-    const pnl = (price - pos.entry_price) * pos.size * dir;
+    const pnl = (price - pos.entry_price) * closeSize * dir;
+    const marginReleased = isPartial ? (pos.margin * closeSize) / pos.size : pos.margin;
     const now = Date.now();
     const ordId = crypto.randomUUID();
 
     await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(pos.margin + pnl, uid),
-      env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(positionId, uid),
+      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnl, uid),
+      isPartial
+        ? env.DB
+            .prepare('UPDATE positions SET size = ?, margin = ? WHERE id = ? AND user_id = ?')
+            .bind(pos.size - closeSize, pos.margin - marginReleased, positionId, uid)
+        : env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(positionId, uid),
       env.DB.prepare(
         'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(ordId, uid, pos.symbol, pos.side, price, pos.size, pos.leverage, 'close', pnl, now),
+      ).bind(ordId, uid, pos.symbol, pos.side, price, closeSize, pos.leverage, 'close', pnl, now),
     ]);
 
     return json(await loadState(env, uid));

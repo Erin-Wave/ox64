@@ -82,6 +82,8 @@ export default function Chart() {
   const [countdown, setCountdown] = useState('');
   const [showOpts, setShowOpts] = useState(false);
   const [prec, setPrec] = useState(2); // 현재 심볼 가격 소수 자릿수
+  const precRef = useRef(prec);
+  precRef.current = prec;
 
   // ── 차트 생성 (1회) ──────────────────────────────────────────
   useEffect(() => {
@@ -130,6 +132,15 @@ export default function Chart() {
       hovering.current = true;
       const real = (param.time as number) - KST_OFFSET;
       setLegend({ time: real, open: d.open, high: d.high, low: d.low, close: d.close, volume: volMap.current.get(real) });
+    });
+
+    // 차트 클릭 → 클릭한 y좌표의 가격을 지정가 주문 입력에 흘려보낸다(OrderPanel 이 구독).
+    chart.subscribeClick((param) => {
+      const c = candleRef.current;
+      if (!c || !param.point) return;
+      const raw = c.coordinateToPrice(param.point.y);
+      if (raw == null) return;
+      useMarketStore.getState().setChartClickPrice(Number(raw.toFixed(precRef.current)));
     });
 
     return () => {

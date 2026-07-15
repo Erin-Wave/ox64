@@ -12,6 +12,8 @@ type Unit = 'coin' | 'usdt';
 export default function OrderPanel() {
   const symbol = useMarketStore((s) => s.symbol);
   const lastPrice = useMarketStore(selectLastPrice);
+  const chartClickPrice = useMarketStore((s) => s.chartClickPrice);
+  const chartClickNonce = useMarketStore((s) => s.chartClickNonce);
   const tradingMode = useSettingsStore((s) => s.tradingMode);
   const openMarket = useTradingStore((s) => s.openMarket);
   const limitOpen = useTradingStore((s) => s.limitOpen);
@@ -38,6 +40,14 @@ export default function OrderPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveTab, lastPrice]);
 
+  // 차트를 클릭하면 그 가격으로 지정가 탭 전환 + 값 채움 (Standard 모드에서만 의미 있음)
+  useEffect(() => {
+    if (chartClickNonce === 0 || chartClickPrice == null || !standard) return;
+    setTab('limit');
+    setLimitPrice(String(chartClickPrice));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartClickNonce]);
+
   const coin = symbol.replace('USDT', '');
   const refPrice = effectiveTab === 'limit' ? Number(limitPrice) || lastPrice : lastPrice;
 
@@ -62,10 +72,13 @@ export default function OrderPanel() {
   const notional = refPrice ? refPrice * Number(size || 0) : 0;
   const margin = notional / leverage;
 
-  // 가용 잔고 기준 수량 설정(fraction = 증거금으로 쓸 잔고 비율, 0~1)
+  // 가용 잔고 기준 수량 설정(fraction = 증거금으로 쓸 잔고 비율, 0~1).
+  // SAFETY: 슬라이더 100% 그대로 계산하면 toFixed 반올림/서버 fetch 시점 가격차로
+  // 증거금이 잔고를 살짝 넘어 주문이 거부되는 경우가 있어 0.1% 여유를 둔다.
+  const SAFETY = 0.999;
   const applyPct = (fraction: number) => {
     if (!refPrice) return;
-    const sz = (balance * leverage * fraction) / refPrice;
+    const sz = (balance * leverage * fraction * SAFETY) / refPrice;
     setSize(sz > 0 ? sz.toFixed(6) : '0');
   };
 

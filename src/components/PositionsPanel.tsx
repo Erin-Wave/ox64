@@ -20,6 +20,14 @@ export default function PositionsPanel() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editSl, setEditSl] = useState('');
   const [editTp, setEditTp] = useState('');
+  const [closeAmt, setCloseAmt] = useState<Record<string, string>>({}); // 포지션별 부분청산 수량(비우면 전량)
+
+  const doClose = (id: string) => {
+    const raw = closeAmt[id];
+    const amt = raw ? Number(raw) : NaN;
+    closePosition(id, amt > 0 ? amt : undefined); // 빈칸/유효하지 않으면 size 생략(전량 청산), 보유량 초과는 서버가 거부
+    setCloseAmt((s) => ({ ...s, [id]: '' }));
+  };
 
   const startEdit = (id: string, sl: number | null, tp: number | null) => {
     setEditingId(id);
@@ -153,13 +161,23 @@ export default function PositionsPanel() {
                       )}
                     </td>
                     <td className="px-3 py-2.5 text-right">
-                      <button
-                        onClick={() => closePosition(p.id)}
-                        disabled={busy}
-                        className="rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
-                      >
-                        청산
-                      </button>
+                      <div className="flex items-center justify-end gap-1">
+                        <input
+                          value={closeAmt[p.id] ?? ''}
+                          onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: e.target.value }))}
+                          placeholder={String(p.size)}
+                          inputMode="decimal"
+                          title="청산 수량(비우면 전량)"
+                          className="w-16 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                        />
+                        <button
+                          onClick={() => doClose(p.id)}
+                          disabled={busy}
+                          className="rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
+                        >
+                          청산
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );

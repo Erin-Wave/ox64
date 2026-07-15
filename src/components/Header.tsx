@@ -1,12 +1,11 @@
 import { useMarketStore, selectLastPrice, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { SYMBOLS } from '@/symbols';
 import { fmtPrice } from '@/format';
+import SymbolSelect from '@/components/SymbolSelect';
 import logo from '@/resources/images/icon_256.png';
 
 export default function Header({ onOpenRank, onOpenSettings }: { onOpenRank: () => void; onOpenSettings: () => void }) {
   const symbol = useMarketStore((s) => s.symbol);
-  const setSymbol = useMarketStore((s) => s.setSymbol);
   const lastPrice = useMarketStore(selectLastPrice);
   const precisions = useMarketStore((s) => s.precisions);
   const connected = useMarketStore((s) => s.connected);
@@ -20,17 +19,7 @@ export default function Header({ onOpenRank, onOpenSettings }: { onOpenRank: () 
       <div className="flex items-center gap-3 sm:gap-4">
         <img src={logo} alt="ox64" className="h-9 w-9 shrink-0 sm:h-10 sm:w-10" />
         <div className="h-6 w-px bg-border" />
-        <select
-          value={symbol}
-          onChange={(e) => setSymbol(e.target.value)}
-          className="cursor-pointer rounded-md bg-panel2 px-2.5 py-1.5 text-sm font-semibold text-text outline-none ring-1 ring-border transition hover:ring-elevated"
-        >
-          {SYMBOLS.map((s) => (
-            <option key={s} value={s}>
-              {s.replace('USDT', '/USDT')}
-            </option>
-          ))}
-        </select>
+        <SymbolSelect />
         <div className="flex flex-col leading-none">
           <span className="text-[15px] font-bold text-text">
             {lastPrice != null ? fmtPrice(lastPrice, precisionOf(precisions, symbol)) : '—'}

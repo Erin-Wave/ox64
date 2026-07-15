@@ -30,7 +30,7 @@ interface TradingState {
     stopLoss?: number | null;
     takeProfit?: number | null;
   }) => Promise<void>;
-  closePosition: (id: string) => Promise<void>;
+  closePosition: (id: string, size?: number) => Promise<void>;
   limitOpen: (p: {
     symbol: string;
     side: Side;
@@ -121,10 +121,10 @@ export const useTradingStore = create<TradingState>((set) => ({
     }
   },
 
-  closePosition: async (id) => {
+  closePosition: async (id, size) => {
     set({ busy: true, error: null });
     try {
-      apply(set, await api.close(id));
+      apply(set, await api.close(id, size));
     } catch (e) {
       set({ error: (e as Error).message });
     } finally {
