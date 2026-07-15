@@ -21,7 +21,7 @@ export interface ApiOrder {
   price: number;
   size: number;
   leverage: number;
-  kind: 'open' | 'close';
+  kind: 'open' | 'close' | 'liquidation';
   pnl: number | null;
   createdAt: number;
 }
@@ -39,6 +39,7 @@ export interface ApiPendingOrder {
 export interface AppState {
   name: string;
   balance: number;
+  refillsLeft: number;
   positions: ApiPosition[];
   orders: ApiOrder[];
   pendingOrders: ApiPendingOrder[];
@@ -85,5 +86,6 @@ export const api = {
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'cancelLimit', pendingId }) }),
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'setSlTp', positionId, ...p }) }),
+  refill: () => req<AppState>('/refill', { method: 'POST' }),
   leaderboard: () => req<{ leaderboard: LeaderRow[] }>('/leaderboard'),
 };

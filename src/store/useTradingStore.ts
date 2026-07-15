@@ -12,6 +12,7 @@ interface TradingState {
   authed: boolean;
   name: string | null;
   balance: number;
+  refillsLeft: number;
   positions: ApiPosition[];
   orders: ApiOrder[];
   pendingOrders: ApiPendingOrder[];
@@ -42,6 +43,7 @@ interface TradingState {
   }) => Promise<void>;
   cancelLimit: (pendingId: string) => Promise<void>;
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) => Promise<void>;
+  refill: () => Promise<void>;
 }
 
 function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
@@ -49,6 +51,7 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     authed: true,
     name: st.name,
     balance: st.balance,
+    refillsLeft: st.refillsLeft,
     positions: st.positions,
     orders: st.orders,
     pendingOrders: st.pendingOrders,
@@ -61,6 +64,7 @@ export const useTradingStore = create<TradingState>((set) => ({
   authed: false,
   name: null,
   balance: 0,
+  refillsLeft: 3,
   positions: [],
   orders: [],
   pendingOrders: [],
@@ -98,7 +102,7 @@ export const useTradingStore = create<TradingState>((set) => ({
     } catch {
       /* 무시 */
     }
-    set({ authed: false, name: null, balance: 0, positions: [], orders: [], pendingOrders: [] });
+    set({ authed: false, name: null, balance: 0, refillsLeft: 3, positions: [], orders: [], pendingOrders: [] });
   },
 
   refresh: async () => {
@@ -158,6 +162,17 @@ export const useTradingStore = create<TradingState>((set) => ({
     set({ busy: true, error: null });
     try {
       apply(set, await api.setSlTp(positionId, p));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  refill: async () => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.refill());
     } catch (e) {
       set({ error: (e as Error).message });
     } finally {

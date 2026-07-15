@@ -4,7 +4,7 @@
 // 조건이 맞으면 그 자리에서 체결시키는 방식으로 대체한다 — 아무도 앱을 켜두지
 // 않은 동안은 체결되지 않는다(지인 대상 모의투자라 허용 가능한 트레이드오프).
 
-import { type Env, type PendingRow, type PositionRow, fetchPrices } from './_shared';
+import { type D1PreparedStatement, type Env, type PendingRow, type PositionRow, fetchPrices } from './_shared';
 
 export async function checkTriggers(env: Env, uid: string): Promise<void> {
   const pendings = (
@@ -17,6 +17,48 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
 
   const symbols = [...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol)])];
   const prices = await fetchPrices(symbols);
+
+  // ── 강제청산(계좌 파산) ── 평가자산(현금+전 포지션 미실현손익 합) < 0 이면
+  // 전 포지션 강제청산 + 미체결 지정가 전부 취소 + 잔고 0 으로 리셋.
+  // 심볼 가격을 하나라도 못 받아왔으면(allPriced=false) 이번 라운드는 건너뛴다 —
+  // 불완전한 데이터로 잘못 청산시키는 것보다 다음 폴링에서 다시 평가하는 게 안전.
+  if (positions.length > 0) {
+    const user = await env.DB.prepare('SELECT balance FROM users WHERE id = ?').bind(uid).first<{ balance: number }>();
+    if (user) {
+      let unrealized = 0;
+      let allPriced = true;
+      for (const pos of positions) {
+        const mark = prices[pos.symbol];
+        if (mark == null) {
+          allPriced = false;
+          continue;
+        }
+        const dir = pos.side === 'long' ? 1 : -1;
+        unrealized += (mark - pos.entry_price) * pos.size * dir;
+      }
+      if (allPriced && user.balance + unrealized < 0) {
+        const now = Date.now();
+        const stmts: D1PreparedStatement[] = [];
+        for (const pos of positions) {
+          const mark = prices[pos.symbol]!;
+          const dir = pos.side === 'long' ? 1 : -1;
+          const pnl = (mark - pos.entry_price) * pos.size * dir;
+          stmts.push(env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid));
+          stmts.push(
+            env.DB.prepare(
+              'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+            ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, mark, pos.size, pos.leverage, 'liquidation', pnl, now),
+          );
+        }
+        for (const p of pendings) {
+          stmts.push(env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid));
+        }
+        stmts.push(env.DB.prepare('UPDATE users SET balance = 0 WHERE id = ?').bind(uid));
+        await env.DB.batch(stmts);
+        return; // 계좌 정리 완료 — 방금 지운 포지션/미체결 대상으로 아래 로직을 더 돌릴 필요 없음
+      }
+    }
+  }
 
   // ── 지정가 체결 ── long: mark<=limit(싸게 매수), short: mark>=limit(비싸게 매도)
   // 체결가는 limit_price 그대로 사용(생성 시 이미 그 가격 기준으로 증거금을 잠갔으므로 재계산 불필요).

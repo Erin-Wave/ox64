@@ -439,12 +439,13 @@ export default function Chart() {
       .filter((o) => o.symbol === symbol)
       .map((o) => {
         const long = o.side === 'long';
+        const liquidation = o.kind === 'liquidation';
         return {
           time: toChart(Math.floor(o.createdAt / 1000)) as Time,
           position: (long ? 'belowBar' : 'aboveBar') as SeriesMarker<Time>['position'],
-          color: long ? '#00c076' : '#f6465d',
+          color: liquidation ? '#ff9800' : long ? '#00c076' : '#f6465d',
           shape: (long ? 'arrowUp' : 'arrowDown') as SeriesMarker<Time>['shape'],
-          text: o.kind === 'close' ? 'C' : long ? 'B' : 'S',
+          text: liquidation ? 'L' : o.kind === 'close' ? 'C' : long ? 'B' : 'S',
         };
       })
       .sort((a, b) => (a.time as number) - (b.time as number));

@@ -7,7 +7,9 @@ CREATE TABLE IF NOT EXISTS users (
   name          TEXT UNIQUE NOT NULL,
   passcode_hash TEXT NOT NULL,
   balance       REAL NOT NULL DEFAULT 10000,
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  refill_count  INTEGER NOT NULL DEFAULT 0,  -- 오늘(refill_date) 사용한 리필 횟수(최대 3)
+  refill_date   TEXT                          -- refill_count 가 적용되는 날짜(KST, YYYY-MM-DD). 날짜 바뀌면 0으로 취급
 );
 
 CREATE TABLE IF NOT EXISTS positions (
@@ -66,3 +68,8 @@ CREATE INDEX IF NOT EXISTS idx_pending_user ON pending_orders(user_id);
 -- 지워도 무방하다.
 -- ALTER TABLE positions ADD COLUMN stop_loss REAL;
 -- ALTER TABLE positions ADD COLUMN take_profit REAL;
+
+-- ⚠ 일회성 마이그레이션 (2026-07-15 추가, 강제청산 리필 지원): 기존 prod DB 의
+-- users 테이블에 컬럼을 추가한다. 위와 동일한 이유로 최초 1회만 실행할 것.
+-- ALTER TABLE users ADD COLUMN refill_count INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE users ADD COLUMN refill_date TEXT;

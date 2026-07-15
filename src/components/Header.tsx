@@ -10,6 +10,9 @@ export default function Header({ onOpenRank, onOpenSettings }: { onOpenRank: () 
   const precisions = useMarketStore((s) => s.precisions);
   const connected = useMarketStore((s) => s.connected);
   const balance = useTradingStore((s) => s.balance);
+  const refillsLeft = useTradingStore((s) => s.refillsLeft);
+  const refill = useTradingStore((s) => s.refill);
+  const busy = useTradingStore((s) => s.busy);
   const name = useTradingStore((s) => s.name);
   const logout = useTradingStore((s) => s.logout);
 
@@ -39,6 +42,14 @@ export default function Header({ onOpenRank, onOpenSettings }: { onOpenRank: () 
             {balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </span>
         </div>
+        <button
+          onClick={() => refill()}
+          disabled={busy || refillsLeft <= 0}
+          title="강제청산 등으로 잔고가 바닥났을 때를 위한 안전망 — 1일 최대 3회"
+          className="rounded-md bg-panel2 px-2.5 py-1.5 text-xs font-semibold text-accent ring-1 ring-border transition hover:bg-elevated disabled:opacity-40"
+        >
+          +1만 리필 ({refillsLeft}/3)
+        </button>
         <button
           onClick={onOpenRank}
           className="rounded-md bg-panel2 px-3 py-1.5 text-xs font-semibold text-text ring-1 ring-border transition hover:bg-elevated"

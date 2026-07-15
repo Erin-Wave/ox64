@@ -31,6 +31,15 @@ export interface Ctx {
 }
 
 export const SEED_BALANCE = 10_000; // 신규 계정 모의 USDT
+export const REFILL_AMOUNT = 10_000;
+export const REFILL_DAILY_LIMIT = 3;
+
+// KST(UTC+9) 기준 오늘 날짜(YYYY-MM-DD) — 리필 일일 한도 판정에 사용.
+// 차트(src/symbols.ts KST_OFFSET)와 동일한 오프셋 트릭: ms 를 더한 뒤 UTC 포맷으로 자르면 KST 날짜가 된다.
+const KST_OFFSET_MS = 9 * 3600 * 1000;
+export function todayKst(): string {
+  return new Date(Date.now() + KST_OFFSET_MS).toISOString().slice(0, 10);
+}
 // USDT 페어 형식만 검증(고정 목록 동기화 부담 제거). 실제 존재 여부는 fetchPrice 가 검증.
 export function isSymbol(s: unknown): s is string {
   return typeof s === 'string' && /^[A-Z0-9]{2,20}USDT$/.test(s);
@@ -212,6 +221,8 @@ export interface UserRow {
   id: string;
   name: string;
   balance: number;
+  refill_count: number;
+  refill_date: string | null;
 }
 export interface PositionRow {
   id: string;
@@ -253,10 +264,11 @@ export interface OrderRow {
 
 /** 로그인 사용자의 전체 상태(잔고+포지션+주문) 조회 */
 export async function loadState(env: Env, uid: string) {
-  const user = await env.DB.prepare('SELECT id, name, balance FROM users WHERE id = ?')
+  const user = await env.DB.prepare('SELECT id, name, balance, refill_count, refill_date FROM users WHERE id = ?')
     .bind(uid)
     .first<UserRow>();
   if (!user) return null;
+  const refillsLeft = user.refill_date === todayKst() ? Math.max(0, REFILL_DAILY_LIMIT - user.refill_count) : REFILL_DAILY_LIMIT;
   const positions = (
     await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? ORDER BY opened_at DESC')
       .bind(uid)
@@ -277,6 +289,7 @@ export async function loadState(env: Env, uid: string) {
   return {
     name: user.name,
     balance: user.balance,
+    refillsLeft,
     positions: positions.map((p) => ({
       id: p.id,
       symbol: p.symbol,
