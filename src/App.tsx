@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import Header from '@/components/Header';
 import Chart from '@/components/Chart';
+import OrderBook from '@/components/OrderBook';
 import OrderPanel from '@/components/OrderPanel';
 import PositionsPanel from '@/components/PositionsPanel';
 import Login from '@/components/Login';
@@ -51,7 +52,8 @@ export default function App() {
           <Chart />
         </div>
 
-        <aside className="shrink-0 border-b border-border bg-panel md:col-start-2 md:row-span-2 md:row-start-1 md:min-h-0 md:overflow-y-auto md:border-b-0 md:border-l">
+        <aside className="flex shrink-0 flex-col border-b border-border bg-panel md:col-start-2 md:row-span-2 md:row-start-1 md:min-h-0 md:overflow-y-auto md:border-b-0 md:border-l">
+          <OrderBook />
           <OrderPanel />
         </aside>
 

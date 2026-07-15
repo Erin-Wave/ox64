@@ -40,7 +40,7 @@ export default function OrderPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveTab, lastPrice]);
 
-  // 차트를 클릭하면 그 가격으로 지정가 탭 전환 + 값 채움 (Standard 모드에서만 의미 있음)
+  // 차트 또는 호가창을 클릭하면 그 가격으로 지정가 탭 전환 + 값 채움 (Standard 모드에서만 의미 있음)
   useEffect(() => {
     if (chartClickNonce === 0 || chartClickPrice == null || !standard) return;
     setTab('limit');

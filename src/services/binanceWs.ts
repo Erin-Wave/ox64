@@ -62,3 +62,35 @@ export function priceStream(symbol: string): { price$: Observable<number>; stop:
   const price$ = klineStream(symbol, '1m').pipe(map((t) => t.candle.close));
   return { price$, stop: () => stopper.next() };
 }
+
+// ── 호가창(부분 호가 스트림) ────────────────────────────────────
+// Partial Book Depth Stream 은 kline 과 달리 이벤트 타입/심볼 필드 없이
+// { lastUpdateId, bids, asks } 스냅샷 그대로 내려온다 — diff 병합 불필요.
+export interface OrderBookLevel {
+  price: number;
+  qty: number;
+}
+export interface OrderBookSnapshot {
+  bids: OrderBookLevel[]; // 높은 가격 순
+  asks: OrderBookLevel[]; // 낮은 가격 순
+}
+interface RawDepth {
+  bids: string[][];
+  asks: string[][];
+}
+
+/** 심볼의 상위 N호가(5/10/20) 스트림. 1초마다 스냅샷 갱신. */
+export function orderbookStream(symbol: string, levels: 5 | 10 | 20 = 10): Observable<OrderBookSnapshot> {
+  const stream = `${symbol.toLowerCase()}@depth${levels}@1000ms`;
+  const socket$: WebSocketSubject<unknown> = webSocket({ url: `${FSTREAM}/${stream}` });
+
+  return socket$.pipe(
+    filter((m): m is RawDepth => !!m && Array.isArray((m as RawDepth).bids) && Array.isArray((m as RawDepth).asks)),
+    map((m): OrderBookSnapshot => ({
+      bids: m.bids.map(([p, q]) => ({ price: Number(p), qty: Number(q) })),
+      asks: m.asks.map(([p, q]) => ({ price: Number(p), qty: Number(q) })),
+    })),
+    retry({ delay: 2000 }),
+    share(),
+  );
+}
