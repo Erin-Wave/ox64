@@ -18,7 +18,7 @@ const DEFAULTS: Record<IndicatorType, Omit<IndicatorConfig, 'id' | 'type'>> = {
 let seq = 0;
 const nextId = () => `ind_${++seq}_${Math.floor(Math.random() * 1e6)}`;
 
-type BoolFlag = 'showCountdown' | 'volume' | 'tradeMarkers' | 'positionLine' | 'slTpLines';
+type BoolFlag = 'showCountdown' | 'volume' | 'tradeMarkers' | 'positionLine' | 'slTpLines' | 'orderBook';
 
 /** 차트 표시 옵션 (localStorage 영속). */
 interface ChartState {
@@ -27,6 +27,7 @@ interface ChartState {
   tradeMarkers: boolean;
   positionLine: boolean;
   slTpLines: boolean;
+  orderBook: boolean;
   visibleBars: number; // 처음 로드 시 보여줄 봉 개수 — 마지막으로 사용자가 확대/축소한 값을 기억
   indicators: IndicatorConfig[];
   toggle: (k: BoolFlag) => void;
@@ -45,11 +46,11 @@ function load(): Partial<ChartState> {
   }
 }
 function persist(s: ChartState) {
-  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, visibleBars, indicators } = s;
+  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, orderBook, visibleBars, indicators } = s;
   try {
     localStorage.setItem(
       KEY,
-      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, visibleBars, indicators }),
+      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, orderBook, visibleBars, indicators }),
     );
   } catch {
     /* ignore */
@@ -63,6 +64,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   tradeMarkers: saved.tradeMarkers ?? true,
   positionLine: saved.positionLine ?? true,
   slTpLines: saved.slTpLines ?? true,
+  orderBook: saved.orderBook ?? true,
   visibleBars: saved.visibleBars ?? 38,
   indicators: saved.indicators ?? [],
   toggle: (k) => {

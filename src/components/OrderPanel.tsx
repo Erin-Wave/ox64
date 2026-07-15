@@ -160,24 +160,28 @@ export default function OrderPanel() {
 
       {/* 수량 */}
       <div>
-        <label className="mb-1.5 block text-xs text-muted">수량</label>
-        <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-          <input
-            value={displaySize}
-            onChange={(e) => onSizeInput(e.target.value)}
-            inputMode="decimal"
-            className="w-full bg-transparent px-3 py-2 text-sm font-semibold text-text outline-none"
-          />
-          <button
-            onClick={toggleUnit}
-            disabled={!refPrice}
-            title="단위 전환"
-            className="mr-1 rounded px-2 py-1 text-xs font-semibold text-muted transition hover:bg-elevated hover:text-text disabled:opacity-40"
-          >
-            {unit === 'coin' ? coin : 'USDT'} ⇄
-          </button>
-        </div>
-        <div className="mt-2">
+        {standard && (
+          <>
+            <label className="mb-1.5 block text-xs text-muted">수량</label>
+            <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+              <input
+                value={displaySize}
+                onChange={(e) => onSizeInput(e.target.value)}
+                inputMode="decimal"
+                className="w-full bg-transparent px-3 py-2 text-sm font-semibold text-text outline-none"
+              />
+              <button
+                onClick={toggleUnit}
+                disabled={!refPrice}
+                title="단위 전환"
+                className="mr-1 rounded px-2 py-1 text-xs font-semibold text-muted transition hover:bg-elevated hover:text-text disabled:opacity-40"
+              >
+                {unit === 'coin' ? coin : 'USDT'} ⇄
+              </button>
+            </div>
+          </>
+        )}
+        <div className={standard ? 'mt-2' : ''}>
           <div className="mb-1 flex items-center justify-between">
             <span className="text-[10px] text-muted">비중(가용 잔고 기준)</span>
             <span className="rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold text-accent">{pct}%</span>
@@ -278,9 +282,6 @@ export default function OrderPanel() {
           숏 · Sell
         </button>
       </div>
-      <p className="text-center text-[10px] leading-tight text-muted">
-        체결가·손익은 서버가 실시간 시세로 계산합니다.
-      </p>
     </div>
   );
 }

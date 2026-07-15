@@ -53,6 +53,33 @@ export interface LeaderRow {
   isMe: boolean;
 }
 
+export interface SpotOrder {
+  id: string;
+  side: 'buy' | 'sell';
+  price: number;
+  size: number;
+  origSize: number;
+  createdAt: number;
+}
+export interface SpotBookLevel {
+  price: number;
+  size: number;
+}
+export interface SpotTrade {
+  id: string;
+  price: number;
+  size: number;
+  createdAt: number;
+  isMe: boolean;
+}
+export interface SpotState {
+  usdtBalance: number;
+  oxBalance: number;
+  myOrders: SpotOrder[];
+  book: { bids: SpotBookLevel[]; asks: SpotBookLevel[] };
+  trades: SpotTrade[];
+}
+
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`/api${path}`, {
     credentials: 'same-origin',
@@ -88,4 +115,9 @@ export const api = {
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'setSlTp', positionId, ...p }) }),
   refill: () => req<AppState>('/refill', { method: 'POST' }),
   leaderboard: () => req<{ leaderboard: LeaderRow[] }>('/leaderboard'),
+  spotState: () => req<SpotState>('/spot'),
+  spotPlace: (side: 'buy' | 'sell', price: number, size: number) =>
+    req<SpotState>('/spot', { method: 'POST', body: JSON.stringify({ action: 'place', side, price, size }) }),
+  spotCancel: (orderId: string) =>
+    req<SpotState>('/spot', { method: 'POST', body: JSON.stringify({ action: 'cancel', orderId }) }),
 };

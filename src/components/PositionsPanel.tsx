@@ -205,16 +205,18 @@ export default function PositionsPanel() {
                       </td>
                       <td className="px-3 py-2.5 text-right">
                         <div className="flex items-center justify-end gap-1">
-                          <input
-                            value={closeAmt[p.id] ?? ''}
-                            onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: e.target.value }))}
-                            placeholder={String(p.size)}
-                            inputMode="decimal"
-                            title="청산 수량(비우면 전량)"
-                            className="w-16 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
-                          />
+                          {standard && (
+                            <input
+                              value={closeAmt[p.id] ?? ''}
+                              onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: e.target.value }))}
+                              placeholder={String(p.size)}
+                              inputMode="decimal"
+                              title="청산 수량(비우면 전량)"
+                              className="w-16 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                            />
+                          )}
                           <button
-                            onClick={() => doClose(p.id)}
+                            onClick={() => (standard ? doClose(p.id) : closePosition(p.id))}
                             disabled={busy}
                             className="rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
                           >

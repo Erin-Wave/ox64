@@ -223,6 +223,27 @@ export interface UserRow {
   balance: number;
   refill_count: number;
   refill_date: string | null;
+  ox_balance: number;
+}
+export interface SpotOrderRow {
+  id: string;
+  user_id: string;
+  pair: string;
+  side: string; // 'buy' | 'sell'
+  price: number;
+  size: number;
+  orig_size: number;
+  status: string; // 'open' | 'filled' | 'cancelled'
+  created_at: number;
+}
+export interface SpotTradeRow {
+  id: string;
+  pair: string;
+  buyer_id: string;
+  seller_id: string;
+  price: number;
+  size: number;
+  created_at: number;
 }
 export interface PositionRow {
   id: string;

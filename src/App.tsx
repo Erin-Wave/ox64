@@ -7,7 +7,10 @@ import PositionsPanel from '@/components/PositionsPanel';
 import Login from '@/components/Login';
 import Leaderboard from '@/components/Leaderboard';
 import Settings from '@/components/Settings';
+import SpotMarket from '@/components/SpotMarket';
 import { useTradingStore } from '@/store/useTradingStore';
+import { useSettingsStore } from '@/store/useSettingsStore';
+import { useChartStore } from '@/store/useChartStore';
 import { useMarkPrices } from '@/hooks/useMarkPrices';
 import { useTriggerPoll } from '@/hooks/useTriggerPoll';
 
@@ -15,9 +18,12 @@ export default function App() {
   const init = useTradingStore((s) => s.init);
   const ready = useTradingStore((s) => s.ready);
   const authed = useTradingStore((s) => s.authed);
+  const standard = useSettingsStore((s) => s.tradingMode) === 'standard';
+  const orderBookOn = useChartStore((s) => s.orderBook);
 
   const [showRank, setShowRank] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showSpot, setShowSpot] = useState(false);
 
   // 현재 심볼 + 보유 포지션 심볼들의 가격 폴링 (다른 심볼 PnL 갱신)
   useMarkPrices();
@@ -41,7 +47,11 @@ export default function App() {
 
   return (
     <div className="flex h-screen flex-col bg-bg text-text">
-      <Header onOpenRank={() => setShowRank(true)} onOpenSettings={() => setShowSettings(true)} />
+      <Header
+        onOpenRank={() => setShowRank(true)}
+        onOpenSettings={() => setShowSettings(true)}
+        onOpenSpot={() => setShowSpot(true)}
+      />
 
       {/*
         모바일(기본): 세로 스크롤 스택 — 차트(45vh) → 주문 → 포지션.
@@ -53,7 +63,7 @@ export default function App() {
         </div>
 
         <aside className="flex shrink-0 flex-col border-b border-border bg-panel md:col-start-2 md:row-span-2 md:row-start-1 md:min-h-0 md:overflow-y-auto md:border-b-0 md:border-l">
-          <OrderBook />
+          {standard && orderBookOn && <OrderBook />}
           <OrderPanel />
         </aside>
 
@@ -64,6 +74,7 @@ export default function App() {
 
       {showRank && <Leaderboard onClose={() => setShowRank(false)} />}
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
+      {showSpot && <SpotMarket onClose={() => setShowSpot(false)} />}
     </div>
   );
 }

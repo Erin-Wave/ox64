@@ -578,6 +578,7 @@ export default function Chart() {
                     ['tradeMarkers', '내 매매 표시 (B/S)'],
                     ['positionLine', '포지션 평단선'],
                     ['slTpLines', 'SL/TP 수평선'],
+                    ['orderBook', '호가창'],
                   ] as const
                 ).map(([k, label]) => (
                   <label
