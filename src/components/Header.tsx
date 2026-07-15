@@ -4,7 +4,7 @@ import { SYMBOLS } from '@/symbols';
 import { fmtPrice } from '@/format';
 import logo from '@/resources/images/icon_256.png';
 
-export default function Header({ onOpenRank }: { onOpenRank: () => void }) {
+export default function Header({ onOpenRank, onOpenSettings }: { onOpenRank: () => void; onOpenSettings: () => void }) {
   const symbol = useMarketStore((s) => s.symbol);
   const setSymbol = useMarketStore((s) => s.setSymbol);
   const lastPrice = useMarketStore(selectLastPrice);
@@ -55,6 +55,13 @@ export default function Header({ onOpenRank }: { onOpenRank: () => void }) {
           className="rounded-md bg-panel2 px-3 py-1.5 text-xs font-semibold text-text ring-1 ring-border transition hover:bg-elevated"
         >
           🏆 랭킹
+        </button>
+        <button
+          onClick={onOpenSettings}
+          aria-label="설정"
+          className="rounded-md bg-panel2 px-2.5 py-1.5 text-xs font-semibold text-text ring-1 ring-border transition hover:bg-elevated"
+        >
+          ⚙️
         </button>
         <div className="hidden items-center gap-2 sm:flex">
           <span className="flex h-7 w-7 items-center justify-center rounded-full bg-elevated text-xs font-bold text-text">

@@ -223,6 +223,21 @@ export interface PositionRow {
   leverage: number;
   margin: number;
   opened_at: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+}
+export interface PendingRow {
+  id: string;
+  user_id: string;
+  symbol: string;
+  side: string;
+  size: number;
+  leverage: number;
+  limit_price: number;
+  margin: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+  created_at: number;
 }
 export interface OrderRow {
   id: string;
@@ -254,6 +269,11 @@ export async function loadState(env: Env, uid: string) {
       .bind(uid)
       .all<OrderRow>()
   ).results;
+  const pending = (
+    await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ? ORDER BY created_at DESC')
+      .bind(uid)
+      .all<PendingRow>()
+  ).results;
   return {
     name: user.name,
     balance: user.balance,
@@ -265,6 +285,8 @@ export async function loadState(env: Env, uid: string) {
       size: p.size,
       leverage: p.leverage,
       openedAt: p.opened_at,
+      stopLoss: p.stop_loss,
+      takeProfit: p.take_profit,
     })),
     orders: orders.map((o) => ({
       id: o.id,
@@ -276,6 +298,17 @@ export async function loadState(env: Env, uid: string) {
       kind: o.kind,
       pnl: o.pnl,
       createdAt: o.created_at,
+    })),
+    pendingOrders: pending.map((p) => ({
+      id: p.id,
+      symbol: p.symbol,
+      side: p.side,
+      size: p.size,
+      leverage: p.leverage,
+      limitPrice: p.limit_price,
+      stopLoss: p.stop_loss,
+      takeProfit: p.take_profit,
+      createdAt: p.created_at,
     })),
   };
 }

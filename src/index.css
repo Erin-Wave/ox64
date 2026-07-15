@@ -34,6 +34,60 @@
   src: url('/fonts/ProximaNova-Extrabold.ttf') format('truetype');
 }
 
+/* ── 테마 (라이트/다크/고대비) ────────────────────────────────
+   RGB 트리플렛(공백 구분)으로 저장 — tailwind.config.js 가
+   rgb(var(--color-x) / <alpha-value>) 형태로 참조해 bg-panel2/80 같은
+   opacity modifier 도 그대로 동작한다. data-theme 미설정(:root) = 다크,
+   JS 로드 전에도 다크로 보이므로 FOUC 없음. */
+:root {
+  --color-bg: 11 13 15;
+  --color-panel: 21 23 27;
+  --color-panel2: 28 31 36;
+  --color-elevated: 35 39 46;
+  --color-border: 40 44 51;
+  --color-up: 0 192 118;
+  --color-upDim: 15 58 46;
+  --color-down: 246 70 93;
+  --color-downDim: 58 31 38;
+  --color-muted: 124 130 139;
+  --color-text: 234 236 239;
+  --color-accent: 0 192 118;
+}
+[data-theme='light'] {
+  --color-bg: 255 255 255;
+  --color-panel: 246 247 249;
+  --color-panel2: 237 239 242;
+  --color-elevated: 225 228 232;
+  --color-border: 214 218 223;
+  --color-up: 0 135 92;
+  --color-upDim: 214 240 229;
+  --color-down: 209 41 63;
+  --color-downDim: 250 222 227;
+  --color-muted: 107 114 122;
+  --color-text: 17 20 24;
+  --color-accent: 0 135 92;
+}
+[data-theme='high-contrast'] {
+  --color-bg: 0 0 0;
+  --color-panel: 8 8 8;
+  --color-panel2: 20 20 20;
+  --color-elevated: 32 32 32;
+  --color-border: 255 255 255;
+  --color-up: 0 255 128;
+  --color-upDim: 0 61 31;
+  --color-down: 255 23 68;
+  --color-downDim: 61 8 20;
+  --color-muted: 200 200 200;
+  --color-text: 255 255 255;
+  --color-accent: 0 255 128;
+}
+/* 고대비: 요소 경계를 항상 눈에 띄게 */
+[data-theme='high-contrast'] *,
+[data-theme='high-contrast'] *::before,
+[data-theme='high-contrast'] *::after {
+  border-width: 2px !important;
+}
+
 html,
 body,
 #root {
@@ -42,8 +96,8 @@ body,
 }
 
 body {
-  background: #0b0d0f;
-  color: #eaecef;
+  background: rgb(var(--color-bg));
+  color: rgb(var(--color-text));
   font-family:
     'Proxima Nova', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
     'Helvetica Neue', Arial, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;

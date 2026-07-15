@@ -11,6 +11,8 @@ export interface ApiPosition {
   size: number;
   leverage: number;
   openedAt: number;
+  stopLoss: number | null;
+  takeProfit: number | null;
 }
 export interface ApiOrder {
   id: string;
@@ -23,11 +25,23 @@ export interface ApiOrder {
   pnl: number | null;
   createdAt: number;
 }
+export interface ApiPendingOrder {
+  id: string;
+  symbol: string;
+  side: Side;
+  size: number;
+  leverage: number;
+  limitPrice: number;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  createdAt: number;
+}
 export interface AppState {
   name: string;
   balance: number;
   positions: ApiPosition[];
   orders: ApiOrder[];
+  pendingOrders: ApiPendingOrder[];
 }
 export interface LeaderRow {
   name: string;
@@ -54,9 +68,22 @@ export const api = {
     req<AppState>('/login', { method: 'POST', body: JSON.stringify({ name, passcode }) }),
   logout: () => req<{ ok: boolean }>('/logout', { method: 'POST' }),
   state: () => req<AppState>('/state'),
-  open: (p: { symbol: string; side: Side; size: number; leverage: number }) =>
+  open: (p: { symbol: string; side: Side; size: number; leverage: number; stopLoss?: number | null; takeProfit?: number | null }) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'open', ...p }) }),
   close: (positionId: string) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'close', positionId }) }),
+  limitOpen: (p: {
+    symbol: string;
+    side: Side;
+    size: number;
+    leverage: number;
+    limitPrice: number;
+    stopLoss?: number | null;
+    takeProfit?: number | null;
+  }) => req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'limitOpen', ...p }) }),
+  cancelLimit: (pendingId: string) =>
+    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'cancelLimit', pendingId }) }),
+  setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) =>
+    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'setSlTp', positionId, ...p }) }),
   leaderboard: () => req<{ leaderboard: LeaderRow[] }>('/leaderboard'),
 };

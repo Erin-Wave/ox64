@@ -41,6 +41,21 @@ export interface Position {
   size: number;
   leverage: number;
   openedAt: number;
+  stopLoss: number | null;
+  takeProfit: number | null;
+}
+
+/** 미체결 지정가 주문 */
+export interface PendingOrder {
+  id: string;
+  symbol: string;
+  side: Side;
+  size: number;
+  leverage: number;
+  limitPrice: number;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  createdAt: number;
 }
 
 /** 지인별 모의 계정 */

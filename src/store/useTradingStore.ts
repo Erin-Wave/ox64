@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api, type ApiOrder, type ApiPosition, type AppState } from '@/services/api';
+import { api, type ApiOrder, type ApiPendingOrder, type ApiPosition, type AppState } from '@/services/api';
 import type { Side } from '@/types';
 
 /**
@@ -14,6 +14,7 @@ interface TradingState {
   balance: number;
   positions: ApiPosition[];
   orders: ApiOrder[];
+  pendingOrders: ApiPendingOrder[];
   busy: boolean;
   error: string | null;
 
@@ -21,8 +22,26 @@ interface TradingState {
   login: (name: string, passcode: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
-  openMarket: (p: { symbol: string; side: Side; size: number; leverage: number }) => Promise<void>;
+  openMarket: (p: {
+    symbol: string;
+    side: Side;
+    size: number;
+    leverage: number;
+    stopLoss?: number | null;
+    takeProfit?: number | null;
+  }) => Promise<void>;
   closePosition: (id: string) => Promise<void>;
+  limitOpen: (p: {
+    symbol: string;
+    side: Side;
+    size: number;
+    leverage: number;
+    limitPrice: number;
+    stopLoss?: number | null;
+    takeProfit?: number | null;
+  }) => Promise<void>;
+  cancelLimit: (pendingId: string) => Promise<void>;
+  setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) => Promise<void>;
 }
 
 function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
@@ -32,6 +51,7 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     balance: st.balance,
     positions: st.positions,
     orders: st.orders,
+    pendingOrders: st.pendingOrders,
     error: null,
   });
 }
@@ -43,6 +63,7 @@ export const useTradingStore = create<TradingState>((set) => ({
   balance: 0,
   positions: [],
   orders: [],
+  pendingOrders: [],
   busy: false,
   error: null,
 
@@ -77,7 +98,7 @@ export const useTradingStore = create<TradingState>((set) => ({
     } catch {
       /* 무시 */
     }
-    set({ authed: false, name: null, balance: 0, positions: [], orders: [] });
+    set({ authed: false, name: null, balance: 0, positions: [], orders: [], pendingOrders: [] });
   },
 
   refresh: async () => {
@@ -88,11 +109,11 @@ export const useTradingStore = create<TradingState>((set) => ({
     }
   },
 
-  openMarket: async ({ symbol, side, size, leverage }) => {
+  openMarket: async ({ symbol, side, size, leverage, stopLoss, takeProfit }) => {
     set({ busy: true, error: null });
     try {
       // 가격은 보내지 않는다 — 서버가 체결가를 직접 받아 쓴다.
-      apply(set, await api.open({ symbol, side, size, leverage }));
+      apply(set, await api.open({ symbol, side, size, leverage, stopLoss, takeProfit }));
     } catch (e) {
       set({ error: (e as Error).message });
     } finally {
@@ -104,6 +125,39 @@ export const useTradingStore = create<TradingState>((set) => ({
     set({ busy: true, error: null });
     try {
       apply(set, await api.close(id));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  limitOpen: async ({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit }) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.limitOpen({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit }));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  cancelLimit: async (pendingId) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.cancelLimit(pendingId));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  setSlTp: async (positionId, p) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.setSlTp(positionId, p));
     } catch (e) {
       set({ error: (e as Error).message });
     } finally {

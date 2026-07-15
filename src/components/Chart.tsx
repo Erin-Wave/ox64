@@ -18,11 +18,25 @@ import { fetchKlines, fetchPricePrecision } from '@/services/binanceRest';
 import { klineStream } from '@/services/binanceWs';
 import { ema, bollinger, rsi } from '@/services/indicators';
 import { useMarketStore } from '@/store/useMarketStore';
-import { useChartStore } from '@/store/useChartStore';
+import { useChartStore, type IndicatorConfig, type IndicatorType } from '@/store/useChartStore';
+import { useSettingsStore, type Theme } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { INTERVAL_GROUPS, intervalSec, KST_OFFSET } from '@/symbols';
 import { fmtPrice, fmtVol } from '@/format';
 import type { Candle } from '@/types';
+
+const IND_LABEL: Record<IndicatorType, string> = { ema: 'EMA', bb: 'Bollinger', rsi: 'RSI' };
+const IND_COLORS = ['#f0b90b', '#4a90e2', '#c77dff', '#00c076', '#ff6b6b', '#3bb2d0', '#e08fd6'];
+
+// 테마별 차트 캔버스 색(배경/격자/축 텍스트/캔들) — UI 크롬은 index.css 의 CSS 변수로,
+// Lightweight Charts 는 캔버스 렌더링이라 여기서 별도로 applyOptions() 해줘야 함.
+const CHART_THEME: Record<Theme, { bg: string; text: string; grid: string; border: string; up: string; down: string }> = {
+  dark: { bg: '#0b0d0f', text: '#7c828b', grid: '#191c21', border: '#282c33', up: '#00c076', down: '#f6465d' },
+  light: { bg: '#ffffff', text: '#6b727a', grid: '#e7e9ec', border: '#d6dadf', up: '#00875c', down: '#d1293f' },
+  'high-contrast': { bg: '#000000', text: '#c8c8c8', grid: '#333333', border: '#ffffff', up: '#00ff80', down: '#ff1744' },
+};
+
+type BbSeries = { upper: ISeriesApi<'Line'>; basis: ISeriesApi<'Line'>; lower: ISeriesApi<'Line'> };
 
 const toChart = (t: number) => (t + KST_OFFSET) as UTCTimestamp;
 const fmtKst = (realSec: number) => {
@@ -45,23 +59,23 @@ export default function Chart() {
   const setConnected = useMarketStore((s) => s.setConnected);
 
   const opts = useChartStore();
+  const theme = useSettingsStore((s) => s.theme);
   const orders = useTradingStore((s) => s.orders);
   const positions = useTradingStore((s) => s.positions);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
-  const emaRef = useRef<ISeriesApi<'Line'> | null>(null);
-  const bbU = useRef<ISeriesApi<'Line'> | null>(null);
-  const bbB = useRef<ISeriesApi<'Line'> | null>(null);
-  const bbL = useRef<ISeriesApi<'Line'> | null>(null);
-  const rsiRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const indSeriesRef = useRef<Map<string, ISeriesApi<'Line'> | BbSeries>>(new Map());
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const volMap = useRef<Map<number, number>>(new Map());
   const priceLines = useRef<IPriceLine[]>([]);
   const hovering = useRef(false);
   const lastCalc = useRef(0);
+  const optsRef = useRef(opts);
+  optsRef.current = opts;
+  const syncIndicatorsRef = useRef<() => void>(() => {});
 
   const [legend, setLegend] = useState<Candle | null>(null);
   const [countdown, setCountdown] = useState('');
@@ -71,16 +85,17 @@ export default function Chart() {
   // ── 차트 생성 (1회) ──────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current) return;
+    const initTheme = CHART_THEME[useSettingsStore.getState().theme];
     const chart = createChart(containerRef.current, {
       layout: {
-        background: { type: ColorType.Solid, color: '#0b0d0f' },
-        textColor: '#7c828b',
+        background: { type: ColorType.Solid, color: initTheme.bg },
+        textColor: initTheme.text,
         fontFamily: 'Proxima Nova, sans-serif',
       },
-      grid: { vertLines: { color: '#191c21' }, horzLines: { color: '#191c21' } },
+      grid: { vertLines: { color: initTheme.grid }, horzLines: { color: initTheme.grid } },
       crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: '#282c33' },
-      timeScale: { borderColor: '#282c33', timeVisible: true, secondsVisible: false },
+      rightPriceScale: { borderColor: initTheme.border },
+      timeScale: { borderColor: initTheme.border, timeVisible: true, secondsVisible: false },
       // 하단 크로스헤어 시간 라벨 = yyyy-MM-dd HH:mm:ss (KST, 이미 오프셋된 값이라 UTC 로 포맷)
       localization: {
         timeFormatter: (t: unknown) => {
@@ -92,11 +107,11 @@ export default function Chart() {
       autoSize: true,
     });
     const candle = chart.addCandlestickSeries({
-      upColor: '#00c076',
-      downColor: '#f6465d',
+      upColor: initTheme.up,
+      downColor: initTheme.down,
       borderVisible: false,
-      wickUpColor: '#00c076',
-      wickDownColor: '#f6465d',
+      wickUpColor: initTheme.up,
+      wickDownColor: initTheme.down,
     });
     chartRef.current = chart;
     candleRef.current = candle;
@@ -120,43 +135,89 @@ export default function Chart() {
       chart.remove();
       chartRef.current = null;
       candleRef.current = null;
-      emaRef.current = bbU.current = bbB.current = bbL.current = rsiRef.current = null;
+      indSeriesRef.current.clear();
       volRef.current = null;
     };
   }, []);
 
+  // ── 테마 변경 시 차트 캔버스(배경/격자/축/캔들) 재도색 ──────────
+  useEffect(() => {
+    const chart = chartRef.current;
+    const candle = candleRef.current;
+    if (!chart || !candle) return;
+    const c = CHART_THEME[theme];
+    chart.applyOptions({
+      layout: { background: { type: ColorType.Solid, color: c.bg }, textColor: c.text },
+      grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
+      rightPriceScale: { borderColor: c.border },
+      timeScale: { borderColor: c.border },
+    });
+    candle.applyOptions({ upColor: c.up, downColor: c.down, wickUpColor: c.up, wickDownColor: c.down });
+  }, [theme]);
+
   // ── 인디케이터 동기화 (candlesRef 기준 재계산) ────────────────
+  // opts 를 직접 클로징하지 않고 optsRef 로 항상 최신 값을 읽는다.
+  // (WS 구독 이펙트처럼 symbol/interval 변경시에만 재생성되는 이펙트 안에서
+  //  옵션 토글 직후 옛 클로저가 다시 실행되며 방금 켠 지표를 지워버리는 버그 방지)
   const syncIndicators = () => {
     const chart = chartRef.current;
     const candles = candlesRef.current;
     if (!chart || candles.length === 0) return;
+    const o = optsRef.current;
     const closes = candles.map((c) => c.close);
     const times = candles.map((c) => c.time);
 
-    // EMA(20)
-    if (opts.ema) {
-      if (!emaRef.current) emaRef.current = chart.addLineSeries({ color: '#f0b90b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
-      emaRef.current.setData(line(ema(closes, 20), times));
-    } else if (emaRef.current) {
-      chart.removeSeries(emaRef.current);
-      emaRef.current = null;
+    // 더 이상 존재하지 않는 인디케이터 인스턴스의 시리즈 제거
+    const activeIds = new Set(o.indicators.map((i) => i.id));
+    for (const [id, ref] of indSeriesRef.current) {
+      if (activeIds.has(id)) continue;
+      if ('upper' in ref) {
+        chart.removeSeries(ref.upper);
+        chart.removeSeries(ref.basis);
+        chart.removeSeries(ref.lower);
+      } else {
+        chart.removeSeries(ref);
+      }
+      indSeriesRef.current.delete(id);
     }
 
-    // Bollinger(20,2)
-    if (opts.bb) {
-      const bands = bollinger(closes, 20, 2);
-      if (!bbU.current) bbU.current = chart.addLineSeries({ color: '#787b86', lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false });
-      if (!bbB.current) bbB.current = chart.addLineSeries({ color: '#4a90e2', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
-      if (!bbL.current) bbL.current = chart.addLineSeries({ color: '#787b86', lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false });
-      bbU.current.setData(line(bands.upper, times));
-      bbB.current.setData(line(bands.basis, times));
-      bbL.current.setData(line(bands.lower, times));
-    } else {
-      for (const r of [bbU, bbB, bbL]) if (r.current) { chart.removeSeries(r.current); r.current = null; }
-    }
+    o.indicators.forEach((ind: IndicatorConfig, idx: number) => {
+      const color = IND_COLORS[idx % IND_COLORS.length];
+      if (ind.type === 'ema') {
+        let s = indSeriesRef.current.get(ind.id) as ISeriesApi<'Line'> | undefined;
+        if (!s) {
+          s = chart.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+          indSeriesRef.current.set(ind.id, s);
+        }
+        s.setData(line(ema(closes, ind.period), times));
+      } else if (ind.type === 'bb') {
+        let s = indSeriesRef.current.get(ind.id) as BbSeries | undefined;
+        if (!s) {
+          s = {
+            upper: chart.addLineSeries({ color, lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false }),
+            basis: chart.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false }),
+            lower: chart.addLineSeries({ color, lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false }),
+          };
+          indSeriesRef.current.set(ind.id, s);
+        }
+        const bands = bollinger(closes, ind.period, ind.mult ?? 2);
+        s.upper.setData(line(bands.upper, times));
+        s.basis.setData(line(bands.basis, times));
+        s.lower.setData(line(bands.lower, times));
+      } else if (ind.type === 'rsi') {
+        let s = indSeriesRef.current.get(ind.id) as ISeriesApi<'Line'> | undefined;
+        if (!s) {
+          s = chart.addLineSeries({ color, lineWidth: 1, priceScaleId: 'rsi', priceLineVisible: false, lastValueVisible: false });
+          s.createPriceLine({ price: 70, color: '#f6465d40', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
+          s.createPriceLine({ price: 30, color: '#00c07640', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
+          indSeriesRef.current.set(ind.id, s);
+        }
+        s.setData(line(rsi(closes, ind.period), times));
+      }
+    });
 
     // 거래량 히스토그램 — 최하단
-    if (opts.volume) {
+    if (o.volume) {
       if (!volRef.current) {
         // lastValueVisible=true → 우측 축에 최신 거래량 티커(1.23M 형식) 표시
         volRef.current = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: true });
@@ -173,26 +234,15 @@ export default function Chart() {
       volRef.current = null;
     }
 
-    // RSI(14) — 별도 스케일
-    if (opts.rsi) {
-      if (!rsiRef.current) {
-        rsiRef.current = chart.addLineSeries({ color: '#c77dff', lineWidth: 1, priceScaleId: 'rsi', priceLineVisible: false, lastValueVisible: false });
-        rsiRef.current.createPriceLine({ price: 70, color: '#f6465d40', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
-        rsiRef.current.createPriceLine({ price: 30, color: '#00c07640', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
-      }
-      rsiRef.current.setData(line(rsi(closes, 14), times));
-    } else if (rsiRef.current) {
-      chart.removeSeries(rsiRef.current);
-      rsiRef.current = null;
-    }
-
     // 하단 영역 스택 배치: [캔들] / [RSI] / [거래량]
-    const volH = opts.volume ? 0.15 : 0;
-    const rsiH = opts.rsi ? 0.16 : 0;
+    const hasRsi = o.indicators.some((i) => i.type === 'rsi');
+    const volH = o.volume ? 0.15 : 0;
+    const rsiH = hasRsi ? 0.16 : 0;
     chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.06, bottom: Math.max(0.04, volH + rsiH + 0.02) } });
-    if (opts.rsi) chart.priceScale('rsi').applyOptions({ scaleMargins: { top: 1 - volH - rsiH, bottom: volH } });
-    if (opts.volume) chart.priceScale('vol').applyOptions({ scaleMargins: { top: 1 - volH, bottom: 0 } });
+    if (hasRsi) chart.priceScale('rsi').applyOptions({ scaleMargins: { top: 1 - volH - rsiH, bottom: volH } });
+    if (o.volume) chart.priceScale('vol').applyOptions({ scaleMargins: { top: 1 - volH, bottom: 0 } });
   };
+  syncIndicatorsRef.current = syncIndicators;
 
   // ── 데이터 로드 + WS 구독 (symbol/interval 변경 시) ───────────
   useEffect(() => {
@@ -224,7 +274,7 @@ export default function Chart() {
         // 기본 표시 = 최근 ~38봉 (모바일 가독성). 이후 왼쪽으로 당기면 과거봉 추가 로드.
         const len = candles.length;
         chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - 38), to: len + 2 });
-        syncIndicators();
+        syncIndicatorsRef.current();
         const l = candles.at(-1);
         if (l && !hovering.current) setLegend(l);
       } catch (e) {
@@ -256,7 +306,7 @@ export default function Chart() {
         candle.setData(
           candlesRef.current.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
         );
-        syncIndicators();
+        syncIndicatorsRef.current();
         // 프리펜드로 인덱스가 fresh.length 만큼 밀리므로 보이던 구간 그대로 유지
         if (before) ts.setVisibleLogicalRange({ from: before.from + fresh.length, to: before.to + fresh.length });
         if (fresh.length < 450) noMore = true; // 더 받을 게 거의 없음(과거 데이터 끝 근처)
@@ -291,7 +341,7 @@ export default function Chart() {
         const now = Date.now();
         if (now - lastCalc.current > 700) {
           lastCalc.current = now;
-          syncIndicators();
+          syncIndicatorsRef.current();
         }
       },
       error: () => setConnected(false),
@@ -305,9 +355,9 @@ export default function Chart() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, interval]);
 
-  // 인디케이터 토글 변경 시 즉시 반영
+  // 인디케이터 추가/삭제/설정 변경, 거래량 토글 시 즉시 반영
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { syncIndicators(); }, [opts.ema, opts.bb, opts.rsi, opts.volume]);
+  useEffect(() => { syncIndicators(); }, [opts.indicators, opts.volume]);
 
   // ── 매매 마커 (B/S) ──────────────────────────────────────────
   useEffect(() => {
@@ -404,13 +454,10 @@ export default function Chart() {
           {showOpts && (
             <>
               <div className="fixed inset-0 z-20" onClick={() => setShowOpts(false)} />
-              <div className="absolute left-0 top-full z-30 mt-1 w-44 rounded-lg border border-border bg-panel p-1.5 shadow-2xl">
+              <div className="absolute left-0 top-full z-30 mt-1 w-64 rounded-lg border border-border bg-panel p-1.5 shadow-2xl">
                 {(
                   [
                     ['volume', '거래량'],
-                    ['ema', 'EMA (20)'],
-                    ['bb', 'Bollinger (20,2)'],
-                    ['rsi', 'RSI (14)'],
                     ['showCountdown', '다음 봉 카운트다운'],
                     ['tradeMarkers', '내 매매 표시 (B/S)'],
                     ['positionLine', '포지션 평단선'],
@@ -424,6 +471,67 @@ export default function Chart() {
                     <input type="checkbox" checked={opts[k]} onChange={() => opts.toggle(k)} className="accent-up" />
                   </label>
                 ))}
+
+                <div className="my-1 border-t border-border" />
+                <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">인디케이터</div>
+
+                {opts.indicators.length === 0 && (
+                  <div className="px-2 py-1.5 text-[11px] text-muted">추가된 인디케이터 없음</div>
+                )}
+                {opts.indicators.map((ind, idx) => (
+                  <div key={ind.id} className="flex items-center gap-1.5 rounded px-2 py-1 text-xs text-text hover:bg-panel2">
+                    <span
+                      className="h-2 w-2 shrink-0 rounded-full"
+                      style={{ backgroundColor: IND_COLORS[idx % IND_COLORS.length] }}
+                    />
+                    <span className="w-16 shrink-0">{IND_LABEL[ind.type]}</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={500}
+                      value={ind.period}
+                      onChange={(e) => {
+                        const v = Math.max(1, Math.min(500, Number(e.target.value) || 1));
+                        opts.updateIndicator(ind.id, { period: v });
+                      }}
+                      className="w-14 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
+                    />
+                    {ind.type === 'bb' && (
+                      <input
+                        type="number"
+                        min={0.5}
+                        max={5}
+                        step={0.5}
+                        value={ind.mult ?? 2}
+                        onChange={(e) => {
+                          const v = Math.max(0.5, Math.min(5, Number(e.target.value) || 2));
+                          opts.updateIndicator(ind.id, { mult: v });
+                        }}
+                        className="w-12 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
+                        title="표준편차 배수"
+                      />
+                    )}
+                    <button
+                      onClick={() => opts.removeIndicator(ind.id)}
+                      className="ml-auto shrink-0 rounded px-1.5 text-muted hover:bg-elevated hover:text-down"
+                      title="삭제"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+
+                <div className="mt-1 flex gap-1 px-1">
+                  {(['ema', 'bb', 'rsi'] as const).map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => opts.addIndicator(t)}
+                      className="flex-1 rounded bg-panel2 px-1.5 py-1 text-[11px] font-semibold text-text ring-1 ring-border transition hover:bg-elevated"
+                    >
+                      + {IND_LABEL[t]}
+                    </button>
+                  ))}
+                </div>
               </div>
             </>
           )}
