@@ -4,7 +4,7 @@ import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { fmtPrice, precisionFromTick } from '@/format';
 
 const fmtQty = (q: number) => (q >= 1000 ? q.toFixed(1) : q.toFixed(4));
-const GROUP_MULTS = [1, 5, 10, 50, 100]; // 심볼 tick 단위의 배수 — "모아보기" 단계
+const GROUP_MULTS = [1, 10, 100, 1000]; // 심볼 tick 단위의 10배씩 — "스프레드" 값을 눌러서 순환
 
 // 같은 가격대(step 배수)로 수량을 합쳐서 보여준다. bid 는 아래로(floor), ask 는 위로(ceil) 반올림 —
 // 스프레드에서 먼 방향으로 묶어야 "이 가격대에 이만큼 쌓여있다"는 의미가 유지된다.
@@ -22,50 +22,35 @@ function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'):
 }
 
 /** 호가창 — 클릭하면 그 가격이 지정가 주문 입력에 채워진다(차트 클릭과 동일한 신호 재사용).
- * 상단의 "모아보기" 단계 선택으로 인접 호가를 묶어서 볼 수 있다. */
+ * 가운데 "스프레드" 값을 클릭하면 묶어보기 단위가 0.01→0.1→1→10… 식으로 10배씩 순환한다. */
 export default function OrderBook() {
   const symbol = useMarketStore((s) => s.symbol);
   const precisions = useMarketStore((s) => s.precisions);
   const [book, setBook] = useState<OrderBookSnapshot | null>(null);
-  const [groupMult, setGroupMult] = useState(1);
+  const [groupIdx, setGroupIdx] = useState(0);
 
   useEffect(() => {
     setBook(null);
-    setGroupMult(1); // 심볼마다 tick 단위가 달라서 배수 선택을 리셋
+    setGroupIdx(0); // 심볼마다 tick 단위가 달라서 배수 선택을 리셋
     const sub = orderbookStream(symbol, 20).subscribe({ next: setBook });
     return () => sub.unsubscribe();
   }, [symbol]);
 
   const prec = precisionOf(precisions, symbol);
   const tick = Math.pow(10, -prec);
-  const groupStep = tick * groupMult;
+  const groupStep = tick * GROUP_MULTS[groupIdx];
+  const cycleGroup = () => setGroupIdx((i) => (i + 1) % GROUP_MULTS.length);
   const pick = (price: number) => useMarketStore.getState().setChartClickPrice(price);
 
   const asks = useMemo(() => (book ? aggregate(book.asks, groupStep, 'ask').slice(0, 8) : []), [book, groupStep]);
   const bids = useMemo(() => (book ? aggregate(book.bids, groupStep, 'bid').slice(0, 8) : []), [book, groupStep]);
 
   const maxQty = Math.max(1e-9, ...bids.map((b) => b.qty), ...asks.map((a) => a.qty));
-  const bestBid = bids[0]?.price;
-  const bestAsk = asks[0]?.price;
-  const spread = bestBid != null && bestAsk != null ? bestAsk - bestBid : null;
   const groupPrec = precisionFromTick(groupStep);
 
   return (
     <div className="border-b border-border bg-panel p-2 text-xs md:border-b-0 md:border-t">
-      <div className="mb-1 flex items-center justify-between px-1">
-        <span className="text-[10px] font-semibold uppercase text-muted">호가창</span>
-        <select
-          value={groupMult}
-          onChange={(e) => setGroupMult(Number(e.target.value))}
-          className="cursor-pointer rounded bg-panel2 px-1.5 py-0.5 text-[10px] font-semibold text-text outline-none ring-1 ring-border hover:ring-elevated"
-        >
-          {GROUP_MULTS.map((m) => (
-            <option key={m} value={m}>
-              모아보기 {fmtPrice(tick * m, precisionFromTick(tick * m))}
-            </option>
-          ))}
-        </select>
-      </div>
+      <div className="mb-1 px-1 text-[10px] font-semibold uppercase text-muted">호가창</div>
       {!book ? (
         <div className="py-6 text-center text-muted">불러오는 중…</div>
       ) : (
@@ -88,10 +73,15 @@ export default function OrderBook() {
             ))}
           </div>
 
-          <div className="my-1 flex items-center justify-between border-y border-border px-1.5 py-1 text-[11px] text-muted">
+          {/* 스프레드 값 클릭 = 묶어보기 단위 10배 순환(0.01→0.1→1→10→0.01...) */}
+          <button
+            onClick={cycleGroup}
+            title="클릭하면 묶어보기 단위가 10배씩 바뀝니다"
+            className="my-1 flex w-full items-center justify-between rounded border-y border-border px-1.5 py-1 text-[11px] text-muted transition hover:bg-panel2"
+          >
             <span>스프레드</span>
-            <span className="text-text">{spread != null ? fmtPrice(spread, groupPrec) : '—'}</span>
-          </div>
+            <span className="font-semibold text-text">{fmtPrice(groupStep, groupPrec)}</span>
+          </button>
 
           {/* 매수(bid) — 최우선호가가 스프레드 바로 아래 */}
           <div className="space-y-0.5">

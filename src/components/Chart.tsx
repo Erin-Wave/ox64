@@ -393,7 +393,10 @@ export default function Chart() {
         const now = Date.now();
         if (now - lastBarsSave > 500) {
           lastBarsSave = now;
-          const bars = Math.round(range.to - range.from);
+          // 초기 로드가 {from: len-N, to: len+2} 로 2봉만큼 여유를 두고 범위를 잡으므로
+          // (아래 참고) 저장할 땐 그 여유분을 빼야 다음 로드 때 N 그대로 복원된다.
+          // 이걸 안 빼면 로드→저장→로드 때마다 매번 +2씩 불어나는 버그가 있었음.
+          const bars = Math.round(range.to - range.from) - 2;
           if (bars > 1) useChartStore.getState().setVisibleBars(bars);
         }
       }

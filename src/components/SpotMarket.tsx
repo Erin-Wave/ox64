@@ -81,7 +81,9 @@ export default function SpotMarket({ onClose }: { onClose: () => void }) {
             레버리지·강제청산 없이 현물 그대로 오갑니다.
           </p>
 
-          {!state ? (
+          {!state && err ? (
+            <p className="rounded-md bg-downDim px-3 py-2 text-down">{err}</p>
+          ) : !state ? (
             <p className="py-8 text-center text-muted">불러오는 중…</p>
           ) : (
             <div className="grid gap-4 md:grid-cols-2">

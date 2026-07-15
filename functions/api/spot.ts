@@ -31,7 +31,9 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     if (envErr) return bad(envErr, 500);
     const sess = await getSession(request, env);
     if (!sess) return bad('unauthorized', 401);
-    return json(await loadSpotState(env, sess.uid));
+    const state = await loadSpotState(env, sess.uid);
+    if (!state) return bad('unauthorized', 401);
+    return json(state);
   });
 }
 
