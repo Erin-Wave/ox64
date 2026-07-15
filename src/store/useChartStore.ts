@@ -18,7 +18,7 @@ const DEFAULTS: Record<IndicatorType, Omit<IndicatorConfig, 'id' | 'type'>> = {
 let seq = 0;
 const nextId = () => `ind_${++seq}_${Math.floor(Math.random() * 1e6)}`;
 
-type BoolFlag = 'showCountdown' | 'volume' | 'tradeMarkers' | 'positionLine';
+type BoolFlag = 'showCountdown' | 'volume' | 'tradeMarkers' | 'positionLine' | 'slTpLines';
 
 /** 차트 표시 옵션 (localStorage 영속). */
 interface ChartState {
@@ -26,6 +26,7 @@ interface ChartState {
   volume: boolean;
   tradeMarkers: boolean;
   positionLine: boolean;
+  slTpLines: boolean;
   indicators: IndicatorConfig[];
   toggle: (k: BoolFlag) => void;
   addIndicator: (type: IndicatorType) => void;
@@ -42,9 +43,12 @@ function load(): Partial<ChartState> {
   }
 }
 function persist(s: ChartState) {
-  const { showCountdown, volume, tradeMarkers, positionLine, indicators } = s;
+  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, indicators } = s;
   try {
-    localStorage.setItem(KEY, JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, indicators }));
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, indicators }),
+    );
   } catch {
     /* ignore */
   }
@@ -56,6 +60,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   volume: saved.volume ?? true,
   tradeMarkers: saved.tradeMarkers ?? true,
   positionLine: saved.positionLine ?? true,
+  slTpLines: saved.slTpLines ?? true,
   indicators: saved.indicators ?? [],
   toggle: (k) => {
     set((s) => ({ [k]: !s[k] }) as Partial<ChartState>);

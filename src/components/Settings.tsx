@@ -1,4 +1,4 @@
-import { useSettingsStore, type Theme, type TradingMode } from '@/store/useSettingsStore';
+import { useSettingsStore, type FontSize, type Theme, type TradingMode } from '@/store/useSettingsStore';
 
 const THEMES: { value: Theme; label: string }[] = [
   { value: 'dark', label: '다크' },
@@ -6,11 +6,19 @@ const THEMES: { value: Theme; label: string }[] = [
   { value: 'high-contrast', label: '고대비' },
 ];
 
+const FONT_SIZES: { value: FontSize; label: string }[] = [
+  { value: 'sm', label: '작게' },
+  { value: 'md', label: '보통' },
+  { value: 'lg', label: '크게' },
+];
+
 export default function Settings({ onClose }: { onClose: () => void }) {
   const theme = useSettingsStore((s) => s.theme);
   const setTheme = useSettingsStore((s) => s.setTheme);
   const tradingMode = useSettingsStore((s) => s.tradingMode);
   const setTradingMode = useSettingsStore((s) => s.setTradingMode);
+  const fontSize = useSettingsStore((s) => s.fontSize);
+  const setFontSize = useSettingsStore((s) => s.setFontSize);
 
   return (
     <div
@@ -70,6 +78,25 @@ export default function Settings({ onClose }: { onClose: () => void }) {
                     {m.label}
                   </div>
                   <div className="mt-0.5 text-[11px] text-muted">{m.desc}</div>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section>
+            <h3 className="mb-2 text-xs font-semibold text-muted">폰트 크기</h3>
+            <div className="grid grid-cols-3 gap-2">
+              {FONT_SIZES.map((f) => (
+                <button
+                  key={f.value}
+                  onClick={() => setFontSize(f.value)}
+                  className={`rounded-lg px-2 py-2.5 text-xs font-semibold ring-1 transition ${
+                    fontSize === f.value
+                      ? 'bg-accent/15 text-accent ring-accent'
+                      : 'bg-panel2 text-text ring-border hover:bg-elevated'
+                  }`}
+                >
+                  {f.label}
                 </button>
               ))}
             </div>

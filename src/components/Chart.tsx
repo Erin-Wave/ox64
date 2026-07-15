@@ -37,6 +37,8 @@ const CHART_THEME: Record<Theme, { bg: string; text: string; grid: string; borde
 };
 
 type BbSeries = { upper: ISeriesApi<'Line'>; basis: ISeriesApi<'Line'>; lower: ISeriesApi<'Line'> };
+type BbValues = { upper: number; basis: number; lower: number };
+type IndLegendValue = number | BbValues;
 
 const toChart = (t: number) => (t + KST_OFFSET) as UTCTimestamp;
 const fmtKst = (realSec: number, withSeconds = false) => {
@@ -68,6 +70,11 @@ export default function Chart() {
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const indSeriesRef = useRef<Map<string, ISeriesApi<'Line'> | BbSeries>>(new Map());
+  // syncIndicators() 가 candlesRef 와 나란한 인덱스로 채워두는 원본 계산값 —
+  // 크로스헤어가 벗어났을 때(마지막 값) 또는 hover 시점 조회에 사용.
+  const indValuesRef = useRef<
+    Map<string, (number | null)[] | { upper: (number | null)[]; basis: (number | null)[]; lower: (number | null)[] }>
+  >(new Map());
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const volMap = useRef<Map<number, number>>(new Map());
@@ -79,11 +86,30 @@ export default function Chart() {
   const syncIndicatorsRef = useRef<() => void>(() => {});
 
   const [legend, setLegend] = useState<Candle | null>(null);
+  const [indLegend, setIndLegend] = useState<Record<string, IndLegendValue>>({});
   const [countdown, setCountdown] = useState('');
   const [showOpts, setShowOpts] = useState(false);
   const [prec, setPrec] = useState(2); // 현재 심볼 가격 소수 자릿수
   const precRef = useRef(prec);
   precRef.current = prec;
+
+  // 크로스헤어가 벗어나 있을 때(또는 최초) 보여줄 "마지막 봉" 기준 지표값.
+  // indValuesRef 는 그냥 ref 라 여기서 최신값을 읽어도 클로저 staleness 문제가 없다.
+  const lastIndLegend = (): Record<string, IndLegendValue> => {
+    const out: Record<string, IndLegendValue> = {};
+    for (const [id, arr] of indValuesRef.current) {
+      if (Array.isArray(arr)) {
+        const v = arr.at(-1);
+        if (v != null) out[id] = v;
+      } else {
+        const u = arr.upper.at(-1);
+        const b = arr.basis.at(-1);
+        const l = arr.lower.at(-1);
+        if (u != null && b != null && l != null) out[id] = { upper: u, basis: b, lower: l };
+      }
+    }
+    return out;
+  };
 
   // ── 차트 생성 (1회) ──────────────────────────────────────────
   useEffect(() => {
@@ -125,6 +151,7 @@ export default function Chart() {
         hovering.current = false;
         const l = candlesRef.current.at(-1);
         if (l) setLegend(l);
+        setIndLegend(lastIndLegend());
         return;
       }
       const d = param.seriesData.get(c) as CandlestickData | undefined;
@@ -132,6 +159,21 @@ export default function Chart() {
       hovering.current = true;
       const real = (param.time as number) - KST_OFFSET;
       setLegend({ time: real, open: d.open, high: d.high, low: d.low, close: d.close, volume: volMap.current.get(real) });
+
+      // 인디케이터 값 — 각 시리즈에 그 시점 데이터가 있으면 param.seriesData 에서 바로 조회.
+      const nextInd: Record<string, IndLegendValue> = {};
+      for (const [id, s] of indSeriesRef.current) {
+        if ('upper' in s) {
+          const u = param.seriesData.get(s.upper) as LineData | undefined;
+          const b = param.seriesData.get(s.basis) as LineData | undefined;
+          const lo = param.seriesData.get(s.lower) as LineData | undefined;
+          if (u && b && lo) nextInd[id] = { upper: u.value, basis: b.value, lower: lo.value };
+        } else {
+          const v = param.seriesData.get(s) as LineData | undefined;
+          if (v) nextInd[id] = v.value;
+        }
+      }
+      setIndLegend(nextInd);
     });
 
     // 차트 클릭 → 클릭한 y좌표의 가격을 지정가 주문 입력에 흘려보낸다(OrderPanel 이 구독).
@@ -197,6 +239,7 @@ export default function Chart() {
         chart.removeSeries(ref);
       }
       indSeriesRef.current.delete(id);
+      indValuesRef.current.delete(id);
     }
 
     o.indicators.forEach((ind: IndicatorConfig, idx: number) => {
@@ -207,7 +250,9 @@ export default function Chart() {
           s = chart.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
           indSeriesRef.current.set(ind.id, s);
         }
-        s.setData(line(ema(closes, ind.period), times));
+        const vals = ema(closes, ind.period);
+        s.setData(line(vals, times));
+        indValuesRef.current.set(ind.id, vals);
       } else if (ind.type === 'bb') {
         let s = indSeriesRef.current.get(ind.id) as BbSeries | undefined;
         if (!s) {
@@ -222,6 +267,7 @@ export default function Chart() {
         s.upper.setData(line(bands.upper, times));
         s.basis.setData(line(bands.basis, times));
         s.lower.setData(line(bands.lower, times));
+        indValuesRef.current.set(ind.id, bands);
       } else if (ind.type === 'rsi') {
         let s = indSeriesRef.current.get(ind.id) as ISeriesApi<'Line'> | undefined;
         if (!s) {
@@ -230,7 +276,9 @@ export default function Chart() {
           s.createPriceLine({ price: 30, color: '#00c07640', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
           indSeriesRef.current.set(ind.id, s);
         }
-        s.setData(line(rsi(closes, ind.period), times));
+        const vals = rsi(closes, ind.period);
+        s.setData(line(vals, times));
+        indValuesRef.current.set(ind.id, vals);
       }
     });
 
@@ -295,6 +343,7 @@ export default function Chart() {
         syncIndicatorsRef.current();
         const l = candles.at(-1);
         if (l && !hovering.current) setLegend(l);
+        if (!hovering.current) setIndLegend(lastIndLegend());
       } catch (e) {
         console.error('[chart] load failed', e);
       }
@@ -360,6 +409,7 @@ export default function Chart() {
         if (now - lastCalc.current > 700) {
           lastCalc.current = now;
           syncIndicatorsRef.current();
+          if (!hovering.current) setIndLegend(lastIndLegend());
         }
       },
       error: () => setConnected(false),
@@ -375,7 +425,10 @@ export default function Chart() {
 
   // 인디케이터 추가/삭제/설정 변경, 거래량 토글 시 즉시 반영
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { syncIndicators(); }, [opts.indicators, opts.volume]);
+  useEffect(() => {
+    syncIndicators();
+    if (!hovering.current) setIndLegend(lastIndLegend());
+  }, [opts.indicators, opts.volume]);
 
   // ── 매매 마커 (B/S) ──────────────────────────────────────────
   useEffect(() => {
@@ -398,29 +451,61 @@ export default function Chart() {
     c.setMarkers(markers);
   }, [orders, symbol, opts.tradeMarkers]);
 
-  // ── 포지션 평단 수평선 ───────────────────────────────────────
+  // ── 포지션 평단 / SL·TP 수평선 ───────────────────────────────
   useEffect(() => {
     const c = candleRef.current;
     if (!c) return;
     for (const pl of priceLines.current) c.removePriceLine(pl);
     priceLines.current = [];
-    if (!opts.positionLine) return;
     const mine = positions.filter((p) => p.symbol === symbol);
     if (mine.length === 0) return;
-    const totSize = mine.reduce((a, p) => a + p.size, 0);
-    const avg = mine.reduce((a, p) => a + p.entryPrice * p.size, 0) / totSize;
-    const side = mine[0].side;
-    priceLines.current.push(
-      c.createPriceLine({
-        price: avg,
-        color: side === 'long' ? '#00c076' : '#f6465d',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: '평단',
-      }),
-    );
-  }, [positions, symbol, opts.positionLine]);
+
+    if (opts.positionLine) {
+      const totSize = mine.reduce((a, p) => a + p.size, 0);
+      const avg = mine.reduce((a, p) => a + p.entryPrice * p.size, 0) / totSize;
+      const side = mine[0].side;
+      priceLines.current.push(
+        c.createPriceLine({
+          price: avg,
+          color: side === 'long' ? '#00c076' : '#f6465d',
+          lineWidth: 1,
+          lineStyle: LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: '평단',
+        }),
+      );
+    }
+
+    if (opts.slTpLines) {
+      // 포지션이 여러 개면 각각의 SL/TP 를 전부 그린다(중복 값이면 겹쳐 보임).
+      for (const p of mine) {
+        if (p.stopLoss != null) {
+          priceLines.current.push(
+            c.createPriceLine({
+              price: p.stopLoss,
+              color: '#f6465d',
+              lineWidth: 1,
+              lineStyle: LineStyle.Dotted,
+              axisLabelVisible: true,
+              title: 'SL',
+            }),
+          );
+        }
+        if (p.takeProfit != null) {
+          priceLines.current.push(
+            c.createPriceLine({
+              price: p.takeProfit,
+              color: '#00c076',
+              lineWidth: 1,
+              lineStyle: LineStyle.Dotted,
+              axisLabelVisible: true,
+              title: 'TP',
+            }),
+          );
+        }
+      }
+    }
+  }, [positions, symbol, opts.positionLine, opts.slTpLines]);
 
   // ── 다음 봉 카운트다운 ───────────────────────────────────────
   useEffect(() => {
@@ -479,6 +564,7 @@ export default function Chart() {
                     ['showCountdown', '다음 봉 카운트다운'],
                     ['tradeMarkers', '내 매매 표시 (B/S)'],
                     ['positionLine', '포지션 평단선'],
+                    ['slTpLines', 'SL/TP 수평선'],
                   ] as const
                 ).map(([k, label]) => (
                   <label
@@ -568,6 +654,24 @@ export default function Chart() {
             <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.low, prec)}</span></span>
             <span className="text-muted">종 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.close, prec)}</span></span>
             <span className="text-muted">거래량 <span className="text-text">{fmtVol(legend.volume)}</span></span>
+            {opts.indicators.map((ind, idx) => {
+              const val = indLegend[ind.id];
+              if (val == null) return null;
+              const color = IND_COLORS[idx % IND_COLORS.length];
+              return (
+                <span key={ind.id} style={{ color }}>
+                  {IND_LABEL[ind.type]}({ind.period})
+                  {typeof val === 'number' ? (
+                    <> {ind.type === 'rsi' ? val.toFixed(1) : fmtPrice(val, prec)}</>
+                  ) : (
+                    <>
+                      {' '}
+                      U {fmtPrice(val.upper, prec)} B {fmtPrice(val.basis, prec)} L {fmtPrice(val.lower, prec)}
+                    </>
+                  )}
+                </span>
+              );
+            })}
           </div>
         )}
         {/* 카운트다운 */}
