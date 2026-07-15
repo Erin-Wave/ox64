@@ -10,11 +10,25 @@ export default function Header({ onOpenRank, onOpenSettings }: { onOpenRank: () 
   const precisions = useMarketStore((s) => s.precisions);
   const connected = useMarketStore((s) => s.connected);
   const balance = useTradingStore((s) => s.balance);
+  const positions = useTradingStore((s) => s.positions);
   const refillsLeft = useTradingStore((s) => s.refillsLeft);
   const refill = useTradingStore((s) => s.refill);
   const busy = useTradingStore((s) => s.busy);
   const name = useTradingStore((s) => s.name);
   const logout = useTradingStore((s) => s.logout);
+  const prices = useMarketStore((s) => s.prices);
+
+  // 서버와 동일한 규칙(평가자산<=0 일 때만 리필 허용)을 클라에서도 미리 반영 — 거부당하기 전에 버튼을 비활성화.
+  const equityKnown = positions.every((p) => prices[p.symbol] != null);
+  const equity =
+    balance +
+    positions.reduce((a, p) => {
+      const live = prices[p.symbol];
+      if (live == null) return a;
+      const dir = p.side === 'long' ? 1 : -1;
+      return a + (live - p.entryPrice) * p.size * dir;
+    }, 0);
+  const canRefill = equityKnown && equity <= 0;
 
   return (
     <header className="flex flex-wrap items-center justify-between gap-y-2 border-b border-border bg-panel px-3 py-2 sm:px-4">
@@ -44,8 +58,8 @@ export default function Header({ onOpenRank, onOpenSettings }: { onOpenRank: () 
         </div>
         <button
           onClick={() => refill()}
-          disabled={busy || refillsLeft <= 0}
-          title="강제청산 등으로 잔고가 바닥났을 때를 위한 안전망 — 1일 최대 3회"
+          disabled={busy || refillsLeft <= 0 || !canRefill}
+          title="평가자산이 0일 때만 가능 — 강제청산 등으로 자산이 바닥났을 때를 위한 안전망, 1일 최대 3회"
           className="rounded-md bg-panel2 px-2.5 py-1.5 text-xs font-semibold text-accent ring-1 ring-border transition hover:bg-elevated disabled:opacity-40"
         >
           +1만 리필 ({refillsLeft}/3)
