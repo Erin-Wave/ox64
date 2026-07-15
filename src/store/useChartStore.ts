@@ -27,8 +27,10 @@ interface ChartState {
   tradeMarkers: boolean;
   positionLine: boolean;
   slTpLines: boolean;
+  visibleBars: number; // 처음 로드 시 보여줄 봉 개수 — 마지막으로 사용자가 확대/축소한 값을 기억
   indicators: IndicatorConfig[];
   toggle: (k: BoolFlag) => void;
+  setVisibleBars: (n: number) => void;
   addIndicator: (type: IndicatorType) => void;
   removeIndicator: (id: string) => void;
   updateIndicator: (id: string, patch: Partial<Pick<IndicatorConfig, 'period' | 'mult'>>) => void;
@@ -43,11 +45,11 @@ function load(): Partial<ChartState> {
   }
 }
 function persist(s: ChartState) {
-  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, indicators } = s;
+  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, visibleBars, indicators } = s;
   try {
     localStorage.setItem(
       KEY,
-      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, indicators }),
+      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, visibleBars, indicators }),
     );
   } catch {
     /* ignore */
@@ -61,9 +63,14 @@ export const useChartStore = create<ChartState>((set, get) => ({
   tradeMarkers: saved.tradeMarkers ?? true,
   positionLine: saved.positionLine ?? true,
   slTpLines: saved.slTpLines ?? true,
+  visibleBars: saved.visibleBars ?? 38,
   indicators: saved.indicators ?? [],
   toggle: (k) => {
     set((s) => ({ [k]: !s[k] }) as Partial<ChartState>);
+    persist(get());
+  },
+  setVisibleBars: (n) => {
+    set({ visibleBars: n });
     persist(get());
   },
   addIndicator: (type) => {

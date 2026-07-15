@@ -337,9 +337,11 @@ export default function Chart() {
         candle.setData(
           candles.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
         );
-        // 기본 표시 = 최근 ~38봉 (모바일 가독성). 이후 왼쪽으로 당기면 과거봉 추가 로드.
+        // 기본 표시 봉수 = 사용자가 마지막으로 확대/축소한 값(localStorage, 없으면 ~38봉).
+        // 이후 왼쪽으로 당기면 과거봉 추가 로드.
         const len = candles.length;
-        chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - 38), to: len + 2 });
+        const initBars = optsRef.current.visibleBars;
+        chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - initBars), to: len + 2 });
         syncIndicatorsRef.current();
         const l = candles.at(-1);
         if (l && !hovering.current) setLegend(l);
@@ -383,8 +385,18 @@ export default function Chart() {
         loadingMore = false;
       }
     };
+    let lastBarsSave = 0;
     const onRange = (range: { from: number; to: number } | null) => {
       if (range && range.from < 10) loadOlder();
+      // 사용자가 확대/축소한 봉 개수를 기억해뒀다가 다음 접속 때 기본값으로 사용(과도한 쓰기 방지로 스로틀).
+      if (range) {
+        const now = Date.now();
+        if (now - lastBarsSave > 500) {
+          lastBarsSave = now;
+          const bars = Math.round(range.to - range.from);
+          if (bars > 1) useChartStore.getState().setVisibleBars(bars);
+        }
+      }
     };
     const tsApi = chartRef.current?.timeScale();
     tsApi?.subscribeVisibleLogicalRangeChange(onRange);
