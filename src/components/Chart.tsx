@@ -24,6 +24,7 @@ import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol } from '@/symbols';
 import { fmtPrice, fmtVol } from '@/format';
+import Clock from '@/components/Clock';
 import type { Candle } from '@/types';
 
 const IND_LABEL: Record<IndicatorType, string> = { ema: 'EMA', bb: 'Bollinger', rsi: 'RSI' };
@@ -766,6 +767,9 @@ export default function Chart() {
             </>
           )}
         </div>
+
+        {/* 실시간 시계(KST) — 우측 구석 */}
+        <Clock className="ml-auto text-xs font-semibold text-muted" />
       </div>
 
       {/* 차트 영역 */}
