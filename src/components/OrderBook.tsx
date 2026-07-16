@@ -63,8 +63,12 @@ export default function OrderBook() {
   const pick = (price: number) => useMarketStore.getState().setChartClickPrice(price);
 
   // 정렬: bids=가격 높은 순(최우선매수=맨 위), asks=가격 낮은 순(최우선매도=맨 위) — 그대로 위→아래 렌더.
-  const asks = useMemo(() => (activeBook ? aggregate(activeBook.asks, groupStep, 'ask').slice(0, 8) : []), [activeBook, groupStep]);
-  const bids = useMemo(() => (activeBook ? aggregate(activeBook.bids, groupStep, 'bid').slice(0, 8) : []), [activeBook, groupStep]);
+  // ⚠ 예전엔 상위 8개만 잘라서 보여줬는데, 스프레드에서 먼 곳에 큰 물량을 걸어두면(예: 벽처럼 큰
+  // 지정가) 정작 그 주문이 8번째 밖으로 밀려 화면에서 통째로 안 보이는 버그가 있었다. 서버가 애초에
+  // 가격대별 최대 15단계까지만 주므로(loadSpotMarket), 프론트도 그만큼 그대로 다 보여준다(스크롤 처리).
+  const BOOK_DEPTH = 15;
+  const asks = useMemo(() => (activeBook ? aggregate(activeBook.asks, groupStep, 'ask').slice(0, BOOK_DEPTH) : []), [activeBook, groupStep]);
+  const bids = useMemo(() => (activeBook ? aggregate(activeBook.bids, groupStep, 'bid').slice(0, BOOK_DEPTH) : []), [activeBook, groupStep]);
 
   const maxQty = Math.max(1e-9, ...bids.map((b) => b.qty), ...asks.map((a) => a.qty));
   const groupPrec = precisionFromTick(groupStep);
@@ -102,7 +106,7 @@ export default function OrderBook() {
         ) : (
           <div className="grid grid-cols-2 gap-1.5">
             {/* 좌: 매수(bid) — 최우선호가(가격 가장 높음)가 맨 위 */}
-            <div className="space-y-0.5">
+            <div className="max-h-56 space-y-0.5 overflow-y-auto">
               {bids.map((b) => (
                 <button
                   key={b.price}
@@ -119,7 +123,7 @@ export default function OrderBook() {
               ))}
             </div>
             {/* 우: 매도(ask) — 최우선호가(가격 가장 낮음)가 맨 위 */}
-            <div className="space-y-0.5">
+            <div className="max-h-56 space-y-0.5 overflow-y-auto">
               {asks.map((a) => (
                 <button
                   key={a.price}
