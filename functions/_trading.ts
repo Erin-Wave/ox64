@@ -100,6 +100,11 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
 
   // ── 지정가 체결 ── long: mark<=limit(싸게 매수), short: mark>=limit(비싸게 매도)
   // 체결가는 limit_price 그대로 사용(생성 시 이미 그 가격 기준으로 증거금을 잠갔으므로 재계산 불필요).
+  // 같은 심볼·방향 포지션이 이미 있으면(또는 이번 루프에서 방금 합쳐졌으면) 새 행을 또 만들지 않고
+  // 평단가를 재계산해 합친다 — order.ts 의 시장가 진입과 동일한 원웨이 모드 동작(포지션 중복 생성 버그 수정).
+  const posBySymbolSide = new Map<string, PositionRow>();
+  for (const pos of positions) posBySymbolSide.set(`${pos.symbol}|${pos.side}`, pos);
+
   for (const p of pendings) {
     const mark = prices[p.symbol];
     if (mark == null) continue;
@@ -107,17 +112,58 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
     if (!fills) continue;
 
     const now = Date.now();
-    const posId = crypto.randomUUID();
     const ordId = crypto.randomUUID();
-    await env.DB.batch([
-      env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid),
-      env.DB.prepare(
-        'INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-      ).bind(posId, uid, p.symbol, p.side, p.limit_price, p.size, p.leverage, p.margin, now, p.stop_loss, p.take_profit),
-      env.DB.prepare(
-        'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(ordId, uid, p.symbol, p.side, p.limit_price, p.size, p.leverage, 'open', null, now),
-    ]);
+    const key = `${p.symbol}|${p.side}`;
+    const existing = posBySymbolSide.get(key);
+
+    if (existing) {
+      const newSize = existing.size + p.size;
+      const newEntry = (existing.entry_price * existing.size + p.limit_price * p.size) / newSize;
+      const newMargin = existing.margin + p.margin;
+      const finalSl = p.stop_loss != null ? p.stop_loss : existing.stop_loss;
+      const finalTp = p.take_profit != null ? p.take_profit : existing.take_profit;
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid),
+        env.DB.prepare(
+          'UPDATE positions SET entry_price = ?, size = ?, margin = ?, stop_loss = ?, take_profit = ? WHERE id = ? AND user_id = ?',
+        ).bind(newEntry, newSize, newMargin, finalSl, finalTp, existing.id, uid),
+        env.DB.prepare(
+          'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        ).bind(ordId, uid, p.symbol, p.side, p.limit_price, p.size, existing.leverage, 'open', null, now),
+      ]);
+      posBySymbolSide.set(key, {
+        ...existing,
+        entry_price: newEntry,
+        size: newSize,
+        margin: newMargin,
+        stop_loss: finalSl,
+        take_profit: finalTp,
+      });
+    } else {
+      const posId = crypto.randomUUID();
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid),
+        env.DB.prepare(
+          'INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        ).bind(posId, uid, p.symbol, p.side, p.limit_price, p.size, p.leverage, p.margin, now, p.stop_loss, p.take_profit),
+        env.DB.prepare(
+          'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        ).bind(ordId, uid, p.symbol, p.side, p.limit_price, p.size, p.leverage, 'open', null, now),
+      ]);
+      posBySymbolSide.set(key, {
+        id: posId,
+        user_id: uid,
+        symbol: p.symbol,
+        side: p.side,
+        entry_price: p.limit_price,
+        size: p.size,
+        leverage: p.leverage,
+        margin: p.margin,
+        opened_at: now,
+        stop_loss: p.stop_loss,
+        take_profit: p.take_profit,
+      });
+    }
   }
 
   // ── SL/TP 트리거 ── 체결가는 stop_loss/take_profit 값 그대로 사용(슬리피지 모델링 없음).

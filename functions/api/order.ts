@@ -74,20 +74,61 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
 
     const price = await fetchPrice(env, symbol); // 서버 체결가
-    const margin = (price * size) / leverage;
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
-    if (!validSlTp(side, price, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
 
     const user = await env.DB.prepare('SELECT id, name, balance FROM users WHERE id = ?')
       .bind(uid)
       .first<UserRow>();
     if (!user) return bad('unauthorized', 401);
-    if (margin > user.balance) return bad('증거금이 부족합니다');
+
+    // 같은 심볼·같은 방향으로 이미 보유 중인 포지션이 있으면 새 행을 또 만들지 않고 그 포지션에
+    // 물타기/불타기 방식으로 합친다(평단가 재계산) — 거래소들의 "원웨이 모드"와 동일한 동작.
+    // 레버리지는 최초 진입 때 값으로 고정(포지션 하나에 레버리지가 섞이면 증거금 계산이 불가능해짐).
+    const existing = await env.DB.prepare(
+      'SELECT * FROM positions WHERE user_id = ? AND symbol = ? AND side = ?',
+    )
+      .bind(uid, symbol, side)
+      .first<PositionRow>();
 
     const now = Date.now();
-    const posId = crypto.randomUUID();
     const ordId = crypto.randomUUID();
+
+    if (existing) {
+      const addMargin = (price * size) / existing.leverage;
+      if (addMargin > user.balance) return bad('증거금이 부족합니다');
+
+      const newSize = existing.size + size;
+      const newEntry = (existing.entry_price * existing.size + price * size) / newSize;
+      const finalSl = stopLoss != null ? stopLoss : existing.stop_loss;
+      const finalTp = takeProfit != null ? takeProfit : existing.take_profit;
+      if ((stopLoss != null || takeProfit != null) && !validSlTp(side, newEntry, finalSl, finalTp)) {
+        return bad('SL/TP 값이 올바르지 않습니다');
+      }
+
+      const res = await env.DB.batch([
+        env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?').bind(
+          addMargin,
+          uid,
+          addMargin,
+        ),
+        env.DB.prepare(
+          'UPDATE positions SET entry_price = ?, size = ?, margin = ?, stop_loss = ?, take_profit = ? WHERE id = ? AND user_id = ?',
+        ).bind(newEntry, newSize, existing.margin + addMargin, finalSl, finalTp, existing.id, uid),
+        env.DB.prepare(
+          'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        ).bind(ordId, uid, symbol, side, price, size, existing.leverage, 'open', null, now),
+      ]);
+      if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
+
+      return json(await loadState(env, uid));
+    }
+
+    const margin = (price * size) / leverage;
+    if (!validSlTp(side, price, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
+    if (margin > user.balance) return bad('증거금이 부족합니다');
+
+    const posId = crypto.randomUUID();
     // 잔고 차감은 조건부 UPDATE 로 원자적 가드(balance >= margin)
     const res = await env.DB.batch([
       env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?').bind(
