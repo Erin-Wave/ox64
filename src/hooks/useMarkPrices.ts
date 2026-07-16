@@ -2,20 +2,29 @@ import { useEffect } from 'react';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { isVirtualSymbol } from '@/symbols';
+import { fetchPricePrecision } from '@/services/binanceRest';
+
+const VIRTUAL_PREC = 4; // OX/USDT 가상 심볼 소수 자릿수 (Chart.tsx 와 동일)
 
 /**
  * 현재 보는 심볼 + 보유 포지션들의 심볼 가격을 주기적으로 폴링해 prices 맵을 갱신한다.
  * 차트 WS 는 현재 심볼만 실시간 갱신하므로, 다른 심볼 포지션의 PnL 이 멈추던 버그를 해결.
  * (브라우저에서 바이낸스 REST 는 접근 가능 — 서버 403 문제와 무관.)
+ * 아울러 보유/미체결/현재 심볼의 가격 정밀도(소수 자릿수)도 채운다 — 예전엔 차트가 현재 심볼만
+ * 채워서, 다른 심볼 포지션의 진입가/청산가/현재가가 소수 2자리로 폴백되던 버그가 있었다.
  */
 export function useMarkPrices() {
   const symbol = useMarketStore((s) => s.symbol);
   const setPrice = useMarketStore((s) => s.setPrice);
+  const setPrecision = useMarketStore((s) => s.setPrecision);
   const positions = useTradingStore((s) => s.positions);
+  const pendingOrders = useTradingStore((s) => s.pendingOrders);
 
-  // 필요한 심볼 집합(현재 + 포지션들)을 문자열 키로 만들어 의존성에 사용
+  // 필요한 심볼 집합을 문자열 키로 만들어 의존성에 사용
   const posSymbols = positions.map((p) => p.symbol).join(',');
+  const pendSymbols = pendingOrders.map((o) => o.symbol).join(',');
 
+  // ── 가격 폴링 (현재 + 보유 포지션 심볼) ──
   useEffect(() => {
     // 가상 심볼(OXUSDT)은 바이낸스에 없는 심볼이라 배치 요청에 섞이면 전체가 실패한다 — 제외.
     const symbols = [...new Set([symbol, ...positions.map((p) => p.symbol)])].filter((s) => !isVirtualSymbol(s));
@@ -45,4 +54,22 @@ export function useMarkPrices() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, posSymbols, setPrice]);
+
+  // ── 가격 정밀도 확보 (현재 + 보유 + 미체결 심볼, 없는 것만 1회 조회) ──
+  useEffect(() => {
+    const syms = [...new Set([symbol, ...posSymbols.split(','), ...pendSymbols.split(',')].filter(Boolean))];
+    const have = useMarketStore.getState().precisions;
+    for (const s of syms) {
+      if (have[s] != null) continue;
+      if (isVirtualSymbol(s)) {
+        setPrecision(s, VIRTUAL_PREC);
+        continue;
+      }
+      fetchPricePrecision(s)
+        .then(({ precision }) => setPrecision(s, precision))
+        .catch(() => {
+          /* 조회 실패 시 다음 변경 때 재시도 */
+        });
+    }
+  }, [symbol, posSymbols, pendSymbols, setPrecision]);
 }

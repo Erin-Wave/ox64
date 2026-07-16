@@ -76,6 +76,8 @@ export default function Chart() {
   const orders = useTradingStore((s) => s.orders);
   const positions = useTradingStore((s) => s.positions);
   const pendingOrders = useTradingStore((s) => s.pendingOrders);
+  const balance = useTradingStore((s) => s.balance);
+  const prices = useMarketStore((s) => s.prices);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -547,6 +549,35 @@ export default function Chart() {
           title: '평단',
         }),
       );
+
+      // 청산가(추정) 수평선 — PositionsPanel 과 동일 산식(평가자산=잔고+전 포지션 미실현손익 이 0 되는 가격).
+      // 다른 포지션들의 미실현손익이 필요하므로 전 심볼 가격이 있어야 계산 가능(없으면 생략).
+      const unrealizedOf = (p: (typeof positions)[number]) => {
+        const lv = prices[p.symbol];
+        if (lv == null) return null;
+        const d = p.side === 'long' ? 1 : -1;
+        return (lv - p.entryPrice) * p.size * d;
+      };
+      if (positions.every((p) => unrealizedOf(p) != null)) {
+        const totalU = positions.reduce((a, p) => a + (unrealizedOf(p) ?? 0), 0);
+        for (const p of mine) {
+          const others = totalU - (unrealizedOf(p) ?? 0);
+          const d = p.side === 'long' ? 1 : -1;
+          const liq = p.entryPrice - (balance + others) / (p.size * d);
+          if (liq > 0) {
+            priceLines.current.push(
+              c.createPriceLine({
+                price: liq,
+                color: '#ff9800',
+                lineWidth: 1,
+                lineStyle: LineStyle.Dashed,
+                axisLabelVisible: true,
+                title: '청산',
+              }),
+            );
+          }
+        }
+      }
     }
 
     if (opts.slTpLines) {
@@ -594,7 +625,7 @@ export default function Chart() {
         );
       }
     }
-  }, [positions, pendingOrders, symbol, opts.positionLine, opts.slTpLines, opts.pendingLine]);
+  }, [positions, pendingOrders, prices, balance, symbol, opts.positionLine, opts.slTpLines, opts.pendingLine]);
 
   // ── 다음 봉 카운트다운 ───────────────────────────────────────
   useEffect(() => {

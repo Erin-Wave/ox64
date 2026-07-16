@@ -105,6 +105,7 @@ export default function PositionsPanel() {
                 <tr className="text-left">
                   <th className="px-3 py-2 font-medium">심볼</th>
                   <th className="px-3 py-2 font-medium">방향</th>
+                  <th className="px-3 py-2 text-right font-medium">현재가</th>
                   <th className="px-3 py-2 text-right font-medium">진입가</th>
                   <th className="px-3 py-2 text-right font-medium">청산가</th>
                   <th className="px-3 py-2 text-right font-medium">수량</th>
@@ -136,11 +137,15 @@ export default function PositionsPanel() {
                           {p.side === 'long' ? '롱' : '숏'} {p.leverage}x
                         </span>
                       </td>
+                      <td className="px-3 py-2.5 text-right text-text">{live != null ? fmtPrice(live, prec) : '—'}</td>
                       <td className="px-3 py-2.5 text-right text-text">{fmtPrice(p.entryPrice, prec)}</td>
                       <td className="px-3 py-2.5 text-right text-down">
                         {liq != null && liq > 0 ? fmtPrice(liq, prec) : '—'}
                       </td>
-                      <td className="px-3 py-2.5 text-right text-text">{p.size}</td>
+                      <td className="px-3 py-2.5 text-right text-text">
+                        <div>{p.size}</div>
+                        <div className="text-[10px] text-muted">({margin.toFixed(2)} USDT)</div>
+                      </td>
                       {standard && (
                         <td className="px-3 py-2.5 text-right">
                           {editing ? (
