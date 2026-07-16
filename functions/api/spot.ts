@@ -196,6 +196,7 @@ async function matchSell(env: Env, uid: string, orderId: string, limitPrice: num
 // 내서(다른 봇 또는 실유저 호가와 매칭) 체결이 계속 발생하게 한다.
 const BOT_TICK_MIN_MS = 3000;
 const BOT_TICK_MAX_MS = 8000;
+const BOT_LEVELS_PER_SIDE = 4; // 봇 1명이 한 틱에 까는 매수/매도 각각의 호가 단계 수(호가창 깊이)
 
 export async function runMarketMaker(env: Env): Promise<void> {
   const row = await env.DB.prepare('SELECT last_run, ref_price FROM spot_bot_state WHERE id = ?')
@@ -263,11 +264,36 @@ export async function runMarketMaker(env: Env): Promise<void> {
     }
   }
 
-  // 기준가 주변에 패시브 호가를 새로 깐다.
-  const spread = 0.003 + Math.random() * 0.005;
-  const size = Number((5 + Math.random() * 40).toFixed(4));
-  await placeBotOrder(env, actor, 'buy', Number((ref * (1 - spread)).toFixed(6)), size);
-  await placeBotOrder(env, actor, 'sell', Number((ref * (1 + spread)).toFixed(6)), size);
+  // 기준가 주변에 패시브 호가를 여러 단계(레벨)로 깐다 — 매 틱마다 이 액터의 호가를 전부 새로
+  // 깔기 때문에(위 취소 로직) 레벨을 늘려도 역전 걱정 없이 호가창 깊이만 두꺼워진다.
+  for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
+    const spread = 0.003 + level * 0.004 + Math.random() * 0.003;
+    const size = Number((5 + Math.random() * 40).toFixed(4));
+    await placeBotOrder(env, actor, 'buy', Number((ref * (1 - spread)).toFixed(6)), size);
+    await placeBotOrder(env, actor, 'sell', Number((ref * (1 + spread)).toFixed(6)), size);
+  }
+}
+
+/** 유저가 OX 를 실제로 레버리지 거래(order.ts open/close)할 때 그 체결을 합성 시장에도 반영한다.
+ * 이걸 안 하면 유저 입장에선 포지션 수량만 조용히 바뀌고 호가창·체결내역·다음 기준가엔 전혀
+ * 안 보여서 "내가 산 게 반영이 안 된다"는 혼란이 생긴다 — 그래서 체결 테이프에 기록하고
+ * 기준가(ref_price)도 이 체결가로 즉시 당겨준다(다음 봇 틱이 이 가격 기준으로 랜덤워크). */
+export async function recordVirtualFill(
+  env: Env,
+  uid: string,
+  price: number,
+  takerSide: 'buy' | 'sell',
+  size: number,
+): Promise<void> {
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
+    ).bind(crypto.randomUUID(), PAIR, uid, uid, price, size, takerSide, now),
+    env.DB.prepare(
+      'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price',
+    ).bind(PAIR, now, price),
+  ]);
 }
 
 /** 봇 전용 주문 배치(에스크로+매칭) — 봇은 잔고가 항상 충분하다. */

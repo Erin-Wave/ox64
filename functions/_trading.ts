@@ -8,7 +8,19 @@
 // 를 따로 뒀다 — cron/ 의 별도 Worker(Cron Trigger, Pages 는 cron 미지원이라 분리 배포)가
 // 1시간마다 호출해 전 유저를 훑는다. 지정가/SL·TP 는 여전히 접속(폴링) 기반 그대로.
 
-import { type D1PreparedStatement, type Env, type PendingRow, type PositionRow, fetchPrices } from './_shared';
+import { type D1PreparedStatement, type Env, type PendingRow, type PositionRow, fetchPrices, isVirtualSymbol } from './_shared';
+import { recordVirtualFill } from './api/spot';
+
+// OX/USDT 는 진짜 상대 거래자가 없으니, 지정가/SL·TP 체결도 합성 시장(호가창·체결내역·다음 봇
+// 기준가)에 반영해준다 — order.ts 의 reflectVirtualFill 과 동일한 이유(실패해도 무시, 표시용 부가효과).
+async function reflectVirtualFill(env: Env, symbol: string, uid: string, price: number, takerSide: 'buy' | 'sell', size: number) {
+  if (!isVirtualSymbol(symbol)) return;
+  try {
+    await recordVirtualFill(env, uid, price, takerSide, size);
+  } catch {
+    /* 표시용 부가효과 — 실패해도 무시 */
+  }
+}
 
 /** 평가자산(잔고+미실현손익 합) < 0 이면 그 유저의 전 포지션을 강제청산 + 미체결 취소 + 잔고 0.
  * 심볼 가격을 하나라도 못 받아왔으면(allPriced=false) 이번 라운드는 건너뛴다 — 불완전한
@@ -131,6 +143,7 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
           'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
         ).bind(ordId, uid, p.symbol, p.side, p.limit_price, p.size, existing.leverage, 'open', null, now),
       ]);
+      await reflectVirtualFill(env, p.symbol, uid, p.limit_price, p.side === 'long' ? 'buy' : 'sell', p.size);
       posBySymbolSide.set(key, {
         ...existing,
         entry_price: newEntry,
@@ -150,6 +163,7 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
           'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
         ).bind(ordId, uid, p.symbol, p.side, p.limit_price, p.size, p.leverage, 'open', null, now),
       ]);
+      await reflectVirtualFill(env, p.symbol, uid, p.limit_price, p.side === 'long' ? 'buy' : 'sell', p.size);
       posBySymbolSide.set(key, {
         id: posId,
         user_id: uid,
@@ -193,5 +207,6 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
         'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
       ).bind(ordId, uid, pos.symbol, pos.side, trigger, pos.size, pos.leverage, 'close', pnl, now),
     ]);
+    await reflectVirtualFill(env, pos.symbol, uid, trigger, pos.side === 'long' ? 'sell' : 'buy', pos.size);
   }
 }

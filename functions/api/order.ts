@@ -6,13 +6,29 @@ import {
   missingEnv,
   getSession,
   isSymbol,
+  isVirtualSymbol,
   fetchPrice,
   loadState,
+  type Env,
   type PositionRow,
   type PendingRow,
   type UserRow,
 } from '../_shared';
 import { checkTriggers } from '../_trading';
+import { recordVirtualFill } from './spot';
+
+// OX/USDT 는 진짜 상대 거래자가 없으니, 유저가 레버리지로 체결시킨 걸 합성 시장(호가창·체결내역·
+// 다음 봇 기준가)에도 반영해준다 — 안 그러면 포지션 수량만 조용히 바뀌고 화면엔 아무 흔적도 안 남아
+// "내 체결이 반영이 안 된다"는 혼란이 생긴다. 실패해도 유저의 실제 거래(잔고/포지션)는 이미
+// 끝난 뒤라 조용히 무시한다(표시용 부가효과일 뿐).
+async function reflectVirtualFill(env: Env, symbol: string, uid: string, price: number, takerSide: 'buy' | 'sell', size: number) {
+  if (!isVirtualSymbol(symbol)) return;
+  try {
+    await recordVirtualFill(env, uid, price, takerSide, size);
+  } catch {
+    /* 표시용 부가효과 — 실패해도 무시 */
+  }
+}
 
 /**
  * POST /api/order
@@ -120,6 +136,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
         ).bind(ordId, uid, symbol, side, price, size, existing.leverage, 'open', null, now),
       ]);
       if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
+      await reflectVirtualFill(env, symbol, uid, price, side === 'long' ? 'buy' : 'sell', size);
 
       return json(await loadState(env, uid));
     }
@@ -144,6 +161,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       ).bind(ordId, uid, symbol, side, price, size, leverage, 'open', null, now),
     ]);
     if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
+    await reflectVirtualFill(env, symbol, uid, price, side === 'long' ? 'buy' : 'sell', size);
 
     return json(await loadState(env, uid));
   }
@@ -180,6 +198,8 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
         'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
       ).bind(ordId, uid, pos.symbol, pos.side, price, closeSize, pos.leverage, 'close', pnl, now),
     ]);
+    // 청산은 원래 방향의 반대 액션(롱 청산=매도, 숏 청산=매수)으로 시장에 반영.
+    await reflectVirtualFill(env, pos.symbol, uid, price, pos.side === 'long' ? 'sell' : 'buy', closeSize);
 
     return json(await loadState(env, uid));
   }
