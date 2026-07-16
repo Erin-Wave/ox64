@@ -16,7 +16,7 @@
 | 상태/UI | **Zustand + Tailwind CSS** | selector 구독으로 리렌더 차단 |
 | **백엔드** | **Cloudflare Pages Functions** (`functions/`) | 프론트와 같은 레포·배포. `/api/*` 라우트 |
 | **DB** | **Cloudflare D1 (SQLite)** | 서버 권위 저장소(users/positions/orders) |
-| **인증** | HMAC 서명 세션 쿠키 + PBKDF2 패스코드 | DB 세션테이블 불필요. 이름+패스코드 로그인 |
+| **인증** | HMAC 서명 세션 쿠키 + PBKDF2 패스코드 | DB 세션테이블 불필요. 이름+패스코드 로그인. 쿠키 30일 지속(자동로그인) — 클라 `init/refresh` 는 **401 일 때만** 로그아웃하고 일시적 네트워크/5xx 오류엔 세션을 유지(폴링 실패로 튕기던 문제 방지, `api.ts ApiError`) |
 
 > **왜 서버 권위인가**: 클라이언트(IndexedDB/localStorage)에 둔 값은 콘솔로 100% 변조 가능
 > → 랭킹 경쟁이 무의미해짐. 그래서 진실원본을 서버로 옮김. (구 IndexedDB/Dexie 구조는 제거됨.)
@@ -38,7 +38,7 @@ ox64/
 │   ├── _shared.ts          인증(HMAC 토큰/PBKDF2)·바이낸스 서버측 시세·D1 타입·loadState(positions/orders/pendingOrders)
 │   ├── _trading.ts         checkTriggers(env,uid) — 접속(폴링) 시 강제청산→지정가→SL/TP 순으로 평가 / sweepForcedLiquidations(env) — 전 유저의 강제청산만 평가(cron/ 워커가 접속 여부 무관하게 호출)
 │   └── api/
-│       ├── login.ts        POST /api/login  (없는 이름=가입, 있으면 패스코드 검증→세션쿠키)
+│       ├── login.ts        POST /api/login  (없는 이름=가입, 있으면 패스코드 검증→세션쿠키 30일 Max-Age=자동로그인)
 │       ├── logout.ts       POST /api/logout (쿠키 제거)
 │       ├── state.ts        GET  /api/state  (checkTriggers 호출 후 잔고+refillsLeft+포지션+주문+미체결주문, 인증필요)
 │       ├── order.ts        POST /api/order  (open/close/limitOpen/cancelLimit/setSlTp — 서버가 체결가 fetch·손익 계산·D1 원자 갱신)

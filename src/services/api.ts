@@ -70,6 +70,17 @@ export interface SpotState {
   trades: SpotTrade[];
 }
 
+/** HTTP 상태를 담는 API 에러 — 401(인증만료)과 일시적 네트워크/5xx 오류를 구분하기 위함.
+ * (일시 오류에 세션을 끊으면 쿠키가 멀쩡해도 로그인 화면으로 튕기므로.) */
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`/api${path}`, {
     credentials: 'same-origin',
@@ -77,7 +88,7 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
     ...opts,
   });
   const data = (await res.json().catch(() => ({}))) as T & { error?: string };
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) throw new ApiError(data.error || `HTTP ${res.status}`, res.status);
   return data;
 }
 

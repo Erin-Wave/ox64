@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import {
   api,
+  ApiError,
   type ApiOrder,
   type ApiPendingOrder,
   type ApiPosition,
@@ -93,16 +94,24 @@ export const useTradingStore = create<TradingState>((set) => ({
   spotBook: { bids: [], asks: [] },
   spotTrades: [],
 
-  // 앱 시작 시 기존 세션(쿠키) 확인
+  // 앱 시작 시 기존 세션(쿠키, 30일) 확인 → 유효하면 자동로그인.
+  // 401(인증만료)이면 즉시 로그인 화면. 그 외 일시적 오류(네트워크·5xx)는 쿠키가 멀쩡할 수
+  // 있으므로 몇 번 재시도한 뒤에야 로그인 화면으로 폴백한다(로드 순간 blip 으로 튕기지 않게).
   init: async () => {
-    try {
-      const st = await api.state();
-      apply(set, st);
-    } catch {
-      set({ authed: false });
-    } finally {
-      set({ ready: true });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        apply(set, await api.state());
+        set({ ready: true });
+        return;
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          set({ authed: false, ready: true });
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1))); // 일시 오류 → 잠시 후 재시도
+      }
     }
+    set({ authed: false, ready: true }); // 계속 실패 시에만 로그인 화면
   },
 
   login: async (name, passcode) => {
@@ -140,8 +149,10 @@ export const useTradingStore = create<TradingState>((set) => ({
   refresh: async () => {
     try {
       apply(set, await api.state());
-    } catch {
-      set({ authed: false });
+    } catch (e) {
+      // 401(인증만료)일 때만 로그아웃. 일시적 네트워크/5xx 로는 세션을 끊지 않는다
+      // (쿠키가 멀쩡한데도 폴링 실패 한 번에 로그인 화면으로 튕기던 문제 → 30일 유지 안 되던 체감의 원인).
+      if (e instanceof ApiError && e.status === 401) set({ authed: false });
     }
   },
 
