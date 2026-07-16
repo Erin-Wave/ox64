@@ -9,7 +9,7 @@
 // 1시간마다 호출해 전 유저를 훑는다. 지정가/SL·TP 는 여전히 접속(폴링) 기반 그대로.
 
 import { type D1PreparedStatement, type Env, type PendingRow, type PositionRow, fetchPrices, isVirtualSymbol } from './_shared';
-import { recordVirtualFill } from './api/spot';
+import { fillOxPending, recordVirtualFill } from './api/spot';
 
 // OX/USDT 는 진짜 상대 거래자가 없으니, 지정가/SL·TP 체결도 합성 시장(호가창·체결내역·다음 봇
 // 기준가)에 반영해준다 — order.ts 의 reflectVirtualFill 과 동일한 이유(실패해도 무시, 표시용 부가효과).
@@ -120,6 +120,14 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
   for (const p of pendings) {
     const mark = prices[p.symbol];
     if (mark == null) continue;
+
+    // OX/USDT 는 합성 시장 체결로 통일 — runMarketMaker 와 공유하는 fillOxPending 을 쓴다(시장가
+    // 가격개선·증거금 정산·선점 기반 이중체결 방지 포함). 실제 코인은 아래 기존 병합 경로 그대로.
+    if (isVirtualSymbol(p.symbol)) {
+      await fillOxPending(env, p, mark);
+      continue;
+    }
+
     const fills = p.side === 'long' ? mark <= p.limit_price : mark >= p.limit_price;
     if (!fills) continue;
 

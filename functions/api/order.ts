@@ -15,7 +15,7 @@ import {
   type UserRow,
 } from '../_shared';
 import { checkTriggers } from '../_trading';
-import { recordVirtualFill } from './spot';
+import { fillOxPending, recordVirtualFill } from './spot';
 
 // OX/USDT 는 진짜 상대 거래자가 없으니, 유저가 레버리지로 체결시킨 걸 합성 시장(호가창·체결내역·
 // 다음 봇 기준가)에도 반영해준다 — 안 그러면 포지션 수량만 조용히 바뀌고 화면엔 아무 흔적도 안 남아
@@ -239,6 +239,30 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       ).bind(pendingId, uid, symbol, side, size, leverage, limitPrice, margin, stopLoss, takeProfit, now),
     ]);
     if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
+
+    // OX/USDT: 지금 체결 가능한(marketable) 지정가면 제출 즉시 시장가로 체결한다 — 실제 거래소처럼
+    // marketable 지정가는 호가창에 남지 않게(유저 매수 > 봇 매도 호가 역전 방지). fillOxPending 이
+    // 체결 가능 여부·선점·증거금 정산을 모두 처리하므로, 체결 불가면 그대로 pending 에 남는다.
+    if (isVirtualSymbol(symbol)) {
+      const ref = await fetchPrice(env, symbol);
+      await fillOxPending(
+        env,
+        {
+          id: pendingId,
+          user_id: uid,
+          symbol,
+          side,
+          size,
+          leverage,
+          limit_price: limitPrice,
+          margin,
+          stop_loss: stopLoss,
+          take_profit: takeProfit,
+          created_at: now,
+        },
+        ref,
+      );
+    }
 
     return json(await loadState(env, uid));
   }

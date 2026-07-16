@@ -10,6 +10,8 @@ import {
   BOT_USER_IDS,
   type SpotOrderRow,
   type SpotTradeRow,
+  type PendingRow,
+  type PositionRow,
 } from '../_shared';
 
 /**
@@ -217,6 +219,12 @@ export async function runMarketMaker(env: Env): Promise<void> {
     .first<{ last_run: number; ref_price: number }>();
   const now = Date.now();
   const last = row?.last_run ?? 0;
+
+  // ⚠ 게이트(봇 재호가 주기)보다 먼저, 매 폴링마다 체결 가능한 유저 지정가를 시장가로 즉시 체결한다.
+  // 이래야 주문 낸 유저의 개인 폴링에 의존하지 않고(백그라운드 탭·접속 종료여도) 시장이 그 가격을
+  // 뚫는 순간 곧바로 체결·소멸돼 호가 역전이 남지 않는다("체결 안 됨/호가 역전"의 근본 해결).
+  if (row?.ref_price) await fillMarketableOxLimits(env, row.ref_price);
+
   const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
   if (now - last < gate) return;
   // 동시 요청이 겹쳐도 대략 한 번만 돌도록 먼저 last_run 을 찍어둔다(완벽한 락은 아니지만 폴링 간격상 충분).
@@ -329,6 +337,122 @@ export async function recordVirtualFill(
       'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price',
     ).bind(PAIR, now, price),
   ]);
+}
+
+/**
+ * OX/USDT 지정가 하나가 지금 체결 가능(marketable)하면 시장가(ref)로 즉시 체결시켜 레버리지
+ * 포지션을 연다. ⚠ 근본 문제였던 "두 개의 분리된 매칭 시스템"을 해소하는 핵심 함수 —
+ * 예전엔 유저 지정가(pending_orders)를 그 유저 자신의 checkTriggers(폴링) 만 스칼라 ref 와
+ * 비교해 체결했고, 봇 매칭엔진(matchBuy/matchSell)은 유저 지정가를 아예 안 봤다. 그래서
+ * "내 매수(1.1111)보다 싼 매도(1.0919)가 계속 올라오는데 안 맞물리는" 호가 역전(크로스)이 났다.
+ * 이 함수는 runMarketMaker(누구의 /api/spot 폴링·크론) 와 checkTriggers(그 유저 폴링) 양쪽에서
+ * 호출돼, 체결 가능한 유저 지정가가 폴링 주체와 무관하게 즉시 체결·소멸되게 한다.
+ *
+ * - 체결 여부: long 은 ref<=limit(싸게 매수 가능), short 는 ref>=limit(비싸게 매도 가능).
+ * - 체결가: 트레이더에게 항상 지정가만큼 유리하거나 같게(가격 개선) — long=min(limit,ref),
+ *   short=max(limit,ref). limit 그대로 물리던(시장가보다 비싸게 물리는) 문제를 제거.
+ * - 증거금: 생성 시 limit 기준으로 잠갔으므로, 실제 체결 증거금과의 차액을 환불(long)하거나
+ *   추가 징수(short, 잔고 부족하면 개선 없이 limit 로 폴백)한다.
+ * - 원자성: 먼저 pending 을 조건부 DELETE 해서 "선점"한다(changes!==1 이면 다른 경로가 이미
+ *   체결/취소한 것 → 이중 체결 방지). 선점 후에만 포지션을 연다.
+ */
+export async function fillOxPending(env: Env, p: PendingRow, ref: number): Promise<boolean> {
+  const isLong = p.side === 'long';
+  const marketable = isLong ? ref <= p.limit_price : ref >= p.limit_price;
+  if (!marketable || !(ref > 0)) return false;
+
+  // 선점(claim): 이 DELETE 가 changes=1 인 경로만 체결을 진행한다(동시 요청 이중 체결 방지).
+  const claim = await env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?')
+    .bind(p.id, p.user_id)
+    .run();
+  if (claim.meta.changes !== 1) return false;
+
+  // 물타기(병합) 시 레버리지는 기존 포지션 값으로 고정 — order.ts 의 open 병합과 동일. 증거금도
+  // 그 레버리지(effLeverage) 기준으로 계산해야 값이 보존된다(신규면 지정가의 레버리지 그대로).
+  const existing = await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? AND symbol = ? AND side = ?')
+    .bind(p.user_id, PAIR, p.side)
+    .first<PositionRow>();
+  const effLeverage = existing ? existing.leverage : p.leverage;
+
+  const improved = isLong ? Math.min(p.limit_price, ref) : Math.max(p.limit_price, ref);
+
+  // 체결가 = 개선가(improved). 필요한 증거금이 생성 시 잠근 것(p.margin)보다 크면(주로 short 가
+  // 시장가로 더 비싸게 체결 → 명목가↑) 차액을 추가 징수하고, 잔고가 부족하면 가격개선을 포기하고
+  // 잠근 증거금 그대로(fillPrice=limit, posMargin=p.margin) 체결한다(항상 값 보존·감당 가능).
+  // 필요한 증거금이 잠근 것 이하이면(주로 long) 차액을 환불한다.
+  let fillPrice = improved;
+  let posMargin = (improved * p.size) / effLeverage;
+  let refundInBatch = 0;
+  if (posMargin <= p.margin) {
+    refundInBatch = p.margin - posMargin;
+  } else {
+    const extra = posMargin - p.margin;
+    const charged = await env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?')
+      .bind(extra, p.user_id, extra)
+      .run();
+    if (charged.meta.changes !== 1) {
+      fillPrice = p.limit_price;
+      posMargin = p.margin;
+    }
+  }
+
+  const now = Date.now();
+  const ordId = crypto.randomUUID();
+
+  const stmts = [];
+  if (existing) {
+    // 같은 심볼·방향 보유분과 병합(원웨이 모드).
+    const newSize = existing.size + p.size;
+    const newEntry = (existing.entry_price * existing.size + fillPrice * p.size) / newSize;
+    const newMargin = existing.margin + posMargin;
+    const finalSl = p.stop_loss != null ? p.stop_loss : existing.stop_loss;
+    const finalTp = p.take_profit != null ? p.take_profit : existing.take_profit;
+    stmts.push(
+      env.DB.prepare(
+        'UPDATE positions SET entry_price = ?, size = ?, margin = ?, stop_loss = ?, take_profit = ? WHERE id = ? AND user_id = ?',
+      ).bind(newEntry, newSize, newMargin, finalSl, finalTp, existing.id, p.user_id),
+      env.DB.prepare(
+        'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      ).bind(ordId, p.user_id, PAIR, p.side, fillPrice, p.size, existing.leverage, 'open', null, now),
+    );
+  } else {
+    const posId = crypto.randomUUID();
+    stmts.push(
+      env.DB.prepare(
+        'INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      ).bind(posId, p.user_id, PAIR, p.side, fillPrice, p.size, p.leverage, posMargin, now, p.stop_loss, p.take_profit),
+      env.DB.prepare(
+        'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      ).bind(ordId, p.user_id, PAIR, p.side, fillPrice, p.size, p.leverage, 'open', null, now),
+    );
+  }
+  if (refundInBatch > 0) {
+    stmts.push(env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(refundInBatch, p.user_id));
+  }
+  await env.DB.batch(stmts);
+
+  try {
+    await recordVirtualFill(env, p.user_id, fillPrice, isLong ? 'buy' : 'sell', p.size);
+  } catch {
+    /* 표시용 부가효과 — 실패해도 체결(위 배치)은 이미 확정 */
+  }
+  return true;
+}
+
+/** 전 유저의 OX 지정가 중 지금 체결 가능한 것을 시장가(ref)로 즉시 체결한다 — runMarketMaker 가
+ * 매 틱 호출하므로, 주문 낸 유저가 접속/폴링 중이 아니어도 시장이 그 가격을 뚫으면 곧 체결된다. */
+async function fillMarketableOxLimits(env: Env, ref: number): Promise<void> {
+  if (!(ref > 0)) return;
+  const pendings = (
+    await env.DB.prepare('SELECT * FROM pending_orders WHERE symbol = ?').bind(PAIR).all<PendingRow>()
+  ).results;
+  for (const p of pendings) {
+    try {
+      await fillOxPending(env, p, ref);
+    } catch {
+      /* 한 건 실패해도 나머지는 계속 — 다음 틱에서 재시도 */
+    }
+  }
 }
 
 /** 봇 전용 주문 배치(에스크로+매칭) — 봇은 잔고가 항상 충분하다. */
