@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useMarketStore, selectLastPrice, precisionOf } from '@/store/useMarketStore';
+import { useMarketStore, selectLastPrice, selectLastTakerSide, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { fmtPrice } from '@/format';
 import SymbolSelect from '@/components/SymbolSelect';
@@ -14,6 +14,7 @@ export default function Header({
 }) {
   const symbol = useMarketStore((s) => s.symbol);
   const lastPrice = useMarketStore(selectLastPrice);
+  const lastTakerSide = useMarketStore(selectLastTakerSide);
   const precisions = useMarketStore((s) => s.precisions);
   const connected = useMarketStore((s) => s.connected);
   const balance = useTradingStore((s) => s.balance);
@@ -37,6 +38,8 @@ export default function Header({
       return a + (live - p.entryPrice) * p.size * dir;
     }, 0);
   const canRefill = equityKnown && equity <= 0;
+  // 마지막 체결이 매수 테이커면 매수색, 매도 테이커면 매도색 — 아직 체결이 없으면 기본색.
+  const priceColor = lastTakerSide === 'buy' ? 'text-up' : lastTakerSide === 'sell' ? 'text-down' : 'text-text';
 
   return (
     <header className="flex items-center justify-between gap-2 border-b border-border bg-panel px-2 py-1.5 sm:gap-3 sm:px-4 sm:py-2">
@@ -45,16 +48,8 @@ export default function Header({
         <img src={logo} alt="ox64" className="hidden h-9 w-9 shrink-0 sm:block sm:h-10 sm:w-10" />
         <div className="hidden h-6 w-px bg-border sm:block" />
         <SymbolSelect />
-        <div className="hidden flex-col leading-none sm:flex">
-          <span className="text-[15px] font-bold text-text">
-            {lastPrice != null ? fmtPrice(lastPrice, precisionOf(precisions, symbol)) : '—'}
-          </span>
-          <span className="mt-0.5 flex items-center gap-1 text-[10px] text-muted">
-            <span className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-up' : 'bg-muted'}`} />
-            {connected ? '실시간' : '연결 끊김'}
-          </span>
-        </div>
-        <span className="flex min-w-0 items-center gap-1 truncate text-xs font-bold text-text sm:hidden">
+        {/* 연결 상태는 텍스트 없이 점 색으로만(초록=실시간, 회색=끊김) */}
+        <span className={`flex min-w-0 items-center gap-1 truncate text-xs font-bold sm:text-[15px] ${priceColor}`}>
           <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${connected ? 'bg-up' : 'bg-muted'}`} />
           {lastPrice != null ? fmtPrice(lastPrice, precisionOf(precisions, symbol)) : '—'}
         </span>

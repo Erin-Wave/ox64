@@ -19,8 +19,8 @@ import { klineStream } from '@/services/binanceWs';
 import { ema, bollinger, rsi } from '@/services/indicators';
 import { api } from '@/services/api';
 import { useMarketStore } from '@/store/useMarketStore';
-import { useChartStore, type IndicatorConfig, type IndicatorType } from '@/store/useChartStore';
-import { useSettingsStore, type Theme } from '@/store/useSettingsStore';
+import { useChartStore, type IndicatorConfig, type IndicatorType, type ChartColorScheme } from '@/store/useChartStore';
+import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol } from '@/symbols';
 import { fmtPrice, fmtVol } from '@/format';
@@ -29,13 +29,22 @@ import type { Candle } from '@/types';
 const IND_LABEL: Record<IndicatorType, string> = { ema: 'EMA', bb: 'Bollinger', rsi: 'RSI' };
 const IND_COLORS = ['#f0b90b', '#4a90e2', '#c77dff', '#00c076', '#ff6b6b', '#3bb2d0', '#e08fd6'];
 
-// 테마별 차트 캔버스 색(배경/격자/축 텍스트/캔들) — UI 크롬은 index.css 의 CSS 변수로,
+// 차트 캔버스 색(배경/격자/축 텍스트/캔들) — UI 크롬은 index.css 의 CSS 변수로,
 // Lightweight Charts 는 캔버스 렌더링이라 여기서 별도로 applyOptions() 해줘야 함.
-const CHART_THEME: Record<Theme, { bg: string; text: string; grid: string; border: string; up: string; down: string }> = {
-  dark: { bg: '#0b0d0f', text: '#7c828b', grid: '#191c21', border: '#282c33', up: '#00c076', down: '#f6465d' },
-  light: { bg: '#ffffff', text: '#6b727a', grid: '#e7e9ec', border: '#d6dadf', up: '#00875c', down: '#d1293f' },
-  'high-contrast': { bg: '#000000', text: '#c8c8c8', grid: '#333333', border: '#ffffff', up: '#00ff80', down: '#ff1744' },
+// 라이트/고대비는 사이트 테마 고정 배색, 다크일 때만 거래소 프리셋(바이낸스/OKX/트레이딩뷰)으로 세분화.
+type ChartColors = { bg: string; text: string; grid: string; border: string; up: string; down: string };
+const LIGHT_THEME: ChartColors = { bg: '#ffffff', text: '#6b727a', grid: '#e7e9ec', border: '#d6dadf', up: '#00875c', down: '#d1293f' };
+const HIGH_CONTRAST_THEME: ChartColors = { bg: '#000000', text: '#c8c8c8', grid: '#333333', border: '#ffffff', up: '#00ff80', down: '#ff1744' };
+const DARK_SCHEMES: Record<ChartColorScheme, ChartColors> = {
+  binance: { bg: '#0b0d0f', text: '#7c828b', grid: '#191c21', border: '#282c33', up: '#0ecb81', down: '#f6465d' },
+  okx: { bg: '#14151a', text: '#76808f', grid: '#1d1f26', border: '#2f333d', up: '#00b897', down: '#ff5b5b' },
+  tradingview: { bg: '#131722', text: '#787b86', grid: '#1e222d', border: '#2a2e39', up: '#26a69a', down: '#ef5350' },
 };
+function chartColors(theme: 'dark' | 'light' | 'high-contrast', colorScheme: ChartColorScheme): ChartColors {
+  if (theme === 'light') return LIGHT_THEME;
+  if (theme === 'high-contrast') return HIGH_CONTRAST_THEME;
+  return DARK_SCHEMES[colorScheme];
+}
 
 type BbSeries = { upper: ISeriesApi<'Line'>; basis: ISeriesApi<'Line'>; lower: ISeriesApi<'Line'> };
 type BbValues = { upper: number; basis: number; lower: number };
@@ -115,7 +124,7 @@ export default function Chart() {
   // ── 차트 생성 (1회) ──────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current) return;
-    const initTheme = CHART_THEME[useSettingsStore.getState().theme];
+    const initTheme = chartColors(useSettingsStore.getState().theme, useChartStore.getState().colorScheme);
     const chart = createChart(containerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: initTheme.bg },
@@ -195,12 +204,12 @@ export default function Chart() {
     };
   }, []);
 
-  // ── 테마 변경 시 차트 캔버스(배경/격자/축/캔들) 재도색 ──────────
+  // ── 테마/차트 색상 프리셋 변경 시 차트 캔버스(배경/격자/축/캔들) 재도색 ──────────
   useEffect(() => {
     const chart = chartRef.current;
     const candle = candleRef.current;
     if (!chart || !candle) return;
-    const c = CHART_THEME[theme];
+    const c = chartColors(theme, opts.colorScheme);
     chart.applyOptions({
       layout: { background: { type: ColorType.Solid, color: c.bg }, textColor: c.text },
       grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
@@ -208,7 +217,7 @@ export default function Chart() {
       timeScale: { borderColor: c.border },
     });
     candle.applyOptions({ upColor: c.up, downColor: c.down, wickUpColor: c.up, wickDownColor: c.down });
-  }, [theme]);
+  }, [theme, opts.colorScheme]);
 
   // ── 초봉(1s) 등 1분 미만 타임프레임에서는 축/레전드에 초 단위까지 표시 ──
   const subMinute = intervalSec(interval) < 60;

@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 
 export type IndicatorType = 'ema' | 'bb' | 'rsi';
+// 캔들/배경 등 차트 전용 색상 프리셋 — 사이트 다크/라이트/고대비 테마와는 별개(차트만 독립적으로 색을 바꿈).
+export type ChartColorScheme = 'binance' | 'okx' | 'tradingview';
 
 export interface IndicatorConfig {
   id: string;
@@ -29,9 +31,11 @@ interface ChartState {
   slTpLines: boolean;
   orderBook: boolean;
   visibleBars: number; // 처음 로드 시 보여줄 봉 개수 — 마지막으로 사용자가 확대/축소한 값을 기억
+  colorScheme: ChartColorScheme;
   indicators: IndicatorConfig[];
   toggle: (k: BoolFlag) => void;
   setVisibleBars: (n: number) => void;
+  setColorScheme: (cs: ChartColorScheme) => void;
   addIndicator: (type: IndicatorType) => void;
   removeIndicator: (id: string) => void;
   updateIndicator: (id: string, patch: Partial<Pick<IndicatorConfig, 'period' | 'mult'>>) => void;
@@ -46,11 +50,11 @@ function load(): Partial<ChartState> {
   }
 }
 function persist(s: ChartState) {
-  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, orderBook, visibleBars, indicators } = s;
+  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, orderBook, visibleBars, colorScheme, indicators } = s;
   try {
     localStorage.setItem(
       KEY,
-      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, orderBook, visibleBars, indicators }),
+      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, orderBook, visibleBars, colorScheme, indicators }),
     );
   } catch {
     /* ignore */
@@ -66,6 +70,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   slTpLines: saved.slTpLines ?? true,
   orderBook: saved.orderBook ?? true,
   visibleBars: saved.visibleBars ?? 38,
+  colorScheme: saved.colorScheme ?? 'binance',
   indicators: saved.indicators ?? [],
   toggle: (k) => {
     set((s) => ({ [k]: !s[k] }) as Partial<ChartState>);
@@ -73,6 +78,10 @@ export const useChartStore = create<ChartState>((set, get) => ({
   },
   setVisibleBars: (n) => {
     set({ visibleBars: n });
+    persist(get());
+  },
+  setColorScheme: (cs) => {
+    set({ colorScheme: cs });
     persist(get());
   },
   addIndicator: (type) => {

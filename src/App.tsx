@@ -13,6 +13,7 @@ import { useChartStore } from '@/store/useChartStore';
 import { useMarkPrices } from '@/hooks/useMarkPrices';
 import { useTriggerPoll } from '@/hooks/useTriggerPoll';
 import { useSpotPoll } from '@/hooks/useSpotPoll';
+import { useTradeTape } from '@/hooks/useTradeTape';
 
 export default function App() {
   const init = useTradingStore((s) => s.init);
@@ -30,6 +31,8 @@ export default function App() {
   useTriggerPoll();
   // OX/USDT(가상 코인) 을 보고 있을 때만 잔고/호가/체결 폴링
   useSpotPoll();
+  // 현재 심볼 체결 테이프(OrderBook "체결" 탭 + Header 현재가 색상이 둘 다 구독)
+  useTradeTape();
 
   // 앱 시작 시 세션(쿠키) 확인 (1회)
   useEffect(() => {

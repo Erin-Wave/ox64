@@ -1,9 +1,16 @@
 import { useSettingsStore, type FontSize, type Theme, type TradingMode } from '@/store/useSettingsStore';
+import { useChartStore, type ChartColorScheme } from '@/store/useChartStore';
 
 const THEMES: { value: Theme; label: string }[] = [
   { value: 'dark', label: '다크' },
   { value: 'light', label: '라이트' },
   { value: 'high-contrast', label: '고대비' },
+];
+
+const CHART_COLOR_SCHEMES: { value: ChartColorScheme; label: string }[] = [
+  { value: 'binance', label: '바이낸스' },
+  { value: 'okx', label: 'OKX' },
+  { value: 'tradingview', label: '트레이딩뷰' },
 ];
 
 const FONT_SIZES: { value: FontSize; label: string }[] = [
@@ -19,6 +26,8 @@ export default function Settings({ onClose }: { onClose: () => void }) {
   const setTradingMode = useSettingsStore((s) => s.setTradingMode);
   const fontSize = useSettingsStore((s) => s.fontSize);
   const setFontSize = useSettingsStore((s) => s.setFontSize);
+  const colorScheme = useChartStore((s) => s.colorScheme);
+  const setColorScheme = useChartStore((s) => s.setColorScheme);
 
   return (
     <div
@@ -51,6 +60,25 @@ export default function Settings({ onClose }: { onClose: () => void }) {
                   }`}
                 >
                   {t.label}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section>
+            <h3 className="mb-2 text-xs font-semibold text-muted">차트 색상 (다크 테마일 때 적용)</h3>
+            <div className="grid grid-cols-3 gap-2">
+              {CHART_COLOR_SCHEMES.map((c) => (
+                <button
+                  key={c.value}
+                  onClick={() => setColorScheme(c.value)}
+                  className={`rounded-lg px-2 py-2.5 text-xs font-semibold ring-1 transition ${
+                    colorScheme === c.value
+                      ? 'bg-accent/15 text-accent ring-accent'
+                      : 'bg-panel2 text-text ring-border hover:bg-elevated'
+                  }`}
+                >
+                  {c.label}
                 </button>
               ))}
             </div>

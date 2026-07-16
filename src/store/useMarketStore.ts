@@ -1,4 +1,7 @@
 import { create } from 'zustand';
+import type { TickerTrade } from '@/types';
+
+const MAX_TRADES = 40;
 
 /**
  * 시장/UI 상태 (Zustand).
@@ -15,6 +18,7 @@ interface MarketState {
   connected: boolean;
   chartClickPrice: number | null; // 차트에서 마지막으로 클릭한 가격
   chartClickNonce: number; // 같은 가격을 다시 클릭해도 신호가 오도록 매번 증가
+  recentTrades: Record<string, TickerTrade[]>; // 심볼별 최근 체결(최신이 [0]) — useTradeTape 가 채움
 
   setSymbol: (s: string) => void;
   setInterval: (i: string) => void;
@@ -22,6 +26,8 @@ interface MarketState {
   setPrecision: (symbol: string, precision: number) => void;
   setConnected: (c: boolean) => void;
   setChartClickPrice: (price: number) => void;
+  pushTrade: (symbol: string, trade: TickerTrade) => void;
+  setRecentTrades: (symbol: string, trades: TickerTrade[]) => void;
 }
 
 const KEY = 'ox64_market_opts_v1';
@@ -49,6 +55,7 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   connected: false,
   chartClickPrice: null,
   chartClickNonce: 0,
+  recentTrades: {},
 
   setSymbol: (symbol) => {
     set({ symbol });
@@ -64,10 +71,16 @@ export const useMarketStore = create<MarketState>((set, get) => ({
     set((s) => (s.precisions[symbol] === precision ? s : { precisions: { ...s.precisions, [symbol]: precision } })),
   setConnected: (connected) => set({ connected }),
   setChartClickPrice: (price) => set((s) => ({ chartClickPrice: price, chartClickNonce: s.chartClickNonce + 1 })),
+  pushTrade: (symbol, trade) =>
+    set((s) => ({ recentTrades: { ...s.recentTrades, [symbol]: [trade, ...(s.recentTrades[symbol] ?? [])].slice(0, MAX_TRADES) } })),
+  setRecentTrades: (symbol, trades) => set((s) => ({ recentTrades: { ...s.recentTrades, [symbol]: trades } })),
 }));
 
 /** 현재 보는 심볼의 최신가(선택자 헬퍼). */
 export const selectLastPrice = (s: MarketState): number | null => s.prices[s.symbol] ?? null;
+/** 현재 보는 심볼의 가장 최근 체결 방향(매수/매도 체결색으로 현재가 표시할 때 사용). */
+export const selectLastTakerSide = (s: MarketState): 'buy' | 'sell' | null =>
+  s.recentTrades[s.symbol]?.[0]?.takerSide ?? null;
 /** 심볼 정밀도(없으면 2) — 가격 자릿수가 확정되기 전 폴백. */
 export const precisionOf = (precisions: Record<string, number>, symbol: string): number =>
   precisions[symbol] ?? 2;

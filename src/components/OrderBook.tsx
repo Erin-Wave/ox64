@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { orderbookStream, aggTradeStream, type OrderBookLevel, type OrderBookSnapshot, type AggTrade } from '@/services/binanceWs';
+import { orderbookStream, type OrderBookLevel, type OrderBookSnapshot } from '@/services/binanceWs';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { isVirtualSymbol } from '@/symbols';
 import { fmtPrice, precisionFromTick } from '@/format';
+import type { TickerTrade } from '@/types';
 
+const EMPTY_TRADES: TickerTrade[] = [];
 const fmtQty = (q: number) => (q >= 1000 ? q.toFixed(1) : q.toFixed(4));
 const fmtTime = (ms: number) => {
   const d = new Date(ms);
@@ -28,26 +30,18 @@ function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'):
   return out;
 }
 
-interface TradeRow {
-  id: string;
-  price: number;
-  qty: number;
-  takerSide: 'buy' | 'sell' | null;
-  time: number;
-}
-
 /** 호가창 + 체결내역 탭. 모바일에서도 한눈에 보이도록 매수(좌)·매도(우) 2열로 나란히 표시하고,
- * 각 열은 최우선호가가 맨 위로 오게 정렬한다. 클릭하면 그 가격이 지정가 주문 입력에 채워진다. */
+ * 각 열은 최우선호가가 맨 위로 오게 정렬한다. 클릭하면 그 가격이 지정가 주문 입력에 채워진다.
+ * 체결 탭 데이터는 useTradeTape(App.tsx 에서 항상 구동)이 채우는 useMarketStore.recentTrades 를 그대로 구독. */
 export default function OrderBook() {
   const symbol = useMarketStore((s) => s.symbol);
   const precisions = useMarketStore((s) => s.precisions);
+  const trades = useMarketStore((s) => s.recentTrades[s.symbol] ?? EMPTY_TRADES);
   const virtual = isVirtualSymbol(symbol);
   const spotBook = useTradingStore((s) => s.spotBook);
-  const spotTrades = useTradingStore((s) => s.spotTrades);
   const [book, setBook] = useState<OrderBookSnapshot | null>(null);
   const [groupIdx, setGroupIdx] = useState(0);
   const [tab, setTab] = useState<'book' | 'trades'>('book');
-  const [liveTrades, setLiveTrades] = useState<AggTrade[]>([]);
 
   useEffect(() => {
     if (virtual) return; // 가상 심볼은 useSpotPoll 이 채우는 store.spotBook 을 대신 사용
@@ -57,23 +51,10 @@ export default function OrderBook() {
     return () => sub.unsubscribe();
   }, [symbol, virtual]);
 
-  useEffect(() => {
-    if (virtual) return; // 가상 심볼은 store.spotTrades(useSpotPoll 폴링) 를 대신 사용
-    setLiveTrades([]);
-    const sub = aggTradeStream(symbol).subscribe({
-      next: (t) => setLiveTrades((prev) => [t, ...prev].slice(0, 40)),
-    });
-    return () => sub.unsubscribe();
-  }, [symbol, virtual]);
-
   // 가상 심볼은 spot_orders 호가(price/size)를 OrderBookLevel(price/qty) 형태로 매핑해 재사용
   const activeBook: OrderBookSnapshot | null = virtual
     ? { bids: spotBook.bids.map((b) => ({ price: b.price, qty: b.size })), asks: spotBook.asks.map((a) => ({ price: a.price, qty: a.size })) }
     : book;
-
-  const trades: TradeRow[] = virtual
-    ? spotTrades.map((t) => ({ id: t.id, price: t.price, qty: t.size, takerSide: t.takerSide, time: t.createdAt }))
-    : liveTrades.map((t, i) => ({ id: `${t.time}-${i}`, price: t.price, qty: t.qty, takerSide: t.takerSide, time: t.time }));
 
   const prec = precisionOf(precisions, symbol);
   const tick = Math.pow(10, -prec);
@@ -162,10 +143,10 @@ export default function OrderBook() {
           <div className="py-6 text-center text-muted">체결 내역이 없습니다</div>
         ) : (
           <div className="max-h-56 space-y-0.5 overflow-auto">
-            {trades.map((t) => {
+            {trades.map((t, i) => {
               const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
               return (
-                <div key={t.id} className="flex items-center justify-between px-1.5 py-0.5">
+                <div key={`${t.time}-${i}`} className="flex items-center justify-between px-1.5 py-0.5">
                   <span className="text-muted">{fmtTime(t.time)}</span>
                   <span className={color}>{fmtPrice(t.price, prec)}</span>
                   <span className="text-muted">{fmtQty(t.qty)}</span>

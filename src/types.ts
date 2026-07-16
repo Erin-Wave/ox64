@@ -20,6 +20,14 @@ export interface KlineTick {
   isClosed: boolean; // 봉 마감 여부
 }
 
+/** 체결 테이프 한 건(실제 심볼=바이낸스 aggTrade, 가상 심볼=서버 spot_trades) — 심볼 무관 공용 형태. */
+export interface TickerTrade {
+  price: number;
+  qty: number;
+  takerSide: 'buy' | 'sell' | null;
+  time: number; // ms
+}
+
 /** 모의 주문 */
 export interface Order {
   id: string;
