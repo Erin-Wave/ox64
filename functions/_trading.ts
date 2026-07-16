@@ -3,8 +3,86 @@
 // state/order 요청이 들어올 때마다(클라이언트가 몇 초 간격으로 폴링) 호출해
 // 조건이 맞으면 그 자리에서 체결시키는 방식으로 대체한다 — 아무도 앱을 켜두지
 // 않은 동안은 체결되지 않는다(지인 대상 모의투자라 허용 가능한 트레이드오프).
+//
+// ⚠ 단, 강제청산(계좌 파산)만큼은 접속 여부와 무관하게 걸리길 원해서 sweepForcedLiquidations()
+// 를 따로 뒀다 — cron/ 의 별도 Worker(Cron Trigger, Pages 는 cron 미지원이라 분리 배포)가
+// 1시간마다 호출해 전 유저를 훑는다. 지정가/SL·TP 는 여전히 접속(폴링) 기반 그대로.
 
 import { type D1PreparedStatement, type Env, type PendingRow, type PositionRow, fetchPrices } from './_shared';
+
+/** 평가자산(잔고+미실현손익 합) < 0 이면 그 유저의 전 포지션을 강제청산 + 미체결 취소 + 잔고 0.
+ * 심볼 가격을 하나라도 못 받아왔으면(allPriced=false) 이번 라운드는 건너뛴다 — 불완전한
+ * 데이터로 잘못 청산시키는 것보다 다음 평가에서 다시 보는 게 안전. 청산이 실행됐으면 true. */
+async function liquidateIfBankrupt(
+  env: Env,
+  uid: string,
+  positions: PositionRow[],
+  pendings: PendingRow[],
+  prices: Record<string, number>,
+): Promise<boolean> {
+  if (positions.length === 0) return false;
+  const user = await env.DB.prepare('SELECT balance FROM users WHERE id = ?').bind(uid).first<{ balance: number }>();
+  if (!user) return false;
+
+  let unrealized = 0;
+  let allPriced = true;
+  for (const pos of positions) {
+    const mark = prices[pos.symbol];
+    if (mark == null) {
+      allPriced = false;
+      continue;
+    }
+    const dir = pos.side === 'long' ? 1 : -1;
+    unrealized += (mark - pos.entry_price) * pos.size * dir;
+  }
+  if (!allPriced || user.balance + unrealized >= 0) return false;
+
+  const now = Date.now();
+  const stmts: D1PreparedStatement[] = [];
+  for (const pos of positions) {
+    const mark = prices[pos.symbol]!;
+    const dir = pos.side === 'long' ? 1 : -1;
+    const pnl = (mark - pos.entry_price) * pos.size * dir;
+    stmts.push(env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid));
+    stmts.push(
+      env.DB.prepare(
+        'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, mark, pos.size, pos.leverage, 'liquidation', pnl, now),
+    );
+  }
+  for (const p of pendings) {
+    stmts.push(env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid));
+  }
+  stmts.push(env.DB.prepare('UPDATE users SET balance = 0 WHERE id = ?').bind(uid));
+  await env.DB.batch(stmts);
+  return true;
+}
+
+/** cron/ Worker 가 접속자 유무와 무관하게 주기 호출 — 포지션이 있는 전 유저를 훑어
+ * 강제청산만 평가한다(지정가/SL·TP 는 범위 밖 — 그건 접속 시 checkTriggers 가 처리). */
+export async function sweepForcedLiquidations(env: Env): Promise<{ checked: number; liquidated: number }> {
+  const positions = (await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()).results;
+  if (positions.length === 0) return { checked: 0, liquidated: 0 };
+
+  const byUser = new Map<string, PositionRow[]>();
+  for (const p of positions) {
+    const arr = byUser.get(p.user_id);
+    if (arr) arr.push(p);
+    else byUser.set(p.user_id, [p]);
+  }
+
+  const symbols = [...new Set(positions.map((p) => p.symbol))];
+  const prices = await fetchPrices(symbols);
+
+  let liquidated = 0;
+  for (const [uid, userPositions] of byUser) {
+    const pendings = (
+      await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ?').bind(uid).all<PendingRow>()
+    ).results;
+    if (await liquidateIfBankrupt(env, uid, userPositions, pendings, prices)) liquidated++;
+  }
+  return { checked: byUser.size, liquidated };
+}
 
 export async function checkTriggers(env: Env, uid: string): Promise<void> {
   const pendings = (
@@ -18,47 +96,7 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
   const symbols = [...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol)])];
   const prices = await fetchPrices(symbols);
 
-  // ── 강제청산(계좌 파산) ── 평가자산(현금+전 포지션 미실현손익 합) < 0 이면
-  // 전 포지션 강제청산 + 미체결 지정가 전부 취소 + 잔고 0 으로 리셋.
-  // 심볼 가격을 하나라도 못 받아왔으면(allPriced=false) 이번 라운드는 건너뛴다 —
-  // 불완전한 데이터로 잘못 청산시키는 것보다 다음 폴링에서 다시 평가하는 게 안전.
-  if (positions.length > 0) {
-    const user = await env.DB.prepare('SELECT balance FROM users WHERE id = ?').bind(uid).first<{ balance: number }>();
-    if (user) {
-      let unrealized = 0;
-      let allPriced = true;
-      for (const pos of positions) {
-        const mark = prices[pos.symbol];
-        if (mark == null) {
-          allPriced = false;
-          continue;
-        }
-        const dir = pos.side === 'long' ? 1 : -1;
-        unrealized += (mark - pos.entry_price) * pos.size * dir;
-      }
-      if (allPriced && user.balance + unrealized < 0) {
-        const now = Date.now();
-        const stmts: D1PreparedStatement[] = [];
-        for (const pos of positions) {
-          const mark = prices[pos.symbol]!;
-          const dir = pos.side === 'long' ? 1 : -1;
-          const pnl = (mark - pos.entry_price) * pos.size * dir;
-          stmts.push(env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid));
-          stmts.push(
-            env.DB.prepare(
-              'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-            ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, mark, pos.size, pos.leverage, 'liquidation', pnl, now),
-          );
-        }
-        for (const p of pendings) {
-          stmts.push(env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid));
-        }
-        stmts.push(env.DB.prepare('UPDATE users SET balance = 0 WHERE id = ?').bind(uid));
-        await env.DB.batch(stmts);
-        return; // 계좌 정리 완료 — 방금 지운 포지션/미체결 대상으로 아래 로직을 더 돌릴 필요 없음
-      }
-    }
-  }
+  if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
 
   // ── 지정가 체결 ── long: mark<=limit(싸게 매수), short: mark>=limit(비싸게 매도)
   // 체결가는 limit_price 그대로 사용(생성 시 이미 그 가격 기준으로 증거금을 잠갔으므로 재계산 불필요).
