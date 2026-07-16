@@ -21,6 +21,7 @@ export default function OrderPanel() {
   const busy = useTradingStore((s) => s.busy);
   const error = useTradingStore((s) => s.error);
   const positions = useTradingStore((s) => s.positions);
+  const markPrices = useTradingStore((s) => s.markPrices);
 
   const [tab, setTab] = useState<Tab>('market');
   const [size, setSize] = useState('0.01'); // 항상 코인 수량이 진실원본, unit 은 표시만 바꿈
@@ -83,13 +84,25 @@ export default function OrderPanel() {
   const notional = refPrice ? refPrice * Number(size || 0) : 0;
   const margin = notional / leverage;
 
-  // 가용 잔고 기준 수량 설정(fraction = 증거금으로 쓸 잔고 비율, 0~1).
+  // 크로스 마진 가용 증거금 = 여유잔고 + 전 포지션 미실현손익(서버 markPrices 기준 — 서버 가용 판정과
+  // 동일 시세). 이익 중이면 그 미실현이익까지 새 주문에 쓸 수 있고, 손실 중이면 가용이 줄어든다.
+  const available = Math.max(
+    0,
+    balance +
+      positions.reduce((a, p) => {
+        const mark = markPrices[p.symbol];
+        if (mark == null) return a;
+        return a + (mark - p.entryPrice) * p.size * (p.side === 'long' ? 1 : -1);
+      }, 0),
+  );
+
+  // 가용 증거금 기준 수량 설정(fraction = 증거금으로 쓸 가용 비율, 0~1).
   // SAFETY: 슬라이더 100% 그대로 계산하면 toFixed 반올림/서버 fetch 시점 가격차로
-  // 증거금이 잔고를 살짝 넘어 주문이 거부되는 경우가 있어 0.1% 여유를 둔다.
+  // 증거금이 가용을 살짝 넘어 주문이 거부되는 경우가 있어 0.1% 여유를 둔다.
   const SAFETY = 0.999;
   const applyPct = (fraction: number) => {
     if (!refPrice) return;
-    const sz = (balance * leverage * fraction * SAFETY) / refPrice;
+    const sz = (available * leverage * fraction * SAFETY) / refPrice;
     setSize(sz > 0 ? sz.toFixed(6) : '0');
   };
 
@@ -261,8 +274,8 @@ export default function OrderPanel() {
       {/* 정보 */}
       <div className="space-y-1 rounded-md bg-panel2 p-2.5 text-xs">
         <div className="flex justify-between">
-          <span className="text-muted">가용</span>
-          <span className="text-text">{balance.toFixed(2)} USDT</span>
+          <span className="text-muted">가용 (크로스)</span>
+          <span className="text-text">{available.toFixed(2)} USDT</span>
         </div>
         <div className="flex justify-between">
           <span className="text-muted">명목가</span>
@@ -270,7 +283,7 @@ export default function OrderPanel() {
         </div>
         <div className="flex justify-between">
           <span className="text-muted">증거금</span>
-          <span className={margin > balance ? 'text-down' : 'text-text'}>
+          <span className={margin > available ? 'text-down' : 'text-text'}>
             {margin ? margin.toFixed(2) : '—'} USDT
           </span>
         </div>

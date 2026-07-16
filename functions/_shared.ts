@@ -264,6 +264,24 @@ export async function fetchPrices(env: Env, symbols: string[]): Promise<Record<s
   return out;
 }
 
+/** 크로스 마진 가용 증거금 계산용 — 유저 전 포지션의 미실현손익 합(marks 에 있는 심볼만 반영).
+ * 신규 주문 가용 = 여유잔고 + 이 값 (= 평가자산 − 사용중 증거금). 이익 중이면 그 미실현이익까지 새
+ * 주문 증거금으로 쓸 수 있고(=크로스), 손실 중이면 가용이 줄어든다. 아이솔레이티드였다면 이 항이 없다. */
+export async function unrealizedTotal(env: Env, uid: string, marks: Record<string, number>): Promise<number> {
+  const positions = (
+    await env.DB.prepare('SELECT symbol, side, entry_price, size FROM positions WHERE user_id = ?')
+      .bind(uid)
+      .all<PositionRow>()
+  ).results;
+  let u = 0;
+  for (const p of positions) {
+    const mark = marks[p.symbol];
+    if (mark == null) continue;
+    u += (mark - p.entry_price) * p.size * (p.side === 'long' ? 1 : -1);
+  }
+  return u;
+}
+
 // ── D1 행 → 클라이언트 응답 형태 ────────────────────────────────
 export interface UserRow {
   id: string;

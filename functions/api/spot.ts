@@ -534,6 +534,7 @@ export async function matchMarketOxOrder(
   leverage: number,
   sl: number | null,
   tp: number | null,
+  floorPnL = 0, // 크로스 가용 = 여유잔고 + floorPnL(전 포지션 미실현손익). balance 는 -floorPnL 까지 허용.
 ): Promise<{ filled: number; avgPrice: number }> {
   const isLong = side === 'long';
   const existing0 = await env.DB.prepare('SELECT leverage FROM positions WHERE user_id=? AND symbol=? AND side=?')
@@ -551,18 +552,20 @@ export async function matchMarketOxOrder(
     let chunk = Math.min(remaining, maker.size);
     const price = maker.price;
     let margin = (price * chunk) / effLev;
-    let deduct = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance>=?')
-      .bind(margin, uid, margin)
+    // 크로스: balance - margin >= -floorPnL (⟺ available >= margin). floorPnL>0(이익)이면 balance 가
+    // 음수까지 허용돼 미실현이익만큼 더 살 수 있고, floorPnL<0(손실)이면 가용이 줄어 덜 산다.
+    let deduct = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
+      .bind(margin, uid, margin, -floorPnL)
       .run();
     if (deduct.meta.changes !== 1) {
-      // 전량 감당 불가 → 잔고로 살 수 있는 만큼만
+      // 전량 감당 불가 → 가용(여유잔고+미실현이익)으로 살 수 있는 만큼만
       const u = await env.DB.prepare('SELECT balance FROM users WHERE id=?').bind(uid).first<{ balance: number }>();
-      const affordable = ((u?.balance ?? 0) * effLev) / price;
+      const affordable = (((u?.balance ?? 0) + floorPnL) * effLev) / price;
       if (affordable <= EPS) break;
       chunk = Math.min(chunk, affordable);
       margin = (price * chunk) / effLev;
-      deduct = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance>=?')
-        .bind(margin, uid, margin)
+      deduct = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
+        .bind(margin, uid, margin, -floorPnL)
         .run();
       if (deduct.meta.changes !== 1) break;
     }

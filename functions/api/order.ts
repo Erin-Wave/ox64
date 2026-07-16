@@ -9,6 +9,7 @@ import {
   isVirtualSymbol,
   fetchPrice,
   loadState,
+  unrealizedTotal,
   type Env,
   type PositionRow,
   type PendingRow,
@@ -101,7 +102,9 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       const marks = await checkTriggers(env, uid);
       const ref = await fetchPrice(env, symbol);
       if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
-      const { filled, avgPrice } = await matchMarketOxOrder(env, uid, side, size, leverage, stopLoss, takeProfit);
+      // 크로스: 여유잔고 + 전 포지션 미실현손익까지 증거금으로 walking 체결에 쓸 수 있게 uPnL 을 넘긴다.
+      const uPnL = await unrealizedTotal(env, uid, marks);
+      const { filled, avgPrice } = await matchMarketOxOrder(env, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
       if (!(filled > 0)) return bad('체결 가능한 호가 물량이 없습니다');
       marks[symbol] = avgPrice || ref;
       return json(await loadState(env, uid, marks));
@@ -115,6 +118,12 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .bind(uid)
       .first<UserRow>();
     if (!user) return bad('unauthorized', 401);
+
+    // 크로스 마진 가용 증거금 = 여유잔고 + 전 포지션 미실현손익. 이익 중이면 그 미실현이익까지 새
+    // 주문 증거금으로 쓸 수 있고(그때 balance 는 -uPnL 까지 음수 허용), 손실 중이면 가용이 줄어든다.
+    // 잔고 차감 가드는 balance - margin >= -uPnL (⟺ available >= margin) 로 원자적으로 막는다.
+    const uPnL = await unrealizedTotal(env, uid, marks);
+    const available = user.balance + uPnL;
 
     // 같은 심볼·같은 방향으로 이미 보유 중인 포지션이 있으면 새 행을 또 만들지 않고 그 포지션에
     // 물타기/불타기 방식으로 합친다(평단가 재계산) — 거래소들의 "원웨이 모드"와 동일한 동작.
@@ -130,7 +139,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     if (existing) {
       const addMargin = (price * size) / existing.leverage;
-      if (addMargin > user.balance) return bad('증거금이 부족합니다');
+      if (addMargin > available) return bad('증거금이 부족합니다');
 
       const newSize = existing.size + size;
       const newEntry = (existing.entry_price * existing.size + price * size) / newSize;
@@ -141,10 +150,11 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       }
 
       const res = await env.DB.batch([
-        env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?').bind(
+        env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?').bind(
           addMargin,
           uid,
           addMargin,
+          -uPnL,
         ),
         env.DB.prepare(
           'UPDATE positions SET entry_price = ?, size = ?, margin = ?, stop_loss = ?, take_profit = ? WHERE id = ? AND user_id = ?',
@@ -162,15 +172,16 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     const margin = (price * size) / leverage;
     if (!validSlTp(side, price, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
-    if (margin > user.balance) return bad('증거금이 부족합니다');
+    if (margin > available) return bad('증거금이 부족합니다');
 
     const posId = crypto.randomUUID();
-    // 잔고 차감은 조건부 UPDATE 로 원자적 가드(balance >= margin)
+    // 잔고 차감은 조건부 UPDATE 로 원자적 가드(balance - margin >= -uPnL ⟺ available >= margin, 크로스)
     const res = await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?').bind(
+      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?').bind(
         margin,
         uid,
         margin,
+        -uPnL,
       ),
       env.DB.prepare(
         'INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
@@ -249,15 +260,19 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .bind(uid)
       .first<UserRow>();
     if (!user) return bad('unauthorized', 401);
-    if (margin > user.balance) return bad('증거금이 부족합니다');
+    // 크로스: 가용 = 여유잔고 + 전 포지션 미실현손익. 지정가도 이 가용 안에서 증거금을 잠근다.
+    const uPnL = await unrealizedTotal(env, uid, marks);
+    const available = user.balance + uPnL;
+    if (margin > available) return bad('증거금이 부족합니다');
 
     const now = Date.now();
     const pendingId = crypto.randomUUID();
     const res = await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?').bind(
+      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?').bind(
         margin,
         uid,
         margin,
+        -uPnL,
       ),
       env.DB.prepare(
         'INSERT INTO pending_orders (id, user_id, symbol, side, size, leverage, limit_price, margin, stop_loss, take_profit, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',

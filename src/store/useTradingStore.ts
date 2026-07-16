@@ -27,6 +27,8 @@ interface TradingState {
   positions: ApiPosition[];
   orders: ApiOrder[];
   pendingOrders: ApiPendingOrder[];
+  // 서버가 내려준 보유 심볼 마크가격(크로스 가용 증거금 계산용 — 서버 강제청산/증거금 판정과 동일 시세).
+  markPrices: Record<string, number>;
   busy: boolean;
   error: string | null;
 
@@ -73,6 +75,7 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     positions: st.positions,
     orders: st.orders,
     pendingOrders: st.pendingOrders,
+    markPrices: st.markPrices ?? {},
     error: null,
   });
   // 서버 마크가격을 가격 맵에 시드 — 보유 심볼(OX 포함, 현재 보고 있지 않아도)의 청산가/미실현PnL 이
@@ -97,6 +100,7 @@ export const useTradingStore = create<TradingState>((set) => ({
   positions: [],
   orders: [],
   pendingOrders: [],
+  markPrices: {},
   busy: false,
   error: null,
 
@@ -150,6 +154,7 @@ export const useTradingStore = create<TradingState>((set) => ({
       positions: [],
       orders: [],
       pendingOrders: [],
+      markPrices: {},
       spotBook: { bids: [], asks: [] },
       spotTrades: [],
     });
