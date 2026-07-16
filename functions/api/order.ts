@@ -15,7 +15,7 @@ import {
   type UserRow,
 } from '../_shared';
 import { checkTriggers } from '../_trading';
-import { fillOxPending, recordVirtualFill } from './spot';
+import { matchLimitPendingAgainstBook, matchMarketOxOrder, recordVirtualFill } from './spot';
 
 // OX/USDT 는 진짜 상대 거래자가 없으니, 유저가 레버리지로 체결시킨 걸 합성 시장(호가창·체결내역·
 // 다음 봇 기준가)에도 반영해준다 — 안 그러면 포지션 수량만 조용히 바뀌고 화면엔 아무 흔적도 안 남아
@@ -89,9 +89,21 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!(size > 0) || !isFinite(size) || size > 1_000_000) return bad('수량 오류');
     if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
 
-    const price = await fetchPrice(env, symbol); // 서버 체결가
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
+
+    // OX/USDT 시장가 = 봇 호가창을 walking 하며 "있는 물량만" 실제 호가 가격에 체결(잔량 버림).
+    // 실제 코인 38종은 외부 시세로 즉시 전량 체결(아래 기존 경로). ⚠ 호가창을 무시하고 ref 한 값에
+    // 전량 체결하던 게 "20만개가 최우선호가보다 싸게 즉시 체결"되던 버그의 원인 → 실제 매칭으로 교체.
+    if (isVirtualSymbol(symbol)) {
+      const ref = await fetchPrice(env, symbol);
+      if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
+      const { filled } = await matchMarketOxOrder(env, uid, side, size, leverage, stopLoss, takeProfit);
+      if (!(filled > 0)) return bad('체결 가능한 호가 물량이 없습니다');
+      return json(await loadState(env, uid));
+    }
+
+    const price = await fetchPrice(env, symbol); // 서버 체결가
 
     const user = await env.DB.prepare('SELECT id, name, balance FROM users WHERE id = ?')
       .bind(uid)
@@ -240,28 +252,11 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     ]);
     if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
 
-    // OX/USDT: 지금 체결 가능한(marketable) 지정가면 제출 즉시 시장가로 체결한다 — 실제 거래소처럼
-    // marketable 지정가는 호가창에 남지 않게(유저 매수 > 봇 매도 호가 역전 방지). fillOxPending 이
-    // 체결 가능 여부·선점·증거금 정산을 모두 처리하므로, 체결 불가면 그대로 pending 에 남는다.
+    // OX/USDT: 제출 즉시 봇 호가창에 walking 매칭한다 — 크로스되는 실제 물량만 실제 호가 가격에
+    // 체결하고, 못 채운 잔량은 pending 에 그대로 남아 대기(다음 유동성/틱에서 이어서 체결). 실제
+    // 거래소처럼 marketable 지정가가 호가창에 유령으로 남거나 유령가격에 전량 체결되지 않게 한다.
     if (isVirtualSymbol(symbol)) {
-      const ref = await fetchPrice(env, symbol);
-      await fillOxPending(
-        env,
-        {
-          id: pendingId,
-          user_id: uid,
-          symbol,
-          side,
-          size,
-          leverage,
-          limit_price: limitPrice,
-          margin,
-          stop_loss: stopLoss,
-          take_profit: takeProfit,
-          created_at: now,
-        },
-        ref,
-      );
+      await matchLimitPendingAgainstBook(env, pendingId);
     }
 
     return json(await loadState(env, uid));
