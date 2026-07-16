@@ -77,20 +77,33 @@ async function loadSpotCandles(env: Env, intervalCode: string, limit: number) {
     .map(([t, c]) => ({ time: Math.floor(t / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
 }
 
-/** 호가창·체결내역 "표시용" 데이터 — 특정 유저의 개인 데이터가 아니라 시장 전체를 보여준다. */
+/** 호가창·체결내역 "표시용" 데이터 — 특정 유저의 개인 데이터가 아니라 시장 전체를 보여준다.
+ * ⚠ 유저가 OX 에 건 지정가 주문(pending_orders, "미체결" 탭)은 봇 호가(spot_orders)와 완전히
+ * 다른 테이블이라 그냥 두면 호가창에 절대 안 나타난다("내가 건 매수가 호가에 안 보인다" 버그의
+ * 근본 원인) — 그래서 두 테이블을 UNION 해서 같은 가격대끼리 합산한다. long 지정가=매수 호가,
+ * short 지정가=매도 호가. pending_orders 는 취소/체결되면 즉시 그 행이 사라지므로(order.ts/
+ * _trading.ts) 별도 동기화 없이 항상 최신 상태가 자동으로 반영된다. */
 async function loadSpotMarket(env: Env) {
   const bids = (
     await env.DB.prepare(
-      "SELECT price, SUM(size) AS size FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open' GROUP BY price ORDER BY price DESC LIMIT 15",
+      `SELECT price, SUM(size) AS size FROM (
+         SELECT price, size FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open'
+         UNION ALL
+         SELECT limit_price AS price, size FROM pending_orders WHERE symbol = ? AND side = 'long'
+       ) GROUP BY price ORDER BY price DESC LIMIT 15`,
     )
-      .bind(PAIR)
+      .bind(PAIR, PAIR)
       .all<{ price: number; size: number }>()
   ).results;
   const asks = (
     await env.DB.prepare(
-      "SELECT price, SUM(size) AS size FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open' GROUP BY price ORDER BY price ASC LIMIT 15",
+      `SELECT price, SUM(size) AS size FROM (
+         SELECT price, size FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open'
+         UNION ALL
+         SELECT limit_price AS price, size FROM pending_orders WHERE symbol = ? AND side = 'short'
+       ) GROUP BY price ORDER BY price ASC LIMIT 15`,
     )
-      .bind(PAIR)
+      .bind(PAIR, PAIR)
       .all<{ price: number; size: number }>()
   ).results;
   const trades = (

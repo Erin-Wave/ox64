@@ -114,6 +114,11 @@ ox64/
 ## 4. 모의 체결 로직 (서버 = `functions/api/order.ts`)
 
 - **진입(open)**: 서버가 `fetchPrice(env, symbol)` → 증거금 `price*size/leverage` 를 잔고에서 **조건부 UPDATE**(`balance >= margin`)로 원자 차감. 부족하면 거부. 포지션+주문 INSERT 를 `DB.batch`(트랜잭션)로. `fetchPrice` 는 `isVirtualSymbol(symbol)`(OXUSDT) 이면 OKX/Coinbase 대신 봇이 만드는 내부가격(`spot_bot_state.ref_price`)을 반환 — **OX 도 다른 38종과 완전히 동일한 이 코드로 거래되며, 체결가 소스만 다르다.**
+  **⚠ 같은 심볼·같은 방향 물타기 = 포지션 병합(중복 생성 버그 수정)**: 이미 보유 중인 포지션이 있으면
+  새 행을 또 만들지 않고 그 포지션에 합친다(평단가 재계산, 거래소들의 "원웨이 모드"와 동일). 레버리지는
+  **최초 진입 때 값으로 고정**(포지션 하나에 레버리지가 섞이면 증거금 계산 불가) — 클라에서 보낸 레버리지는
+  기존 포지션이 있으면 무시하고 `existing.leverage` 를 그대로 씀. `limitOpen` 체결(`_trading.ts`)도 동일한
+  병합 로직을 탄다(`posBySymbolSide` 맵으로 같은 폴링 라운드 안의 연속 체결까지 올바르게 병합).
 - **미실현 PnL**: `(mark-entry)*size*dir`. 랭킹/표시에서 계산(저장 안 함).
 - **청산(close)**: 서버가 청산가 fetch → `pnl` 계산 → 잔고에 `margin+pnl` 반환, 포지션 DELETE, close 주문 기록(pnl 포함). 전부 batch. `size` 를 지정하면 **부분 청산**(보유수량보다 작을 때) — 증거금/포지션 수량을 비율만큼만 줄이고 포지션은 유지, 생략/전량이면 기존과 동일하게 DELETE.
 - **입력 검증**: 심볼 allowlist(`SYMBOLS`), side∈long/short, size>0, leverage 1~125.
@@ -147,6 +152,22 @@ ox64/
   시장 전체의 `{ book, trades }` 만 반환한다(`loadSpotMarket()`). `OrderBook.tsx` 가 실제 코인은
   바이낸스 WS, OX 는 이 데이터를 3초 폴링(`useSpotPoll`)해서 **같은 컴포넌트, 같은 UI**로 보여준다 —
   클릭하면 그 가격이 지정가 입력에 채워지는 것도 동일.
+- **⚠ 호가창에 유저 자신의 지정가가 안 보이던 버그와 그 수정**: OX 지정가 주문은 `order.ts` 의
+  `pending_orders` 에 쌓이는데, 호가창은 봇 전용 `spot_orders` 만 읽어서 **유저가 건 지정가가 호가창에
+  절대 안 나타나는** 구조적 문제가 있었다(실제 코인은 바이낸스의 진짜 시장이 워낙 커서 이 괴리가
+  안 보이지만, OX 는 그 자체가 유일한 "시장"이라 바로 티가 남). **수정**: `loadSpotMarket()` 의 bids/asks
+  쿼리가 `spot_orders` 와 `pending_orders`(symbol='OXUSDT', long=매수/short=매도, limit_price 기준)를
+  `UNION ALL` 해서 같은 가격대끼리 합산한다. `pending_orders` 는 취소/체결 시 즉시 그 행이 사라지므로
+  별도 동기화 로직 없이 항상 최신 상태가 자동 반영된다.
+- **유저 체결이 합성 시장에 반영**: `order.ts`(시장가 진입/청산) 와 `_trading.ts`(지정가·SL/TP 체결)
+  가 OX 일 때 `spot.ts` 의 `recordVirtualFill()` 을 호출한다 — 체결내역(`spot_trades`)에 기록하고
+  기준가(`ref_price`)를 그 체결가로 당기는 것은 물론, **반대편 최우선호가부터 체결수량만큼 실제로
+  `spot_orders` 를 소비**한다(다 채워지면 `status='filled'`). 이걸 안 하면 "체결 탭엔 찍히는데 호가창은
+  그대로"인 괴리가 생긴다. 봇 잔고는 조정하지 않음(봇은 무한 유동성 풀이라 다음 취소·재호가 때 자연히
+  정리됨, 경제적으로 의미 없는 값).
+- **레버리지는 포지션당 고정**: `OrderPanel.tsx` 는 현재 심볼에 보유 포지션이 있으면 그 레버리지로
+  슬라이더를 동기화하고 잠근다(서버도 물타기 시 항상 기존 포지션의 레버리지를 쓰므로, 슬라이더가
+  다른 값을 보여주면 실제 체결과 화면이 어긋나 보이는 문제가 있었음).
 - **캔들(차트)**: 외부 시세가 없으므로 `spot_trades`(봇끼리의 체결 기록)를 서버가 interval 단위로 JS
   버킷팅해 OHLCV 를 만든다(`GET /api/spot?candles=1&interval=..&limit=..`, `loadSpotCandles()`).
   거래량이 적어 SQL 윈도우함수 대신 최근 거래 최대 5000건을 한 번에 읽어 그룹핑 — 모의투자 규모에선
