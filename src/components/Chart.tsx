@@ -75,6 +75,7 @@ export default function Chart() {
   const theme = useSettingsStore((s) => s.theme);
   const orders = useTradingStore((s) => s.orders);
   const positions = useTradingStore((s) => s.positions);
+  const pendingOrders = useTradingStore((s) => s.pendingOrders);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -531,9 +532,8 @@ export default function Chart() {
     for (const pl of priceLines.current) c.removePriceLine(pl);
     priceLines.current = [];
     const mine = positions.filter((p) => p.symbol === symbol);
-    if (mine.length === 0) return;
 
-    if (opts.positionLine) {
+    if (opts.positionLine && mine.length > 0) {
       const totSize = mine.reduce((a, p) => a + p.size, 0);
       const avg = mine.reduce((a, p) => a + p.entryPrice * p.size, 0) / totSize;
       const side = mine[0].side;
@@ -578,7 +578,23 @@ export default function Chart() {
         }
       }
     }
-  }, [positions, symbol, opts.positionLine, opts.slTpLines]);
+
+    // ── 걸어둔 지정가(미체결) 수평선 + 수량 ──
+    if (opts.pendingLine) {
+      for (const p of pendingOrders.filter((o) => o.symbol === symbol)) {
+        priceLines.current.push(
+          c.createPriceLine({
+            price: p.limitPrice,
+            color: p.side === 'long' ? '#00c076' : '#f6465d',
+            lineWidth: 1,
+            lineStyle: LineStyle.LargeDashed,
+            axisLabelVisible: true,
+            title: `${p.side === 'long' ? '매수' : '매도'} ${fmtVol(p.size)}`,
+          }),
+        );
+      }
+    }
+  }, [positions, pendingOrders, symbol, opts.positionLine, opts.slTpLines, opts.pendingLine]);
 
   // ── 다음 봉 카운트다운 ───────────────────────────────────────
   useEffect(() => {
@@ -638,6 +654,7 @@ export default function Chart() {
                     ['tradeMarkers', '내 매매 표시 (B/S)'],
                     ['positionLine', '포지션 평단선'],
                     ['slTpLines', 'SL/TP 수평선'],
+                    ['pendingLine', '지정가 주문선 (수량)'],
                     ['orderBook', '호가창'],
                   ] as const
                 ).map(([k, label]) => (

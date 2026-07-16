@@ -20,7 +20,7 @@ const DEFAULTS: Record<IndicatorType, Omit<IndicatorConfig, 'id' | 'type'>> = {
 let seq = 0;
 const nextId = () => `ind_${++seq}_${Math.floor(Math.random() * 1e6)}`;
 
-type BoolFlag = 'showCountdown' | 'volume' | 'tradeMarkers' | 'positionLine' | 'slTpLines' | 'orderBook';
+type BoolFlag = 'showCountdown' | 'volume' | 'tradeMarkers' | 'positionLine' | 'slTpLines' | 'pendingLine' | 'orderBook';
 
 /** 차트 표시 옵션 (localStorage 영속). */
 interface ChartState {
@@ -29,6 +29,7 @@ interface ChartState {
   tradeMarkers: boolean;
   positionLine: boolean;
   slTpLines: boolean;
+  pendingLine: boolean;
   orderBook: boolean;
   visibleBars: number; // 처음 로드 시 보여줄 봉 개수 — 마지막으로 사용자가 확대/축소한 값을 기억
   colorScheme: ChartColorScheme;
@@ -50,11 +51,11 @@ function load(): Partial<ChartState> {
   }
 }
 function persist(s: ChartState) {
-  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, orderBook, visibleBars, colorScheme, indicators } = s;
+  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook, visibleBars, colorScheme, indicators } = s;
   try {
     localStorage.setItem(
       KEY,
-      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, orderBook, visibleBars, colorScheme, indicators }),
+      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook, visibleBars, colorScheme, indicators }),
     );
   } catch {
     /* ignore */
@@ -68,6 +69,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   tradeMarkers: saved.tradeMarkers ?? true,
   positionLine: saved.positionLine ?? true,
   slTpLines: saved.slTpLines ?? true,
+  pendingLine: saved.pendingLine ?? true,
   orderBook: saved.orderBook ?? true,
   visibleBars: saved.visibleBars ?? 38,
   colorScheme: saved.colorScheme ?? 'binance',
