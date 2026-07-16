@@ -89,6 +89,21 @@ CREATE TABLE IF NOT EXISTS spot_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_spot_trades_pair ON spot_trades(pair, created_at);
 
+-- ── 가상 코인 마켓메이커 봇(OX/USDT 유동성 공급용) ──────────────────────
+-- 예약된 봇 유저 2개(서로 매칭 상대가 되어줌, 실유저와도 매칭됨) — 폴링 시점마다
+-- functions/api/spot.ts runMarketMaker() 가 랜덤워크로 기준가를 움직이며 호가를 깐다.
+-- passcode_hash 의 scheme 이 'pbkdf2' 가 아니므로 verifyPasscode 가 항상 false → 로그인 불가.
+-- name 이 유니크 제약으로 이미 선점되어 실유저가 같은 이름으로 가입할 수도 없다.
+INSERT OR IGNORE INTO users (id, name, passcode_hash, balance, created_at, ox_balance) VALUES
+  ('bot-mm-1', 'MarketMaker1', 'disabled$$bot-account-no-login', 100000000, 0, 100000000),
+  ('bot-mm-2', 'MarketMaker2', 'disabled$$bot-account-no-login', 100000000, 0, 100000000);
+
+CREATE TABLE IF NOT EXISTS spot_bot_state (
+  id        TEXT PRIMARY KEY,   -- pair (예: 'OXUSDT')
+  last_run  INTEGER NOT NULL,
+  ref_price REAL NOT NULL
+);
+
 -- ⚠ 일회성 마이그레이션 (2026-07-15 추가, SL/TP 지원): 이미 스키마가 적용된 기존
 -- prod DB 의 positions 테이블에 컬럼을 추가한다. CREATE TABLE IF NOT EXISTS 는
 -- 기존 테이블에 컬럼을 더해주지 않으므로 별도 ALTER 필요. 최초 1회

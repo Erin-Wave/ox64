@@ -1,5 +1,15 @@
 import { create } from 'zustand';
-import { api, type ApiOrder, type ApiPendingOrder, type ApiPosition, type AppState } from '@/services/api';
+import {
+  api,
+  type ApiOrder,
+  type ApiPendingOrder,
+  type ApiPosition,
+  type AppState,
+  type SpotOrder,
+  type SpotBookLevel,
+  type SpotTrade,
+  type SpotState,
+} from '@/services/api';
 import type { Side } from '@/types';
 
 /**
@@ -18,6 +28,12 @@ interface TradingState {
   pendingOrders: ApiPendingOrder[];
   busy: boolean;
   error: string | null;
+
+  // OX/USDT 가상 코인 현물(레버리지 없음, 별개 매칭엔진) — balance(USDT)는 위 필드를 공유한다.
+  oxBalance: number;
+  spotOpenOrders: SpotOrder[];
+  spotBook: { bids: SpotBookLevel[]; asks: SpotBookLevel[] };
+  spotTrades: SpotTrade[];
 
   init: () => Promise<void>;
   login: (name: string, passcode: string) => Promise<void>;
@@ -44,6 +60,10 @@ interface TradingState {
   cancelLimit: (pendingId: string) => Promise<void>;
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) => Promise<void>;
   refill: () => Promise<void>;
+
+  spotRefresh: () => Promise<void>;
+  spotPlace: (side: 'buy' | 'sell', price: number, size: number) => Promise<void>;
+  spotCancel: (orderId: string) => Promise<void>;
 }
 
 function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
@@ -55,6 +75,16 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     positions: st.positions,
     orders: st.orders,
     pendingOrders: st.pendingOrders,
+    error: null,
+  });
+}
+function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState) {
+  set({
+    balance: st.usdtBalance,
+    oxBalance: st.oxBalance,
+    spotOpenOrders: st.myOrders,
+    spotBook: st.book,
+    spotTrades: st.trades,
     error: null,
   });
 }
@@ -70,6 +100,11 @@ export const useTradingStore = create<TradingState>((set) => ({
   pendingOrders: [],
   busy: false,
   error: null,
+
+  oxBalance: 0,
+  spotOpenOrders: [],
+  spotBook: { bids: [], asks: [] },
+  spotTrades: [],
 
   // 앱 시작 시 기존 세션(쿠키) 확인
   init: async () => {
@@ -102,7 +137,19 @@ export const useTradingStore = create<TradingState>((set) => ({
     } catch {
       /* 무시 */
     }
-    set({ authed: false, name: null, balance: 0, refillsLeft: 3, positions: [], orders: [], pendingOrders: [] });
+    set({
+      authed: false,
+      name: null,
+      balance: 0,
+      refillsLeft: 3,
+      positions: [],
+      orders: [],
+      pendingOrders: [],
+      oxBalance: 0,
+      spotOpenOrders: [],
+      spotBook: { bids: [], asks: [] },
+      spotTrades: [],
+    });
   },
 
   refresh: async () => {
@@ -173,6 +220,36 @@ export const useTradingStore = create<TradingState>((set) => ({
     set({ busy: true, error: null });
     try {
       apply(set, await api.refill());
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  spotRefresh: async () => {
+    try {
+      applySpot(set, await api.spotState());
+    } catch {
+      /* 다음 폴링에서 재시도 — 마지막 알려진 값 유지 */
+    }
+  },
+
+  spotPlace: async (side, price, size) => {
+    set({ busy: true, error: null });
+    try {
+      applySpot(set, await api.spotPlace(side, price, size));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  spotCancel: async (orderId) => {
+    set({ busy: true, error: null });
+    try {
+      applySpot(set, await api.spotCancel(orderId));
     } catch (e) {
       set({ error: (e as Error).message });
     } finally {

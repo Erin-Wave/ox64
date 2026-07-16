@@ -1,7 +1,7 @@
 // 서버 권위 백엔드(/api/*, Cloudflare Pages Functions + D1) 클라이언트.
 // 잔고/체결/손익은 서버가 계산하므로 프론트는 요청·표시만 담당한다.
 
-import type { Side } from '@/types';
+import type { Candle, Side } from '@/types';
 
 export interface ApiPosition {
   id: string;
@@ -121,4 +121,6 @@ export const api = {
     req<SpotState>('/spot', { method: 'POST', body: JSON.stringify({ action: 'place', side, price, size }) }),
   spotCancel: (orderId: string) =>
     req<SpotState>('/spot', { method: 'POST', body: JSON.stringify({ action: 'cancel', orderId }) }),
+  spotCandles: (interval: string, limit = 500) =>
+    req<{ candles: Candle[] }>(`/spot?candles=1&interval=${encodeURIComponent(interval)}&limit=${limit}`),
 };

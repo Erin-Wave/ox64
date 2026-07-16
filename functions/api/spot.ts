@@ -6,6 +6,8 @@ import {
   safe,
   missingEnv,
   getSession,
+  intervalSecFromCode,
+  BOT_USER_IDS,
   type UserRow,
   type SpotOrderRow,
   type SpotTradeRow,
@@ -31,6 +33,19 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     if (envErr) return bad(envErr, 500);
     const sess = await getSession(request, env);
     if (!sess) return bad('unauthorized', 401);
+    try {
+      await runMarketMaker(env);
+    } catch {
+      /* 봇 실패가 유저 요청을 막으면 안 됨 — 다음 폴링에서 재시도 */
+    }
+
+    const url = new URL(request.url);
+    if (url.searchParams.get('candles')) {
+      const interval = url.searchParams.get('interval') || '1m';
+      const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit')) || 500));
+      return json({ candles: await loadSpotCandles(env, interval, limit) });
+    }
+
     const state = await loadSpotState(env, sess.uid);
     if (!state) return bad('unauthorized', 401);
     return json(state);
@@ -39,6 +54,147 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
 
 export function onRequestPost({ request, env }: Ctx): Promise<Response> {
   return safe(() => handlePost(request, env));
+}
+
+/** spot_trades 를 interval 버킷으로 묶어 OHLCV 캔들을 만든다(거래량이 적어 SQL 윈도우함수 대신 JS 로 처리). */
+async function loadSpotCandles(env: Env, intervalCode: string, limit: number) {
+  const sec = intervalSecFromCode(intervalCode);
+  const bucketMs = sec * 1000;
+  const trades = (
+    await env.DB.prepare('SELECT price, size, created_at FROM spot_trades WHERE pair = ? ORDER BY created_at ASC LIMIT 5000')
+      .bind(PAIR)
+      .all<{ price: number; size: number; created_at: number }>()
+  ).results;
+  if (trades.length === 0) return [];
+
+  const buckets = new Map<number, { open: number; high: number; low: number; close: number; volume: number }>();
+  for (const t of trades) {
+    const b = Math.floor(t.created_at / bucketMs) * bucketMs;
+    const bucket = buckets.get(b);
+    if (!bucket) {
+      buckets.set(b, { open: t.price, high: t.price, low: t.price, close: t.price, volume: t.size });
+    } else {
+      bucket.high = Math.max(bucket.high, t.price);
+      bucket.low = Math.min(bucket.low, t.price);
+      bucket.close = t.price;
+      bucket.volume += t.size;
+    }
+  }
+  return [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .slice(-limit)
+    .map(([t, c]) => ({ time: Math.floor(t / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+}
+
+// ── 마켓메이커 봇(유동성 공급) ──────────────────────────────────
+// 예약된 봇 유저 2개가 폴링 시점마다(요청이 들어올 때만 — cron 없음) 기준가를 랜덤워크로
+// 살짝 움직이고 그 주변에 매수/매도 지정가를 소량 깔아둔다. 가끔 반대편 최우선호가를
+// 즉시 크로스하는 주문을 내서(다른 봇 또는 실유저 호가와 매칭) 체결이 계속 발생하게 한다.
+const BOT_TICK_MIN_MS = 3000;
+const BOT_TICK_MAX_MS = 8000;
+const BOT_MAX_RESTING_PER_SIDE = 3;
+
+async function runMarketMaker(env: Env): Promise<void> {
+  const row = await env.DB.prepare('SELECT last_run, ref_price FROM spot_bot_state WHERE id = ?')
+    .bind(PAIR)
+    .first<{ last_run: number; ref_price: number }>();
+  const now = Date.now();
+  const last = row?.last_run ?? 0;
+  const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
+  if (now - last < gate) return;
+  // 동시 요청이 겹쳐도 대략 한 번만 돌도록 먼저 last_run 을 찍어둔다(완벽한 락은 아니지만 폴링 간격상 충분).
+  await env.DB.prepare(
+    'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run',
+  )
+    .bind(PAIR, now, row?.ref_price ?? 1)
+    .run();
+
+  let ref = row?.ref_price;
+  if (!ref) {
+    const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
+      .bind(PAIR)
+      .first<{ price: number }>();
+    ref = lastTrade?.price ?? 1;
+  }
+  ref = Math.max(0.01, ref * (1 + (Math.random() - 0.5) * 0.012)); // ±0.6% 랜덤워크
+  await env.DB.prepare('UPDATE spot_bot_state SET ref_price = ? WHERE id = ?').bind(ref, PAIR).run();
+
+  const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
+
+  // 오래된 봇 호가 정리(한도 초과분만 취소)
+  for (const side of ['buy', 'sell'] as const) {
+    const mine = (
+      await env.DB.prepare(
+        "SELECT * FROM spot_orders WHERE user_id = ? AND pair = ? AND side = ? AND status = 'open' ORDER BY created_at ASC",
+      )
+        .bind(actor, PAIR, side)
+        .all<SpotOrderRow>()
+    ).results;
+    if (mine.length > BOT_MAX_RESTING_PER_SIDE) {
+      for (const o of mine.slice(0, mine.length - BOT_MAX_RESTING_PER_SIDE)) {
+        const refund = side === 'buy' ? o.price * o.size : o.size;
+        const col = side === 'buy' ? 'balance' : 'ox_balance';
+        await env.DB.batch([
+          env.DB.prepare("UPDATE spot_orders SET status = 'cancelled' WHERE id = ?").bind(o.id),
+          env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(refund, actor),
+        ]);
+      }
+    }
+  }
+
+  // 가끔 반대편 최우선호가를 즉시 크로스 — 다른 봇/실유저 호가와 체결시켜 최근체결·차트가 계속 움직이게 함.
+  if (Math.random() < 0.5) {
+    const crossSide = Math.random() < 0.5 ? 'buy' : 'sell';
+    const bestOpp =
+      crossSide === 'buy'
+        ? await env.DB.prepare(
+            "SELECT price FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open' AND user_id != ? ORDER BY price ASC LIMIT 1",
+          )
+            .bind(PAIR, actor)
+            .first<{ price: number }>()
+        : await env.DB.prepare(
+            "SELECT price FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open' AND user_id != ? ORDER BY price DESC LIMIT 1",
+          )
+            .bind(PAIR, actor)
+            .first<{ price: number }>();
+    if (bestOpp) {
+      const crossPrice = crossSide === 'buy' ? bestOpp.price * 1.002 : bestOpp.price * 0.998;
+      await placeBotOrder(env, actor, crossSide, crossPrice, Number((2 + Math.random() * 10).toFixed(4)));
+    }
+  }
+
+  // 기준가 주변에 패시브 호가를 새로 깐다.
+  const spread = 0.003 + Math.random() * 0.005;
+  const size = Number((5 + Math.random() * 40).toFixed(4));
+  await placeBotOrder(env, actor, 'buy', Number((ref * (1 - spread)).toFixed(6)), size);
+  await placeBotOrder(env, actor, 'sell', Number((ref * (1 + spread)).toFixed(6)), size);
+}
+
+/** 봇 전용 주문 배치(에스크로+매칭) — handlePost 의 'place' 로직과 동일하되 봇은 잔고가 항상 충분하다. */
+async function placeBotOrder(env: Env, uid: string, side: 'buy' | 'sell', price: number, size: number) {
+  if (!(price > 0) || !(size > 0)) return;
+  const orderId = crypto.randomUUID();
+  const now = Date.now();
+  if (side === 'buy') {
+    const cost = price * size;
+    const res = await env.DB.batch([
+      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?').bind(cost, uid, cost),
+      env.DB.prepare(
+        'INSERT INTO spot_orders (id, user_id, pair, side, price, size, orig_size, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+      ).bind(orderId, uid, PAIR, 'buy', price, size, size, 'open', now),
+    ]);
+    if (res[0].meta.changes !== 1) return; // 봇 잔고 바닥(거의 없음) — 이번 틱은 스킵
+    await matchBuy(env, uid, orderId, price);
+  } else {
+    const res = await env.DB.batch([
+      env.DB.prepare('UPDATE users SET ox_balance = ox_balance - ? WHERE id = ? AND ox_balance >= ?').bind(size, uid, size),
+      env.DB.prepare(
+        'INSERT INTO spot_orders (id, user_id, pair, side, price, size, orig_size, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+      ).bind(orderId, uid, PAIR, 'sell', price, size, size, 'open', now),
+    ]);
+    if (res[0].meta.changes !== 1) return;
+    await matchSell(env, uid, orderId, price);
+  }
 }
 
 async function loadSpotState(env: Env, uid: string) {
@@ -184,6 +340,11 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
   const sess = await getSession(request, env);
   if (!sess) return bad('unauthorized', 401);
   const uid = sess.uid;
+  try {
+    await runMarketMaker(env);
+  } catch {
+    /* 봇 실패가 유저 주문을 막으면 안 됨 */
+  }
 
   let body: Record<string, unknown>;
   try {

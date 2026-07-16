@@ -17,11 +17,12 @@ import {
 import { fetchKlines, fetchPricePrecision } from '@/services/binanceRest';
 import { klineStream } from '@/services/binanceWs';
 import { ema, bollinger, rsi } from '@/services/indicators';
+import { api } from '@/services/api';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useChartStore, type IndicatorConfig, type IndicatorType } from '@/store/useChartStore';
 import { useSettingsStore, type Theme } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { INTERVAL_GROUPS, intervalSec, KST_OFFSET } from '@/symbols';
+import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol } from '@/symbols';
 import { fmtPrice, fmtVol } from '@/format';
 import type { Candle } from '@/types';
 
@@ -317,6 +318,49 @@ export default function Chart() {
     let cancelled = false;
     candlesRef.current = [];
     volMap.current.clear();
+
+    // ── 가상 코인(OX/USDT): 바이낸스 REST/WS 대신 spot_trades 기반 캔들을 짧은 폴링으로 ──
+    if (isVirtualSymbol(symbol)) {
+      const VIRTUAL_PREC = 4;
+      setPrec(VIRTUAL_PREC);
+      setPrecision(symbol, VIRTUAL_PREC);
+      candle.applyOptions({ priceFormat: { type: 'price', precision: VIRTUAL_PREC, minMove: Math.pow(10, -VIRTUAL_PREC) } });
+
+      const load = async () => {
+        try {
+          const { candles } = await api.spotCandles(interval, 500);
+          if (cancelled) return;
+          candlesRef.current = candles;
+          for (const c of candles) volMap.current.set(c.time, c.volume ?? 0);
+          candle.setData(
+            candles.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
+          );
+          if (candles.length) {
+            const len = candles.length;
+            const initBars = optsRef.current.visibleBars;
+            chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - initBars), to: len + 2 });
+          }
+          syncIndicatorsRef.current();
+          const l = candles.at(-1);
+          setConnected(true);
+          if (l) {
+            setPrice(symbol, l.close);
+            if (!hovering.current) setLegend(l);
+          }
+          if (!hovering.current) setIndLegend(lastIndLegend());
+        } catch (e) {
+          console.error('[chart] spot candle load failed', e);
+          setConnected(false);
+        }
+      };
+      load();
+      const t = window.setInterval(load, 3000);
+      return () => {
+        cancelled = true;
+        window.clearInterval(t);
+        setConnected(false);
+      };
+    }
 
     // 심볼별 가격 정밀도 적용(우측 축·크로스헤어·레전드) — 소수점 2자리 고정 버그 수정
     fetchPricePrecision(symbol)

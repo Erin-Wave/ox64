@@ -7,11 +7,9 @@ import logo from '@/resources/images/icon_256.png';
 export default function Header({
   onOpenRank,
   onOpenSettings,
-  onOpenSpot,
 }: {
   onOpenRank: () => void;
   onOpenSettings: () => void;
-  onOpenSpot: () => void;
 }) {
   const symbol = useMarketStore((s) => s.symbol);
   const lastPrice = useMarketStore(selectLastPrice);
@@ -71,12 +69,6 @@ export default function Header({
           className="rounded-md bg-panel2 px-2.5 py-1.5 text-xs font-semibold text-accent ring-1 ring-border transition hover:bg-elevated disabled:opacity-40"
         >
           +1만 리필 ({refillsLeft}/3)
-        </button>
-        <button
-          onClick={onOpenSpot}
-          className="rounded-md bg-panel2 px-2.5 py-1.5 text-xs font-semibold text-text ring-1 ring-border transition hover:bg-elevated"
-        >
-          🪙 OX
         </button>
         <button
           onClick={onOpenRank}

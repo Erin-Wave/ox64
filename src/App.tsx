@@ -7,12 +7,12 @@ import PositionsPanel from '@/components/PositionsPanel';
 import Login from '@/components/Login';
 import Leaderboard from '@/components/Leaderboard';
 import Settings from '@/components/Settings';
-import SpotMarket from '@/components/SpotMarket';
 import { useTradingStore } from '@/store/useTradingStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useChartStore } from '@/store/useChartStore';
 import { useMarkPrices } from '@/hooks/useMarkPrices';
 import { useTriggerPoll } from '@/hooks/useTriggerPoll';
+import { useSpotPoll } from '@/hooks/useSpotPoll';
 
 export default function App() {
   const init = useTradingStore((s) => s.init);
@@ -23,12 +23,13 @@ export default function App() {
 
   const [showRank, setShowRank] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showSpot, setShowSpot] = useState(false);
 
   // 현재 심볼 + 보유 포지션 심볼들의 가격 폴링 (다른 심볼 PnL 갱신)
   useMarkPrices();
   // 지정가/SL/TP 체결 체크(서버는 cron 이 없어 이 폴링이 체결 트리거 역할을 함)
   useTriggerPoll();
+  // OX/USDT(가상 코인) 을 보고 있을 때만 잔고/호가/체결 폴링
+  useSpotPoll();
 
   // 앱 시작 시 세션(쿠키) 확인 (1회)
   useEffect(() => {
@@ -47,11 +48,7 @@ export default function App() {
 
   return (
     <div className="flex h-screen flex-col bg-bg text-text">
-      <Header
-        onOpenRank={() => setShowRank(true)}
-        onOpenSettings={() => setShowSettings(true)}
-        onOpenSpot={() => setShowSpot(true)}
-      />
+      <Header onOpenRank={() => setShowRank(true)} onOpenSettings={() => setShowSettings(true)} />
 
       {/*
         모바일(기본): 세로 스크롤 스택 — 차트(45vh) → 주문 → 포지션.
@@ -74,7 +71,6 @@ export default function App() {
 
       {showRank && <Leaderboard onClose={() => setShowRank(false)} />}
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
-      {showSpot && <SpotMarket onClose={() => setShowSpot(false)} />}
     </div>
   );
 }

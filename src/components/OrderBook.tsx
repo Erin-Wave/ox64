@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { orderbookStream, type OrderBookLevel, type OrderBookSnapshot } from '@/services/binanceWs';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
+import { useTradingStore } from '@/store/useTradingStore';
+import { isVirtualSymbol } from '@/symbols';
 import { fmtPrice, precisionFromTick } from '@/format';
 
 const fmtQty = (q: number) => (q >= 1000 ? q.toFixed(1) : q.toFixed(4));
@@ -26,15 +28,23 @@ function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'):
 export default function OrderBook() {
   const symbol = useMarketStore((s) => s.symbol);
   const precisions = useMarketStore((s) => s.precisions);
+  const virtual = isVirtualSymbol(symbol);
+  const spotBook = useTradingStore((s) => s.spotBook);
   const [book, setBook] = useState<OrderBookSnapshot | null>(null);
   const [groupIdx, setGroupIdx] = useState(0);
 
   useEffect(() => {
+    if (virtual) return; // 가상 심볼은 useSpotPoll 이 채우는 store.spotBook 을 대신 사용
     setBook(null);
     setGroupIdx(0); // 심볼마다 tick 단위가 달라서 배수 선택을 리셋
     const sub = orderbookStream(symbol, 20).subscribe({ next: setBook });
     return () => sub.unsubscribe();
-  }, [symbol]);
+  }, [symbol, virtual]);
+
+  // 가상 심볼은 spot_orders 호가(price/size)를 OrderBookLevel(price/qty) 형태로 매핑해 재사용
+  const activeBook: OrderBookSnapshot | null = virtual
+    ? { bids: spotBook.bids.map((b) => ({ price: b.price, qty: b.size })), asks: spotBook.asks.map((a) => ({ price: a.price, qty: a.size })) }
+    : book;
 
   const prec = precisionOf(precisions, symbol);
   const tick = Math.pow(10, -prec);
@@ -42,8 +52,8 @@ export default function OrderBook() {
   const cycleGroup = () => setGroupIdx((i) => (i + 1) % GROUP_MULTS.length);
   const pick = (price: number) => useMarketStore.getState().setChartClickPrice(price);
 
-  const asks = useMemo(() => (book ? aggregate(book.asks, groupStep, 'ask').slice(0, 8) : []), [book, groupStep]);
-  const bids = useMemo(() => (book ? aggregate(book.bids, groupStep, 'bid').slice(0, 8) : []), [book, groupStep]);
+  const asks = useMemo(() => (activeBook ? aggregate(activeBook.asks, groupStep, 'ask').slice(0, 8) : []), [activeBook, groupStep]);
+  const bids = useMemo(() => (activeBook ? aggregate(activeBook.bids, groupStep, 'bid').slice(0, 8) : []), [activeBook, groupStep]);
 
   const maxQty = Math.max(1e-9, ...bids.map((b) => b.qty), ...asks.map((a) => a.qty));
   const groupPrec = precisionFromTick(groupStep);
@@ -51,7 +61,7 @@ export default function OrderBook() {
   return (
     <div className="border-b border-border bg-panel p-2 text-xs md:border-b-0 md:border-t">
       <div className="mb-1 px-1 text-[10px] font-semibold uppercase text-muted">호가창</div>
-      {!book ? (
+      {!activeBook ? (
         <div className="py-6 text-center text-muted">불러오는 중…</div>
       ) : (
         <>

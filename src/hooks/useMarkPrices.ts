@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
+import { isVirtualSymbol } from '@/symbols';
 
 /**
  * 현재 보는 심볼 + 보유 포지션들의 심볼 가격을 주기적으로 폴링해 prices 맵을 갱신한다.
@@ -16,7 +17,9 @@ export function useMarkPrices() {
   const posSymbols = positions.map((p) => p.symbol).join(',');
 
   useEffect(() => {
-    const symbols = [...new Set([symbol, ...positions.map((p) => p.symbol)])];
+    // 가상 심볼(OXUSDT)은 바이낸스에 없는 심볼이라 배치 요청에 섞이면 전체가 실패한다 — 제외.
+    const symbols = [...new Set([symbol, ...positions.map((p) => p.symbol)])].filter((s) => !isVirtualSymbol(s));
+    if (symbols.length === 0) return;
     let alive = true;
 
     const poll = async () => {

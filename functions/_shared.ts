@@ -34,6 +34,20 @@ export const SEED_BALANCE = 10_000; // 신규 계정 모의 USDT
 export const REFILL_AMOUNT = 10_000;
 export const REFILL_DAILY_LIMIT = 3;
 
+// OX/USDT 유동성 공급용 예약 봇 유저(schema.sql 에서 시딩) — 랭킹/통계에서 제외해야 함.
+export const BOT_USER_IDS = ['bot-mm-1', 'bot-mm-2'] as const;
+
+// 캔들 인터벌 코드 → 초 (src/symbols.ts INTERVAL_GROUPS 와 동일한 값을 함수 쪽에 독립 보관).
+const INTERVAL_SEC: Record<string, number> = {
+  '1s': 1,
+  '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+  '1h': 3600, '2h': 7200, '4h': 14400, '6h': 21600, '8h': 28800, '12h': 43200,
+  '1d': 86400, '3d': 259200, '1w': 604800, '1M': 2592000,
+};
+export function intervalSecFromCode(code: string): number {
+  return INTERVAL_SEC[code] ?? 60;
+}
+
 // KST(UTC+9) 기준 오늘 날짜(YYYY-MM-DD) — 리필 일일 한도 판정에 사용.
 // 차트(src/symbols.ts KST_OFFSET)와 동일한 오프셋 트릭: ms 를 더한 뒤 UTC 포맷으로 자르면 KST 날짜가 된다.
 const KST_OFFSET_MS = 9 * 3600 * 1000;

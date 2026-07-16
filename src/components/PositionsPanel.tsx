@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
+import { isVirtualSymbol } from '@/symbols';
 import { fmtPrice } from '@/format';
 import type { ApiOrder } from '@/services/api';
 
@@ -24,7 +25,13 @@ export default function PositionsPanel() {
   const busy = useTradingStore((s) => s.busy);
   const prices = useMarketStore((s) => s.prices);
   const precisions = useMarketStore((s) => s.precisions);
+  const symbol = useMarketStore((s) => s.symbol);
   const standard = useSettingsStore((s) => s.tradingMode) === 'standard';
+  const virtual = isVirtualSymbol(symbol);
+  const oxBalance = useTradingStore((s) => s.oxBalance);
+  const spotOpenOrders = useTradingStore((s) => s.spotOpenOrders);
+  const spotTrades = useTradingStore((s) => s.spotTrades);
+  const spotCancel = useTradingStore((s) => s.spotCancel);
 
   const [tab, setTab] = useState<Tab>('positions');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -88,12 +95,27 @@ export default function PositionsPanel() {
     <div className="flex h-full flex-col">
       {/* 탭 헤더 */}
       <div className="flex items-center gap-1 border-b border-border px-2 py-1.5">
-        {tabBtn('positions', `포지션 (${positions.length})`)}
-        {standard && tabBtn('pending', `미체결 (${pendingOrders.length})`)}
+        {tabBtn('positions', virtual ? '보유' : `포지션 (${positions.length})`)}
+        {(standard || virtual) && tabBtn('pending', `미체결 (${virtual ? spotOpenOrders.length : pendingOrders.length})`)}
         {tabBtn('history', '주문내역')}
       </div>
 
-      {tab === 'positions' &&
+      {tab === 'positions' && virtual && (
+        <div className="flex flex-1 items-center justify-center p-6">
+          <div className="space-y-1 rounded-md bg-panel2 px-4 py-3 text-xs">
+            <div className="flex justify-between gap-6">
+              <span className="text-muted">보유 OX</span>
+              <span className="font-bold text-text">{oxBalance.toFixed(4)}</span>
+            </div>
+            <div className="flex justify-between gap-6">
+              <span className="text-muted">보유 USDT</span>
+              <span className="font-bold text-text">{balance.toFixed(2)}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab === 'positions' && !virtual &&
         (positions.length === 0 ? (
           <div className="flex flex-1 items-center justify-center p-6 text-xs text-muted">
             보유 중인 포지션이 없습니다
@@ -232,7 +254,47 @@ export default function PositionsPanel() {
           </div>
         ))}
 
-      {tab === 'pending' &&
+      {tab === 'pending' && virtual &&
+        (spotOpenOrders.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-xs text-muted">
+            미체결 주문이 없습니다
+          </div>
+        ) : (
+          <div className="flex-1 overflow-auto">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-panel text-muted">
+                <tr className="text-left">
+                  <th className="px-3 py-2 font-medium">방향</th>
+                  <th className="px-3 py-2 text-right font-medium">가격</th>
+                  <th className="px-3 py-2 text-right font-medium">수량</th>
+                  <th className="px-3 py-2" />
+                </tr>
+              </thead>
+              <tbody>
+                {spotOpenOrders.map((o) => (
+                  <tr key={o.id} className="border-b border-border/60">
+                    <td className="px-3 py-2.5">
+                      <span className={o.side === 'buy' ? 'text-up' : 'text-down'}>{o.side === 'buy' ? '매수' : '매도'}</span>
+                    </td>
+                    <td className="px-3 py-2.5 text-right text-text">{o.price}</td>
+                    <td className="px-3 py-2.5 text-right text-text">{o.size}</td>
+                    <td className="px-3 py-2.5 text-right">
+                      <button
+                        onClick={() => spotCancel(o.id)}
+                        disabled={busy}
+                        className="rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
+                      >
+                        취소
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+      {tab === 'pending' && !virtual &&
         (pendingOrders.length === 0 ? (
           <div className="flex flex-1 items-center justify-center p-6 text-xs text-muted">
             미체결 지정가 주문이 없습니다
@@ -282,7 +344,40 @@ export default function PositionsPanel() {
           </div>
         ))}
 
-      {tab === 'history' &&
+      {tab === 'history' && virtual &&
+        (spotTrades.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-xs text-muted">체결 내역이 없습니다</div>
+        ) : (
+          <div className="flex-1 overflow-auto">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-panel text-muted">
+                <tr className="text-left">
+                  <th className="px-3 py-2 font-medium">시각</th>
+                  <th className="px-3 py-2 font-medium">방향</th>
+                  <th className="px-3 py-2 text-right font-medium">가격</th>
+                  <th className="px-3 py-2 text-right font-medium">수량</th>
+                </tr>
+              </thead>
+              <tbody>
+                {spotTrades.map((t) => {
+                  const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
+                  return (
+                    <tr key={t.id} className={`border-b border-border/60 ${t.isMe ? 'bg-panel2' : ''}`}>
+                      <td className="whitespace-nowrap px-3 py-2 text-muted">{fmtTime(t.createdAt)}</td>
+                      <td className={`px-3 py-2 ${color}`}>
+                        {t.takerSide === 'buy' ? '매수' : t.takerSide === 'sell' ? '매도' : '—'}
+                      </td>
+                      <td className={`px-3 py-2 text-right ${color}`}>{t.price}</td>
+                      <td className="px-3 py-2 text-right text-text">{t.size}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+      {tab === 'history' && !virtual &&
         (orders.length === 0 ? (
           <div className="flex flex-1 items-center justify-center p-6 text-xs text-muted">주문 내역이 없습니다</div>
         ) : (

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useMarketStore } from '@/store/useMarketStore';
-import { SYMBOLS } from '@/symbols';
+import { SYMBOLS, VIRTUAL_SYMBOLS, isVirtualSymbol } from '@/symbols';
+import { api } from '@/services/api';
 
 interface Stat {
   price: number;
@@ -27,6 +28,7 @@ export default function SymbolSelect() {
   const setSymbol = useMarketStore((s) => s.setSymbol);
   const [open, setOpen] = useState(false);
   const [stats, setStats] = useState<Record<string, Stat>>({});
+  const [oxPrice, setOxPrice] = useState<number | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>('symbol');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
 
@@ -42,6 +44,26 @@ export default function SymbolSelect() {
         const next: Record<string, Stat> = {};
         for (const x of arr) next[x.symbol] = { price: Number(x.lastPrice), changePct: Number(x.priceChangePercent) };
         if (alive) setStats(next);
+      } catch {
+        /* 네트워크 오류 무시(다음 주기 재시도) */
+      }
+    };
+    load();
+    const t = setInterval(load, 5000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [open]);
+
+  // 가상 마켓(OX/USDT)은 바이낸스에 없으므로 서버 최근 체결가를 별도로 가져온다(24h 변동률은 생략).
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    const load = async () => {
+      try {
+        const st = await api.spotState();
+        if (alive && st.trades[0]) setOxPrice(st.trades[0].price);
       } catch {
         /* 네트워크 오류 무시(다음 주기 재시도) */
       }
@@ -87,12 +109,37 @@ export default function SymbolSelect() {
         onClick={() => setOpen((v) => !v)}
         className="cursor-pointer rounded-md bg-panel2 px-2.5 py-1.5 text-sm font-semibold text-text outline-none ring-1 ring-border transition hover:ring-elevated"
       >
-        {symbol.replace('USDT', '/USDT')} <span className="text-muted">▾</span>
+        {symbol.replace('USDT', '/USDT')}
+        {isVirtualSymbol(symbol) && (
+          <span className="ml-1 rounded bg-accent/20 px-1 py-0.5 align-middle text-[9px] font-bold text-accent">가상</span>
+        )}{' '}
+        <span className="text-muted">▾</span>
       </button>
       {open && (
         <>
           <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
           <div className="absolute left-0 top-full z-30 mt-1 max-h-80 w-72 overflow-auto rounded-lg border border-border bg-panel shadow-2xl">
+            {/* 가상 마켓 — 실제 심볼과 같은 목록에 두되 뱃지로 구분 */}
+            <div className="border-b border-border">
+              {VIRTUAL_SYMBOLS.map((s) => (
+                <button
+                  key={s}
+                  onClick={() => {
+                    setSymbol(s);
+                    setOpen(false);
+                  }}
+                  className={`flex w-full items-center justify-between px-3 py-2 text-xs transition hover:bg-panel2 ${
+                    s === symbol ? 'bg-panel2' : ''
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 font-semibold text-text">
+                    {s.replace('USDT', '/USDT')}
+                    <span className="rounded bg-accent/20 px-1 py-0.5 text-[9px] font-bold text-accent">가상</span>
+                  </span>
+                  <span className="text-text">{oxPrice != null ? fmtAdaptive(oxPrice) : '—'}</span>
+                </button>
+              ))}
+            </div>
             <div className="sticky top-0 flex items-center justify-between border-b border-border bg-panel px-3 py-1.5 text-[10px] font-semibold text-muted">
               <button onClick={() => toggleSort('symbol')} className="transition hover:text-text">
                 심볼 {sortArrow('symbol')}

@@ -8,6 +8,11 @@ export const SYMBOLS = [
   'PUMPUSDT', 'XPLUSDT', 'GRAMUSDT', 'KITEUSDT', 'SENTUSDT', 'ALLOUSDT',
 ];
 
+// 외부 시세 없는 가상 코인(유저간 주문매칭, functions/api/spot.ts). 실제 심볼과 같은
+// 콤보박스(SymbolSelect)에서 선택하지만 차트/호가/주문 데이터소스가 완전히 다르다.
+export const VIRTUAL_SYMBOLS = ['OXUSDT'] as const;
+export const isVirtualSymbol = (s: string): boolean => (VIRTUAL_SYMBOLS as readonly string[]).includes(s);
+
 export interface IntervalDef {
   code: string; // 바이낸스 kline interval
   label: string; // 표시명

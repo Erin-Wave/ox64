@@ -1,4 +1,4 @@
-import { type Ctx, bad, json, safe, missingEnv, getSession, fetchPrices, type PositionRow } from '../_shared';
+import { type Ctx, bad, json, safe, missingEnv, getSession, fetchPrices, BOT_USER_IDS, type PositionRow } from '../_shared';
 
 /**
  * GET /api/leaderboard — 친구들 자산 순위.
@@ -16,11 +16,15 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   if (!sess) return bad('unauthorized', 401);
 
   const users = (
-    await env.DB.prepare('SELECT id, name, balance FROM users').all<{
-      id: string;
-      name: string;
-      balance: number;
-    }>()
+    await env.DB.prepare(
+      `SELECT id, name, balance FROM users WHERE id NOT IN (${BOT_USER_IDS.map(() => '?').join(',')})`,
+    )
+      .bind(...BOT_USER_IDS)
+      .all<{
+        id: string;
+        name: string;
+        balance: number;
+      }>()
   ).results;
   const positions = (
     await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()
