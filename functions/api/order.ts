@@ -70,9 +70,6 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   if (!sess) return bad('unauthorized', 401);
   const uid = sess.uid;
 
-  // 지정가/SL/TP 체결 체크 — 수동 액션과 레이스 방지 위해 여기서도 먼저 평가
-  await checkTriggers(env, uid);
-
   let body: Record<string, unknown>;
   try {
     body = await request.json();
@@ -80,13 +77,18 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     return bad('invalid json');
   }
 
+  // 지정가/SL·TP/강제청산 체크는 각 액션 안에서 호출한다(수동 액션과 레이스 방지). 반환된 마크가격
+  // 맵을 loadState 로 넘겨 클라가 서버와 동일 시세로 청산가/평가자산을 즉시 계산하게 한다.
+
   if (body.action === 'open') {
     const { symbol, side } = body;
     const size = Number(body.size);
     const leverage = Math.round(Number(body.leverage));
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
-    if (!(size > 0) || !isFinite(size) || size > 1_000_000) return bad('수량 오류');
+    // 수량 상한 = 1e15 (싼 코인은 정상적으로 수십억 개를 거래한다 — 예전 1,000,000 캡은 PEPE 등에서
+    // "수량 오류"를 유발했다. 실제 한도는 증거금 <= 잔고 조건이 잡아준다; 이 캡은 부동소수 폭주 방지용).
+    if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
     if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
 
     const stopLoss = num(body.stopLoss);
@@ -96,14 +98,18 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 실제 코인 38종은 외부 시세로 즉시 전량 체결(아래 기존 경로). ⚠ 호가창을 무시하고 ref 한 값에
     // 전량 체결하던 게 "20만개가 최우선호가보다 싸게 즉시 체결"되던 버그의 원인 → 실제 매칭으로 교체.
     if (isVirtualSymbol(symbol)) {
+      const marks = await checkTriggers(env, uid);
       const ref = await fetchPrice(env, symbol);
       if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
-      const { filled } = await matchMarketOxOrder(env, uid, side, size, leverage, stopLoss, takeProfit);
+      const { filled, avgPrice } = await matchMarketOxOrder(env, uid, side, size, leverage, stopLoss, takeProfit);
       if (!(filled > 0)) return bad('체결 가능한 호가 물량이 없습니다');
-      return json(await loadState(env, uid));
+      marks[symbol] = avgPrice || ref;
+      return json(await loadState(env, uid, marks));
     }
 
-    const price = await fetchPrice(env, symbol); // 서버 체결가
+    // 실제 코인: 트리거 평가와 체결가 fetch 를 병렬로 돌려 롱/숏 버튼 지연을 줄인다.
+    // 둘 다 끝난 뒤에야 잔고/기존포지션을 읽으므로(아래) 원자성 문제는 없다.
+    const [marks, price] = await Promise.all([checkTriggers(env, uid), fetchPrice(env, symbol)]);
 
     const user = await env.DB.prepare('SELECT id, name, balance FROM users WHERE id = ?')
       .bind(uid)
@@ -150,7 +156,8 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
       await reflectVirtualFill(env, symbol, uid, price, side === 'long' ? 'buy' : 'sell', size);
 
-      return json(await loadState(env, uid));
+      marks[symbol] = price;
+      return json(await loadState(env, uid, marks));
     }
 
     const margin = (price * size) / leverage;
@@ -175,10 +182,12 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
     await reflectVirtualFill(env, symbol, uid, price, side === 'long' ? 'buy' : 'sell', size);
 
-    return json(await loadState(env, uid));
+    marks[symbol] = price;
+    return json(await loadState(env, uid, marks));
   }
 
   if (body.action === 'close') {
+    const marks = await checkTriggers(env, uid);
     const positionId = typeof body.positionId === 'string' ? body.positionId : '';
     const pos = await env.DB.prepare('SELECT * FROM positions WHERE id = ? AND user_id = ?')
       .bind(positionId, uid)
@@ -213,19 +222,23 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 청산은 원래 방향의 반대 액션(롱 청산=매도, 숏 청산=매수)으로 시장에 반영.
     await reflectVirtualFill(env, pos.symbol, uid, price, pos.side === 'long' ? 'sell' : 'buy', closeSize);
 
-    return json(await loadState(env, uid));
+    marks[pos.symbol] = price;
+    return json(await loadState(env, uid, marks));
   }
 
   if (body.action === 'limitOpen') {
+    const marks = await checkTriggers(env, uid);
     const { symbol, side } = body;
     const size = Number(body.size);
     const leverage = Math.round(Number(body.leverage));
-    const limitPrice = Number(body.limitPrice);
+    let limitPrice = Number(body.limitPrice);
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
-    if (!(size > 0) || !isFinite(size) || size > 1_000_000) return bad('수량 오류');
+    if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
     if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
     if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
+    // OX 는 4자리 틱(0.0001) 정합성 유지 — 유저가 더 세밀한 지정가를 넣어도 호가창/체결이 4자리를 넘지 않게.
+    if (isVirtualSymbol(symbol)) limitPrice = Math.round(limitPrice * 1e4) / 1e4;
 
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
@@ -259,10 +272,11 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       await matchLimitPendingAgainstBook(env, pendingId);
     }
 
-    return json(await loadState(env, uid));
+    return json(await loadState(env, uid, marks));
   }
 
   if (body.action === 'cancelLimit') {
+    const marks = await checkTriggers(env, uid);
     const pendingId = typeof body.pendingId === 'string' ? body.pendingId : '';
     const pending = await env.DB.prepare('SELECT * FROM pending_orders WHERE id = ? AND user_id = ?')
       .bind(pendingId, uid)
@@ -274,10 +288,11 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(pendingId, uid),
     ]);
 
-    return json(await loadState(env, uid));
+    return json(await loadState(env, uid, marks));
   }
 
   if (body.action === 'setSlTp') {
+    const marks = await checkTriggers(env, uid);
     const positionId = typeof body.positionId === 'string' ? body.positionId : '';
     const pos = await env.DB.prepare('SELECT * FROM positions WHERE id = ? AND user_id = ?')
       .bind(positionId, uid)
@@ -292,7 +307,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .bind(stopLoss, takeProfit, positionId, uid)
       .run();
 
-    return json(await loadState(env, uid));
+    return json(await loadState(env, uid, marks));
   }
 
   return bad('알 수 없는 action');

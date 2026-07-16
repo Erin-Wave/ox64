@@ -61,16 +61,18 @@ export default function PositionsPanel() {
   };
   const totalUnrealizedKnown = positions.every((p) => unrealizedOf(p) != null);
   const totalUnrealized = positions.reduce((a, p) => a + (unrealizedOf(p) ?? 0), 0);
+  const totalMargin = positions.reduce((a, p) => a + (p.entryPrice * p.size) / p.leverage, 0);
 
-  // 청산가: 이 포지션의 가격이 얼마가 되면 계좌 평가자산(잔고+전체 미실현손익 합)이 0이 되는지.
-  // 서버(functions/_trading.ts checkTriggers)의 강제청산 조건과 동일한 산식 — 추정치 표시용(체결은 서버가 함).
+  // 청산가: 이 포지션의 가격이 얼마가 되면 계좌 평가자산이 0이 되는지.
+  // 평가자산 = 여유잔고 + Σ(잠긴 증거금 + 미실현손익) — 서버(functions/_trading.ts)의 강제청산 조건과
+  // 동일한 산식(증거금 항 포함). 추정치 표시용(실제 체결은 서버가 함).
   const liqPriceOf = (p: (typeof positions)[number]): number | null => {
     if (!totalUnrealizedKnown) return null;
     const mine = unrealizedOf(p);
     if (mine == null) return null;
     const others = totalUnrealized - mine;
     const dir = p.side === 'long' ? 1 : -1;
-    return p.entryPrice - (balance + others) / (p.size * dir);
+    return p.entryPrice - (balance + totalMargin + others) / (p.size * dir);
   };
 
   const tabBtn = (t: Tab, label: string) => (

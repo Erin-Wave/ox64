@@ -560,10 +560,12 @@ export default function Chart() {
       };
       if (positions.every((p) => unrealizedOf(p) != null)) {
         const totalU = positions.reduce((a, p) => a + (unrealizedOf(p) ?? 0), 0);
+        // 평가자산 = 여유잔고 + Σ(잠긴 증거금 + 미실현손익). PositionsPanel/서버와 동일한 산식(증거금 항 포함).
+        const totalMargin = positions.reduce((a, p) => a + (p.entryPrice * p.size) / p.leverage, 0);
         for (const p of mine) {
           const others = totalU - (unrealizedOf(p) ?? 0);
           const d = p.side === 'long' ? 1 : -1;
-          const liq = p.entryPrice - (balance + others) / (p.size * d);
+          const liq = p.entryPrice - (balance + totalMargin + others) / (p.size * d);
           if (liq > 0) {
             priceLines.current.push(
               c.createPriceLine({

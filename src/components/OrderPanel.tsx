@@ -49,10 +49,12 @@ export default function OrderPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveTab, lastPrice]);
 
-  // 차트 또는 호가창을 클릭하면 그 가격으로 지정가 탭 전환 + 값 채움 (Standard 모드에서만 의미 있음)
+  // 차트/호가창 클릭 → 그 가격을 지정가 입력에 채운다. ⚠ 예전엔 클릭만 해도 지정가 탭으로 강제
+  // 전환해서, 시장가로 주문하려다 무심코 차트를 클릭하면 시장가 주문이 지정가로 걸리던 버그가 있었다.
+  // 이제 이미 지정가 탭일 때만 값을 채운다(시장가 탭에서의 클릭은 조회일 뿐 주문 유형을 바꾸지 않음).
   useEffect(() => {
     if (chartClickNonce === 0 || chartClickPrice == null || !standard) return;
-    setTab('limit');
+    if (tab !== 'limit') return;
     setLimitPrice(String(chartClickPrice));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartClickNonce]);

@@ -191,20 +191,32 @@ export async function getSession(request: Request, env: Env): Promise<SessionPay
 const HDR = { accept: 'application/json', 'user-agent': 'ox64/1.0' };
 const base = (symbol: string) => symbol.replace(/USDT$/, '');
 
+// 외부 시세 소스가 느리거나 멈추면 주문/상태 응답 전체가 그만큼 지연된다(롱/숏 버튼 체감 지연의
+// 주원인). 각 요청에 짧은 타임아웃을 걸어, 한 소스가 늦으면 즉시 다음 폴백으로 넘어가게 한다.
+async function timedFetch(url: string, ms = 2500): Promise<Response> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { headers: HDR, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function fromOkx(symbol: string): Promise<number> {
-  const r = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${base(symbol)}-USDT`, { headers: HDR });
+  const r = await timedFetch(`https://www.okx.com/api/v5/market/ticker?instId=${base(symbol)}-USDT`);
   if (!r.ok) throw new Error(`okx ${r.status}`);
   const d = (await r.json()) as { data?: { last: string }[] };
   return Number(d.data?.[0]?.last);
 }
 async function fromCoinbase(symbol: string): Promise<number> {
-  const r = await fetch(`https://api.exchange.coinbase.com/products/${base(symbol)}-USD/ticker`, { headers: HDR });
+  const r = await timedFetch(`https://api.exchange.coinbase.com/products/${base(symbol)}-USD/ticker`);
   if (!r.ok) throw new Error(`coinbase ${r.status}`);
   const d = (await r.json()) as { price?: string };
   return Number(d.price);
 }
 async function fromBinanceMirror(symbol: string): Promise<number> {
-  const r = await fetch(`https://data-api.binance.vision/api/v3/ticker/price?symbol=${symbol}`, { headers: HDR });
+  const r = await timedFetch(`https://data-api.binance.vision/api/v3/ticker/price?symbol=${symbol}`);
   if (!r.ok) throw new Error(`binance ${r.status}`);
   const d = (await r.json()) as { price: string };
   return Number(d.price);
@@ -320,8 +332,11 @@ export interface OrderRow {
   created_at: number;
 }
 
-/** 로그인 사용자의 전체 상태(잔고+포지션+주문) 조회 */
-export async function loadState(env: Env, uid: string) {
+/** 로그인 사용자의 전체 상태(잔고+포지션+주문) 조회.
+ * marks: 이미 받아둔 마크가격 맵(대개 checkTriggers 가 방금 fetch 한 것) — 넘기면 그대로 재사용해
+ * 추가 시세 fetch 를 피한다. 안 넘기고 보유 심볼이 있으면 여기서 한 번 조회한다. 응답의 markPrices 는
+ * 클라가 서버와 "동일한 시세"로 청산가/평가자산을 즉시(폴링 지연 없이) 계산하게 해준다(§청산가 표시). */
+export async function loadState(env: Env, uid: string, marks?: Record<string, number>) {
   const user = await env.DB.prepare('SELECT id, name, balance, refill_count, refill_date FROM users WHERE id = ?')
     .bind(uid)
     .first<UserRow>();
@@ -344,10 +359,13 @@ export async function loadState(env: Env, uid: string) {
       .bind(uid)
       .all<PendingRow>()
   ).results;
+  const heldSymbols = [...new Set([...positions.map((p) => p.symbol), ...pending.map((p) => p.symbol)])];
+  const markPrices = marks ?? (heldSymbols.length ? await fetchPrices(env, heldSymbols) : {});
   return {
     name: user.name,
     balance: user.balance,
     refillsLeft,
+    markPrices,
     positions: positions.map((p) => ({
       id: p.id,
       symbol: p.symbol,

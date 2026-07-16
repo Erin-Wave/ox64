@@ -11,6 +11,7 @@ import {
   type SpotState,
 } from '@/services/api';
 import type { Side } from '@/types';
+import { useMarketStore } from '@/store/useMarketStore';
 
 /**
  * 모의 트레이딩 상태 (서버 권위).
@@ -74,6 +75,14 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     pendingOrders: st.pendingOrders,
     error: null,
   });
+  // 서버 마크가격을 가격 맵에 시드 — 보유 심볼(OX 포함, 현재 보고 있지 않아도)의 청산가/미실현PnL 이
+  // 폴링을 기다리지 않고 즉시, 그리고 서버 강제청산 판정과 동일한 시세로 계산된다(청산가 안 찍히던 버그 수정).
+  if (st.markPrices) {
+    const setPrice = useMarketStore.getState().setPrice;
+    for (const [sym, price] of Object.entries(st.markPrices)) {
+      if (typeof price === 'number' && isFinite(price) && price > 0) setPrice(sym, price);
+    }
+  }
 }
 function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState) {
   set({ spotBook: st.book, spotTrades: st.trades });

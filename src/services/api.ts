@@ -43,6 +43,9 @@ export interface AppState {
   positions: ApiPosition[];
   orders: ApiOrder[];
   pendingOrders: ApiPendingOrder[];
+  // 보유/미체결 심볼의 서버 마크가격 맵 — 클라가 서버와 동일 시세로 청산가/평가자산을 즉시 계산하게 한다
+  // (OX 를 보고 있지 않아도 그 포지션 청산가가 계산되고, 진입 직후 청산가가 바로 표시됨).
+  markPrices?: Record<string, number>;
 }
 export interface LeaderRow {
   name: string;

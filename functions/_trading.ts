@@ -36,7 +36,11 @@ async function liquidateIfBankrupt(
   const user = await env.DB.prepare('SELECT balance FROM users WHERE id = ?').bind(uid).first<{ balance: number }>();
   if (!user) return false;
 
-  let unrealized = 0;
+  // 계좌 순자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익).
+  // ⚠ 예전엔 증거금 항을 빠뜨리고 "잔고 + 미실현손익"으로만 계산했다 — 진입 시 증거금은 잔고에서
+  // 이미 빠져나갔는데(그게 곧 담보다) 그걸 순자산에서 또 제외한 꼴이라, 증거금 비중을 크게 잡으면
+  // (슬라이더 100% 등) 진입 즉시 equity 가 0 근처가 돼 아주 작은 역행 틱에도 강제청산되던 치명적 버그.
+  let equity = user.balance;
   let allPriced = true;
   for (const pos of positions) {
     const mark = prices[pos.symbol];
@@ -45,9 +49,9 @@ async function liquidateIfBankrupt(
       continue;
     }
     const dir = pos.side === 'long' ? 1 : -1;
-    unrealized += (mark - pos.entry_price) * pos.size * dir;
+    equity += pos.margin + (mark - pos.entry_price) * pos.size * dir;
   }
-  if (!allPriced || user.balance + unrealized >= 0) return false;
+  if (!allPriced || equity >= 0) return false;
 
   const now = Date.now();
   const stmts: D1PreparedStatement[] = [];
@@ -96,19 +100,21 @@ export async function sweepForcedLiquidations(env: Env): Promise<{ checked: numb
   return { checked: byUser.size, liquidated };
 }
 
-export async function checkTriggers(env: Env, uid: string): Promise<void> {
+// 반환값 = 이번에 받아온 마크가격 맵(loadState 로 넘겨 클라가 서버와 동일한 시세로 청산가/평가자산을
+// 즉시 계산하게 한다 — 추가 fetch 없이 재사용). 포지션/미체결이 없으면 빈 맵.
+export async function checkTriggers(env: Env, uid: string): Promise<Record<string, number>> {
   const pendings = (
     await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ?').bind(uid).all<PendingRow>()
   ).results;
   const positions = (
     await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()
   ).results;
-  if (pendings.length === 0 && positions.length === 0) return;
+  if (pendings.length === 0 && positions.length === 0) return {};
 
   const symbols = [...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol)])];
   const prices = await fetchPrices(env, symbols);
 
-  if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
+  if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return prices; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
 
   // ── 지정가 체결 ── long: mark<=limit(싸게 매수), short: mark>=limit(비싸게 매도)
   // 체결가는 limit_price 그대로 사용(생성 시 이미 그 가격 기준으로 증거금을 잠갔으므로 재계산 불필요).
@@ -217,4 +223,6 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
     ]);
     await reflectVirtualFill(env, pos.symbol, uid, trigger, pos.side === 'long' ? 'sell' : 'buy', pos.size);
   }
+
+  return prices;
 }

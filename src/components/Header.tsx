@@ -27,15 +27,16 @@ export default function Header({
   const prices = useMarketStore((s) => s.prices);
   const [showMenu, setShowMenu] = useState(false);
 
-  // 서버와 동일한 규칙(평가자산<=0 일 때만 리필 허용)을 클라에서도 미리 반영 — 거부당하기 전에 버튼을 비활성화.
+  // 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익). 진입 시 잔고에서 빠진 증거금도 담보라
+  // 포함해야 포지션을 열자마자 평가자산이 증거금만큼 깎여 보이지 않는다(서버 강제청산/리필 판정과 동일한 정의).
   const equityKnown = positions.every((p) => prices[p.symbol] != null);
   const equity =
     balance +
     positions.reduce((a, p) => {
+      const margin = (p.entryPrice * p.size) / p.leverage;
       const live = prices[p.symbol];
-      if (live == null) return a;
-      const dir = p.side === 'long' ? 1 : -1;
-      return a + (live - p.entryPrice) * p.size * dir;
+      const u = live == null ? 0 : (live - p.entryPrice) * p.size * (p.side === 'long' ? 1 : -1);
+      return a + margin + u;
     }, 0);
   const canRefill = equityKnown && equity <= 0;
   // 마지막 체결이 매수 테이커면 매수색, 매도 테이커면 매도색 — 아직 체결이 없으면 기본색.

@@ -39,16 +39,19 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   const positions = (
     await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()
   ).results;
+  let marks: Record<string, number> | undefined;
   if (positions.length > 0) {
     const prices = await fetchPrices(env, [...new Set(positions.map((p) => p.symbol))]);
-    let unrealized = 0;
+    marks = prices;
+    // 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익). 강제청산 판정(_trading.ts)과 동일한 식.
+    let equity = user.balance;
     for (const pos of positions) {
       const mark = prices[pos.symbol];
       if (mark == null) return bad('시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요');
       const dir = pos.side === 'long' ? 1 : -1;
-      unrealized += (mark - pos.entry_price) * pos.size * dir;
+      equity += pos.margin + (mark - pos.entry_price) * pos.size * dir;
     }
-    if (user.balance + unrealized > 0) return bad('평가자산이 남아있는 동안에는 리필할 수 없습니다');
+    if (equity > 0) return bad('평가자산이 남아있는 동안에는 리필할 수 없습니다');
   } else if (user.balance > 0) {
     return bad('잔고가 남아있는 동안에는 리필할 수 없습니다');
   }
@@ -61,5 +64,5 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     .bind(REFILL_AMOUNT, usedToday + 1, today, uid)
     .run();
 
-  return json(await loadState(env, uid));
+  return json(await loadState(env, uid, marks));
 }

@@ -26,6 +26,9 @@ import {
  */
 const PAIR = 'OXUSDT';
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차
+// OX/USDT 최소 호가 단위 = 0.0001(4자리). 봇 기준가/호가/체결가를 전부 이 틱에 스냅해서, 실제
+// 코인처럼 정해진 소수 자릿수 이상으로는 호가·체결이 생기지 않게 한다(가상코인 소수점 무결성).
+const roundOx = (p: number) => Number((Math.round(p * 1e4) / 1e4).toFixed(4));
 
 export function onRequestGet({ request, env }: Ctx): Promise<Response> {
   return safe(async () => {
@@ -242,7 +245,7 @@ export async function runMarketMaker(env: Env): Promise<void> {
       .first<{ price: number }>();
     ref = lastTrade?.price ?? 1;
   }
-  ref = Math.max(0.01, ref * (1 + (Math.random() - 0.5) * 0.012)); // ±0.6% 랜덤워크
+  ref = roundOx(Math.max(0.01, ref * (1 + (Math.random() - 0.5) * 0.012))); // ±0.6% 랜덤워크(4자리 틱 스냅)
   await env.DB.prepare('UPDATE spot_bot_state SET ref_price = ? WHERE id = ?').bind(ref, PAIR).run();
 
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
@@ -281,7 +284,7 @@ export async function runMarketMaker(env: Env): Promise<void> {
             .bind(PAIR, actor)
             .first<{ price: number }>();
     if (bestOpp) {
-      const crossPrice = crossSide === 'buy' ? bestOpp.price * 1.002 : bestOpp.price * 0.998;
+      const crossPrice = roundOx(crossSide === 'buy' ? bestOpp.price * 1.002 : bestOpp.price * 0.998);
       await placeBotOrder(env, actor, crossSide, crossPrice, Number((2 + Math.random() * 10).toFixed(4)));
     }
   }
@@ -293,8 +296,8 @@ export async function runMarketMaker(env: Env): Promise<void> {
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
     const spread = 0.003 + level * 0.004 + Math.random() * 0.003;
     const size = Number((2000 + Math.random() * 8000).toFixed(4));
-    await placeBotOrder(env, actor, 'buy', Number((ref * (1 - spread)).toFixed(6)), size);
-    await placeBotOrder(env, actor, 'sell', Number((ref * (1 + spread)).toFixed(6)), size);
+    await placeBotOrder(env, actor, 'buy', roundOx(ref * (1 - spread)), size);
+    await placeBotOrder(env, actor, 'sell', roundOx(ref * (1 + spread)), size);
   }
 
   // 방금 깐 신선한 유동성에 대기 유저 지정가를 다시 매칭 — 봇이 유저 매수보다 싼 매도를 깔면
@@ -313,6 +316,7 @@ export async function recordVirtualFill(
   takerSide: 'buy' | 'sell',
   size: number,
 ): Promise<void> {
+  price = roundOx(price); // 체결내역/기준가도 4자리 틱 유지
   const now = Date.now();
 
   // ⚠ 체결 테이프에만 기록하고 호가창(spot_orders)은 그대로 두면 "체결은 찍히는데 호가는 그대로"인
