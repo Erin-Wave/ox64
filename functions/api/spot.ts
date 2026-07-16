@@ -94,7 +94,7 @@ const BOT_TICK_MIN_MS = 3000;
 const BOT_TICK_MAX_MS = 8000;
 const BOT_MAX_RESTING_PER_SIDE = 3;
 
-async function runMarketMaker(env: Env): Promise<void> {
+export async function runMarketMaker(env: Env): Promise<void> {
   const row = await env.DB.prepare('SELECT last_run, ref_price FROM spot_bot_state WHERE id = ?')
     .bind(PAIR)
     .first<{ last_run: number; ref_price: number }>();

@@ -1,14 +1,15 @@
-# 강제청산 전용 Cron Worker — 메인 ox64 Pages 프로젝트와 별개로 배포한다.
-# Cloudflare Pages Functions 는 정기 실행(Cron Trigger)을 지원하지 않기 때문에
+# 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker — 메인 ox64 Pages 프로젝트와
+# 별개로 배포한다. Cloudflare Pages Functions 는 정기 실행(Cron Trigger)을 지원하지 않기 때문에
 # (Durable Objects 도 Pages 프로젝트 안에서 새로 만들 수 없음 — 어차피 별도 배포 필요),
-# 접속자가 없어도 강제청산만큼은 걸리도록 이 작은 Worker 하나를 따로 둔다.
+# 이 작은 Worker 하나로 두 가지를 처리한다: (1) 강제청산(접속 유무 무관하게 걸리기만 하면 됨)
+# (2) OX/USDT 마켓메이커 봇(아무도 안 켜놔도 꾸준히 호가/체결이 살아있게, 느려도 무방).
 # 같은 D1(ox64)을 바인딩해서 쓰므로 메인 앱과 데이터는 완전히 공유된다.
 name = "ox64-liquidation-cron"
 main = "index.ts"
 compatibility_date = "2024-11-01"
 
 [triggers]
-crons = ["0 * * * *"]  # 매시 정각(KST 무관 UTC 기준) — 강제청산은 접속 유무와 무관하게 되기만 하면 되므로 주기는 넉넉하게
+crons = ["*/5 * * * *"]  # 5분마다 — 강제청산은 넉넉해도 되고, OX 봇은 "느려도 꾸준히"만 필요해서 이 주기 하나로 둘 다 처리
 
 [[d1_databases]]
 binding = "DB"

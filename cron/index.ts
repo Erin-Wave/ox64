@@ -1,10 +1,13 @@
-// 강제청산 전용 Cron Worker — 메인 ox64 Pages 프로젝트와 별도로 배포된다(cron/wrangler.toml 참고).
-// scheduled() 가 매시 정각 sweepForcedLiquidations() 를 돌려서, 아무도 접속하지 않아도
-// 강제청산(계좌 파산)만큼은 걸리게 한다. 같은 D1(ox64) 을 바인딩해서 메인 앱과 데이터를 공유.
+// 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker — 메인 ox64 Pages 프로젝트와
+// 별도로 배포된다(cron/wrangler.toml 참고). scheduled() 가 5분마다 두 가지를 돌린다:
+//   (1) sweepForcedLiquidations() — 강제청산(계좌 파산), 접속 여부 무관하게 걸려야 함
+//   (2) runMarketMaker()          — OX/USDT 마켓메이커 봇, 아무도 안 켜놔도 꾸준히(느려도 무방) 체결이 생기게
+// 같은 D1(ox64) 을 바인딩해서 메인 앱과 데이터를 공유한다.
 //
 // @cloudflare/workers-types 를 의존성으로 두지 않는 프로젝트 관례(functions/_shared.ts 참고)를
 // 그대로 따라 ScheduledEvent/ExecutionContext 도 필요한 최소 형태만 직접 선언한다.
 import { sweepForcedLiquidations } from '../functions/_trading';
+import { runMarketMaker } from '../functions/api/spot';
 import type { Env as TradingEnv, D1Database } from '../functions/_shared';
 
 interface Env {
@@ -19,12 +22,18 @@ interface MinimalExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
 }
 
+async function runTick(env: Env): Promise<{ liquidation: { checked: number; liquidated: number } }> {
+  // 둘 다 env.DB 만 사용 — SESSION_SECRET 은 이 워커엔 없어도 무방.
+  const tradingEnv = env as unknown as TradingEnv;
+  const [liquidation] = await Promise.all([sweepForcedLiquidations(tradingEnv), runMarketMaker(tradingEnv)]);
+  return { liquidation };
+}
+
 export default {
   async scheduled(_event: MinimalScheduledEvent, env: Env, ctx: MinimalExecutionContext): Promise<void> {
-    // sweepForcedLiquidations 는 env.DB 만 사용 — SESSION_SECRET 은 이 워커엔 없어도 무방.
     ctx.waitUntil(
-      sweepForcedLiquidations(env as unknown as TradingEnv).then((r) => {
-        console.log(`[liquidation-cron] checked=${r.checked} liquidated=${r.liquidated}`);
+      runTick(env).then((r) => {
+        console.log(`[ox64-cron] liquidation checked=${r.liquidation.checked} liquidated=${r.liquidation.liquidated}`);
       }),
     );
   },
@@ -37,7 +46,7 @@ export default {
         headers: { 'content-type': 'application/json' },
       });
     }
-    const result = await sweepForcedLiquidations(env as unknown as TradingEnv);
+    const result = await runTick(env);
     return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
   },
 };
