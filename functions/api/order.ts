@@ -73,7 +73,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!(size > 0) || !isFinite(size) || size > 1_000_000) return bad('수량 오류');
     if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
 
-    const price = await fetchPrice(symbol); // 서버 체결가
+    const price = await fetchPrice(env, symbol); // 서버 체결가
     const margin = (price * size) / leverage;
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
@@ -121,7 +121,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const closeSize = reqSize == null ? pos.size : reqSize;
     const isPartial = closeSize < pos.size - 1e-9;
 
-    const price = await fetchPrice(pos.symbol); // 서버 청산가
+    const price = await fetchPrice(env, pos.symbol); // 서버 청산가
     const dir = pos.side === 'long' ? 1 : -1;
     const pnl = (price - pos.entry_price) * closeSize * dir;
     const marginReleased = isPartial ? (pos.margin * closeSize) / pos.size : pos.margin;

@@ -5,7 +5,6 @@ import {
   type ApiPendingOrder,
   type ApiPosition,
   type AppState,
-  type SpotOrder,
   type SpotBookLevel,
   type SpotTrade,
   type SpotState,
@@ -29,9 +28,8 @@ interface TradingState {
   busy: boolean;
   error: string | null;
 
-  // OX/USDT 가상 코인 현물(레버리지 없음, 별개 매칭엔진) — balance(USDT)는 위 필드를 공유한다.
-  oxBalance: number;
-  spotOpenOrders: SpotOrder[];
+  // OX/USDT 는 다른 심볼과 동일하게 레버리지로 거래된다(positions/orders 공용) — 이 두 필드는
+  // 호가창·체결내역 "표시용" 시장 데이터일 뿐(유저 개인 데이터 아님, 봇이 만든 합성 시장).
   spotBook: { bids: SpotBookLevel[]; asks: SpotBookLevel[] };
   spotTrades: SpotTrade[];
 
@@ -62,8 +60,6 @@ interface TradingState {
   refill: () => Promise<void>;
 
   spotRefresh: () => Promise<void>;
-  spotPlace: (side: 'buy' | 'sell', price: number, size: number) => Promise<void>;
-  spotCancel: (orderId: string) => Promise<void>;
 }
 
 function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
@@ -79,14 +75,7 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
   });
 }
 function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState) {
-  set({
-    balance: st.usdtBalance,
-    oxBalance: st.oxBalance,
-    spotOpenOrders: st.myOrders,
-    spotBook: st.book,
-    spotTrades: st.trades,
-    error: null,
-  });
+  set({ spotBook: st.book, spotTrades: st.trades });
 }
 
 export const useTradingStore = create<TradingState>((set) => ({
@@ -101,8 +90,6 @@ export const useTradingStore = create<TradingState>((set) => ({
   busy: false,
   error: null,
 
-  oxBalance: 0,
-  spotOpenOrders: [],
   spotBook: { bids: [], asks: [] },
   spotTrades: [],
 
@@ -145,8 +132,6 @@ export const useTradingStore = create<TradingState>((set) => ({
       positions: [],
       orders: [],
       pendingOrders: [],
-      oxBalance: 0,
-      spotOpenOrders: [],
       spotBook: { bids: [], asks: [] },
       spotTrades: [],
     });
@@ -232,28 +217,6 @@ export const useTradingStore = create<TradingState>((set) => ({
       applySpot(set, await api.spotState());
     } catch {
       /* 다음 폴링에서 재시도 — 마지막 알려진 값 유지 */
-    }
-  },
-
-  spotPlace: async (side, price, size) => {
-    set({ busy: true, error: null });
-    try {
-      applySpot(set, await api.spotPlace(side, price, size));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  spotCancel: async (orderId) => {
-    set({ busy: true, error: null });
-    try {
-      applySpot(set, await api.spotCancel(orderId));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
     }
   },
 }));

@@ -37,6 +37,14 @@ export const REFILL_DAILY_LIMIT = 3;
 // OX/USDT 유동성 공급용 예약 봇 유저(schema.sql 에서 시딩) — 랭킹/통계에서 제외해야 함.
 export const BOT_USER_IDS = ['bot-mm-1', 'bot-mm-2'] as const;
 
+// 외부 시세 없는 가상 심볼(서버측 사본 — functions/ 는 src/symbols.ts 를 import 할 수 없어
+// intervalSecFromCode 와 같은 이유로 값만 독립 보관). OXUSDT 는 레버리지 롱/숏도 다른 38종과
+// 완전히 동일하게 order.ts 를 타지만, 체결가만 OKX/Coinbase 대신 봇이 만든 내부가격을 쓴다.
+const VIRTUAL_SYMBOLS = ['OXUSDT'] as const;
+export function isVirtualSymbol(s: string): boolean {
+  return (VIRTUAL_SYMBOLS as readonly string[]).includes(s);
+}
+
 // 캔들 인터벌 코드 → 초 (src/symbols.ts INTERVAL_GROUPS 와 동일한 값을 함수 쪽에 독립 보관).
 const INTERVAL_SEC: Record<string, number> = {
   '1s': 1,
@@ -202,7 +210,21 @@ async function fromBinanceMirror(symbol: string): Promise<number> {
   return Number(d.price);
 }
 
-export async function fetchPrice(symbol: string): Promise<number> {
+// OX/USDT 는 외부 거래소에 없으므로 봇(runMarketMaker, functions/api/spot.ts)이 랜덤워크로
+// 유지하는 내부 기준가를 그대로 체결가로 쓴다. D1 읽기라 외부 HTTP 처럼 실패할 일이 거의 없다.
+async function getVirtualPrice(env: Env, pair: string): Promise<number> {
+  const state = await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id = ?')
+    .bind(pair)
+    .first<{ ref_price: number }>();
+  if (state?.ref_price) return state.ref_price;
+  const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
+    .bind(pair)
+    .first<{ price: number }>();
+  return lastTrade?.price ?? 1;
+}
+
+export async function fetchPrice(env: Env, symbol: string): Promise<number> {
+  if (isVirtualSymbol(symbol)) return getVirtualPrice(env, symbol);
   let last = '';
   for (const src of [fromOkx, fromCoinbase, fromBinanceMirror]) {
     try {
@@ -215,13 +237,13 @@ export async function fetchPrice(symbol: string): Promise<number> {
   }
   throw new Error(`시세 조회 실패 (${last})`);
 }
-export async function fetchPrices(symbols: string[]): Promise<Record<string, number>> {
+export async function fetchPrices(env: Env, symbols: string[]): Promise<Record<string, number>> {
   const uniq = [...new Set(symbols)];
   const out: Record<string, number> = {};
   await Promise.all(
     uniq.map(async (s) => {
       try {
-        out[s] = await fetchPrice(s);
+        out[s] = await fetchPrice(env, s);
       } catch {
         /* 그 심볼만 스킵 */
       }

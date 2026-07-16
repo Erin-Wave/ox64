@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { isVirtualSymbol } from '@/symbols';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit';
@@ -21,10 +20,6 @@ export default function OrderPanel() {
   const balance = useTradingStore((s) => s.balance);
   const busy = useTradingStore((s) => s.busy);
   const error = useTradingStore((s) => s.error);
-  const oxBalance = useTradingStore((s) => s.oxBalance);
-  const spotBook = useTradingStore((s) => s.spotBook);
-  const spotPlace = useTradingStore((s) => s.spotPlace);
-  const virtual = isVirtualSymbol(symbol);
 
   const [tab, setTab] = useState<Tab>('market');
   const [size, setSize] = useState('0.01'); // 항상 코인 수량이 진실원본, unit 은 표시만 바꿈
@@ -52,118 +47,6 @@ export default function OrderPanel() {
     setLimitPrice(String(chartClickPrice));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartClickNonce]);
-
-  // ── 가상 코인(OX/USDT): 레버리지/SL·TP 없는 매수/매도 지정가 매칭 ──────
-  if (virtual) {
-    const submitSpot = (side: 'buy' | 'sell') => {
-      const sz = Number(size);
-      if (!sz || sz <= 0 || busy) return;
-      let price: number;
-      if (standard) {
-        price = Number(limitPrice);
-        if (!price || price <= 0) return;
-      } else {
-        // Easy 모드: 반대편 최우선호가 기준으로 소폭 불리하게 넣어 즉시 체결(마켓성 지정가)
-        const ref = side === 'buy' ? spotBook.asks[0]?.price : spotBook.bids[0]?.price;
-        if (!ref) return;
-        price = side === 'buy' ? ref * 1.01 : ref * 0.99;
-      }
-      spotPlace(side, price, sz);
-    };
-    const applyPctSpot = (fraction: number) => {
-      const sz = oxBalance * fraction;
-      setSize(sz > 0 ? sz.toFixed(4) : '0');
-    };
-
-    return (
-      <div className="flex h-full flex-col gap-3 p-3">
-        <div className="rounded-md bg-panel2 p-2.5 text-xs leading-relaxed text-muted">
-          OX/USDT 는 외부 시세가 없는 가상 코인입니다. 레버리지 없이 유저 간 지정가 주문이 직접 매칭됩니다.
-        </div>
-
-        {standard && (
-          <>
-            <div>
-              <label className="mb-1.5 block text-xs text-muted">지정가</label>
-              <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-                <input
-                  value={limitPrice}
-                  onChange={(e) => setLimitPrice(e.target.value)}
-                  inputMode="decimal"
-                  className="w-full bg-transparent px-3 py-2 text-sm font-semibold text-text outline-none"
-                />
-                <span className="px-3 text-xs text-muted">USDT</span>
-              </div>
-            </div>
-            <div>
-              <label className="mb-1.5 block text-xs text-muted">수량 (OX)</label>
-              <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-                <input
-                  value={size}
-                  onChange={(e) => setSize(e.target.value)}
-                  inputMode="decimal"
-                  className="w-full bg-transparent px-3 py-2 text-sm font-semibold text-text outline-none"
-                />
-              </div>
-            </div>
-          </>
-        )}
-
-        <div>
-          <div className="mb-1 flex items-center justify-between">
-            <span className="text-[10px] text-muted">비중(보유 OX 기준)</span>
-            <span className="rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold text-accent">{pct}%</span>
-          </div>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            value={pct}
-            onChange={(e) => {
-              const v = Number(e.target.value);
-              setPct(v);
-              applyPctSpot(v / 100);
-            }}
-            className="w-full accent-up"
-          />
-          <div className="mt-0.5 flex justify-between text-[10px] text-muted">
-            <span>0%</span>
-            <span>100%</span>
-          </div>
-        </div>
-
-        <div className="space-y-1 rounded-md bg-panel2 p-2.5 text-xs">
-          <div className="flex justify-between">
-            <span className="text-muted">보유 USDT</span>
-            <span className="text-text">{balance.toFixed(2)}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-muted">보유 OX</span>
-            <span className="text-text">{oxBalance.toFixed(4)}</span>
-          </div>
-        </div>
-
-        {error && <p className="rounded-md bg-downDim px-2.5 py-1.5 text-xs text-down">{error}</p>}
-
-        <div className="mt-auto grid grid-cols-2 gap-2">
-          <button
-            onClick={() => submitSpot('buy')}
-            disabled={busy}
-            className="rounded-md bg-up py-2.5 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
-          >
-            매수 · Buy
-          </button>
-          <button
-            onClick={() => submitSpot('sell')}
-            disabled={busy}
-            className="rounded-md bg-down py-2.5 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
-          >
-            매도 · Sell
-          </button>
-        </div>
-      </div>
-    );
-  }
 
   const coin = symbol.replace('USDT', '');
   const refPrice = effectiveTab === 'limit' ? Number(limitPrice) || lastPrice : lastPrice;

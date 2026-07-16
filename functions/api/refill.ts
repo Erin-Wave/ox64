@@ -40,7 +40,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()
   ).results;
   if (positions.length > 0) {
-    const prices = await fetchPrices([...new Set(positions.map((p) => p.symbol))]);
+    const prices = await fetchPrices(env, [...new Set(positions.map((p) => p.symbol))]);
     let unrealized = 0;
     for (const pos of positions) {
       const mark = prices[pos.symbol];

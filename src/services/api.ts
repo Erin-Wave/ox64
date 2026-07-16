@@ -53,14 +53,6 @@ export interface LeaderRow {
   isMe: boolean;
 }
 
-export interface SpotOrder {
-  id: string;
-  side: 'buy' | 'sell';
-  price: number;
-  size: number;
-  origSize: number;
-  createdAt: number;
-}
 export interface SpotBookLevel {
   price: number;
   size: number;
@@ -71,12 +63,9 @@ export interface SpotTrade {
   size: number;
   takerSide: 'buy' | 'sell' | null;
   createdAt: number;
-  isMe: boolean;
 }
+/** OX/USDT 시장 전체 표시용 데이터(호가창/체결내역) — 유저 개인 데이터 아님, 봇이 만든 합성 시장. */
 export interface SpotState {
-  usdtBalance: number;
-  oxBalance: number;
-  myOrders: SpotOrder[];
   book: { bids: SpotBookLevel[]; asks: SpotBookLevel[] };
   trades: SpotTrade[];
 }
@@ -117,10 +106,6 @@ export const api = {
   refill: () => req<AppState>('/refill', { method: 'POST' }),
   leaderboard: () => req<{ leaderboard: LeaderRow[] }>('/leaderboard'),
   spotState: () => req<SpotState>('/spot'),
-  spotPlace: (side: 'buy' | 'sell', price: number, size: number) =>
-    req<SpotState>('/spot', { method: 'POST', body: JSON.stringify({ action: 'place', side, price, size }) }),
-  spotCancel: (orderId: string) =>
-    req<SpotState>('/spot', { method: 'POST', body: JSON.stringify({ action: 'cancel', orderId }) }),
   spotCandles: (interval: string, limit = 500) =>
     req<{ candles: Candle[] }>(`/spot?candles=1&interval=${encodeURIComponent(interval)}&limit=${limit}`),
 };

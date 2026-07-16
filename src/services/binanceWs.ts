@@ -94,3 +94,36 @@ export function orderbookStream(symbol: string, levels: 5 | 10 | 20 = 10): Obser
     share(),
   );
 }
+
+// ── 체결내역(최근 체결 테이프) ──────────────────────────────────
+export interface AggTrade {
+  price: number;
+  qty: number;
+  takerSide: 'buy' | 'sell'; // 이 체결을 발생시킨(나중에 낸) 테이커 방향
+  time: number; // ms
+}
+interface RawAggTrade {
+  e: string; // 'aggTrade'
+  p: string; // price
+  q: string; // qty
+  T: number; // trade time (ms)
+  m: boolean; // isBuyerMaker — true 면 매수자가 메이커(=테이커가 매도)
+}
+
+/** 심볼의 실시간 체결 스트림(aggTrade). OX/USDT 는 이 스트림이 없어 서버 spot_trades 폴링으로 대체. */
+export function aggTradeStream(symbol: string): Observable<AggTrade> {
+  const stream = `${symbol.toLowerCase()}@aggTrade`;
+  const socket$: WebSocketSubject<unknown> = webSocket({ url: `${FSTREAM}/${stream}` });
+
+  return socket$.pipe(
+    filter((m): m is RawAggTrade => !!m && (m as RawAggTrade).e === 'aggTrade'),
+    map((m): AggTrade => ({
+      price: Number(m.p),
+      qty: Number(m.q),
+      takerSide: m.m ? 'sell' : 'buy',
+      time: m.T,
+    })),
+    retry({ delay: 2000 }),
+    share(),
+  );
+}

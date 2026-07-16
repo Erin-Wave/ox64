@@ -326,6 +326,7 @@ export default function Chart() {
       setPrecision(symbol, VIRTUAL_PREC);
       candle.applyOptions({ priceFormat: { type: 'price', precision: VIRTUAL_PREC, minMove: Math.pow(10, -VIRTUAL_PREC) } });
 
+      let isFirstLoad = true;
       const load = async () => {
         try {
           const { candles } = await api.spotCandles(interval, 500);
@@ -335,7 +336,10 @@ export default function Chart() {
           candle.setData(
             candles.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
           );
-          if (candles.length) {
+          // 최초 1회만 표시 범위를 잡는다 — 매번(3초 폴링마다) 다시 잡으면 사용자가 확대/축소한
+          // 뷰가 계속 리셋되는 버그가 있었음(실제 심볼은 초기 로드 1번 + WS 업데이트뿐이라 이 문제가 없음).
+          if (candles.length && isFirstLoad) {
+            isFirstLoad = false;
             const len = candles.length;
             const initBars = optsRef.current.visibleBars;
             chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - initBars), to: len + 2 });

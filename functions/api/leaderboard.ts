@@ -30,7 +30,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()
   ).results;
 
-  const prices = await fetchPrices(positions.map((p) => p.symbol));
+  const prices = await fetchPrices(env, positions.map((p) => p.symbol));
 
   const unrealizedByUser: Record<string, number> = {};
   const openCountByUser: Record<string, number> = {};

@@ -72,7 +72,7 @@ export async function sweepForcedLiquidations(env: Env): Promise<{ checked: numb
   }
 
   const symbols = [...new Set(positions.map((p) => p.symbol))];
-  const prices = await fetchPrices(symbols);
+  const prices = await fetchPrices(env, symbols);
 
   let liquidated = 0;
   for (const [uid, userPositions] of byUser) {
@@ -94,7 +94,7 @@ export async function checkTriggers(env: Env, uid: string): Promise<void> {
   if (pendings.length === 0 && positions.length === 0) return;
 
   const symbols = [...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol)])];
-  const prices = await fetchPrices(symbols);
+  const prices = await fetchPrices(env, symbols);
 
   if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
 
