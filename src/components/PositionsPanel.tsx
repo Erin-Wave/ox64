@@ -136,7 +136,7 @@ export default function PositionsPanel() {
                             p.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
                           }`}
                         >
-                          {p.side === 'long' ? '롱' : '숏'} {p.leverage}x
+                          {p.side === 'long' ? '롱' : '숏'} 크로스 {p.leverage}x
                         </span>
                       </td>
                       <td className="px-3 py-2.5 text-right text-text">{live != null ? fmtPrice(live, prec) : '—'}</td>
@@ -266,7 +266,7 @@ export default function PositionsPanel() {
                           o.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
                         }`}
                       >
-                        {o.side === 'long' ? '롱' : '숏'} {o.leverage}x
+                        {o.side === 'long' ? '롱' : '숏'} 크로스 {o.leverage}x
                       </span>
                     </td>
                     <td className="px-3 py-2.5 text-right text-text">

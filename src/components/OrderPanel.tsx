@@ -153,9 +153,10 @@ export default function OrderPanel() {
       <div>
         <div className="mb-1.5 flex items-center justify-between">
           <span className="text-xs text-muted">
-            레버리지{existingPosition && <span className="ml-1 text-[10px] text-accent">(포지션 보유 중 고정)</span>}
+            레버리지 <span className="text-[10px] text-muted">· 크로스</span>
+            {existingPosition && <span className="ml-1 text-[10px] text-accent">(포지션 보유 중 고정)</span>}
           </span>
-          <span className="rounded bg-panel2 px-2 py-0.5 text-xs font-bold text-accent">{leverage}x</span>
+          <span className="rounded bg-panel2 px-2 py-0.5 text-xs font-bold text-accent">크로스 {leverage}x</span>
         </div>
         <input
           type="range"

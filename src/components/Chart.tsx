@@ -648,6 +648,8 @@ export default function Chart() {
   }, [interval, opts.showCountdown]);
 
   const up = legend ? legend.close >= legend.open : true;
+  // 종가 옆 변동률 = 그 봉의 (종가-시가)/시가 (레전드 상하 색과 동일 기준). hover 시 그 봉, 아니면 마지막 봉.
+  const chgPct = legend && legend.open ? ((legend.close - legend.open) / legend.open) * 100 : null;
 
   return (
     <div className="flex h-full flex-col">
@@ -776,7 +778,13 @@ export default function Chart() {
             <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.open, prec)}</span></span>
             <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.high, prec)}</span></span>
             <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.low, prec)}</span></span>
-            <span className="text-muted">종 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.close, prec)}</span></span>
+            <span className="text-muted">
+              종{' '}
+              <span className={up ? 'text-up' : 'text-down'}>
+                {fmtPrice(legend.close, prec)}
+                {chgPct != null && ` (${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%)`}
+              </span>
+            </span>
             <span className="text-muted">거래량 <span className="text-text">{fmtVol(legend.volume)}</span></span>
             {opts.indicators.map((ind, idx) => {
               const val = indLegend[ind.id];

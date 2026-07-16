@@ -75,7 +75,7 @@ ox64/
         ├── SymbolSelect.tsx    심볼 드롭다운 — 실제 38종(바이낸스 ticker/24hr 폴링) + 가상 OX/USDT(뱃지) 를 **같은 목록·같은 정렬(심볼/가격/24h변동, 컬럼 헤더 클릭)에 통합**. OX 가격=`/api/spot` 최근체결가, OX 24h변동률=`/api/spot?candles=1&interval=1h&limit=24` 로 24h 전 시가 대비 계산(데이터 24h 미만이면 최초 시점 대비). `statOf(sym)` 이 심볼 종류에 따라 stat 소스만 분기해 정렬은 동일하게 처리
         ├── OrderBook.tsx       호가(매수 좌열·매도 우열, 각 최우선호가가 맨 위) / 체결(내부 탭으로 전환) — 실제 심볼=바이낸스 depth WS/aggTrade WS, 가상 심볼=useTradingStore.spotBook·spotTrades(useSpotPoll 3초 폴링). Standard 모드 + 옵션(useChartStore.orderBook) 둘 다 켜져 있을 때만 표시
         ├── Settings.tsx        테마 3선택 + 거래모드(Easy/Standard) 2선택 + 폰트 크기 3선택 모달
-        ├── Chart.tsx           Lightweight Charts: 타임프레임 그룹셀렉트(초봉 포함)·KST+9·OHLCV+인디케이터값 레전드(hover/터치)·다음봉 카운트다운·인디케이터(추가/삭제/기간편집)·매매 B/S/L 마커·포지션 평단선+청산가선(추정, 평단선 옵션에 묶임)·SL/TP 수평선·미체결 지정가 주문선(가격+수량, 매수녹색/매도적색)·차트 클릭→지정가 입력·테마 반응형 캔버스 재도색. 가상 심볼은 바이낸스 REST/WS 대신 api.spotCandles(3초 폴링, spot_trades 기반 서버 집계 캔들)로 분기하되 표시범위는 최초 로드 때만 설정(매 폴링마다 재설정하면 줌이 리셋되는 버그가 있었음)
+        ├── Chart.tsx           Lightweight Charts: 타임프레임 그룹셀렉트(초봉 포함)·KST+9·OHLCV+인디케이터값 레전드(hover/터치, 종가 옆에 그 봉의 변동률 (종가-시가)/시가 % 표시)·다음봉 카운트다운·인디케이터(추가/삭제/기간편집)·매매 B/S/L 마커·포지션 평단선+청산가선(추정, 평단선 옵션에 묶임)·SL/TP 수평선·미체결 지정가 주문선(가격+수량, 매수녹색/매도적색)·차트 클릭→지정가 입력·테마 반응형 캔버스 재도색. 가상 심볼은 바이낸스 REST/WS 대신 api.spotCandles(3초 폴링, spot_trades 기반 서버 집계 캔들)로 분기하되 표시범위는 최초 로드 때만 설정(매 폴링마다 재설정하면 줌이 리셋되는 버그가 있었음)
         ├── OrderPanel.tsx      Easy=슬라이더로 비중만 정해 롱/숏 버튼 / Standard=시장가+지정가 탭·SL·TP 입력·수량 텍스트입력+단위(코인/USDT) 전환 (레버리지는 공통, 체결가는 서버가 fetch). **OXUSDT 도 이 컴포넌트 하나로 처리**(가상 전용 분기 없음 — 실제 코인과 완전히 동일한 레버리지 거래)
         ├── PositionsPanel.tsx  탭: 포지션(청산가 표시·(Standard 전용) 부분청산 수량 입력·SL/TP 인라인 편집, Easy 는 전량청산 버튼만) / (Standard) 미체결 지정가 / 주문내역(전체 체결 이력, 강제청산 하이라이트). **OXUSDT 도 이 컴포넌트 하나로 처리**(가상 전용 분기 없음)
         └── Leaderboard.tsx     친구 자산 순위 모달(5초 폴링)
@@ -120,6 +120,7 @@ ox64/
   기존 포지션이 있으면 무시하고 `existing.leverage` 를 그대로 씀. `limitOpen` 체결(`_trading.ts`)도 동일한
   병합 로직을 탄다(`posBySymbolSide` 맵으로 같은 폴링 라운드 안의 연속 체결까지 올바르게 병합).
 - **미실현 PnL**: `(mark-entry)*size*dir`. 랭킹/표시에서 계산(저장 안 함).
+- **마진 모드 = 크로스(Cross) 고정**: 모든 포지션이 계좌 전체(여유잔고+전 포지션 증거금)를 공유 담보로 쓰고, 강제청산은 **계좌 평가자산이 0 이하일 때 전 포지션 동시**로만 일어난다(개별 포지션이 자기 증거금만 소진했다고 청산되는 아이솔레이티드가 아님). 청산가도 계좌 전체가 뒷받침한다는 전제로 계산된다(아래 산식). 아이솔레이티드 옵션은 없음. UI 는 OrderPanel 레버리지 뱃지·PositionsPanel 포지션/미체결 뱃지에 "크로스"를 명시.
 - **⚠ 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익)** — 진입 시 증거금은 잔고(`users.balance`)에서 이미 빠져나가지만(그게 곧 담보), 청산 시 `balance += margin + pnl` 로 되돌아오므로 **증거금은 순자산의 일부다**. 강제청산(`_trading.ts liquidateIfBankrupt`)·리필(`refill.ts`)·랭킹(`leaderboard.ts`)·클라 표시(Header/PositionsPanel/Chart 청산가)가 전부 이 식을 쓴다. 예전엔 증거금 항을 빠뜨리고 `잔고+미실현`으로만 계산해서, 증거금 비중을 크게 잡으면(슬라이더 100% 등) **진입 즉시 강제청산**되고 랭킹 자산도 증거금만큼 깎여 보이던 치명적 버그가 있었음(수정됨).
 - **청산(close)**: 서버가 청산가 fetch → `pnl` 계산 → 잔고에 `margin+pnl` 반환, 포지션 DELETE, close 주문 기록(pnl 포함). 전부 batch. `size` 를 지정하면 **부분 청산**(보유수량보다 작을 때) — 증거금/포지션 수량을 비율만큼만 줄이고 포지션은 유지, 생략/전량이면 기존과 동일하게 DELETE.
 - **입력 검증**: 심볼 형식(USDT 페어), side∈long/short, `size>0 && size<=1e15`, leverage 1~125. ⚠ 수량 상한은 예전 `1,000,000` 이었는데 PEPE 등 **싼 코인은 정상적으로 수십억 개**를 거래해서 "수량 오류"가 나던 버그가 있었다 → `1e15` 로 완화(실제 한도는 `margin<=balance` 조건이 잡아주고, 이 캡은 부동소수 폭주 방지용 안전장치).
