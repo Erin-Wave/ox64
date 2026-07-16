@@ -286,6 +286,28 @@ export async function recordVirtualFill(
   size: number,
 ): Promise<void> {
   const now = Date.now();
+
+  // ⚠ 체결 테이프에만 기록하고 호가창(spot_orders)은 그대로 두면 "체결은 찍히는데 호가는 그대로"인
+  // 이상한 상태가 됨 — 실제 매칭처럼 반대편 최우선호가부터 이 체결수량만큼 소비(줄이거나 다 채움)한다.
+  // 봇 잔고는 조정하지 않는다(봇은 경제적으로 의미 없는 무한 유동성 풀 — 다음 취소·재호가 때 자연히 정리됨).
+  const oppositeSide = takerSide === 'buy' ? 'sell' : 'buy';
+  const order = oppositeSide === 'sell' ? 'price ASC' : 'price DESC';
+  let remaining = size;
+  for (let i = 0; i < 50 && remaining > EPS; i++) {
+    const maker = await env.DB.prepare(
+      `SELECT * FROM spot_orders WHERE pair = ? AND side = ? AND status = 'open' ORDER BY ${order}, created_at ASC LIMIT 1`,
+    )
+      .bind(PAIR, oppositeSide)
+      .first<SpotOrderRow>();
+    if (!maker) break;
+    const consumed = Math.min(maker.size, remaining);
+    const makerRemaining = maker.size - consumed;
+    await env.DB.prepare('UPDATE spot_orders SET size = ?, status = ? WHERE id = ?')
+      .bind(makerRemaining, makerRemaining <= EPS ? 'filled' : 'open', maker.id)
+      .run();
+    remaining -= consumed;
+  }
+
   await env.DB.batch([
     env.DB.prepare(
       'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',

@@ -20,6 +20,7 @@ export default function OrderPanel() {
   const balance = useTradingStore((s) => s.balance);
   const busy = useTradingStore((s) => s.busy);
   const error = useTradingStore((s) => s.error);
+  const positions = useTradingStore((s) => s.positions);
 
   const [tab, setTab] = useState<Tab>('market');
   const [size, setSize] = useState('0.01'); // 항상 코인 수량이 진실원본, unit 은 표시만 바꿈
@@ -33,6 +34,14 @@ export default function OrderPanel() {
 
   const standard = tradingMode === 'standard';
   const effectiveTab: Tab = standard ? tab : 'market';
+  // 이 심볼에 이미 보유 중인 포지션이 있으면 그 레버리지로 고정한다(서버도 물타기 시 기존
+  // 레버리지를 그대로 쓰므로, 슬라이더가 다른 값을 보여주면 실제 체결과 화면이 어긋나 보임).
+  const existingPosition = positions.find((p) => p.symbol === symbol);
+
+  useEffect(() => {
+    if (existingPosition) setLeverage(existingPosition.leverage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [existingPosition?.leverage]);
 
   // 지정가 탭을 처음 열 때 현재가로 기본값 채움
   useEffect(() => {
@@ -138,10 +147,12 @@ export default function OrderPanel() {
         </div>
       )}
 
-      {/* 레버리지 */}
+      {/* 레버리지 — 보유 포지션이 있으면 그 레버리지로 고정(청산 전까지 변경 불가) */}
       <div>
         <div className="mb-1.5 flex items-center justify-between">
-          <span className="text-xs text-muted">레버리지</span>
+          <span className="text-xs text-muted">
+            레버리지{existingPosition && <span className="ml-1 text-[10px] text-accent">(포지션 보유 중 고정)</span>}
+          </span>
           <span className="rounded bg-panel2 px-2 py-0.5 text-xs font-bold text-accent">{leverage}x</span>
         </div>
         <input
@@ -149,8 +160,9 @@ export default function OrderPanel() {
           min={1}
           max={125}
           value={leverage}
+          disabled={!!existingPosition}
           onChange={(e) => setLeverage(Number(e.target.value))}
-          className="w-full accent-up"
+          className="w-full accent-up disabled:opacity-40"
         />
         <div className="mt-0.5 flex justify-between text-[10px] text-muted">
           <span>1x</span>
