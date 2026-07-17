@@ -119,13 +119,13 @@ export default function OrderPanel() {
   const toggleUnit = () => setUnit((u) => (u === 'coin' ? 'usdt' : 'coin'));
 
   return (
-    <div className="flex h-full flex-col gap-3 p-3">
+    <div className="flex h-full flex-col gap-2 p-2.5">
       {/* 주문 타입 탭 */}
       {standard ? (
         <div className="flex gap-1 rounded-md bg-panel2 p-1 text-xs">
           <button
             onClick={() => setTab('market')}
-            className={`flex-1 rounded py-1.5 text-center font-semibold transition ${
+            className={`flex-1 rounded py-1 text-center font-semibold transition ${
               effectiveTab === 'market' ? 'bg-elevated text-text' : 'text-muted hover:text-text'
             }`}
           >
@@ -133,7 +133,7 @@ export default function OrderPanel() {
           </button>
           <button
             onClick={() => setTab('limit')}
-            className={`flex-1 rounded py-1.5 text-center font-semibold transition ${
+            className={`flex-1 rounded py-1 text-center font-semibold transition ${
               effectiveTab === 'limit' ? 'bg-elevated text-text' : 'text-muted hover:text-text'
             }`}
           >
@@ -142,20 +142,20 @@ export default function OrderPanel() {
         </div>
       ) : (
         <div className="flex gap-1 rounded-md bg-panel2 p-1 text-xs">
-          <span className="flex-1 rounded bg-elevated py-1.5 text-center font-semibold text-text">시장가</span>
+          <span className="flex-1 rounded bg-elevated py-1 text-center font-semibold text-text">시장가</span>
         </div>
       )}
 
       {/* 지정가 */}
       {effectiveTab === 'limit' && (
         <div>
-          <label className="mb-1.5 block text-xs text-muted">지정가</label>
+          <label className="mb-1 block text-xs text-muted">지정가</label>
           <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
             <input
               value={limitPrice}
               onChange={(e) => setLimitPrice(e.target.value)}
               inputMode="decimal"
-              className="w-full bg-transparent px-3 py-2 text-sm font-semibold text-text outline-none"
+              className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none"
             />
             <span className="px-3 text-xs text-muted">USDT</span>
           </div>
@@ -164,7 +164,7 @@ export default function OrderPanel() {
 
       {/* 레버리지 — 보유 포지션이 있으면 그 레버리지로 고정(청산 전까지 변경 불가) */}
       <div>
-        <div className="mb-1.5 flex items-center justify-between">
+        <div className="mb-1 flex items-center justify-between">
           <span className="text-xs text-muted">
             레버리지 <span className="text-[10px] text-muted">· 크로스</span>
             {existingPosition && <span className="ml-1 text-[10px] text-accent">(포지션 보유 중 고정)</span>}
@@ -180,23 +180,19 @@ export default function OrderPanel() {
           onChange={(e) => setLeverage(Number(e.target.value))}
           className="w-full accent-up disabled:opacity-40"
         />
-        <div className="mt-0.5 flex justify-between text-[10px] text-muted">
-          <span>1x</span>
-          <span>125x</span>
-        </div>
       </div>
 
       {/* 수량 */}
       <div>
         {standard && (
           <>
-            <label className="mb-1.5 block text-xs text-muted">수량</label>
+            <label className="mb-1 block text-xs text-muted">수량</label>
             <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
               <input
                 value={displaySize}
                 onChange={(e) => onSizeInput(e.target.value)}
                 inputMode="decimal"
-                className="w-full bg-transparent px-3 py-2 text-sm font-semibold text-text outline-none"
+                className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none"
               />
               <button
                 onClick={toggleUnit}
@@ -209,9 +205,9 @@ export default function OrderPanel() {
             </div>
           </>
         )}
-        <div className={standard ? 'mt-2' : ''}>
+        <div className={standard ? 'mt-1.5' : ''}>
           <div className="mb-1 flex items-center justify-between">
-            <span className="text-[10px] text-muted">비중(가용 잔고 기준)</span>
+            <span className="text-[10px] text-muted">비중(가용 기준)</span>
             <span className="rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold text-accent">{pct}%</span>
           </div>
           <input
@@ -227,17 +223,13 @@ export default function OrderPanel() {
             }}
             className="w-full accent-up disabled:opacity-40"
           />
-          <div className="mt-0.5 flex justify-between text-[10px] text-muted">
-            <span>0%</span>
-            <span>100%</span>
-          </div>
         </div>
       </div>
 
       {/* SL / TP (Standard 전용) */}
       {standard && (
         <div>
-          <label className="mb-1.5 flex cursor-pointer items-center gap-2 text-xs text-muted">
+          <label className="mb-1 flex cursor-pointer items-center gap-2 text-xs text-muted">
             <input
               type="checkbox"
               checked={useSlTp}
@@ -254,7 +246,7 @@ export default function OrderPanel() {
                   onChange={(e) => setStopLoss(e.target.value)}
                   inputMode="decimal"
                   placeholder="손절가"
-                  className="w-full bg-transparent px-2.5 py-2 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                  className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
                 />
               </div>
               <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
@@ -263,7 +255,7 @@ export default function OrderPanel() {
                   onChange={(e) => setTakeProfit(e.target.value)}
                   inputMode="decimal"
                   placeholder="익절가"
-                  className="w-full bg-transparent px-2.5 py-2 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                  className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
                 />
               </div>
             </div>
@@ -272,7 +264,7 @@ export default function OrderPanel() {
       )}
 
       {/* 정보 */}
-      <div className="space-y-1 rounded-md bg-panel2 p-2.5 text-xs">
+      <div className="space-y-0.5 rounded-md bg-panel2 p-2 text-xs">
         <div className="flex justify-between">
           <span className="text-muted">가용 (크로스)</span>
           <span className="text-text">{available.toFixed(2)} USDT</span>
@@ -298,14 +290,14 @@ export default function OrderPanel() {
         <button
           onClick={() => submit('long')}
           disabled={busy}
-          className="rounded-md bg-up py-2.5 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
+          className="rounded-md bg-up py-2 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
         >
           롱 · Buy
         </button>
         <button
           onClick={() => submit('short')}
           disabled={busy}
-          className="rounded-md bg-down py-2.5 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
+          className="rounded-md bg-down py-2 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
         >
           숏 · Sell
         </button>

@@ -76,7 +76,7 @@ export default function OrderBook() {
   const tabBtn = (t: typeof tab, label: string) => (
     <button
       onClick={() => setTab(t)}
-      className={`rounded px-2 py-1 text-[11px] font-semibold transition ${
+      className={`rounded px-2 py-0.5 text-[11px] font-semibold transition ${
         tab === t ? 'bg-elevated text-text' : 'text-muted hover:text-text'
       }`}
     >
@@ -85,7 +85,7 @@ export default function OrderBook() {
   );
 
   return (
-    <div className="border-b border-border bg-panel p-2 text-xs md:border-b-0 md:border-t">
+    <div className="border-b border-border bg-panel p-1.5 text-[11px] md:border-b-0 md:border-t">
       <div className="mb-1 flex items-center gap-1">
         {tabBtn('book', '호가')}
         {tabBtn('trades', '체결')}
@@ -102,11 +102,11 @@ export default function OrderBook() {
 
       {tab === 'book' &&
         (!activeBook ? (
-          <div className="py-6 text-center text-muted">불러오는 중…</div>
+          <div className="py-4 text-center text-muted">불러오는 중…</div>
         ) : (
           <div className="grid grid-cols-2 gap-1.5">
             {/* 좌: 매수(bid) — 최우선호가(가격 가장 높음)가 맨 위 */}
-            <div className="max-h-56 space-y-0.5 overflow-y-auto">
+            <div className="max-h-36 space-y-0.5 overflow-y-auto">
               {bids.map((b) => (
                 <button
                   key={b.price}
@@ -123,7 +123,7 @@ export default function OrderBook() {
               ))}
             </div>
             {/* 우: 매도(ask) — 최우선호가(가격 가장 낮음)가 맨 위 */}
-            <div className="max-h-56 space-y-0.5 overflow-y-auto">
+            <div className="max-h-36 space-y-0.5 overflow-y-auto">
               {asks.map((a) => (
                 <button
                   key={a.price}
@@ -144,9 +144,9 @@ export default function OrderBook() {
 
       {tab === 'trades' &&
         (trades.length === 0 ? (
-          <div className="py-6 text-center text-muted">체결 내역이 없습니다</div>
+          <div className="py-4 text-center text-muted">체결 내역이 없습니다</div>
         ) : (
-          <div className="max-h-56 space-y-0.5 overflow-auto">
+          <div className="max-h-36 space-y-0.5 overflow-auto">
             {trades.map((t, i) => {
               const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
               return (
