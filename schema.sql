@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS pending_orders (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_user ON pending_orders(user_id);
+-- OX 호가창(loadSpotMarket UNION)·마켓메이커 sweep 이 매 폴링마다 symbol 로 조회하므로 인덱스를 둔다.
+CREATE INDEX IF NOT EXISTS idx_pending_symbol ON pending_orders(symbol);
 
 -- ── 가상 코인 현물 거래(OX/USDT, 예시 1종) — 외부 시세 없이 유저 대 유저 주문매칭 ──────
 -- 레버리지·마진 없음. 매수는 USDT(users.balance)를, 매도는 OX(users.ox_balance)를
@@ -127,3 +129,7 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
 -- ⚠ 일회성 마이그레이션 (2026-07-15 추가, 체결 탭 매수/매도 색상 구분): 이미 spot_trades 가
 -- 생성된 prod DB 에 컬럼을 추가한다. 위와 동일한 이유로 최초 1회만 실행할 것.
 -- ALTER TABLE spot_trades ADD COLUMN taker_side TEXT;
+
+-- ⚠ 마이그레이션 (2026-07-18 추가, OX 호가/sweep symbol 인덱스): CREATE INDEX IF NOT EXISTS 라
+-- 멱등이므로 `wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다
+-- (별도 ALTER 불필요). 위 idx_pending_symbol 참고.

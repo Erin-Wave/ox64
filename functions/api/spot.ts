@@ -21,8 +21,7 @@ import {
  * fetchPrice 참고). 이 파일은 이제 유저 액션이 아니라 두 가지만 담당한다:
  *   - GET /api/spot            — 호가창/체결내역 "표시용" 데이터(로그인만 확인, 유저별 데이터 없음)
  *   - GET /api/spot?candles=1  — spot_trades 를 버킷팅한 OHLCV 캔들
- *   - runMarketMaker()         — 봇 유저 2명이 서로/실유저 포지션의 참조가와 무관하게 자기들끼리
- *     지정가를 매칭시켜 합성 시세·호가·체결 테이프를 만드는 엔진(cron/ 이 주기 호출).
+ *   - runMarketMaker()         — 봇 유저 2명이 합성 시세·호가·체결 테이프를 만드는 엔진(cron/ 이 주기 호출).
  */
 const PAIR = 'OXUSDT';
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차
@@ -135,92 +134,30 @@ async function loadSpotMarket(env: Env) {
   };
 }
 
-// 매수 주문 체결 루프 — 상대(매도) 최우선호가(가격 낮은 순 → 시간 순)와 매칭.
-// 체결가는 항상 먼저 있던(메이커) 주문의 가격. 테이커(이 매수 주문)가 자기 지정가보다
-// 싸게 체결되면 그 차액을 즉시 환불(에스크로 시 자기 지정가 기준으로 전액을 미리 잠갔으므로).
-async function matchBuy(env: Env, uid: string, orderId: string, limitPrice: number) {
-  for (let i = 0; i < 200; i++) {
-    const order = await env.DB.prepare('SELECT * FROM spot_orders WHERE id = ?').bind(orderId).first<SpotOrderRow>();
-    if (!order || order.status !== 'open' || order.size <= EPS) return;
-    // user_id != ? : 본인이 낸 반대편 주문과는 체결되지 않는다(셀프매칭 방지).
-    const maker = await env.DB.prepare(
-      "SELECT * FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open' AND price <= ? AND user_id != ? ORDER BY price ASC, created_at ASC LIMIT 1",
-    )
-      .bind(PAIR, limitPrice, uid)
-      .first<SpotOrderRow>();
-    if (!maker) return;
-
-    const tradeSize = Math.min(order.size, maker.size);
-    const tradePrice = maker.price;
-    const refund = (limitPrice - tradePrice) * tradeSize;
-    const buyerRemaining = order.size - tradeSize;
-    const makerRemaining = maker.size - tradeSize;
-    const now = Date.now();
-
-    await env.DB.batch([
-      env.DB
-        .prepare('UPDATE spot_orders SET size = ?, status = ? WHERE id = ?')
-        .bind(buyerRemaining, buyerRemaining <= EPS ? 'filled' : 'open', orderId),
-      env.DB
-        .prepare('UPDATE spot_orders SET size = ?, status = ? WHERE id = ?')
-        .bind(makerRemaining, makerRemaining <= EPS ? 'filled' : 'open', maker.id),
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(refund, uid),
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(tradePrice * tradeSize, maker.user_id),
-      env.DB.prepare('UPDATE users SET ox_balance = ox_balance + ? WHERE id = ?').bind(tradeSize, uid),
-      env.DB.prepare(
-        'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), PAIR, uid, maker.user_id, tradePrice, tradeSize, 'buy', now),
-    ]);
-
-    if (buyerRemaining <= EPS) return;
-  }
-}
-
-// 매도 주문 체결 루프 — 상대(매수) 최우선호가(가격 높은 순 → 시간 순)와 매칭.
-// 매도자는 OX 수량 그대로를 에스크로했으므로(가격 무관) 환불 계산이 필요 없다.
-async function matchSell(env: Env, uid: string, orderId: string, limitPrice: number) {
-  for (let i = 0; i < 200; i++) {
-    const order = await env.DB.prepare('SELECT * FROM spot_orders WHERE id = ?').bind(orderId).first<SpotOrderRow>();
-    if (!order || order.status !== 'open' || order.size <= EPS) return;
-    // user_id != ? : 본인이 낸 반대편 주문과는 체결되지 않는다(셀프매칭 방지).
-    const maker = await env.DB.prepare(
-      "SELECT * FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open' AND price >= ? AND user_id != ? ORDER BY price DESC, created_at ASC LIMIT 1",
-    )
-      .bind(PAIR, limitPrice, uid)
-      .first<SpotOrderRow>();
-    if (!maker) return;
-
-    const tradeSize = Math.min(order.size, maker.size);
-    const tradePrice = maker.price;
-    const sellerRemaining = order.size - tradeSize;
-    const makerRemaining = maker.size - tradeSize;
-    const now = Date.now();
-
-    await env.DB.batch([
-      env.DB
-        .prepare('UPDATE spot_orders SET size = ?, status = ? WHERE id = ?')
-        .bind(sellerRemaining, sellerRemaining <= EPS ? 'filled' : 'open', orderId),
-      env.DB
-        .prepare('UPDATE spot_orders SET size = ?, status = ? WHERE id = ?')
-        .bind(makerRemaining, makerRemaining <= EPS ? 'filled' : 'open', maker.id),
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(tradePrice * tradeSize, uid),
-      env.DB.prepare('UPDATE users SET ox_balance = ox_balance + ? WHERE id = ?').bind(tradeSize, maker.user_id),
-      env.DB.prepare(
-        'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), PAIR, maker.user_id, uid, tradePrice, tradeSize, 'sell', now),
-    ]);
-
-    if (sellerRemaining <= EPS) return;
-  }
-}
-
 // ── 마켓메이커 봇(합성 시세·호가·체결 생성) ──────────────────────────
-// 예약된 봇 유저 2개가 폴링 시점마다(요청이 들어올 때만) 기준가를 랜덤워크로 살짝 움직이고
-// 그 주변에 매수/매도 지정가를 소량 깔아둔다. 가끔 반대편 최우선호가를 즉시 크로스하는 주문을
-// 내서(다른 봇 또는 실유저 호가와 매칭) 체결이 계속 발생하게 한다.
+// 예약된 봇 유저 2명이 폴링 시점마다(요청이 들어올 때만) 기준가를 랜덤워크로 살짝 움직이고 그
+// 주변에 매수/매도 지정가 사다리를 깐다. 유저 주문은 이 호가를 실제로 walking 매칭한다.
+//
+// ⚠ DB I/O 최소화(재작성): 예전엔 한 틱에 봇 호가 16개를 "개별 batch 로 취소"(16 왕복)하고 다시
+// 16개를 "개별 placeBotOrder"(각각 매칭 SELECT 2회+쓰기 = 32 왕복)로 깔아 한 틱에 수십~100+
+// 문장/수십 왕복이 나갔다. 지금은 (취소 1문 + 사다리 16문 + 합성체결 1문 + 기준가 1문)을 단 하나의
+// batch(왕복 1회)로 처리한다. 게이트 통과(재호가) 틱이 아니면 DB read 1회로 즉시 반환한다.
+//
+// ⚠ 봇 호가는 잔고 에스크로를 하지 않는다 — 봇 잔고(users.balance/ox_balance)는 랭킹에서 제외되고
+// 시세는 spot_bot_state, 호가는 spot_orders 에서 읽으므로 "어디서도 읽히지 않는 write-only" 값이었다.
+// 부기를 유지하느라 취소마다 환불·체결마다 정산하던 왕복이 순수 낭비여서 전부 제거했다(무한 유동성 풀).
+// 유저↔봇 체결의 물량 소비만 조건부 UPDATE 로 원자 처리하면 되고(matchLimitPendingAgainstBook 등),
+// 봇 잔고 숫자는 무의미하다.
 const BOT_TICK_MIN_MS = 3000;
 const BOT_TICK_MAX_MS = 8000;
-const BOT_LEVELS_PER_SIDE = 8; // 봇 1명이 한 틱에 까는 매수/매도 각각의 호가 단계 수(호가창 깊이)
+const BOT_LEVELS_PER_SIDE = 8; // 한 틱에 까는 매수/매도 각각의 호가 단계 수(호가창 깊이)
+
+// 봇 패시브 호가 1개를 INSERT 하는 문장(에스크로 없음).
+function botQuoteStmt(env: Env, actor: string, side: 'buy' | 'sell', price: number, size: number, now: number): D1PreparedStatement {
+  return env.DB.prepare(
+    'INSERT INTO spot_orders (id, user_id, pair, side, price, size, orig_size, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+  ).bind(crypto.randomUUID(), actor, PAIR, side, price, size, size, 'open', now);
+}
 
 export async function runMarketMaker(env: Env): Promise<void> {
   const row = await env.DB.prepare('SELECT last_run, ref_price FROM spot_bot_state WHERE id = ?')
@@ -229,84 +166,66 @@ export async function runMarketMaker(env: Env): Promise<void> {
   const now = Date.now();
   const last = row?.last_run ?? 0;
 
-  // ⚠ 게이트(봇 재호가 주기)보다 먼저, 매 폴링마다 대기 중 유저 지정가를 지금 서 있는 봇 호가에
-  // 매칭한다(실제 호가창 walking 체결). 주문 낸 유저의 개인 폴링에 의존하지 않으므로(백그라운드
-  // 탭·접속 종료여도) 유동성이 크로스되면 곧바로 실제 호가 가격에 체결·소멸돼 호가 역전이 안 남는다.
-  await sweepRestingOxPendings(env);
-
   const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
-  if (now - last < gate) return;
-  // 동시 요청이 겹쳐도 대략 한 번만 돌도록 먼저 last_run 을 찍어둔다(완벽한 락은 아니지만 폴링 간격상 충분).
-  await env.DB.prepare(
-    'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run',
-  )
-    .bind(PAIR, now, row?.ref_price ?? 1)
-    .run();
+  if (now - last < gate) return; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
 
-  let ref = row?.ref_price;
-  if (!ref) {
+  // 재호가 틱을 원자적으로 선점(동시 폴링이 겹쳐도 이 틱은 한 번만 requote) — 조건부 upsert.
+  // 최초(행 없음)엔 INSERT 로 changes=1, 이미 다른 요청이 last_run 을 옮겼으면 WHERE 불일치로 changes=0.
+  const claim = await env.DB.prepare(
+    'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run WHERE spot_bot_state.last_run = ?',
+  )
+    .bind(PAIR, now, row?.ref_price ?? 1, last)
+    .run();
+  if (claim.meta.changes !== 1) return; // 다른 요청이 이 틱을 이미 선점 — 중복 requote 방지
+
+  let prevRef = row?.ref_price ?? 0;
+  if (!prevRef) {
     const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
       .bind(PAIR)
       .first<{ price: number }>();
-    ref = lastTrade?.price ?? 1;
+    prevRef = lastTrade?.price ?? 1;
   }
-  ref = roundOx(Math.max(0.01, ref * (1 + (Math.random() - 0.5) * 0.012))); // ±0.6% 랜덤워크(4자리 틱 스냅)
-  await env.DB.prepare('UPDATE spot_bot_state SET ref_price = ? WHERE id = ?').bind(ref, PAIR).run();
-
+  const ref = roundOx(Math.max(0.01, prevRef * (1 + (Math.random() - 0.5) * 0.012))); // ±0.6% 랜덤워크(4자리 틱 스냅)
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
 
-  // ⚠ 호가창 역전 버그 수정: "초과분만 취소"하던 예전 방식은 같은 봇의 오래된 호가가 남아있다가
-  // 랜덤워크로 기준가가 움직인 뒤 자기 자신의 새 주문과 가격이 역전돼도 셀프매칭 방지(user_id != ?)
-  // 때문에 절대 안 맞물려서 그대로 살아남았다(집계에서 최우선매수 > 최우선매도로 보임). 그래서 매
-  // 틱마다 이 액터의 기존 호가를 전부 취소·환불하고 새로 2개(매수/매도)만 깐다.
-  const mine = (
-    await env.DB.prepare("SELECT * FROM spot_orders WHERE user_id = ? AND pair = ? AND status = 'open'")
-      .bind(actor, PAIR)
-      .all<SpotOrderRow>()
-  ).results;
-  for (const o of mine) {
-    const refund = o.side === 'buy' ? o.price * o.size : o.size;
-    const col = o.side === 'buy' ? 'balance' : 'ox_balance';
-    await env.DB.batch([
-      env.DB.prepare("UPDATE spot_orders SET status = 'cancelled' WHERE id = ?").bind(o.id),
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(refund, actor),
-    ]);
-  }
-
-  // 가끔 반대편 최우선호가를 즉시 크로스 — 다른 봇/실유저 호가와 체결시켜 최근체결·차트가 계속 움직이게 함.
-  if (Math.random() < 0.5) {
-    const crossSide = Math.random() < 0.5 ? 'buy' : 'sell';
-    const bestOpp =
-      crossSide === 'buy'
-        ? await env.DB.prepare(
-            "SELECT price FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open' AND user_id != ? ORDER BY price ASC LIMIT 1",
-          )
-            .bind(PAIR, actor)
-            .first<{ price: number }>()
-        : await env.DB.prepare(
-            "SELECT price FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open' AND user_id != ? ORDER BY price DESC LIMIT 1",
-          )
-            .bind(PAIR, actor)
-            .first<{ price: number }>();
-    if (bestOpp) {
-      const crossPrice = roundOx(crossSide === 'buy' ? bestOpp.price * 1.002 : bestOpp.price * 0.998);
-      await placeBotOrder(env, actor, crossSide, crossPrice, Number((2 + Math.random() * 10).toFixed(4)));
-    }
-  }
-
-  // 기준가 주변에 패시브 호가를 여러 단계(레벨)로 깐다 — 매 틱마다 이 액터의 호가를 전부 새로
-  // 깔기 때문에(위 취소 로직) 레벨을 늘려도 역전 걱정 없이 호가창 깊이만 두꺼워진다.
-  // 유저 주문이 실제 호가창을 walking 체결하므로(matchLimitPendingAgainstBook), 체결이 시원하게
-  // 되도록 물량을 크게 깐다(봇 잔고는 1억씩 시딩+체결마다 정산돼 고갈 안 됨).
+  // === 단일 batch: (1) 이 페어의 봇 호가 전부 취소  (2) 새 양방향 사다리 호가  (3) 합성 체결 1건
+  //                (4) 기준가 갱신 — 전부 왕복 1회로 끝낸다. ===
+  const stmts: D1PreparedStatement[] = [
+    // ⚠ 매 틱 이 페어의 봇 호가를 "전부"(두 봇 모두) 비우고 한 액터가 일관된 사다리를 새로 깐다.
+    // 액터 것만 취소하면 다른 봇의 오래된 호가가 남아, 랜덤워크로 기준가가 움직인 뒤 호가 역전
+    // (최우선매수 > 최우선매도)이 생긴다 — 예전엔 봇끼리 크로스 매칭이 이걸 정리했지만 그 왕복을
+    // 없앴으므로, 아예 전체를 비우고 다시 까는 게 가장 싸고 확실하다(user 주문은 pending_orders 라
+    // spot_orders 엔 봇 호가만 있으니 pair 전체를 지워도 유저 주문엔 영향 없음). batch 원자성으로
+    // 호가창이 빈 순간이 노출되지 않는다(취소+재호가가 한 스냅샷).
+    env.DB.prepare("UPDATE spot_orders SET status = 'cancelled' WHERE pair = ? AND status = 'open'").bind(PAIR),
+  ];
+  // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 실거래소처럼 타이트하게(최우선호가가 mid 에
+  // 바싹 붙게) 잡아 시장가 체결이 mid 근처에서 이뤄지게 하되, 깊은 레벨로 갈수록 벌어지며 대량 주문엔
+  // 슬리피지가 생긴다. 물량을 크게 깔아(2000~10000) 유저 주문이 시원하게 체결되게 한다.
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
-    const spread = 0.003 + level * 0.004 + Math.random() * 0.003;
-    const size = Number((2000 + Math.random() * 8000).toFixed(4));
-    await placeBotOrder(env, actor, 'buy', roundOx(ref * (1 - spread)), size);
-    await placeBotOrder(env, actor, 'sell', roundOx(ref * (1 + spread)), size);
+    const spread = 0.0012 + level * 0.0016 + Math.random() * 0.0008;
+    const buySize = Number((2000 + Math.random() * 8000).toFixed(4));
+    const sellSize = Number((2000 + Math.random() * 8000).toFixed(4));
+    stmts.push(botQuoteStmt(env, actor, 'buy', roundOx(ref * (1 - spread)), buySize, now));
+    stmts.push(botQuoteStmt(env, actor, 'sell', roundOx(ref * (1 + spread)), sellSize, now));
   }
+  // 합성 체결 1건 — 봇끼리 크로스 주문을 내고 매칭하던(호가 1개 더 깔고 매칭 왕복) 예전 방식을 대체.
+  // 체결 테이프·차트가 계속 움직이게 하되 왕복 없이 batch 안에서 끝낸다. 체결가=새 기준가(mid),
+  // 색상은 기준가가 오르면 매수/내리면 매도.
+  const tradeSize = Number((5 + Math.random() * 40).toFixed(4));
+  const takerSide = ref >= prevRef ? 'buy' : 'sell';
+  stmts.push(
+    env.DB.prepare(
+      'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
+    ).bind(crypto.randomUUID(), PAIR, actor, actor, ref, tradeSize, takerSide, now),
+  );
+  stmts.push(env.DB.prepare('UPDATE spot_bot_state SET ref_price = ? WHERE id = ?').bind(ref, PAIR));
+  await env.DB.batch(stmts);
 
-  // 방금 깐 신선한 유동성에 대기 유저 지정가를 다시 매칭 — 봇이 유저 매수보다 싼 매도를 깔면
-  // 같은 틱에 바로 소비돼 호가 역전이 화면에 안 보인다.
+  // 방금 깐 신선한 유동성에 대기 중 유저 지정가를 이어서 매칭(walking) — 봇이 유저 매수보다 싼
+  // 매도를 깔면 같은 틱에 소비돼 호가 역전이 화면에 안 남는다. 주문 낸 유저의 접속/폴링과 무관하게 진행.
+  // (게이트 전 sweep 은 제거했다 — 호가창은 이 requote 틱에만 바뀌므로 매 폴링 sweep 은 낭비였고,
+  //  유저 본인 pending 은 checkTriggers 5초 폴링이 별도로 훑는다.)
   await sweepRestingOxPendings(env);
 }
 
@@ -326,7 +245,7 @@ export async function recordVirtualFill(
 
   // ⚠ 체결 테이프에만 기록하고 호가창(spot_orders)은 그대로 두면 "체결은 찍히는데 호가는 그대로"인
   // 이상한 상태가 됨 — 실제 매칭처럼 반대편 최우선호가부터 이 체결수량만큼 소비(줄이거나 다 채움)한다.
-  // 봇 잔고는 조정하지 않는다(봇은 경제적으로 의미 없는 무한 유동성 풀 — 다음 취소·재호가 때 자연히 정리됨).
+  // 봇 잔고는 조정하지 않는다(무한 유동성 풀 — 다음 취소·재호가 때 자연히 정리됨).
   const oppositeSide = takerSide === 'buy' ? 'sell' : 'buy';
   const order = oppositeSide === 'sell' ? 'price ASC' : 'price DESC';
   let remaining = size;
@@ -361,7 +280,7 @@ export async function recordVirtualFill(
 // 버그가 있었다. 이제 유저 주문은 봇이 실제로 깐 호가(spot_orders)를 가격-시간 우선순위로
 // walking 하며 체결한다 — 있는 물량만, 실제 호가 가격에, 최우선호가보다 유리하게는 절대 안 체결.
 // 못 채운 잔량은 지정가면 호가창에 남아 대기(다음 유동성에 매칭), 시장가면 버린다. 봇은 무한
-// 유동성 풀이므로 체결 시 상대(봇)에게 대금/코인을 그대로 정산해준다(matchBuy/matchSell 과 동일).
+// 유동성 풀이라 체결 시 상대(봇) 잔고를 따로 정산하지 않는다(봇 잔고는 어디서도 읽히지 않음).
 
 // 체결분을 유저 OX 레버리지 포지션에 반영하는 문장(positions 테이블만). 물타기면 병합.
 function oxPositionStmts(
@@ -393,14 +312,6 @@ function oxPositionStmts(
       'INSERT INTO positions (id,user_id,symbol,side,entry_price,size,leverage,margin,opened_at,stop_loss,take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
     ).bind(crypto.randomUUID(), uid, PAIR, side, price, size, effLev, margin, now, sl, tp),
   ];
-}
-
-// 봇(maker) 정산 — 유저 매수 시 봇(매도자)에게 대금, 유저 매도 시 봇(매수자)에게 코인 지급.
-// (maker 물량 차감은 호출부에서 원자적 선점으로 이미 처리) matchBuy/matchSell 과 동일한 정산.
-function botCreditStmt(env: Env, botId: string, price: number, size: number, takerBuy: boolean): D1PreparedStatement {
-  return takerBuy
-    ? env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(price * size, botId)
-    : env.DB.prepare('UPDATE users SET ox_balance = ox_balance + ? WHERE id = ?').bind(size, botId);
 }
 
 // 체결 테이프 기록 + 기준가(ref)를 체결가로 갱신.
@@ -456,7 +367,8 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
   let cost = 0;
 
   for (let i = 0; i < 500; i++) {
-    const p = await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
+    // iter 0 은 위에서 이미 읽은 first 를 재사용(중복 read 제거), 이후엔 동시 체결 반영 위해 재조회.
+    const p = i === 0 ? first : await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
     if (!p) break;
     if (p.size <= EPS) {
       await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run();
@@ -502,7 +414,6 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
         ? env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId)
         : env.DB.prepare('UPDATE pending_orders SET size=?, margin=? WHERE id=?').bind(newPendingSize, newPendingMargin, pendingId),
       ...oxPositionStmts(env, existing, p.user_id, p.side, fillPrice, chunk, effLev, posMargin, p.stop_loss, p.take_profit, now),
-      botCreditStmt(env, maker.user_id, fillPrice, chunk, isLong),
       ...spotTradeStmts(
         env,
         isLong ? p.user_id : maker.user_id,
@@ -590,7 +501,6 @@ export async function matchMarketOxOrder(
     const now = Date.now();
     await env.DB.batch([
       ...oxPositionStmts(env, existing, uid, side, price, chunk, effLev, margin, sl, tp, now),
-      botCreditStmt(env, maker.user_id, price, chunk, isLong),
       ...spotTradeStmts(env, isLong ? uid : maker.user_id, isLong ? maker.user_id : uid, price, chunk, isLong ? 'buy' : 'sell', now),
     ]);
     remaining -= chunk;
@@ -606,7 +516,7 @@ export async function matchMarketOxOrder(
   return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
 }
 
-/** 대기 중인 전 유저의 OX 지정가를 봇 호가창에 매칭 — runMarketMaker 가 매 폴링 호출하므로,
+/** 대기 중인 전 유저의 OX 지정가를 봇 호가창에 매칭 — runMarketMaker 가 재호가 직후 호출하므로,
  * 주문 낸 유저가 접속/폴링 중이 아니어도 유동성이 크로스되면 실제 호가 가격에 이어서 체결된다. */
 async function sweepRestingOxPendings(env: Env): Promise<void> {
   const pendings = (
@@ -618,32 +528,5 @@ async function sweepRestingOxPendings(env: Env): Promise<void> {
     } catch {
       /* 한 건 실패해도 나머지는 계속 — 다음 틱에서 재시도 */
     }
-  }
-}
-
-/** 봇 전용 주문 배치(에스크로+매칭) — 봇은 잔고가 항상 충분하다. */
-async function placeBotOrder(env: Env, uid: string, side: 'buy' | 'sell', price: number, size: number) {
-  if (!(price > 0) || !(size > 0)) return;
-  const orderId = crypto.randomUUID();
-  const now = Date.now();
-  if (side === 'buy') {
-    const cost = price * size;
-    const res = await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?').bind(cost, uid, cost),
-      env.DB.prepare(
-        'INSERT INTO spot_orders (id, user_id, pair, side, price, size, orig_size, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
-      ).bind(orderId, uid, PAIR, 'buy', price, size, size, 'open', now),
-    ]);
-    if (res[0].meta.changes !== 1) return; // 봇 잔고 바닥(거의 없음) — 이번 틱은 스킵
-    await matchBuy(env, uid, orderId, price);
-  } else {
-    const res = await env.DB.batch([
-      env.DB.prepare('UPDATE users SET ox_balance = ox_balance - ? WHERE id = ? AND ox_balance >= ?').bind(size, uid, size),
-      env.DB.prepare(
-        'INSERT INTO spot_orders (id, user_id, pair, side, price, size, orig_size, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
-      ).bind(orderId, uid, PAIR, 'sell', price, size, size, 'open', now),
-    ]);
-    if (res[0].meta.changes !== 1) return;
-    await matchSell(env, uid, orderId, price);
   }
 }

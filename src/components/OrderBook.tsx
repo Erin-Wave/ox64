@@ -106,12 +106,12 @@ export default function OrderBook() {
         ) : (
           <div className="grid grid-cols-2 gap-1.5">
             {/* 좌: 매수(bid) — 최우선호가(가격 가장 높음)가 맨 위 */}
-            <div className="max-h-36 space-y-0.5 overflow-y-auto">
+            <div className="max-h-40 overflow-y-auto">
               {bids.map((b) => (
                 <button
                   key={b.price}
                   onClick={() => pick(b.price)}
-                  className="relative flex w-full items-center justify-between overflow-hidden rounded px-1.5 py-0.5 text-right transition hover:bg-panel2"
+                  className="relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2"
                 >
                   <span
                     className="absolute inset-y-0 left-0 bg-upDim"
@@ -123,12 +123,12 @@ export default function OrderBook() {
               ))}
             </div>
             {/* 우: 매도(ask) — 최우선호가(가격 가장 낮음)가 맨 위 */}
-            <div className="max-h-36 space-y-0.5 overflow-y-auto">
+            <div className="max-h-40 overflow-y-auto">
               {asks.map((a) => (
                 <button
                   key={a.price}
                   onClick={() => pick(a.price)}
-                  className="relative flex w-full items-center justify-between overflow-hidden rounded px-1.5 py-0.5 text-right transition hover:bg-panel2"
+                  className="relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2"
                 >
                   <span
                     className="absolute inset-y-0 right-0 bg-downDim"
@@ -146,11 +146,11 @@ export default function OrderBook() {
         (trades.length === 0 ? (
           <div className="py-4 text-center text-muted">체결 내역이 없습니다</div>
         ) : (
-          <div className="max-h-36 space-y-0.5 overflow-auto">
+          <div className="max-h-40 overflow-auto">
             {trades.map((t, i) => {
               const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
               return (
-                <div key={`${t.time}-${i}`} className="flex items-center justify-between px-1.5 py-0.5">
+                <div key={`${t.time}-${i}`} className="flex items-center justify-between px-1.5 py-px leading-[14px]">
                   <span className="text-muted">{fmtTime(t.time)}</span>
                   <span className={color}>{fmtPrice(t.price, prec)}</span>
                   <span className="text-muted">{fmtQty(t.qty)}</span>
