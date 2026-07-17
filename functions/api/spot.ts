@@ -53,12 +53,17 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
   });
 }
 
-/** spot_trades 를 interval 버킷으로 묶어 OHLCV 캔들을 만든다(거래량이 적어 SQL 윈도우함수 대신 JS 로 처리). */
+/** spot_trades 를 interval 버킷으로 묶어 OHLCV 캔들을 만든다(거래량이 적어 SQL 윈도우함수 대신 JS 로 처리).
+ * ⚠ 반드시 "가장 최신" 5000건을 읽어야 한다 — 예전엔 `ORDER BY created_at ASC LIMIT 5000`(가장 오래된
+ * 5000건)이라, 총 거래가 5000건을 넘는 순간부터 새 거래가 이 창 밖으로 밀려나 차트가 그 시점에 멈춰버렸다
+ * (OX 차트가 "고장난" 것처럼 마지막 봉이 갱신 안 되던 버그). 최신 5000건을 DESC 로 뽑아 다시 ASC 로 정렬해 버킷팅. */
 async function loadSpotCandles(env: Env, intervalCode: string, limit: number) {
   const sec = intervalSecFromCode(intervalCode);
   const bucketMs = sec * 1000;
   const trades = (
-    await env.DB.prepare('SELECT price, size, created_at FROM spot_trades WHERE pair = ? ORDER BY created_at ASC LIMIT 5000')
+    await env.DB.prepare(
+      'SELECT price, size, created_at FROM (SELECT price, size, created_at FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 5000) ORDER BY created_at ASC',
+    )
       .bind(PAIR)
       .all<{ price: number; size: number; created_at: number }>()
   ).results;
