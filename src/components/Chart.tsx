@@ -102,6 +102,11 @@ export default function Chart() {
   const [legend, setLegend] = useState<Candle | null>(null);
   const [indLegend, setIndLegend] = useState<Record<string, IndLegendValue>>({});
   const [countdown, setCountdown] = useState('');
+  // 카운트다운 위치 — 트레이딩뷰처럼 우측 가격축의 현재가 티커(마지막 봉 종가 라벨) 바로 아래에 붙인다.
+  // top=현재가 y좌표, width=가격축 너비, up=마지막 봉 방향(색상). 가격/스케일 변화마다 갱신.
+  const [countdownPos, setCountdownPos] = useState<{ top: number; width: number; up: boolean } | null>(null);
+  const countdownPosRef = useRef<{ top: number; width: number; up: boolean } | null>(null);
+  const repositionCountdownRef = useRef<() => void>(() => {});
   const [showOpts, setShowOpts] = useState(false);
   const [prec, setPrec] = useState(2); // 현재 심볼 가격 소수 자릿수
   const precRef = useRef(prec);
@@ -124,6 +129,30 @@ export default function Chart() {
     }
     return out;
   };
+
+  // 카운트다운을 현재가(마지막 봉 종가) 라벨의 y좌표 바로 아래로 옮긴다(우측 가격축 위, 트레이딩뷰식).
+  // 가격/스케일이 바뀔 때마다(WS 틱·폴링·팬/줌·1초 틱·크로스헤어) 호출한다 — refs 만 읽어 stale 문제 없음.
+  const repositionCountdown = () => {
+    const chart = chartRef.current;
+    const c = candleRef.current;
+    const last = candlesRef.current.at(-1);
+    const clear = () => {
+      if (countdownPosRef.current) {
+        countdownPosRef.current = null;
+        setCountdownPos(null);
+      }
+    };
+    if (!chart || !c || !last) return clear();
+    const y = c.priceToCoordinate(last.close);
+    if (y == null) return clear();
+    const next = { top: y as number, width: chart.priceScale('right').width(), up: last.close >= last.open };
+    const prev = countdownPosRef.current;
+    // 1px 미만 이동·같은 너비/색이면 리렌더 생략(WS 틱이 초당 여러 번 와도 낭비 방지)
+    if (prev && Math.abs(prev.top - next.top) < 1 && prev.width === next.width && prev.up === next.up) return;
+    countdownPosRef.current = next;
+    setCountdownPos(next);
+  };
+  repositionCountdownRef.current = repositionCountdown;
 
   // ── 차트 생성 (1회) ──────────────────────────────────────────
   useEffect(() => {
@@ -160,6 +189,7 @@ export default function Chart() {
     candleRef.current = candle;
 
     chart.subscribeCrosshairMove((param) => {
+      repositionCountdownRef.current(); // 마우스 이동(팬/줌 포함) 시 축 라벨 따라 위치 갱신
       const c = candleRef.current;
       if (!c || param.time == null) {
         hovering.current = false;
@@ -365,6 +395,7 @@ export default function Chart() {
             if (!hovering.current) setLegend(l);
           }
           if (!hovering.current) setIndLegend(lastIndLegend());
+          repositionCountdownRef.current();
         } catch (e) {
           console.error('[chart] spot candle load failed', e);
           setConnected(false);
@@ -407,6 +438,7 @@ export default function Chart() {
         const l = candles.at(-1);
         if (l && !hovering.current) setLegend(l);
         if (!hovering.current) setIndLegend(lastIndLegend());
+        repositionCountdownRef.current();
       } catch (e) {
         console.error('[chart] load failed', e);
       }
@@ -448,6 +480,7 @@ export default function Chart() {
     };
     let lastBarsSave = 0;
     const onRange = (range: { from: number; to: number } | null) => {
+      repositionCountdownRef.current(); // 가로 팬/줌으로 가격축 스케일이 바뀌면 카운트다운 위치도 갱신
       if (range && range.from < 10) loadOlder();
       // 사용자가 확대/축소한 봉 개수를 기억해뒀다가 다음 접속 때 기본값으로 사용(과도한 쓰기 방지로 스로틀).
       if (range) {
@@ -481,6 +514,7 @@ export default function Chart() {
         if (arr.length && arr[arr.length - 1].time === bar.time) arr[arr.length - 1] = bar;
         else arr.push(bar);
         if (!hovering.current) setLegend(bar);
+        repositionCountdownRef.current(); // 현재가 이동 → 카운트다운도 축 티커 따라 이동
         const now = Date.now();
         if (now - lastCalc.current > 700) {
           lastCalc.current = now;
@@ -642,6 +676,7 @@ export default function Chart() {
       const s = Math.floor(remain % 60);
       const p = (n: number) => String(n).padStart(2, '0');
       setCountdown(h > 0 ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`);
+      repositionCountdownRef.current(); // 축 드래그/리사이즈 등 이벤트 없는 변화도 1초마다 보정
     };
     tick();
     const t = window.setInterval(tick, 1000);
@@ -810,10 +845,19 @@ export default function Chart() {
             })}
           </div>
         )}
-        {/* 카운트다운 */}
-        {opts.showCountdown && countdown && (
-          <div className="pointer-events-none absolute right-2 top-1.5 z-10 rounded bg-panel2/80 px-2 py-0.5 text-[11px] font-semibold text-accent">
-            {countdown}
+        {/* 다음 봉 카운트다운 — 트레이딩뷰처럼 우측 가격축의 현재가 티커(마지막 봉 종가 라벨) 바로 아래 */}
+        {opts.showCountdown && countdown && countdownPos && (
+          <div
+            className="pointer-events-none absolute z-10 flex justify-center"
+            style={{ top: countdownPos.top + 9, right: 0, width: countdownPos.width }}
+          >
+            <span
+              className={`rounded-sm bg-elevated px-1 py-px text-[10px] font-semibold tabular-nums ring-1 ring-border ${
+                countdownPos.up ? 'text-up' : 'text-down'
+              }`}
+            >
+              {countdown}
+            </span>
           </div>
         )}
         <div ref={containerRef} className="absolute inset-0" />
