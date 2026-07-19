@@ -16,7 +16,13 @@ import {
   type UserRow,
 } from '../_shared';
 import { checkTriggers } from '../_trading';
-import { matchLimitPendingAgainstBook, matchMarketOxOrder, recordVirtualFill } from './spot';
+import {
+  matchLimitPendingAgainstBook,
+  matchMarketOxOrder,
+  marketCloseOxPosition,
+  matchReduceOnlyOxPending,
+  recordVirtualFill,
+} from './spot';
 
 // OX/USDT 는 진짜 상대 거래자가 없으니, 유저가 레버리지로 체결시킨 걸 합성 시장(호가창·체결내역·
 // 다음 봇 기준가)에도 반영해준다 — 안 그러면 포지션 수량만 조용히 바뀌고 화면엔 아무 흔적도 안 남아
@@ -210,8 +216,18 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (reqSize != null && !(reqSize > 0)) return bad('청산 수량 오류');
     if (reqSize != null && reqSize > pos.size + 1e-9) return bad('보유 수량보다 많습니다');
     const closeSize = reqSize == null ? pos.size : reqSize;
-    const isPartial = closeSize < pos.size - 1e-9;
 
+    // OX/USDT 시장가 청산 = 봇 호가창을 walking 하며 "있는 물량만" 실제 호가 가격에 청산(매물 없으면 부분).
+    // ⚠ 예전엔 호가창 무관하게 ref 한 값에 전량 청산돼 "매물 없어도 전량 청산"되던 버그 → 진입과 대칭으로 교체.
+    if (isVirtualSymbol(pos.symbol)) {
+      const { filled, avgPrice } = await marketCloseOxPosition(env, uid, pos, closeSize);
+      if (!(filled > 0)) return bad('청산할 수 있는 호가 물량이 없습니다');
+      if (avgPrice > 0) marks[pos.symbol] = avgPrice;
+      return json(await loadState(env, uid, marks));
+    }
+
+    // 실제 코인: 외부 시세로 즉시 청산(로컬 호가창이 없어 mark 정산이 표준, 유동성 사실상 무한).
+    const isPartial = closeSize < pos.size - 1e-9;
     const price = await fetchPrice(env, pos.symbol); // 서버 청산가
     const dir = pos.side === 'long' ? 1 : -1;
     const pnl = (price - pos.entry_price) * closeSize * dir;
@@ -234,6 +250,40 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     await reflectVirtualFill(env, pos.symbol, uid, price, pos.side === 'long' ? 'sell' : 'buy', closeSize);
 
     marks[pos.symbol] = price;
+    return json(await loadState(env, uid, marks));
+  }
+
+  // 지정가 청산(reduce-only) — 포지션을 지정가에 청산 예약. 증거금을 새로 잠그지 않고(청산이므로),
+  // pending_orders 에 reduce_only=1 로 쌓아둔다. 체결 시(OX=호가창 walking, 실제코인=mark 가 지정가 크로스)
+  // 새 포지션을 열지 않고 대상 포지션을 그 수량만큼 줄인다(checkTriggers). 주문 방향(side)은 포지션 반대.
+  if (body.action === 'limitClose') {
+    const marks = await checkTriggers(env, uid);
+    const positionId = typeof body.positionId === 'string' ? body.positionId : '';
+    const pos = await env.DB.prepare('SELECT * FROM positions WHERE id = ? AND user_id = ?')
+      .bind(positionId, uid)
+      .first<PositionRow>();
+    if (!pos) return bad('포지션을 찾을 수 없음', 404);
+
+    const size = Number(body.size);
+    let limitPrice = Number(body.limitPrice);
+    if (!(size > 0) || !isFinite(size) || size > pos.size + 1e-9) return bad('청산 수량 오류');
+    if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
+    if (isVirtualSymbol(pos.symbol)) limitPrice = Math.round(limitPrice * 1e4) / 1e4; // OX 4자리 틱
+
+    const closeSide = pos.side === 'long' ? 'short' : 'long'; // 롱 청산=매도(short), 숏 청산=매수(long)
+    const now = Date.now();
+    const pendingId = crypto.randomUUID();
+    // reduce_only=1, margin=0(증거금 안 잠금), SL/TP 없음(청산 주문엔 불필요).
+    await env.DB.prepare(
+      'INSERT INTO pending_orders (id, user_id, symbol, side, size, leverage, limit_price, margin, stop_loss, take_profit, created_at, reduce_only) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)',
+    )
+      .bind(pendingId, uid, pos.symbol, closeSide, size, pos.leverage, limitPrice, 0, null, null, now)
+      .run();
+
+    // OX 는 제출 즉시 봇 호가창에 매칭 시도(marketable 이면 바로 체결, 아니면 대기). 실제 코인은 checkTriggers 가
+    // mark 가 지정가를 크로스할 때 체결한다.
+    if (isVirtualSymbol(pos.symbol)) await matchReduceOnlyOxPending(env, pendingId);
+
     return json(await loadState(env, uid, marks));
   }
 

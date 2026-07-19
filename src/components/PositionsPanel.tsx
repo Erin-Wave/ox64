@@ -19,6 +19,7 @@ export default function PositionsPanel() {
   const orders = useTradingStore((s) => s.orders);
   const balance = useTradingStore((s) => s.balance);
   const closePosition = useTradingStore((s) => s.closePosition);
+  const limitClose = useTradingStore((s) => s.limitClose);
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
   const setSlTp = useTradingStore((s) => s.setSlTp);
   const busy = useTradingStore((s) => s.busy);
@@ -31,12 +32,17 @@ export default function PositionsPanel() {
   const [editSl, setEditSl] = useState('');
   const [editTp, setEditTp] = useState('');
   const [closeAmt, setCloseAmt] = useState<Record<string, string>>({}); // 포지션별 부분청산 수량(비우면 전량)
+  const [closePx, setClosePx] = useState<Record<string, string>>({}); // 포지션별 청산 지정가(비우면 시장가)
 
-  const doClose = (id: string) => {
-    const raw = closeAmt[id];
-    const amt = raw ? Number(raw) : NaN;
-    closePosition(id, amt > 0 ? amt : undefined); // 빈칸/유효하지 않으면 size 생략(전량 청산), 보유량 초과는 서버가 거부
+  // 지정가가 채워져 있으면 지정가 청산(reduce-only 주문 예약), 아니면 시장가 청산.
+  // 수량이 비어 있으면 전량(시장가는 size 생략, 지정가는 보유수량 전체) — 보유량 초과는 서버가 거부.
+  const doClose = (id: string, posSize: number) => {
+    const amt = closeAmt[id] ? Number(closeAmt[id]) : NaN;
+    const px = closePx[id] ? Number(closePx[id]) : NaN;
+    if (px > 0) limitClose(id, amt > 0 ? amt : posSize, px);
+    else closePosition(id, amt > 0 ? amt : undefined);
     setCloseAmt((s) => ({ ...s, [id]: '' }));
+    setClosePx((s) => ({ ...s, [id]: '' }));
   };
 
   const startEdit = (id: string, sl: number | null, tp: number | null) => {
@@ -213,18 +219,29 @@ export default function PositionsPanel() {
                       <td className="px-3 py-2.5 text-right">
                         <div className="flex items-center justify-end gap-1">
                           {standard && (
-                            <input
-                              value={closeAmt[p.id] ?? ''}
-                              onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: e.target.value }))}
-                              placeholder={String(p.size)}
-                              inputMode="decimal"
-                              title="청산 수량(비우면 전량)"
-                              className="w-16 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
-                            />
+                            <>
+                              <input
+                                value={closeAmt[p.id] ?? ''}
+                                onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: e.target.value }))}
+                                placeholder={String(p.size)}
+                                inputMode="decimal"
+                                title="청산 수량(비우면 전량)"
+                                className="w-14 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                              />
+                              <input
+                                value={closePx[p.id] ?? ''}
+                                onChange={(e) => setClosePx((s) => ({ ...s, [p.id]: e.target.value }))}
+                                placeholder="시장가"
+                                inputMode="decimal"
+                                title="청산 지정가(비우면 시장가, 채우면 그 가격에 지정가 청산 예약)"
+                                className="w-16 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                              />
+                            </>
                           )}
                           <button
-                            onClick={() => (standard ? doClose(p.id) : closePosition(p.id))}
+                            onClick={() => (standard ? doClose(p.id, p.size) : closePosition(p.id))}
                             disabled={busy}
+                            title={standard ? '지정가 입력 시 지정가 청산, 비우면 시장가 청산' : '전량 시장가 청산'}
                             className="rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
                           >
                             청산
@@ -261,13 +278,20 @@ export default function PositionsPanel() {
                   <tr key={o.id} className="border-b border-border/60">
                     <td className="px-3 py-2.5 font-medium text-text">{o.symbol.replace('USDT', '')}</td>
                     <td className="px-3 py-2.5">
-                      <span
-                        className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
-                          o.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
-                        }`}
-                      >
-                        {o.side === 'long' ? '롱' : '숏'} 크로스 {o.leverage}x
-                      </span>
+                      {o.reduceOnly ? (
+                        // 지정가 청산(reduce-only) — 주문 방향(side)의 반대가 청산 대상 포지션 방향.
+                        <span className="rounded bg-elevated px-1.5 py-0.5 text-[11px] font-semibold text-accent">
+                          {o.side === 'short' ? '롱' : '숏'} 청산
+                        </span>
+                      ) : (
+                        <span
+                          className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                            o.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
+                          }`}
+                        >
+                          {o.side === 'long' ? '롱' : '숏'} 크로스 {o.leverage}x
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-2.5 text-right text-text">
                       {fmtPrice(o.limitPrice, precisionOf(precisions, o.symbol))}

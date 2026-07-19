@@ -576,15 +576,122 @@ export async function matchMarketOxOrder(
   return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
 }
 
-/** 대기 중인 전 유저의 OX 지정가를 봇 호가창에 매칭 — runMarketMaker 가 재호가 직후 호출하므로,
+/**
+ * OX 포지션을 봇 호가창에 walking 매칭해 청산한다(시장가 청산·지정가 청산 공용의 핵심).
+ * ⚠ 예전엔 OX 청산이 호가창을 무시하고 `fetchPrice`(ref) 한 값에 **전량** 정산돼, 매물이 없어도(호가창이
+ * 얇아도) 전 물량이 즉시 청산되는 버그가 있었다. 이제 진입(matchMarketOxOrder)과 대칭으로 **있는 물량만**
+ * 실제 호가 가격에 청산하고, 매물이 부족하면 그만큼만(부분) 청산하고 나머지는 포지션에 남긴다.
+ * - limitPrice=null : 시장가 청산(가격 제한 없이 walking).
+ * - limitPrice!=null: 지정가 청산(그 가격보다 불리하게는 체결 안 함 — 롱 청산은 ≥limit 매수호가만 소비).
+ * - pendingId!=null : 지정가 청산의 대기 주문(pending_orders) — 체결분만큼 줄이거나(부분) 삭제(완료).
+ * PnL·증거금 환급은 실제 체결가(가중평균) 기준으로 청크마다 정산한다. 반환: { filled, avgPrice }.
+ */
+async function closePositionAgainstBook(
+  env: Env,
+  uid: string,
+  pos: PositionRow,
+  closeSize: number,
+  limitPrice: number | null,
+  pendingId: string | null,
+  pendingSize: number,
+): Promise<{ filled: number; avgPrice: number }> {
+  const closeTaker = pos.side === 'long' ? 'short' : 'long'; // 청산 방향(롱 청산=매도=short, 봇 매수호가 소비)
+  const tapeSide: 'buy' | 'sell' = pos.side === 'long' ? 'sell' : 'buy'; // 체결내역 taker 방향(롱 청산=매도)
+  const dir = pos.side === 'long' ? 1 : -1;
+  const marginPerUnit = pos.size > EPS ? pos.margin / pos.size : 0;
+  let remaining = Math.min(closeSize, pos.size);
+  let filled = 0;
+  let cost = 0;
+  let pnlTotal = 0;
+
+  for (let i = 0; i < 500 && remaining > EPS; i++) {
+    const maker = await bestBotMaker(env, closeTaker, limitPrice);
+    if (!maker) break; // 크로스되는 호가 없음 → 남은 수량은 미청산(시장가면 버려지고, 지정가면 pending 에 대기)
+
+    const chunk = Math.min(remaining, maker.size);
+    const makerRem = maker.size - chunk;
+    const claim = await env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open' AND size>=?")
+      .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
+      .run();
+    if (claim.meta.changes !== 1) continue; // 다른 경로가 먼저 선점 → 재시도
+
+    const fillPrice = maker.price;
+    const chunkPnl = (fillPrice - pos.entry_price) * chunk * dir;
+    const chunkMargin = marginPerUnit * chunk;
+    const newFilled = filled + chunk;
+    const fullyClosed = newFilled >= pos.size - EPS;
+    const now = Date.now();
+
+    await env.DB.batch([
+      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(chunkMargin + chunkPnl, uid),
+      fullyClosed
+        ? env.DB.prepare('DELETE FROM positions WHERE id=? AND user_id=?').bind(pos.id, uid)
+        : env.DB.prepare('UPDATE positions SET size=?, margin=? WHERE id=? AND user_id=?')
+            .bind(pos.size - newFilled, pos.margin - marginPerUnit * newFilled, pos.id, uid),
+      ...spotTradeStmts(
+        env,
+        tapeSide === 'buy' ? uid : maker.user_id,
+        tapeSide === 'buy' ? maker.user_id : uid,
+        fillPrice,
+        chunk,
+        tapeSide,
+        now,
+      ),
+    ]);
+    filled = newFilled;
+    remaining -= chunk;
+    cost += fillPrice * chunk;
+    pnlTotal += chunkPnl;
+    if (fullyClosed) break;
+  }
+
+  if (filled > EPS) {
+    if (pendingId) {
+      if (filled >= pendingSize - EPS)
+        await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run();
+      else await env.DB.prepare('UPDATE pending_orders SET size=? WHERE id=?').bind(pendingSize - filled, pendingId).run();
+    }
+    // 청산 체결 이력 1건(가중평균가·총 실현손익). side 는 포지션 방향(기존 close 기록과 동일 규약).
+    await env.DB.prepare(
+      'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+    ).bind(crypto.randomUUID(), uid, PAIR, pos.side, cost / filled, filled, pos.leverage, 'close', pnlTotal, Date.now()).run();
+  }
+  return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
+}
+
+/** OX 시장가 청산 — 봇 호가창을 walking 하며 있는 물량만큼만 청산(매물 없으면 부분). order.ts close 액션이 호출. */
+export function marketCloseOxPosition(env: Env, uid: string, pos: PositionRow, closeSize: number) {
+  return closePositionAgainstBook(env, uid, pos, closeSize, null, null, 0);
+}
+
+/** OX 지정가 청산(reduce-only) 대기 주문 하나를 봇 호가창에 매칭한다(제출 직후·재호가 sweep·checkTriggers 공용).
+ * 청산 대상 포지션이 이미 없으면(전량청산·강제청산됨) 고아 pending 을 정리한다. */
+export async function matchReduceOnlyOxPending(env: Env, pendingId: string): Promise<void> {
+  const p = await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
+  if (!p || p.symbol !== PAIR || !p.reduce_only) return;
+  const posSide = p.side === 'short' ? 'long' : 'short'; // 청산 대상 포지션 방향(주문 side 의 반대)
+  const pos = await env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
+    .bind(p.user_id, PAIR, posSide)
+    .first<PositionRow>();
+  if (!pos) {
+    await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run(); // 청산할 포지션 없음 → 정리
+    return;
+  }
+  await closePositionAgainstBook(env, p.user_id, pos, Math.min(p.size, pos.size), p.limit_price, pendingId, p.size);
+}
+
+/** 대기 중인 전 유저의 OX 지정가(진입·청산)를 봇 호가창에 매칭 — runMarketMaker 가 재호가 직후 호출하므로,
  * 주문 낸 유저가 접속/폴링 중이 아니어도 유동성이 크로스되면 실제 호가 가격에 이어서 체결된다. */
 async function sweepRestingOxPendings(env: Env): Promise<void> {
   const pendings = (
-    await env.DB.prepare('SELECT id FROM pending_orders WHERE symbol=?').bind(PAIR).all<{ id: string }>()
+    await env.DB.prepare('SELECT id, reduce_only FROM pending_orders WHERE symbol=?')
+      .bind(PAIR)
+      .all<{ id: string; reduce_only: number }>()
   ).results;
   for (const p of pendings) {
     try {
-      await matchLimitPendingAgainstBook(env, p.id);
+      if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id);
+      else await matchLimitPendingAgainstBook(env, p.id);
     } catch {
       /* 한 건 실패해도 나머지는 계속 — 다음 틱에서 재시도 */
     }

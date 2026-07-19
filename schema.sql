@@ -48,14 +48,15 @@ CREATE TABLE IF NOT EXISTS pending_orders (
   id          TEXT PRIMARY KEY,
   user_id     TEXT NOT NULL,
   symbol      TEXT NOT NULL,
-  side        TEXT NOT NULL,          -- 'long' | 'short'
+  side        TEXT NOT NULL,          -- 'long' | 'short' (주문 방향. reduce_only 면 청산 대상 포지션의 반대: 롱 청산=short)
   size        REAL NOT NULL,
   leverage    INTEGER NOT NULL,
   limit_price REAL NOT NULL,
-  margin      REAL NOT NULL,          -- 생성 시 잠근 증거금 (limit_price 기준)
+  margin      REAL NOT NULL,          -- 생성 시 잠근 증거금 (limit_price 기준). reduce_only 는 증거금 안 잠금(=0)
   stop_loss   REAL,
   take_profit REAL,
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  reduce_only INTEGER NOT NULL DEFAULT 0  -- 1이면 지정가 "청산"(체결 시 포지션을 열지 않고 반대 포지션을 줄인다), 증거금 안 잠금
 );
 CREATE INDEX IF NOT EXISTS idx_pending_user ON pending_orders(user_id);
 -- OX 호가창(loadSpotMarket UNION)·마켓메이커 sweep 이 매 폴링마다 symbol 로 조회하므로 인덱스를 둔다.
@@ -155,3 +156,9 @@ CREATE TABLE IF NOT EXISTS spot_candles (
 -- `wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요).
 -- 신규 배포 직후엔 비어 있으므로 loadSpotCandles 가 잠시 거래 버킷팅으로 폴백하다가, 봇/유저 체결이
 -- 쌓이면서 자연히 이 테이블이 채워져 이후 히스토리가 영구 보존된다(백필 스크립트 불필요).
+
+-- ⚠ 일회성 마이그레이션 (2026-07-19 추가, 지정가 청산=reduce-only 주문): 기존 prod DB 의 pending_orders
+-- 에 컬럼을 추가한다. CREATE TABLE IF NOT EXISTS 는 기존 테이블에 컬럼을 더해주지 않으므로 최초 1회만
+-- 아래를 직접 실행할 것(코드가 이 컬럼을 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다 — limitClose
+-- INSERT 가 실패하지 않게). 이미 실행했다면 재실행 시 "duplicate column name" 에러(무시 가능).
+-- ALTER TABLE pending_orders ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0;

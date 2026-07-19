@@ -35,6 +35,7 @@ export interface ApiPendingOrder {
   stopLoss: number | null;
   takeProfit: number | null;
   createdAt: number;
+  reduceOnly: boolean; // true 면 지정가 "청산" 주문(체결 시 반대 포지션을 줄인다)
 }
 export interface AppState {
   name: string;
@@ -104,6 +105,8 @@ export const api = {
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'open', ...p }) }),
   close: (positionId: string, size?: number) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'close', positionId, size }) }),
+  limitClose: (positionId: string, size: number, limitPrice: number) =>
+    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'limitClose', positionId, size, limitPrice }) }),
   limitOpen: (p: {
     symbol: string;
     side: Side;

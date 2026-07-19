@@ -337,6 +337,7 @@ export interface PendingRow {
   stop_loss: number | null;
   take_profit: number | null;
   created_at: number;
+  reduce_only: number; // 1이면 지정가 청산(reduce-only) — 체결 시 포지션을 열지 않고 반대 포지션을 줄인다
 }
 export interface OrderRow {
   id: string;
@@ -416,6 +417,7 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
       stopLoss: p.stop_loss,
       takeProfit: p.take_profit,
       createdAt: p.created_at,
+      reduceOnly: !!p.reduce_only,
     })),
   };
 }

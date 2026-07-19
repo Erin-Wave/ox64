@@ -657,7 +657,7 @@ export default function Chart() {
             lineWidth: 1,
             lineStyle: LineStyle.LargeDashed,
             axisLabelVisible: true,
-            title: `${p.side === 'long' ? '매수' : '매도'} ${fmtVol(p.size)}`,
+            title: `${p.reduceOnly ? '청산 ' : ''}${p.side === 'long' ? '매수' : '매도'} ${fmtVol(p.size)}`,
           }),
         );
       }

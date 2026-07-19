@@ -9,7 +9,7 @@
 // 1시간마다 호출해 전 유저를 훑는다. 지정가/SL·TP 는 여전히 접속(폴링) 기반 그대로.
 
 import { type D1PreparedStatement, type Env, type PendingRow, type PositionRow, fetchPrices, isVirtualSymbol } from './_shared';
-import { matchLimitPendingAgainstBook, recordVirtualFill } from './api/spot';
+import { matchLimitPendingAgainstBook, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
 
 // OX/USDT 는 진짜 상대 거래자가 없으니, 지정가/SL·TP 체결도 합성 시장(호가창·체결내역·다음 봇
 // 기준가)에 반영해준다 — order.ts 의 reflectVirtualFill 과 동일한 이유(실패해도 무시, 표시용 부가효과).
@@ -100,6 +100,43 @@ export async function sweepForcedLiquidations(env: Env): Promise<{ checked: numb
   return { checked: byUser.size, liquidated };
 }
 
+/** 실제 코인 지정가 청산(reduce-only) 정산 — mark 가 지정가를 크로스하면 대상 포지션을 그 지정가에 청산.
+ * 대상 포지션(주문 side 의 반대)을 최신 상태로 다시 읽어(같은 폴링에서 물타기 등이 바꿨을 수 있음) 있으면
+ * min(주문수량, 포지션수량)만큼 청산하고 pending 을 삭제한다. 포지션이 이미 없으면 고아 pending 을 정리.
+ * (OX 는 봇 호가창 walking 이 필요해 spot.ts matchReduceOnlyOxPending 이 따로 담당 — 여기선 실제 코인 전용.) */
+async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark: number): Promise<void> {
+  const posSide = p.side === 'short' ? 'long' : 'short'; // 청산 대상 포지션 방향(주문 side 의 반대)
+  const pos = await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? AND symbol = ? AND side = ?')
+    .bind(uid, p.symbol, posSide)
+    .first<PositionRow>();
+  if (!pos) {
+    await env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid).run(); // 고아 정리
+    return;
+  }
+  // 매도청산(side short)은 가격이 지정가 이상으로 오르면, 매수청산(side long)은 지정가 이하로 내리면 체결.
+  const fills = p.side === 'short' ? mark >= p.limit_price : mark <= p.limit_price;
+  if (!fills) return;
+
+  const closeSize = Math.min(p.size, pos.size);
+  const dir = pos.side === 'long' ? 1 : -1;
+  const pnl = (p.limit_price - pos.entry_price) * closeSize * dir;
+  const marginReleased = (pos.margin * closeSize) / pos.size;
+  const fullyClosed = closeSize >= pos.size - 1e-9;
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnl, uid),
+    fullyClosed
+      ? env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid)
+      : env.DB.prepare('UPDATE positions SET size = ?, margin = ? WHERE id = ? AND user_id = ?')
+          .bind(pos.size - closeSize, pos.margin - marginReleased, pos.id, uid),
+    env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid),
+    env.DB.prepare(
+      'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+    ).bind(crypto.randomUUID(), uid, p.symbol, pos.side, p.limit_price, closeSize, pos.leverage, 'close', pnl, now),
+  ]);
+  await reflectVirtualFill(env, p.symbol, uid, p.limit_price, pos.side === 'long' ? 'sell' : 'buy', closeSize);
+}
+
 // 반환값 = 이번에 받아온 마크가격 맵(loadState 로 넘겨 클라가 서버와 동일한 시세로 청산가/평가자산을
 // 즉시 계산하게 한다 — 추가 fetch 없이 재사용). 포지션/미체결이 없으면 빈 맵.
 export async function checkTriggers(env: Env, uid: string): Promise<Record<string, number>> {
@@ -128,9 +165,17 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
     if (mark == null) continue;
 
     // OX/USDT 는 봇 호가창에 walking 매칭(runMarketMaker 와 공유하는 실제 매칭 엔진). 있는 물량만
-    // 실제 호가 가격에 체결, 잔량은 대기. 실제 코인은 아래 기존 limit_price 체결 경로 그대로.
+    // 실제 호가 가격에 체결, 잔량은 대기. reduce_only(지정가 청산)면 청산 매칭으로 분기. 실제 코인은 아래로.
     if (isVirtualSymbol(p.symbol)) {
-      await matchLimitPendingAgainstBook(env, p.id);
+      if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id);
+      else await matchLimitPendingAgainstBook(env, p.id);
+      continue;
+    }
+
+    // 지정가 청산(reduce-only, 실제 코인) — 로컬 호가창이 없어 mark 가 지정가를 크로스하면 그 지정가에 청산.
+    // 매도청산(side short)은 mark>=limit(가격이 오르면 롱 익절), 매수청산(side long)은 mark<=limit(가격이 내리면 숏 익절).
+    if (p.reduce_only) {
+      await settleReduceOnlyClose(env, uid, p, mark);
       continue;
     }
 
@@ -195,10 +240,16 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
   }
 
   // ── SL/TP 트리거 ── 체결가는 stop_loss/take_profit 값 그대로 사용(슬리피지 모델링 없음).
-  for (const pos of positions) {
-    if (pos.stop_loss == null && pos.take_profit == null) continue;
-    const mark = prices[pos.symbol];
+  for (const posSnap of positions) {
+    if (posSnap.stop_loss == null && posSnap.take_profit == null) continue;
+    const mark = prices[posSnap.symbol];
     if (mark == null) continue;
+    // ⚠ 같은 폴링에서 지정가 청산(reduce-only)·물타기가 이 포지션을 이미 줄이거나 없앴을 수 있으므로,
+    // 스냅샷이 아니라 최신 상태를 다시 읽어 이중 청산(사라진 포지션에 잔고를 또 환급)하지 않게 한다.
+    const pos = await env.DB.prepare('SELECT * FROM positions WHERE id = ? AND user_id = ?')
+      .bind(posSnap.id, uid)
+      .first<PositionRow>();
+    if (!pos || (pos.stop_loss == null && pos.take_profit == null)) continue;
     const dir = pos.side === 'long' ? 1 : -1;
 
     let trigger: number | null = null;
