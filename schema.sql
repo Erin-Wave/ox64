@@ -106,6 +106,23 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   ref_price REAL NOT NULL
 );
 
+-- ── OX 영속 캔들(차트 히스토리 영구 보존) ─────────────────────────────
+-- 예전엔 캔들을 매 요청마다 "최신 spot_trades 5000건"을 버킷팅해 만들어서, 총 거래가 5000건을 넘으면
+-- 오래된 캔들이 창 밖으로 밀려 차트 데이터가 시간이 지나면 사라졌다(특히 큰 인터벌은 몇 봉만 남음).
+-- 이제 모든 체결(functions/api/spot.ts candleUpsertStmts)이 인터벌별 OHLCV 를 여기에 누적 upsert 하고,
+-- loadSpotCandles 가 이 테이블에서 읽어 히스토리를 영구 보존한다(1s 만 예외로 최신 거래 버킷팅).
+CREATE TABLE IF NOT EXISTS spot_candles (
+  pair     TEXT NOT NULL,      -- 'OXUSDT'
+  interval TEXT NOT NULL,      -- 인터벌 코드('1m','5m','1h','1d' 등, functions/api/spot.ts CANDLE_INTERVALS)
+  bucket   INTEGER NOT NULL,   -- 버킷 시작 시각(ms, epoch) = floor(체결시각 / 인터벌ms) * 인터벌ms
+  open     REAL NOT NULL,
+  high     REAL NOT NULL,
+  low      REAL NOT NULL,
+  close    REAL NOT NULL,
+  volume   REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (pair, interval, bucket)   -- (pair,interval) 로 조회 + bucket 정렬을 이 인덱스로 커버
+);
+
 -- ⚠ 일회성 마이그레이션 (2026-07-15 추가, SL/TP 지원): 이미 스키마가 적용된 기존
 -- prod DB 의 positions 테이블에 컬럼을 추가한다. CREATE TABLE IF NOT EXISTS 는
 -- 기존 테이블에 컬럼을 더해주지 않으므로 별도 ALTER 필요. 최초 1회
@@ -133,3 +150,8 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
 -- ⚠ 마이그레이션 (2026-07-18 추가, OX 호가/sweep symbol 인덱스): CREATE INDEX IF NOT EXISTS 라
 -- 멱등이므로 `wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다
 -- (별도 ALTER 불필요). 위 idx_pending_symbol 참고.
+
+-- ⚠ 마이그레이션 (2026-07-19 추가, OX 영속 캔들): 위 spot_candles 는 CREATE TABLE IF NOT EXISTS 라
+-- `wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요).
+-- 신규 배포 직후엔 비어 있으므로 loadSpotCandles 가 잠시 거래 버킷팅으로 폴백하다가, 봇/유저 체결이
+-- 쌓이면서 자연히 이 테이블이 채워져 이후 히스토리가 영구 보존된다(백필 스크립트 불필요).

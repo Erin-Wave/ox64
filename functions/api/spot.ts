@@ -52,13 +52,41 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
   });
 }
 
-/** spot_trades 를 interval 버킷으로 묶어 OHLCV 캔들을 만든다(거래량이 적어 SQL 윈도우함수 대신 JS 로 처리).
- * ⚠ 반드시 "가장 최신" 5000건을 읽어야 한다 — 예전엔 `ORDER BY created_at ASC LIMIT 5000`(가장 오래된
- * 5000건)이라, 총 거래가 5000건을 넘는 순간부터 새 거래가 이 창 밖으로 밀려나 차트가 그 시점에 멈춰버렸다
- * (OX 차트가 "고장난" 것처럼 마지막 봉이 갱신 안 되던 버그). 최신 5000건을 DESC 로 뽑아 다시 ASC 로 정렬해 버킷팅. */
-async function loadSpotCandles(env: Env, intervalCode: string, limit: number) {
-  const sec = intervalSecFromCode(intervalCode);
-  const bucketMs = sec * 1000;
+// ── 영속 캔들(차트 히스토리 영구 보존) ────────────────────────────────
+// ⚠ 예전엔 캔들을 매 요청마다 "최신 spot_trades 5000건"을 버킷팅해서 만들었다 — 총 거래가 5000건을
+// 넘으면 오래된 거래가 읽기 창 밖으로 밀려나 옛 캔들이 통째로 사라지고(특히 큰 인터벌은 몇 봉밖에
+// 안 남음), "시간이 지나면 차트 데이터가 지워지는" 문제가 있었다. 이제 모든 체결(봇 합성체결·유저
+// 매칭체결·recordVirtualFill)이 candleUpsertStmts 로 인터벌별 집계 캔들을 spot_candles 에 누적 upsert 하고,
+// 차트는 그 테이블에서 읽는다 → 거래가 아무리 쌓여도 히스토리가 영구 보존되고, 읽기도 인터벌+버킷
+// 인덱스로 필요한 만큼만 가져와 가볍다. 1s(및 <60s)만 예외로 영속화하지 않고(단기 조회 전용, 영속
+// 저장은 낭비) 최신 거래 버킷팅으로 처리한다.
+const CANDLE_INTERVALS: readonly [string, number][] = [
+  ['1m', 60], ['3m', 180], ['5m', 300], ['15m', 900], ['30m', 1800],
+  ['1h', 3600], ['2h', 7200], ['4h', 14400], ['6h', 21600], ['8h', 28800], ['12h', 43200],
+  ['1d', 86400], ['3d', 259200], ['1w', 604800], ['1M', 2592000],
+];
+
+/** 한 체결(price,size,now)을 모든 영속 인터벌의 캔들에 반영하는 upsert 문장들.
+ * 버킷이 없으면 새로 만들고(open=high=low=close=price), 있으면 high/low/close/volume 만 갱신(open 유지).
+ * 모든 spot_trades INSERT 경로가 이 문장들을 같은 batch 에 함께 넣어 차트 히스토리를 영구 보존한다. */
+function candleUpsertStmts(env: Env, price: number, size: number, now: number): D1PreparedStatement[] {
+  return CANDLE_INTERVALS.map(([code, sec]) => {
+    const bucket = Math.floor(now / (sec * 1000)) * (sec * 1000);
+    return env.DB.prepare(
+      `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT(pair, interval, bucket) DO UPDATE SET
+         high = MAX(spot_candles.high, excluded.high),
+         low = MIN(spot_candles.low, excluded.low),
+         close = excluded.close,
+         volume = spot_candles.volume + excluded.volume`,
+    ).bind(PAIR, code, bucket, price, price, price, price, size);
+  });
+}
+
+/** 최신 spot_trades 를 interval 버킷으로 묶어 OHLCV 를 만든다(1s 등 단기 인터벌 + 영속 캔들 폴백 전용).
+ * ⚠ 반드시 "가장 최신" 5000건(DESC 로 뽑아 ASC 재정렬) — ASC LIMIT 이면 총 거래가 5000건을 넘는 순간
+ * 새 거래가 창 밖으로 밀려 차트 마지막 봉이 멈춘다. */
+async function bucketTradesToCandles(env: Env, bucketMs: number, limit: number) {
   const trades = (
     await env.DB.prepare(
       'SELECT price, size, created_at FROM (SELECT price, size, created_at FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 5000) ORDER BY created_at ASC',
@@ -85,6 +113,28 @@ async function loadSpotCandles(env: Env, intervalCode: string, limit: number) {
     .sort((a, b) => a[0] - b[0])
     .slice(-limit)
     .map(([t, c]) => ({ time: Math.floor(t / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+}
+
+/** OX 캔들 로드. 1m 이상은 영속 테이블(spot_candles)에서 읽어 히스토리가 시간이 지나도 사라지지 않게
+ * 한다. 1s(및 <60s)는 단기 조회라 최신 거래 버킷팅. 영속 테이블이 아직 빈 인터벌(신규 배포 직후,
+ * 거래가 아직 안 쌓인 상태)은 거래 버킷팅으로 폴백해 차트가 비지 않게 한다. */
+async function loadSpotCandles(env: Env, intervalCode: string, limit: number) {
+  const sec = intervalSecFromCode(intervalCode);
+  const bucketMs = sec * 1000;
+  if (sec < 60) return bucketTradesToCandles(env, bucketMs, limit);
+
+  const rows = (
+    await env.DB.prepare(
+      'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? ORDER BY bucket DESC LIMIT ?',
+    )
+      .bind(PAIR, intervalCode, limit)
+      .all<{ bucket: number; open: number; high: number; low: number; close: number; volume: number }>()
+  ).results;
+  if (rows.length === 0) return bucketTradesToCandles(env, bucketMs, limit);
+
+  return rows
+    .reverse()
+    .map((r) => ({ time: Math.floor(r.bucket / 1000), open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
 }
 
 /** 호가창·체결내역 "표시용" 데이터 — 특정 유저의 개인 데이터가 아니라 시장 전체를 보여준다.
@@ -148,8 +198,12 @@ async function loadSpotMarket(env: Env) {
 // 부기를 유지하느라 취소마다 환불·체결마다 정산하던 왕복이 순수 낭비여서 전부 제거했다(무한 유동성 풀).
 // 유저↔봇 체결의 물량 소비만 조건부 UPDATE 로 원자 처리하면 되고(matchLimitPendingAgainstBook 등),
 // 봇 잔고 숫자는 무의미하다.
-const BOT_TICK_MIN_MS = 3000;
-const BOT_TICK_MAX_MS = 8000;
+// 재호가(requote) 주기 — 짧을수록 기준가·호가·체결 테이프가 자주 갱신되고, 크로스되는 유저 주문이
+// 그만큼 빨리 체결된다(sweepRestingOxPendings 가 매 재호가 직후 도므로). 체결 딜레이를 줄이려고
+// 예전(3~8s)보다 크게 낮췄다 — runMarketMaker 는 /api/spot 폴링 시점에만 불리므로 실질 주기는
+// max(게이트, 폴링간격)이고, 프론트 폴링도 함께 1.5s 로 낮춰 유저가 OX 를 볼 때 ~1~2s 마다 갱신된다.
+const BOT_TICK_MIN_MS = 900;
+const BOT_TICK_MAX_MS = 2200;
 const BOT_LEVELS_PER_SIDE = 8; // 한 틱에 까는 매수/매도 각각의 호가 단계 수(호가창 깊이)
 
 // 봇 패시브 호가 1개를 INSERT 하는 문장(에스크로 없음).
@@ -220,12 +274,16 @@ export async function runMarketMaker(env: Env): Promise<void> {
     ).bind(crypto.randomUUID(), PAIR, actor, actor, ref, tradeSize, takerSide, now),
   );
   stmts.push(env.DB.prepare('UPDATE spot_bot_state SET ref_price = ? WHERE id = ?').bind(ref, PAIR));
+  stmts.push(...candleUpsertStmts(env, ref, tradeSize, now)); // 영속 캔들 갱신(같은 batch, 왕복 추가 없음)
   await env.DB.batch(stmts);
 
-  // 방금 깐 신선한 유동성에 대기 중 유저 지정가를 이어서 매칭(walking) — 봇이 유저 매수보다 싼
-  // 매도를 깔면 같은 틱에 소비돼 호가 역전이 화면에 안 남는다. 주문 낸 유저의 접속/폴링과 무관하게 진행.
-  // (게이트 전 sweep 은 제거했다 — 호가창은 이 requote 틱에만 바뀌므로 매 폴링 sweep 은 낭비였고,
-  //  유저 본인 pending 은 checkTriggers 5초 폴링이 별도로 훑는다.)
+  // ⚠ 봇이 호가를 새로 깔면(위) 그 즉시 호가창에 크로스되는 유저 물량이 있는지 판단해 바로 체결한다.
+  // 방금 깐 신선한 유동성에 대기 중 유저 지정가를 walking 매칭 — 봇이 유저 매수보다 싼 매도를 깔면 같은
+  // 틱에 소비돼 호가 역전이 화면에 안 남고, "호가창에 물량이 있으면 바로 체결"된다. 주문 낸 유저의
+  // 접속/폴링과 무관하게 진행. 재호가 게이트(위 BOT_TICK_*)를 짧게 잡아, 유저가 OX 를 보고 있으면
+  // 이 크로스 체결이 ~1~2s 마다 돌아 체결 딜레이가 거의 없다.
+  // (게이트 전 sweep 은 두지 않는다 — 호가창은 이 requote 틱에만 바뀌므로 매 폴링 sweep 은 낭비였고,
+  //  유저 본인 pending 은 checkTriggers 폴링이 별도로 훑는다.)
   await sweepRestingOxPendings(env);
 }
 
@@ -271,6 +329,7 @@ export async function recordVirtualFill(
     env.DB.prepare(
       'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price',
     ).bind(PAIR, now, price),
+    ...candleUpsertStmts(env, price, size, now), // 영속 캔들 갱신
   ]);
 }
 
@@ -331,6 +390,7 @@ function spotTradeStmts(
     env.DB.prepare(
       'INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price',
     ).bind(PAIR, now, price),
+    ...candleUpsertStmts(env, price, size, now), // 유저 매칭체결도 영속 캔들에 반영
   ];
 }
 
