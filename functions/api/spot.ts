@@ -213,41 +213,28 @@ function botQuoteStmt(env: Env, actor: string, side: 'buy' | 'sell', price: numb
   ).bind(crypto.randomUUID(), actor, PAIR, side, price, size, size, 'open', now);
 }
 
-export async function runMarketMaker(env: Env): Promise<void> {
-  const row = await env.DB.prepare('SELECT last_run, ref_price FROM spot_bot_state WHERE id = ?')
-    .bind(PAIR)
-    .first<{ last_run: number; ref_price: number }>();
-  const now = Date.now();
-  const last = row?.last_run ?? 0;
+// ⚠ 한 틱에 찍는 합성 체결의 개수·크기 — 예전엔 5~45 짜리 1건이라 캔들 거래량이 수백에 그쳤다("봇이
+// 쫄보"). 실제 시장처럼 보이도록 매 틱 여러 건을 큰 물량으로 찍는다(테이프도 붐비고 거래량도 유의미).
+const BOT_TRADES_PER_TICK_MIN = 3;
+const BOT_TRADES_PER_TICK_MAX = 6;
+const BOT_TRADE_SIZE_MIN = 1000;
+const BOT_TRADE_SIZE_MAX = 8000;
+const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에 몰아 돌리는 틱 수(시장이 계속 살아있게)
 
-  const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
-  if (now - last < gate) return; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
-
-  // 재호가 틱을 원자적으로 선점(동시 폴링이 겹쳐도 이 틱은 한 번만 requote) — 조건부 upsert.
-  // 최초(행 없음)엔 INSERT 로 changes=1, 이미 다른 요청이 last_run 을 옮겼으면 WHERE 불일치로 changes=0.
-  const claim = await env.DB.prepare(
-    'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run WHERE spot_bot_state.last_run = ?',
-  )
-    .bind(PAIR, now, row?.ref_price ?? 1, last)
-    .run();
-  if (claim.meta.changes !== 1) return; // 다른 요청이 이 틱을 이미 선점 — 중복 requote 방지
-
-  let prevRef = row?.ref_price ?? 0;
-  if (!prevRef) {
-    const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
-      .bind(PAIR)
-      .first<{ price: number }>();
-    prevRef = lastTrade?.price ?? 1;
-  }
+/**
+ * 마켓메이커 한 틱(requote): 봇 호가를 새로 깔고, 큰 합성 체결을 여러 건 찍어 테이프/거래량을 만들고,
+ * 유저 지정가 "벽"을 존중(클램프+소비)하고, 대기 중 유저 지정가를 walking 매칭한다. prevRef 기준으로
+ * 랜덤워크한 새 ref 를 반환. now 는 이 틱의 기준 시각(cron 버스트는 조금씩 다른 값을 넘겨 캔들이 최근
+ * 시간대에 자연스럽게 퍼지게 한다). ref_price 는 갱신하지만 last_run 은 건드리지 않는다(게이트는 호출자 담당).
+ */
+async function marketMakerTick(env: Env, prevRef: number, now: number): Promise<number> {
   const candidateRef = roundOx(Math.max(0.01, prevRef * (1 + (Math.random() - 0.5) * 0.012))); // ±0.6% 랜덤워크(4자리 틱 스냅)
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
 
   // ⚠ 유저가 걸어둔 지정가 "벽"을 존중한다(가짜 high 버그 수정). 랜덤워크 기준가가 유저의 최우선 매도벽
   // 위로 올라가거나 최우선 매수벽 아래로 내려가면, 실제 시장이라면 그 벽을 먼저 소비해야 하므로 기준가·
-  // 합성체결을 벽 너머에 찍으면 안 된다 — 예전엔 "1.1 에 큰 매도벽이 있어도 봇이 1.11 에 합성체결을 찍어
-  // 차트 high 만 1.11 로 가짜로 뜨고(벽은 그대로 안 팔림)" 버그가 있었다. → 기준가를 [최우선 매수벽,
-  // 최우선 매도벽] 안으로 클램프하고, 벽에 눌리면(press) 그 벽 가격에 봇 호가를 하나 놓아 아래 sweep 이
-  // 벽을 실제 체결로 조금씩 소비하게 한다(가격이 벽에서 저항받다가 물량이 소진되면 뚫린다 — 실거래소와 동일).
+  // 합성체결을 벽 너머에 찍으면 안 된다. → 기준가를 [최우선 매수벽, 최우선 매도벽] 안으로 클램프하고,
+  // 벽에 눌리면(press) 그 벽 가격에 봇 호가를 하나 놓아 아래 sweep 이 벽을 실제 체결로 조금씩 소비하게 한다.
   const walls = await env.DB.prepare(
     "SELECT MIN(CASE WHEN side='short' THEN limit_price END) AS ask, MAX(CASE WHEN side='long' THEN limit_price END) AS bid FROM pending_orders WHERE symbol=?",
   )
@@ -265,20 +252,13 @@ export async function runMarketMaker(env: Env): Promise<void> {
     press = 'down'; // 매수벽에 눌림 — 봇이 벽 가격에 매도호가를 놓아 벽을 소비
   }
 
-  // === 단일 batch: (1) 이 페어의 봇 호가 전부 취소  (2) 새 양방향 사다리 호가  (3) 합성 체결 1건
-  //                (4) 기준가 갱신 — 전부 왕복 1회로 끝낸다. ===
   const stmts: D1PreparedStatement[] = [
-    // ⚠ 매 틱 이 페어의 봇 호가를 "전부"(두 봇 모두) 비우고 한 액터가 일관된 사다리를 새로 깐다.
-    // 액터 것만 취소하면 다른 봇의 오래된 호가가 남아, 랜덤워크로 기준가가 움직인 뒤 호가 역전
-    // (최우선매수 > 최우선매도)이 생긴다 — 예전엔 봇끼리 크로스 매칭이 이걸 정리했지만 그 왕복을
-    // 없앴으므로, 아예 전체를 비우고 다시 까는 게 가장 싸고 확실하다(user 주문은 pending_orders 라
-    // spot_orders 엔 봇 호가만 있으니 pair 전체를 지워도 유저 주문엔 영향 없음). batch 원자성으로
-    // 호가창이 빈 순간이 노출되지 않는다(취소+재호가가 한 스냅샷).
+    // ⚠ 매 틱 이 페어의 봇 호가를 "전부"(두 봇 모두) 비우고 한 액터가 일관된 사다리를 새로 깐다(호가 역전 방지).
+    // spot_orders 엔 봇 호가만 있으니(유저 주문은 pending_orders) pair 전체를 지워도 유저 주문엔 영향 없다.
     env.DB.prepare("UPDATE spot_orders SET status = 'cancelled' WHERE pair = ? AND status = 'open'").bind(PAIR),
   ];
-  // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 실거래소처럼 타이트하게(최우선호가가 mid 에
-  // 바싹 붙게) 잡아 시장가 체결이 mid 근처에서 이뤄지게 하되, 깊은 레벨로 갈수록 벌어지며 대량 주문엔
-  // 슬리피지가 생긴다. 물량을 크게 깔아(2000~10000) 유저 주문이 시원하게 체결되게 한다.
+  // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 타이트하게(최우선호가가 mid 에 바싹) 잡되 깊은
+  // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
     const spread = 0.0012 + level * 0.0016 + Math.random() * 0.0008;
     const buySize = Number((2000 + Math.random() * 8000).toFixed(4));
@@ -286,33 +266,89 @@ export async function runMarketMaker(env: Env): Promise<void> {
     stmts.push(botQuoteStmt(env, actor, 'buy', roundOx(ref * (1 - spread)), buySize, now));
     stmts.push(botQuoteStmt(env, actor, 'sell', roundOx(ref * (1 + spread)), sellSize, now));
   }
-  // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 하나 얹는다 — 사다리 최우선호가는 mid±spread 라
-  // 벽(=ref)에 닿지 않으므로, 여기서 벽 가격에 반대편 호가를 놓아야 아래 sweep 이 유저 벽을 실제 체결로
-  // 소비한다(벽이 조금씩 깎이다 소진되면 가격이 뚫림). 소비량은 봇 사다리 물량과 같은 스케일.
+  // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 하나 얹는다 — 아래 sweep 이 유저 벽을 그 가격에 소비.
   if (press === 'up') stmts.push(botQuoteStmt(env, actor, 'buy', ref, Number((2000 + Math.random() * 8000).toFixed(4)), now));
   else if (press === 'down') stmts.push(botQuoteStmt(env, actor, 'sell', ref, Number((2000 + Math.random() * 8000).toFixed(4)), now));
-  // 합성 체결 1건 — 봇끼리 크로스 주문을 내고 매칭하던(호가 1개 더 깔고 매칭 왕복) 예전 방식을 대체.
-  // 체결 테이프·차트가 계속 움직이게 하되 왕복 없이 batch 안에서 끝낸다. 체결가=새 기준가(mid),
-  // 색상은 기준가가 오르면 매수/내리면 매도.
-  const tradeSize = Number((5 + Math.random() * 40).toFixed(4));
-  const takerSide = ref >= prevRef ? 'buy' : 'sell';
-  stmts.push(
-    env.DB.prepare(
-      'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), PAIR, actor, actor, ref, tradeSize, takerSide, now),
-  );
+
+  // 합성 체결을 여러 건(버스트) 큰 물량으로 찍는다 — 예전 1건(5~45)이 거래량 ~300 밖에 안 되던 원인.
+  // 체결가=ref, 방향은 ref 진행 방향으로 편향(70%)하되 섞어 테이프가 자연스럽게. 캔들은 총량으로 1회 upsert.
+  const nTrades = BOT_TRADES_PER_TICK_MIN + Math.floor(Math.random() * (BOT_TRADES_PER_TICK_MAX - BOT_TRADES_PER_TICK_MIN + 1));
+  const upBias = ref >= prevRef;
+  let vol = 0;
+  for (let i = 0; i < nTrades; i++) {
+    const sz = Number((BOT_TRADE_SIZE_MIN + Math.random() * (BOT_TRADE_SIZE_MAX - BOT_TRADE_SIZE_MIN)).toFixed(4));
+    vol += sz;
+    const takerSide = Math.random() < 0.7 ? (upBias ? 'buy' : 'sell') : upBias ? 'sell' : 'buy';
+    stmts.push(
+      env.DB.prepare(
+        'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), PAIR, actor, actor, ref, sz, takerSide, now + i),
+    );
+  }
   stmts.push(env.DB.prepare('UPDATE spot_bot_state SET ref_price = ? WHERE id = ?').bind(ref, PAIR));
-  stmts.push(...candleUpsertStmts(env, ref, tradeSize, now)); // 영속 캔들 갱신(같은 batch, 왕복 추가 없음)
+  stmts.push(...candleUpsertStmts(env, ref, vol, now)); // 영속 캔들: 이 틱 버스트의 총 거래량으로 1회 갱신
   await env.DB.batch(stmts);
 
-  // ⚠ 봇이 호가를 새로 깔면(위) 그 즉시 호가창에 크로스되는 유저 물량이 있는지 판단해 바로 체결한다.
-  // 방금 깐 신선한 유동성에 대기 중 유저 지정가를 walking 매칭 — 봇이 유저 매수보다 싼 매도를 깔면 같은
-  // 틱에 소비돼 호가 역전이 화면에 안 남고, "호가창에 물량이 있으면 바로 체결"된다. 주문 낸 유저의
-  // 접속/폴링과 무관하게 진행. 재호가 게이트(위 BOT_TICK_*)를 짧게 잡아, 유저가 OX 를 보고 있으면
-  // 이 크로스 체결이 ~1~2s 마다 돌아 체결 딜레이가 거의 없다.
-  // (게이트 전 sweep 은 두지 않는다 — 호가창은 이 requote 틱에만 바뀌므로 매 폴링 sweep 은 낭비였고,
-  //  유저 본인 pending 은 checkTriggers 폴링이 별도로 훑는다.)
+  // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
   await sweepRestingOxPendings(env);
+  return ref;
+}
+
+/** 폴링(유저 접속) 시 호출 — 재호가 게이트를 통과할 때만 한 틱을 돈다. */
+export async function runMarketMaker(env: Env): Promise<void> {
+  const row = await env.DB.prepare('SELECT last_run, ref_price FROM spot_bot_state WHERE id = ?')
+    .bind(PAIR)
+    .first<{ last_run: number; ref_price: number }>();
+  const now = Date.now();
+  const last = row?.last_run ?? 0;
+
+  const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
+  if (now - last < gate) return; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
+
+  // 재호가 틱을 원자적으로 선점(동시 폴링이 겹쳐도 이 틱은 한 번만 requote) — 조건부 upsert.
+  const claim = await env.DB.prepare(
+    'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run WHERE spot_bot_state.last_run = ?',
+  )
+    .bind(PAIR, now, row?.ref_price ?? 1, last)
+    .run();
+  if (claim.meta.changes !== 1) return; // 다른 요청이 이 틱을 이미 선점 — 중복 requote 방지
+
+  let prevRef = row?.ref_price ?? 0;
+  if (!prevRef) {
+    const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
+      .bind(PAIR)
+      .first<{ price: number }>();
+    prevRef = lastTrade?.price ?? 1;
+  }
+  await marketMakerTick(env, prevRef, now);
+}
+
+/**
+ * cron 전용 — 접속자가 없어도 시장이 계속 살아있도록 한 번에 여러 틱을 몰아 돈다(게이트 무시).
+ * cron 이 1분마다 부르므로 그 사이의 거래량·가격 움직임을 여기서 만든다(예전엔 5분마다 1틱뿐이라
+ * 아무도 안 볼 때 차트가 사실상 멈춰 있었다). 각 틱의 체결 시각을 최근 구간에 조금씩 퍼뜨려 캔들이
+ * 한 봉에만 뭉치지 않게 한다. 마지막에 last_run 을 갱신해 직후 폴링이 곧바로 겹쳐 requote 하지 않게 함.
+ */
+export async function runMarketMakerBurst(env: Env, ticks: number = BOT_BURST_TICKS, spanMs: number = 55000): Promise<void> {
+  const row = await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id = ?').bind(PAIR).first<{ ref_price: number }>();
+  let ref = row?.ref_price ?? 0;
+  if (!ref) {
+    const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
+      .bind(PAIR)
+      .first<{ price: number }>();
+    ref = lastTrade?.price ?? 1;
+  }
+  const base = Date.now();
+  for (let i = 0; i < ticks; i++) {
+    // 체결 시각을 [base-spanMs, base] 에 고르게 퍼뜨려 최근 캔들들을 채운다(빈 봉 방지).
+    const ts = base - spanMs + Math.floor(((i + 1) / ticks) * spanMs);
+    ref = await marketMakerTick(env, ref, ts);
+  }
+  await env.DB.prepare(
+    'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run, ref_price = excluded.ref_price',
+  )
+    .bind(PAIR, Date.now(), ref)
+    .run();
 }
 
 /** 유저가 OX 를 실제로 레버리지 거래(order.ts open/close)할 때 그 체결을 합성 시장에도 반영한다.

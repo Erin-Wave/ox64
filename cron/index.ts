@@ -7,7 +7,7 @@
 // @cloudflare/workers-types 를 의존성으로 두지 않는 프로젝트 관례(functions/_shared.ts 참고)를
 // 그대로 따라 ScheduledEvent/ExecutionContext 도 필요한 최소 형태만 직접 선언한다.
 import { sweepForcedLiquidations } from '../functions/_trading';
-import { runMarketMaker } from '../functions/api/spot';
+import { runMarketMakerBurst } from '../functions/api/spot';
 import type { Env as TradingEnv, D1Database } from '../functions/_shared';
 
 interface Env {
@@ -24,8 +24,11 @@ interface MinimalExecutionContext {
 
 async function runTick(env: Env): Promise<{ liquidation: { checked: number; liquidated: number } }> {
   // 둘 다 env.DB 만 사용 — SESSION_SECRET 은 이 워커엔 없어도 무방.
+  // ⚠ 마켓메이커는 단발 틱(runMarketMaker)이 아니라 "버스트"(runMarketMakerBurst)로 돌린다 — 아무도 앱을
+  // 안 켜놨을 땐 이 cron 만이 유일한 클럭이라, 한 번에 여러 틱을 몰아 최근 구간의 거래량/가격 움직임을
+  // 만들어야 차트가 살아있다(예전엔 단발 틱이라 접속자 없으면 사실상 멈춤). cron 주기는 wrangler.toml 참고.
   const tradingEnv = env as unknown as TradingEnv;
-  const [liquidation] = await Promise.all([sweepForcedLiquidations(tradingEnv), runMarketMaker(tradingEnv)]);
+  const [liquidation] = await Promise.all([sweepForcedLiquidations(tradingEnv), runMarketMakerBurst(tradingEnv)]);
   return { liquidation };
 }
 

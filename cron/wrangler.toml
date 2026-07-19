@@ -9,7 +9,7 @@ main = "index.ts"
 compatibility_date = "2024-11-01"
 
 [triggers]
-crons = ["*/5 * * * *"]  # 5분마다 — 강제청산은 넉넉해도 되고, OX 봇은 "느려도 꾸준히"만 필요해서 이 주기 하나로 둘 다 처리
+crons = ["* * * * *"]  # 매 1분 — OX 봇이 접속자 없어도 활발하게 살아있게(매 분 runMarketMakerBurst 로 여러 틱을 몰아 실행). 강제청산도 이 주기로 넉넉히 처리
 
 [[d1_databases]]
 binding = "DB"

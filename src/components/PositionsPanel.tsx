@@ -26,6 +26,7 @@ export default function PositionsPanel() {
   const busy = useTradingStore((s) => s.busy);
   const prices = useMarketStore((s) => s.prices);
   const precisions = useMarketStore((s) => s.precisions);
+  const setSymbol = useMarketStore((s) => s.setSymbol);
   const standard = useSettingsStore((s) => s.tradingMode) === 'standard';
 
   const [tab, setTab] = useState<Tab>('positions');
@@ -152,7 +153,15 @@ export default function PositionsPanel() {
                   const liq = liqPriceOf(p);
                   return (
                     <tr key={p.id} className="border-b border-border/60 transition hover:bg-panel2">
-                      <td className="px-3 py-2.5 font-medium text-text">{p.symbol.replace('USDT', '')}</td>
+                      <td className="px-3 py-2.5 font-medium text-text">
+                        <button
+                          onClick={() => setSymbol(p.symbol)}
+                          title={`${p.symbol.replace('USDT', '')} 차트로 이동`}
+                          className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
+                        >
+                          {p.symbol.replace('USDT', '')}
+                        </button>
+                      </td>
                       <td className="px-3 py-2.5">
                         <span
                           className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
@@ -295,7 +304,15 @@ export default function PositionsPanel() {
                   const pe = editPendId === o.id;
                   return (
                     <tr key={o.id} className="border-b border-border/60">
-                      <td className="px-3 py-2.5 font-medium text-text">{o.symbol.replace('USDT', '')}</td>
+                      <td className="px-3 py-2.5 font-medium text-text">
+                        <button
+                          onClick={() => setSymbol(o.symbol)}
+                          title={`${o.symbol.replace('USDT', '')} 차트로 이동`}
+                          className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
+                        >
+                          {o.symbol.replace('USDT', '')}
+                        </button>
+                      </td>
                       <td className="px-3 py-2.5">
                         {o.reduceOnly ? (
                           // 지정가 청산(reduce-only) — 주문 방향(side)의 반대가 청산 대상 포지션 방향.
@@ -408,7 +425,15 @@ export default function PositionsPanel() {
                   return (
                     <tr key={o.id} className="border-b border-border/60">
                       <td className="whitespace-nowrap px-3 py-2 text-muted">{fmtTime(o.createdAt)}</td>
-                      <td className="px-3 py-2 font-medium text-text">{o.symbol.replace('USDT', '')}</td>
+                      <td className="px-3 py-2 font-medium text-text">
+                        <button
+                          onClick={() => setSymbol(o.symbol)}
+                          title={`${o.symbol.replace('USDT', '')} 차트로 이동`}
+                          className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
+                        >
+                          {o.symbol.replace('USDT', '')}
+                        </button>
+                      </td>
                       <td className="px-3 py-2">
                         <span className={o.side === 'long' ? 'text-up' : 'text-down'}>
                           {o.side === 'long' ? '롱' : '숏'} {o.leverage}x
