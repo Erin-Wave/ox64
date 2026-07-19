@@ -239,8 +239,31 @@ export async function runMarketMaker(env: Env): Promise<void> {
       .first<{ price: number }>();
     prevRef = lastTrade?.price ?? 1;
   }
-  const ref = roundOx(Math.max(0.01, prevRef * (1 + (Math.random() - 0.5) * 0.012))); // ±0.6% 랜덤워크(4자리 틱 스냅)
+  const candidateRef = roundOx(Math.max(0.01, prevRef * (1 + (Math.random() - 0.5) * 0.012))); // ±0.6% 랜덤워크(4자리 틱 스냅)
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
+
+  // ⚠ 유저가 걸어둔 지정가 "벽"을 존중한다(가짜 high 버그 수정). 랜덤워크 기준가가 유저의 최우선 매도벽
+  // 위로 올라가거나 최우선 매수벽 아래로 내려가면, 실제 시장이라면 그 벽을 먼저 소비해야 하므로 기준가·
+  // 합성체결을 벽 너머에 찍으면 안 된다 — 예전엔 "1.1 에 큰 매도벽이 있어도 봇이 1.11 에 합성체결을 찍어
+  // 차트 high 만 1.11 로 가짜로 뜨고(벽은 그대로 안 팔림)" 버그가 있었다. → 기준가를 [최우선 매수벽,
+  // 최우선 매도벽] 안으로 클램프하고, 벽에 눌리면(press) 그 벽 가격에 봇 호가를 하나 놓아 아래 sweep 이
+  // 벽을 실제 체결로 조금씩 소비하게 한다(가격이 벽에서 저항받다가 물량이 소진되면 뚫린다 — 실거래소와 동일).
+  const walls = await env.DB.prepare(
+    "SELECT MIN(CASE WHEN side='short' THEN limit_price END) AS ask, MAX(CASE WHEN side='long' THEN limit_price END) AS bid FROM pending_orders WHERE symbol=?",
+  )
+    .bind(PAIR)
+    .first<{ ask: number | null; bid: number | null }>();
+  const wallAsk = walls?.ask ?? null;
+  const wallBid = walls?.bid ?? null;
+  let ref = candidateRef;
+  let press: 'up' | 'down' | null = null;
+  if (wallAsk != null && ref > wallAsk) {
+    ref = roundOx(wallAsk);
+    press = 'up'; // 매도벽에 눌림 — 봇이 벽 가격에 매수호가를 놓아 벽을 소비
+  } else if (wallBid != null && ref < wallBid) {
+    ref = roundOx(wallBid);
+    press = 'down'; // 매수벽에 눌림 — 봇이 벽 가격에 매도호가를 놓아 벽을 소비
+  }
 
   // === 단일 batch: (1) 이 페어의 봇 호가 전부 취소  (2) 새 양방향 사다리 호가  (3) 합성 체결 1건
   //                (4) 기준가 갱신 — 전부 왕복 1회로 끝낸다. ===
@@ -263,6 +286,11 @@ export async function runMarketMaker(env: Env): Promise<void> {
     stmts.push(botQuoteStmt(env, actor, 'buy', roundOx(ref * (1 - spread)), buySize, now));
     stmts.push(botQuoteStmt(env, actor, 'sell', roundOx(ref * (1 + spread)), sellSize, now));
   }
+  // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 하나 얹는다 — 사다리 최우선호가는 mid±spread 라
+  // 벽(=ref)에 닿지 않으므로, 여기서 벽 가격에 반대편 호가를 놓아야 아래 sweep 이 유저 벽을 실제 체결로
+  // 소비한다(벽이 조금씩 깎이다 소진되면 가격이 뚫림). 소비량은 봇 사다리 물량과 같은 스케일.
+  if (press === 'up') stmts.push(botQuoteStmt(env, actor, 'buy', ref, Number((2000 + Math.random() * 8000).toFixed(4)), now));
+  else if (press === 'down') stmts.push(botQuoteStmt(env, actor, 'sell', ref, Number((2000 + Math.random() * 8000).toFixed(4)), now));
   // 합성 체결 1건 — 봇끼리 크로스 주문을 내고 매칭하던(호가 1개 더 깔고 매칭 왕복) 예전 방식을 대체.
   // 체결 테이프·차트가 계속 움직이게 하되 왕복 없이 batch 안에서 끝낸다. 체결가=새 기준가(mid),
   // 색상은 기준가가 오르면 매수/내리면 매도.

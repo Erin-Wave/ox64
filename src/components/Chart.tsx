@@ -23,7 +23,7 @@ import { useChartStore, type IndicatorConfig, type IndicatorType, type ChartColo
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol } from '@/symbols';
-import { fmtPrice, fmtVol } from '@/format';
+import { fmtPrice, fmtQty } from '@/format';
 import Clock from '@/components/Clock';
 import type { Candle } from '@/types';
 
@@ -77,6 +77,7 @@ export default function Chart() {
   const orders = useTradingStore((s) => s.orders);
   const positions = useTradingStore((s) => s.positions);
   const pendingOrders = useTradingStore((s) => s.pendingOrders);
+  const cancelLimit = useTradingStore((s) => s.cancelLimit);
   const balance = useTradingStore((s) => s.balance);
   const prices = useMarketStore((s) => s.prices);
 
@@ -107,6 +108,12 @@ export default function Chart() {
   const [countdownPos, setCountdownPos] = useState<{ top: number; width: number; up: boolean } | null>(null);
   const countdownPosRef = useRef<{ top: number; width: number; up: boolean } | null>(null);
   const repositionCountdownRef = useRef<() => void>(() => {});
+
+  // 미체결(지정가) 주문선 옆의 취소(X) 버튼 위치 — 각 주문 지정가의 y좌표에 얹는다(카운트다운과 동일 패턴).
+  type PendBtn = { id: string; top: number; axisW: number; sell: boolean; reduceOnly: boolean; label: string };
+  const [pendBtns, setPendBtns] = useState<PendBtn[]>([]);
+  const pendBtnsRef = useRef<PendBtn[]>([]);
+  const repositionPendBtnsRef = useRef<() => void>(() => {});
   const [showOpts, setShowOpts] = useState(false);
   const [prec, setPrec] = useState(2); // 현재 심볼 가격 소수 자릿수
   const precRef = useRef(prec);
@@ -132,7 +139,46 @@ export default function Chart() {
 
   // 카운트다운을 현재가(마지막 봉 종가) 라벨의 y좌표 바로 아래로 옮긴다(우측 가격축 위, 트레이딩뷰식).
   // 가격/스케일이 바뀔 때마다(WS 틱·폴링·팬/줌·1초 틱·크로스헤어) 호출한다 — refs 만 읽어 stale 문제 없음.
+  // 미체결 주문선의 취소(X) 버튼을 각 지정가 y좌표에 재배치한다. 카운트다운과 같은 트리거(팬/줌·틱·1초)
+  // 에서 함께 불리도록 repositionCountdown 안에서 호출한다. opts.pendingLine 이 꺼져 있으면 안 그린다.
+  const repositionPendBtns = () => {
+    const chart = chartRef.current;
+    const c = candleRef.current;
+    const clear = () => {
+      if (pendBtnsRef.current.length) {
+        pendBtnsRef.current = [];
+        setPendBtns([]);
+      }
+    };
+    if (!chart || !c || !optsRef.current.pendingLine) return clear();
+    const axisW = chart.priceScale('right').width();
+    const next: PendBtn[] = [];
+    for (const o of pendingOrders) {
+      if (o.symbol !== symbol) continue;
+      const y = c.priceToCoordinate(o.limitPrice);
+      if (y == null) continue;
+      next.push({
+        id: o.id,
+        top: y as number,
+        axisW,
+        sell: o.side === 'short',
+        reduceOnly: o.reduceOnly,
+        label: `${o.reduceOnly ? '청산 ' : ''}${o.side === 'long' ? '매수' : '매도'} ${fmtQty(o.size)}`,
+      });
+    }
+    const prev = pendBtnsRef.current;
+    // 개수·위치(±1px)·라벨이 그대로면 리렌더 생략
+    const same =
+      prev.length === next.length &&
+      prev.every((p, i) => p.id === next[i].id && Math.abs(p.top - next[i].top) < 1 && p.axisW === next[i].axisW && p.label === next[i].label);
+    if (same) return;
+    pendBtnsRef.current = next;
+    setPendBtns(next);
+  };
+  repositionPendBtnsRef.current = repositionPendBtns;
+
   const repositionCountdown = () => {
+    repositionPendBtnsRef.current(); // 미체결 취소버튼도 같은 트리거에서 함께 재배치
     const chart = chartRef.current;
     const c = candleRef.current;
     const last = candlesRef.current.at(-1);
@@ -657,11 +703,12 @@ export default function Chart() {
             lineWidth: 1,
             lineStyle: LineStyle.LargeDashed,
             axisLabelVisible: true,
-            title: `${p.reduceOnly ? '청산 ' : ''}${p.side === 'long' ? '매수' : '매도'} ${fmtVol(p.size)}`,
+            title: `${p.reduceOnly ? '청산 ' : ''}${p.side === 'long' ? '매수' : '매도'} ${fmtQty(p.size)}`,
           }),
         );
       }
     }
+    repositionPendBtnsRef.current(); // 주문선이 바뀌면 취소(X) 버튼 위치도 즉시 갱신
   }, [positions, pendingOrders, prices, balance, symbol, opts.positionLine, opts.slTpLines, opts.pendingLine]);
 
   // ── 다음 봉 카운트다운 ───────────────────────────────────────
@@ -824,7 +871,7 @@ export default function Chart() {
                 {chgPct != null && ` (${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%)`}
               </span>
             </span>
-            <span className="text-muted">거래량 <span className="text-text">{fmtVol(legend.volume)}</span></span>
+            <span className="text-muted">거래량 <span className="text-text">{fmtQty(legend.volume)}</span></span>
             {opts.indicators.map((ind, idx) => {
               const val = indLegend[ind.id];
               if (val == null) return null;
@@ -860,6 +907,23 @@ export default function Chart() {
             </span>
           </div>
         )}
+        {/* 미체결 지정가 주문선 옆 취소(X) 버튼 — 각 주문 지정가의 y좌표, 우측 가격축 바로 왼쪽에 얹는다. */}
+        {opts.pendingLine &&
+          pendBtns.map((b) => (
+            <button
+              key={b.id}
+              onClick={() => cancelLimit(b.id)}
+              title={`${b.label} — 클릭하면 취소`}
+              style={{ top: b.top - 8, right: b.axisW + 3 }}
+              className={`pointer-events-auto absolute z-20 flex h-4 w-4 items-center justify-center rounded-sm text-[11px] font-bold leading-none ring-1 transition ${
+                b.sell
+                  ? 'bg-downDim text-down ring-down/40 hover:bg-down hover:text-white'
+                  : 'bg-upDim text-up ring-up/40 hover:bg-up hover:text-white'
+              }`}
+            >
+              ×
+            </button>
+          ))}
         <div ref={containerRef} className="absolute inset-0" />
       </div>
     </div>

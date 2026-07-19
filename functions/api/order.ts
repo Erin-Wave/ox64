@@ -356,6 +356,51 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     return json(await loadState(env, uid, marks));
   }
 
+  // 미체결(지정가) 주문의 지정가·수량 수정. 진입 지정가는 증거금을 재계산해 델타만큼 잔고를 원자 조정
+  // (추가 잠금은 크로스 가용 가드), reduce-only(지정가 청산)는 증거금이 없어 값만 갱신. 값 변경 후 OX 는
+  // 새 가격으로 즉시 재매칭(marketable 이면 바로 체결). 취소 후 재주문 대신 한 번에 수정.
+  if (body.action === 'editLimit') {
+    const marks = await checkTriggers(env, uid);
+    const pendingId = typeof body.pendingId === 'string' ? body.pendingId : '';
+    const pending = await env.DB.prepare('SELECT * FROM pending_orders WHERE id = ? AND user_id = ?')
+      .bind(pendingId, uid)
+      .first<PendingRow>();
+    if (!pending) return bad('주문을 찾을 수 없음', 404);
+
+    let newLimit = body.limitPrice != null ? Number(body.limitPrice) : pending.limit_price;
+    const newSize = body.size != null ? Number(body.size) : pending.size;
+    if (!(newLimit > 0) || !isFinite(newLimit)) return bad('지정가 오류');
+    if (!(newSize > 0) || !isFinite(newSize) || newSize > 1e15) return bad('수량 오류');
+    if (isVirtualSymbol(pending.symbol)) newLimit = Math.round(newLimit * 1e4) / 1e4; // OX 4자리 틱
+
+    if (pending.reduce_only) {
+      // 지정가 청산 — 증거금 없음(margin=0), 값만 갱신.
+      await env.DB.prepare('UPDATE pending_orders SET limit_price = ?, size = ? WHERE id = ? AND user_id = ?')
+        .bind(newLimit, newSize, pendingId, uid)
+        .run();
+      if (isVirtualSymbol(pending.symbol)) await matchReduceOnlyOxPending(env, pendingId);
+      return json(await loadState(env, uid, marks));
+    }
+
+    // 진입 지정가 — 증거금 재계산. delta(=신규-기존)만큼 잔고를 조정한다. 추가 잠금(delta>0)은 크로스
+    // 가용(여유잔고+미실현손익)이 충분해야 한다. ⚠ 잔고 차감을 "먼저" 원자 가드로 확정하고, 성공했을
+    // 때만 pending 을 수정한다 — batch 로 묶으면 잔고 가드가 0행 매칭(증거금 부족)이어도 pending UPDATE 는
+    // 그대로 커밋돼 "증거금 없이 주문만 커지는" 상태가 된다(D1 batch 는 조건부 UPDATE 0행을 실패로 보지 않음).
+    const newMargin = (newLimit * newSize) / pending.leverage;
+    const delta = newMargin - pending.margin; // >0: 추가 잠금 / <0: 환불(가드 항상 통과)
+    const uPnL = await unrealizedTotal(env, uid, marks);
+    const charge = await env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?')
+      .bind(delta, uid, delta, -uPnL)
+      .run();
+    if (charge.meta.changes !== 1) return bad('증거금이 부족합니다');
+    await env.DB.prepare('UPDATE pending_orders SET limit_price = ?, size = ?, margin = ? WHERE id = ? AND user_id = ?')
+      .bind(newLimit, newSize, newMargin, pendingId, uid)
+      .run();
+    if (isVirtualSymbol(pending.symbol)) await matchLimitPendingAgainstBook(env, pendingId);
+
+    return json(await loadState(env, uid, marks));
+  }
+
   if (body.action === 'setSlTp') {
     const marks = await checkTriggers(env, uid);
     const positionId = typeof body.positionId === 'string' ? body.positionId : '';

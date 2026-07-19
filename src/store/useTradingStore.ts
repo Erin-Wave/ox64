@@ -61,6 +61,7 @@ interface TradingState {
     takeProfit?: number | null;
   }) => Promise<void>;
   cancelLimit: (pendingId: string) => Promise<void>;
+  editLimit: (pendingId: string, p: { limitPrice?: number; size?: number }) => Promise<void>;
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) => Promise<void>;
   refill: () => Promise<void>;
 
@@ -220,6 +221,17 @@ export const useTradingStore = create<TradingState>((set) => ({
     set({ busy: true, error: null });
     try {
       apply(set, await api.cancelLimit(pendingId));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  editLimit: async (pendingId, p) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.editLimit(pendingId, p));
     } catch (e) {
       set({ error: (e as Error).message });
     } finally {

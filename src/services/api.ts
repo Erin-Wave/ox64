@@ -118,6 +118,8 @@ export const api = {
   }) => req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'limitOpen', ...p }) }),
   cancelLimit: (pendingId: string) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'cancelLimit', pendingId }) }),
+  editLimit: (pendingId: string, p: { limitPrice?: number; size?: number }) =>
+    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'editLimit', pendingId, ...p }) }),
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'setSlTp', positionId, ...p }) }),
   refill: () => req<AppState>('/refill', { method: 'POST' }),

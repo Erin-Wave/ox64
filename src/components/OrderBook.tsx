@@ -7,7 +7,8 @@ import { fmtPrice, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
 
 const EMPTY_TRADES: TickerTrade[] = [];
-const fmtQty = (q: number) => (q >= 1000 ? q.toFixed(1) : q.toFixed(4));
+// 수량은 세자리 콤마로. 큰 물량(≥1000)은 소수 1자리, 작은 물량은 최대 4자리(뒤 0 은 자동으로 떨어짐).
+const fmtQty = (q: number) => q.toLocaleString(undefined, { maximumFractionDigits: q >= 1000 ? 1 : 4 });
 const fmtTime = (ms: number) => {
   const d = new Date(ms);
   const p = (n: number) => String(n).padStart(2, '0');

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtPrice } from '@/format';
+import { fmtPrice, fmtQty, fmtUsd } from '@/format';
 import type { ApiOrder } from '@/services/api';
 
 type Tab = 'positions' | 'pending' | 'history';
@@ -21,6 +21,7 @@ export default function PositionsPanel() {
   const closePosition = useTradingStore((s) => s.closePosition);
   const limitClose = useTradingStore((s) => s.limitClose);
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
+  const editLimit = useTradingStore((s) => s.editLimit);
   const setSlTp = useTradingStore((s) => s.setSlTp);
   const busy = useTradingStore((s) => s.busy);
   const prices = useMarketStore((s) => s.prices);
@@ -56,6 +57,22 @@ export default function PositionsPanel() {
       takeProfit: editTp ? Number(editTp) : null,
     });
     setEditingId(null);
+  };
+
+  // 미체결(지정가) 주문 수정 — 지정가/수량 인라인 편집.
+  const [editPendId, setEditPendId] = useState<string | null>(null);
+  const [editPendPx, setEditPendPx] = useState('');
+  const [editPendSize, setEditPendSize] = useState('');
+  const startEditPend = (id: string, price: number, size: number) => {
+    setEditPendId(id);
+    setEditPendPx(String(price));
+    setEditPendSize(String(size));
+  };
+  const saveEditPend = (id: string) => {
+    const px = editPendPx ? Number(editPendPx) : NaN;
+    const size = editPendSize ? Number(editPendSize) : NaN;
+    editLimit(id, { limitPrice: px > 0 ? px : undefined, size: size > 0 ? size : undefined });
+    setEditPendId(null);
   };
 
   // 각 포지션의 미실현 PnL(현재 시세 기준) — 청산가 계산에서 "다른 포지션들"의 몫을 뺄 때 재사용.
@@ -151,8 +168,8 @@ export default function PositionsPanel() {
                         {liq != null && liq > 0 ? fmtPrice(liq, prec) : '—'}
                       </td>
                       <td className="px-3 py-2.5 text-right text-text">
-                        <div>{p.size}</div>
-                        <div className="text-[10px] text-muted">({margin.toFixed(2)} USDT)</div>
+                        <div>{fmtQty(p.size)}</div>
+                        <div className="text-[10px] text-muted">({fmtUsd(margin)} USDT)</div>
                       </td>
                       {standard && (
                         <td className="px-3 py-2.5 text-right">
@@ -208,7 +225,7 @@ export default function PositionsPanel() {
                         ) : (
                           <>
                             {pos ? '+' : ''}
-                            {pnl.toFixed(2)}
+                            {fmtUsd(pnl)}
                             <span className="ml-1 text-[10px] opacity-80">
                               ({pos ? '+' : ''}
                               {roe?.toFixed(1)}%)
@@ -223,7 +240,7 @@ export default function PositionsPanel() {
                               <input
                                 value={closeAmt[p.id] ?? ''}
                                 onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: e.target.value }))}
-                                placeholder={String(p.size)}
+                                placeholder={fmtQty(p.size)}
                                 inputMode="decimal"
                                 title="청산 수량(비우면 전량)"
                                 className="w-14 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
@@ -274,40 +291,94 @@ export default function PositionsPanel() {
                 </tr>
               </thead>
               <tbody>
-                {pendingOrders.map((o) => (
-                  <tr key={o.id} className="border-b border-border/60">
-                    <td className="px-3 py-2.5 font-medium text-text">{o.symbol.replace('USDT', '')}</td>
-                    <td className="px-3 py-2.5">
-                      {o.reduceOnly ? (
-                        // 지정가 청산(reduce-only) — 주문 방향(side)의 반대가 청산 대상 포지션 방향.
-                        <span className="rounded bg-elevated px-1.5 py-0.5 text-[11px] font-semibold text-accent">
-                          {o.side === 'short' ? '롱' : '숏'} 청산
-                        </span>
-                      ) : (
-                        <span
-                          className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
-                            o.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
-                          }`}
-                        >
-                          {o.side === 'long' ? '롱' : '숏'} 크로스 {o.leverage}x
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5 text-right text-text">
-                      {fmtPrice(o.limitPrice, precisionOf(precisions, o.symbol))}
-                    </td>
-                    <td className="px-3 py-2.5 text-right text-text">{o.size}</td>
-                    <td className="px-3 py-2.5 text-right">
-                      <button
-                        onClick={() => cancelLimit(o.id)}
-                        disabled={busy}
-                        className="rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
-                      >
-                        취소
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {pendingOrders.map((o) => {
+                  const pe = editPendId === o.id;
+                  return (
+                    <tr key={o.id} className="border-b border-border/60">
+                      <td className="px-3 py-2.5 font-medium text-text">{o.symbol.replace('USDT', '')}</td>
+                      <td className="px-3 py-2.5">
+                        {o.reduceOnly ? (
+                          // 지정가 청산(reduce-only) — 주문 방향(side)의 반대가 청산 대상 포지션 방향.
+                          <span className="rounded bg-elevated px-1.5 py-0.5 text-[11px] font-semibold text-accent">
+                            {o.side === 'short' ? '롱' : '숏'} 청산
+                          </span>
+                        ) : (
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                              o.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
+                            }`}
+                          >
+                            {o.side === 'long' ? '롱' : '숏'} 크로스 {o.leverage}x
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5 text-right text-text">
+                        {pe ? (
+                          <input
+                            value={editPendPx}
+                            onChange={(e) => setEditPendPx(e.target.value)}
+                            placeholder="지정가"
+                            inputMode="decimal"
+                            className="w-20 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
+                          />
+                        ) : (
+                          fmtPrice(o.limitPrice, precisionOf(precisions, o.symbol))
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5 text-right text-text">
+                        {pe ? (
+                          <input
+                            value={editPendSize}
+                            onChange={(e) => setEditPendSize(e.target.value)}
+                            placeholder="수량"
+                            inputMode="decimal"
+                            className="w-20 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
+                          />
+                        ) : (
+                          fmtQty(o.size)
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          {pe ? (
+                            <>
+                              <button
+                                onClick={() => saveEditPend(o.id)}
+                                disabled={busy}
+                                className="rounded bg-elevated px-2 py-1 text-accent transition hover:bg-panel2 disabled:opacity-40"
+                              >
+                                저장
+                              </button>
+                              <button
+                                onClick={() => setEditPendId(null)}
+                                className="rounded border border-border px-2 py-1 text-muted transition hover:text-text"
+                              >
+                                취소
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => startEditPend(o.id, o.limitPrice, o.size)}
+                                disabled={busy}
+                                className="rounded border border-border px-2 py-1 text-muted transition hover:border-accent hover:text-accent disabled:opacity-40"
+                              >
+                                수정
+                              </button>
+                              <button
+                                onClick={() => cancelLimit(o.id)}
+                                disabled={busy}
+                                className="rounded border border-border px-2 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
+                              >
+                                취소
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -353,9 +424,9 @@ export default function PositionsPanel() {
                         </span>
                       </td>
                       <td className="px-3 py-2 text-right text-text">{fmtPrice(o.price, prec)}</td>
-                      <td className="px-3 py-2 text-right text-text">{o.size}</td>
+                      <td className="px-3 py-2 text-right text-text">{fmtQty(o.size)}</td>
                       <td className={`px-3 py-2 text-right font-medium ${o.pnl == null ? 'text-muted' : pos ? 'text-up' : 'text-down'}`}>
-                        {o.pnl == null ? '—' : `${pos ? '+' : ''}${o.pnl.toFixed(2)}`}
+                        {o.pnl == null ? '—' : `${pos ? '+' : ''}${fmtUsd(o.pnl)}`}
                       </td>
                     </tr>
                   );

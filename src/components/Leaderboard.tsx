@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type LeaderRow } from '@/services/api';
+import { fmtUsd } from '@/format';
 
 const MEDAL = ['🥇', '🥈', '🥉'];
 
@@ -73,12 +74,10 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
                   </div>
                 </div>
                 <div className="text-right">
-                  <div className="text-sm font-bold text-text">
-                    {r.equity.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                  </div>
+                  <div className="text-sm font-bold text-text">{fmtUsd(r.equity)}</div>
                   <div className={`text-[11px] ${r.unrealized >= 0 ? 'text-up' : 'text-down'}`}>
                     {r.unrealized >= 0 ? '+' : ''}
-                    {r.unrealized.toFixed(2)}
+                    {fmtUsd(r.unrealized)}
                   </div>
                 </div>
               </li>

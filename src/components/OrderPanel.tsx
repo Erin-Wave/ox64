@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
+import { fmtUsd } from '@/format';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit';
@@ -267,16 +268,16 @@ export default function OrderPanel() {
       <div className="space-y-0.5 rounded-md bg-panel2 p-2 text-xs">
         <div className="flex justify-between">
           <span className="text-muted">가용 (크로스)</span>
-          <span className="text-text">{available.toFixed(2)} USDT</span>
+          <span className="text-text">{fmtUsd(available)} USDT</span>
         </div>
         <div className="flex justify-between">
           <span className="text-muted">명목가</span>
-          <span className="text-text">{notional ? notional.toFixed(2) : '—'} USDT</span>
+          <span className="text-text">{notional ? fmtUsd(notional) : '—'} USDT</span>
         </div>
         <div className="flex justify-between">
           <span className="text-muted">증거금</span>
           <span className={margin > available ? 'text-down' : 'text-text'}>
-            {margin ? margin.toFixed(2) : '—'} USDT
+            {margin ? fmtUsd(margin) : '—'} USDT
           </span>
         </div>
       </div>
