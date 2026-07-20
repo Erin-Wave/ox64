@@ -528,7 +528,7 @@ export default function Chart() {
       tsApiV?.subscribeVisibleLogicalRangeChange(onRangeV);
 
       load();
-      const t = window.setInterval(load, 1500); // 3s→1.5s: OX 캔들/현재가 갱신을 더 촘촘히(체결 딜레이 감소 맥락)
+      const t = window.setInterval(load, 1000); // 3s→1.5s→1s: OX 캔들/현재가 갱신을 더 촘촘히(체결 딜레이 감소 맥락)
       return () => {
         cancelled = true;
         window.clearInterval(t);

@@ -233,10 +233,11 @@ async function loadSpotMarket(env: Env, uid: string) {
 // 봇 잔고 숫자는 무의미하다.
 // 재호가(requote) 주기 — 짧을수록 기준가·호가·체결 테이프가 자주 갱신되고, 크로스되는 유저 주문이
 // 그만큼 빨리 체결된다(sweepRestingOxPendings 가 매 재호가 직후 도므로). 체결 딜레이를 줄이려고
-// 예전(3~8s)보다 크게 낮췄다 — runMarketMaker 는 /api/spot 폴링 시점에만 불리므로 실질 주기는
-// max(게이트, 폴링간격)이고, 프론트 폴링도 함께 1.5s 로 낮춰 유저가 OX 를 볼 때 ~1~2s 마다 갱신된다.
-const BOT_TICK_MIN_MS = 900;
-const BOT_TICK_MAX_MS = 2200;
+// 3~8s → 0.9~2.2s → 0.45~1.1s 로 단계적으로 낮췄다 — runMarketMaker 는 /api/spot 폴링 시점에만 불리므로
+// 실질 주기는 max(게이트, 폴링간격)이고, 프론트 폴링(useSpotPoll)도 1s 라 게이트가 그보다 낮으면
+// 사실상 "매 폴링(1s)마다 재호가+대기 지정가 sweep" → OX 를 보고 있으면 지정가가 ~1초 안에 체결된다.
+const BOT_TICK_MIN_MS = 450;
+const BOT_TICK_MAX_MS = 1100;
 // 한 틱에 까는 매수/매도 각각의 호가 단계 수(호가창 깊이).
 // ⚠ 봇 계정이 2개뿐이라 "여러 사람이 만든 시장"처럼 보이려면 계정 수가 아니라 **한 봇이 촘촘하게
 // 여러 개를 까는 것**으로 밀도를 만들어야 한다(계정을 늘려도 spot_orders 행이 늘 뿐 화면상 차이는
