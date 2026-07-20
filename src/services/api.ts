@@ -65,6 +65,8 @@ export interface LeaderRow {
 }
 
 export interface SpotBookLevel {
+  /** 이 가격대에 내가 걸어둔 물량(호가창에서 내 주문을 표시하기 위해 서버가 따로 합산해 내려준다) */
+  mine?: number;
   price: number;
   size: number;
 }

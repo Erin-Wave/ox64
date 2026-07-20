@@ -15,6 +15,7 @@ import {
   type D1PreparedStatement,
   feeRateOf,
   feeAccrualStmts,
+  vipOf,
 } from '../_shared';
 
 /**
@@ -29,6 +30,9 @@ const PAIR = 'OXUSDT';
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차
 // OX/USDT 최소 호가 단위 = 0.0001(4자리). 봇 기준가/호가/체결가를 전부 이 틱에 스냅해서, 실제
 // 코인처럼 정해진 소수 자릿수 이상으로는 호가·체결이 생기지 않게 한다(가상코인 소수점 무결성).
+// 호가창에 내려보내는 가격대 수. ⚠ 클라(OrderBook BOOK_DEPTH)가 이보다 많이 그리려 하면 그만큼은
+// 빈 채로 남는다 — 표시 개수를 바꿀 땐 두 값을 같이 맞출 것.
+const BOOK_LIMIT = 40;
 const roundOx = (p: number) => Number((Math.round(p * 1e4) / 1e4).toFixed(4));
 
 export function onRequestGet({ request, env }: Ctx): Promise<Response> {
@@ -39,8 +43,11 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     if (!sess) return bad('unauthorized', 401);
     try {
       await runMarketMaker(env);
-    } catch {
-      /* 봇 실패가 유저 요청을 막으면 안 됨 — 다음 폴링에서 재시도 */
+    } catch (e) {
+      // 봇 실패가 유저 요청을 막으면 안 되지만(다음 폴링에서 재시도), ⚠ 조용히 삼키면 봇이 몇 시간째
+      // 죽어 있어도 아무도 모른다 — 실제로 배치 문장 수 초과로 호가가 안 깔리는데 화면상 멀쩡해 보여
+      // 원인을 찾는 데 한참 걸렸다. 최소한 로그는 남긴다(wrangler tail / 대시보드에서 확인 가능).
+      console.error('[ox64] runMarketMaker failed:', e instanceof Error ? e.message : e);
     }
 
     const url = new URL(request.url);
@@ -50,7 +57,7 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
       return json({ candles: await loadSpotCandles(env, interval, limit) });
     }
 
-    return json(await loadSpotMarket(env));
+    return json(await loadSpotMarket(env, sess.uid));
   });
 }
 
@@ -157,28 +164,32 @@ async function loadSpotCandles(env: Env, intervalCode: string, limit: number) {
  * 근본 원인) — 그래서 두 테이블을 UNION 해서 같은 가격대끼리 합산한다. long 지정가=매수 호가,
  * short 지정가=매도 호가. pending_orders 는 취소/체결되면 즉시 그 행이 사라지므로(order.ts/
  * _trading.ts) 별도 동기화 없이 항상 최신 상태가 자동으로 반영된다. */
-async function loadSpotMarket(env: Env) {
+async function loadSpotMarket(env: Env, uid: string) {
+  // `mine` = 그 가격대에 이 유저가 걸어둔 물량. 호가창에서 내 주문을 티나게 표시하려면 합계만으론
+  // 알 수 없어서(봇 물량과 섞임) 유저 소유분을 따로 합산해 내려준다.
   const bids = (
     await env.DB.prepare(
-      `SELECT price, SUM(size) AS size FROM (
-         SELECT price, size FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open'
+      `SELECT price, SUM(size) AS size, SUM(mine) AS mine FROM (
+         SELECT price, size, 0 AS mine FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open'
          UNION ALL
-         SELECT limit_price AS price, size FROM pending_orders WHERE symbol = ? AND side = 'long'
-       ) GROUP BY price ORDER BY price DESC LIMIT 15`,
+         SELECT limit_price AS price, size, CASE WHEN user_id = ? THEN size ELSE 0 END AS mine
+           FROM pending_orders WHERE symbol = ? AND side = 'long'
+       ) GROUP BY price ORDER BY price DESC LIMIT ${BOOK_LIMIT}`,
     )
-      .bind(PAIR, PAIR)
-      .all<{ price: number; size: number }>()
+      .bind(PAIR, uid, PAIR)
+      .all<{ price: number; size: number; mine: number }>()
   ).results;
   const asks = (
     await env.DB.prepare(
-      `SELECT price, SUM(size) AS size FROM (
-         SELECT price, size FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open'
+      `SELECT price, SUM(size) AS size, SUM(mine) AS mine FROM (
+         SELECT price, size, 0 AS mine FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open'
          UNION ALL
-         SELECT limit_price AS price, size FROM pending_orders WHERE symbol = ? AND side = 'short'
-       ) GROUP BY price ORDER BY price ASC LIMIT 15`,
+         SELECT limit_price AS price, size, CASE WHEN user_id = ? THEN size ELSE 0 END AS mine
+           FROM pending_orders WHERE symbol = ? AND side = 'short'
+       ) GROUP BY price ORDER BY price ASC LIMIT ${BOOK_LIMIT}`,
     )
-      .bind(PAIR, PAIR)
-      .all<{ price: number; size: number }>()
+      .bind(PAIR, uid, PAIR)
+      .all<{ price: number; size: number; mine: number }>()
   ).results;
   const trades = (
     await env.DB.prepare('SELECT * FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 30')
@@ -218,7 +229,11 @@ async function loadSpotMarket(env: Env) {
 // max(게이트, 폴링간격)이고, 프론트 폴링도 함께 1.5s 로 낮춰 유저가 OX 를 볼 때 ~1~2s 마다 갱신된다.
 const BOT_TICK_MIN_MS = 900;
 const BOT_TICK_MAX_MS = 2200;
-const BOT_LEVELS_PER_SIDE = 8; // 한 틱에 까는 매수/매도 각각의 호가 단계 수(호가창 깊이)
+// 한 틱에 까는 매수/매도 각각의 호가 단계 수(호가창 깊이).
+// ⚠ 봇 계정이 2개뿐이라 "여러 사람이 만든 시장"처럼 보이려면 계정 수가 아니라 **한 봇이 촘촘하게
+// 여러 개를 까는 것**으로 밀도를 만들어야 한다(계정을 늘려도 spot_orders 행이 늘 뿐 화면상 차이는
+// 같다 — 호가창은 가격대별 합계만 보여주므로). 8단계는 스프레드 근처 몇 줄만 차서 휑했다.
+const BOT_LEVELS_PER_SIDE = 22;
 
 // 봇 패시브 호가 1개를 INSERT 하는 문장(에스크로 없음).
 function botQuoteStmt(env: Env, actor: string, side: 'buy' | 'sell', price: number, size: number, now: number): D1PreparedStatement {
@@ -277,6 +292,36 @@ const REGIME_PARAMS: Record<Regime, { bias: number; volMult: number; sizeMult: n
 
 const ROUND_STEP = 0.05; // 라운드넘버 자석이 잡아당기는 심리적 가격대 간격
 
+/**
+ * 봇도 거래 수수료를 낸다 — 합성 체결(봇끼리)이든 유저 상대 체결이든.
+ * ⚠ 봇 잔고(users.balance)는 어디서도 읽히지 않는 무한 풀이라 잔고에서 빼는 건 의미가 없지만,
+ * **수수료 원장(fee_ledger)엔 반드시 남겨야 "플랫폼이 번 돈"이 온전해진다** — 시장 물량의 대부분이
+ * 봇에서 나오는데 봇만 면제하면 원장이 실제 거래량과 동떨어진다. 요율은 유저와 똑같이 누적
+ * 거래대금에서 파생(vipOf)하므로 봇도 거래가 쌓일수록 등급이 오른다(특혜 없음).
+ * 여러 봇이 섞인 체결은 봇별 명목금액을 모아 한 번에 처리한다(read 1회 + 봇당 2문장).
+ */
+async function botFeeStmts(
+  env: Env,
+  notionalByBot: Map<string, number>,
+  now: number,
+): Promise<D1PreparedStatement[]> {
+  const ids = [...notionalByBot.keys()].filter((id) => (notionalByBot.get(id) ?? 0) > EPS);
+  if (ids.length === 0) return [];
+  const rows = (
+    await env.DB.prepare(`SELECT id, total_volume FROM users WHERE id IN (${ids.map(() => '?').join(',')})`)
+      .bind(...ids)
+      .all<{ id: string; total_volume: number }>()
+  ).results;
+  const volById = new Map(rows.map((r) => [r.id, r.total_volume ?? 0]));
+  const out: D1PreparedStatement[] = [];
+  for (const id of ids) {
+    const notional = notionalByBot.get(id)!;
+    const rate = vipOf(volById.get(id) ?? 0).rate;
+    out.push(...feeAccrualStmts(env, id, PAIR, 'bot', notional, rate, notional * rate, now));
+  }
+  return out;
+}
+
 // ── 사람처럼 "떨어지는" 호가 가격·수량(price clustering) ──────────────────────
 // ⚠ 예전엔 호가를 전부 `ref * (1 ± spread)` 로만 찍어서 1.4067 / 1.4074 / 1.4081 처럼 어중간한 값이
 // 기계적으로 균일한 간격으로 늘어섰다 — 실제 호가창은 절대 그렇게 안 생겼다. 사람은 1.4000 / 1.4050
@@ -300,7 +345,11 @@ const PRICE_GRIDS: readonly { step: number; sizeMult: number; pull: number }[] =
 function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): { price: number; sizeMult: number } {
   const tol = 0.0009 + depth * 0.0022; // 이만큼 넘게 끌려가야 하면 그 격자는 포기(사다리가 뭉개지지 않게)
   for (const g of PRICE_GRIDS) {
-    const snapped = side === 'buy' ? Math.floor(target / g.step) * g.step : Math.ceil(target / g.step) * g.step;
+    // ⚠ price/step 을 그냥 floor/ceil 하면 정확히 격자 위에 있는 값이 한 칸 밀린다
+    // (1.45/0.0001 = 14499.999999999998). 정수에서 1e-9 이내면 그 정수로 간주해 흡수한다.
+    const ticks = target / g.step;
+    const idx = side === 'buy' ? Math.floor(ticks + 1e-9) : Math.ceil(ticks - 1e-9);
+    const snapped = idx * g.step;
     if (Math.abs(snapped - target) / target > tol) continue;
     if (Math.random() > g.pull * (0.6 + 0.7 * depth)) continue;
     return { price: roundOx(snapped), sizeMult: g.sizeMult };
@@ -308,11 +357,19 @@ function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): {
   return { price: roundOx(target), sizeMult: 1 }; // 어느 격자에도 안 붙으면 원래 값(어중간한 가격도 섞여야 자연스럽다)
 }
 
-/** 사람이 실제로 입력하는 수량처럼 떨어지는 숫자로 맞춘다(가끔은 좀 더 잘게 — 전부 딱 떨어져도 부자연스럽다). */
+/**
+ * 주문 수량. ⚠ 예전엔 전부 1,000 / 5,000 처럼 딱 떨어지게 맞췄는데 그러면 그것대로 기계 같다 —
+ * 실제 호가창은 여러 사람이 제각각 넣은 값이라 2,384 개 같은 어중간한 수량이 대부분이고, 딱 떨어지는
+ * 수량은 가끔 섞일 뿐이다(가격과 달리 수량엔 라운드 넘버 심리가 약하다). 그래서 기본은 정수로만
+ * 다듬고, 18% 만 눈에 띄게 떨어지는 수량으로 만든다.
+ */
 function humanSize(raw: number): number {
-  const step = raw >= 20000 ? 5000 : raw >= 8000 ? 1000 : raw >= 2000 ? 500 : 100;
-  const s = Math.random() < 0.22 ? step / 5 : step;
-  return Math.max(s, Math.round(raw / s) * s);
+  const v = Math.max(1, raw);
+  if (Math.random() < 0.18) {
+    const step = v >= 20000 ? 5000 : v >= 8000 ? 1000 : v >= 2000 ? 500 : 100;
+    return Math.max(step, Math.round(v / step) * step);
+  }
+  return Math.round(v);
 }
 // 적정가(anchor)가 아주 약하게 끌려가는 장기 기준선. 국면 bias 를 아무리 맞춰도 랜덤워크는 며칠 단위로
 // 얼마든지 멀리 갈 수 있어서(0 에 붙거나 수십 배로 뜀), 반감기 ~14시간짜리 약한 복원력을 하나 둔다.
@@ -485,7 +542,7 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   };
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
     const depth = level / (BOT_LEVELS_PER_SIDE - 1);
-    const spread = (0.0009 + level * 0.0013 + Math.random() * 0.0006) * step.spreadMult;
+    const spread = (0.0006 + level * 0.00055 + Math.random() * 0.0004) * step.spreadMult;
     placeQuote('buy', ref * (1 - spread), depth);
     placeQuote('sell', ref * (1 + spread), depth);
   }
@@ -503,6 +560,7 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
     12,
   );
   let volume = 0;
+  let notionalSum = 0; // 봇 수수료 산정용(합성 체결의 명목금액 합)
   let high = ref;
   let low = ref;
   let open = ref;
@@ -522,8 +580,9 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
 
     let sz = (BOT_TRADE_SIZE_MIN + Math.random() * (BOT_TRADE_SIZE_MAX - BOT_TRADE_SIZE_MIN)) * step.sizeMult;
     if (Math.random() < 0.04) sz *= 2.5 + Math.random() * 4; // 가끔 고래가 크게 친다(팻테일 거래량)
-    sz = humanSize(sz); // 체결 테이프도 사람이 넣은 듯 떨어지는 수량으로
+    sz = humanSize(sz);
     volume += sz;
+    notionalSum += price * sz;
 
     const takerSide = Math.random() < step.buyProb ? 'buy' : 'sell';
     stmts.push(
@@ -540,6 +599,8 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   );
   // 영속 캔들: 이 틱이 찍은 체결들의 OHLCV 로 1회 갱신(위 spot_trades 들과 정확히 일치해야 한다).
   stmts.push(...candleUpsertStmts(env, { open, high, low, close: ref, volume }, now));
+  // 봇도 수수료를 낸다 — 이 틱의 합성 체결 명목금액에 대해(같은 batch, 왕복 추가 없음).
+  stmts.push(...(await botFeeStmts(env, new Map([[actor, notionalSum]]), now)));
   await env.DB.batch(stmts);
 
   // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
@@ -783,6 +844,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
   let filled = 0;
   let cost = 0;
   let limitFeeTotal = 0;
+  const limitMakerNotional = new Map<string, number>(); // 상대편 봇 수수료
 
   for (let i = 0; i < 500; i++) {
     // iter 0 은 위에서 이미 읽은 first 를 재사용(중복 read 제거), 이후엔 동시 체결 반영 위해 재조회.
@@ -853,6 +915,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
     filled += chunk;
     cost += fillPrice * chunk;
     limitFeeTotal += chunkFee;
+    limitMakerNotional.set(maker.user_id, (limitMakerNotional.get(maker.user_id) ?? 0) + fillPrice * chunk);
   }
 
   if (filled > EPS) {
@@ -864,6 +927,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
       ).bind(crypto.randomUUID(), first.user_id, PAIR, first.side, cost / filled, filled, effLev, 'open', null, done),
       // 잔고는 청크마다 상계 정산 — 여기선 누적 카운터+원장만(합계 1행)
       ...feeAccrualStmts(env, first.user_id, PAIR, 'open', cost, limitFeeRate, limitFeeTotal, done),
+      ...(await botFeeStmts(env, limitMakerNotional, done)),
     ]);
   }
 }
@@ -894,6 +958,7 @@ export async function matchMarketOxOrder(
   let filled = 0;
   let cost = 0;
   let feeTotal = 0;
+  const makerNotional = new Map<string, number>(); // 상대편 봇도 수수료를 낸다(봇별 명목금액 집계)
 
   for (let i = 0; i < 500 && remaining > EPS; i++) {
     const maker = await bestBotMaker(env, side, null);
@@ -947,6 +1012,7 @@ export async function matchMarketOxOrder(
     filled += chunk;
     cost += price * chunk;
     feeTotal += chunkFee;
+    makerNotional.set(maker.user_id, (makerNotional.get(maker.user_id) ?? 0) + price * chunk);
   }
 
   if (filled > EPS) {
@@ -957,6 +1023,7 @@ export async function matchMarketOxOrder(
       ).bind(crypto.randomUUID(), uid, PAIR, side, cost / filled, filled, effLev, 'open', null, done),
       // 잔고는 청크마다 이미 정산됐으므로 여기선 누적 카운터+원장만(합계 1행 — 청크 수만큼 불어나지 않게)
       ...feeAccrualStmts(env, uid, PAIR, 'open', cost, feeRate, feeTotal, done),
+      ...(await botFeeStmts(env, makerNotional, done)),
     ]);
   }
   return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
@@ -992,6 +1059,7 @@ async function closePositionAgainstBook(
   // 요율은 이 청산 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 바뀔 수 있다).
   const closeFeeRate = await feeRateOf(env, uid);
   let closeFeeTotal = 0;
+  const closeMakerNotional = new Map<string, number>(); // 상대편 봇 수수료
 
   for (let i = 0; i < 500 && remaining > EPS; i++) {
     const maker = await bestBotMaker(env, closeTaker, limitPrice);
@@ -1033,6 +1101,7 @@ async function closePositionAgainstBook(
     cost += fillPrice * chunk;
     pnlTotal += chunkPnl;
     closeFeeTotal += chunkFee;
+    closeMakerNotional.set(maker.user_id, (closeMakerNotional.get(maker.user_id) ?? 0) + fillPrice * chunk);
     if (fullyClosed) break;
   }
 
@@ -1050,6 +1119,7 @@ async function closePositionAgainstBook(
       ).bind(crypto.randomUUID(), uid, PAIR, pos.side, cost / filled, filled, pos.leverage, 'close', pnlTotal, done),
       // 잔고는 청크마다 이미 정산 — 여기선 누적 카운터+원장만(합계 1행)
       ...feeAccrualStmts(env, uid, PAIR, 'close', cost, closeFeeRate, closeFeeTotal, done),
+      ...(await botFeeStmts(env, closeMakerNotional, done)),
     ]);
   }
   return { filled, avgPrice: filled > EPS ? cost / filled : 0 };

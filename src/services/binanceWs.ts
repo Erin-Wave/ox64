@@ -67,6 +67,8 @@ export function priceStream(symbol: string): { price$: Observable<number>; stop:
 // Partial Book Depth Stream 은 kline 과 달리 이벤트 타입/심볼 필드 없이
 // { lastUpdateId, bids, asks } 스냅샷 그대로 내려온다 — diff 병합 불필요.
 export interface OrderBookLevel {
+  /** 이 가격대에 "내가" 걸어둔 물량(가상 심볼 전용 — 서버가 내려줌). 실제 심볼(바이낸스 WS)엔 없음. */
+  mine?: number;
   price: number;
   qty: number;
 }
