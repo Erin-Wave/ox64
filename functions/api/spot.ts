@@ -863,6 +863,39 @@ function spotTradeStmts(
   ];
 }
 
+// ── 시장가 잔량 흡수용 합성 유동성 ─────────────────────────────────────────
+// ⚠ 봇 호가창은 한 틱 스냅샷이라 22단계 × 2천~1만 = 최대 십수만 개뿐이다. 5천만 개짜리 포지션을 시장가로
+// 청산하면 이 사다리를 다 소비한 뒤 bestBotMaker 가 null 을 반환해 루프가 break → **부분 청산 후 멈춤**
+// (유저가 버튼을 계속 눌러야 했다). 봇은 설계상 "무한 유동성 공급자"이므로, 시장가는 사다리를 다 먹은
+// 뒤에도 봇이 잔량을 받아줘야 한다. 단, 대량 시장가는 시장을 밀어야 하므로(시장충격) 체결가가 진행
+// 방향으로 점점 불리해진다(슬리피지). 지정가(limitPrice != null)는 여기 오지 않는다 — 크로스되는 호가가
+// 없으면 잔량은 대기하는 게 맞으므로 호출부에서 break 한다.
+// 합성 흡수는 **고정 스텝 수**로 완결한다(반복 횟수를 잔량과 무관하게 상한 짓는다 — remote D1 은 스텝마다
+// batch 왕복이라 잔량/40 식으로 나누면 수백 왕복이 나 느려지고 타임아웃 위험). 첫 합성 시 잔량을 이 개수로
+// 균등 분할해 청크를 한 번만 정한다. 시장충격은 스텝이 진행될수록 선형으로 커지되 SYNTH_MAX_IMPACT 로 상한
+// — 봇은 "깊은 유동성 풀"이라 대량이라도 슬리피지가 완만하다(예전 잔량/40 방식은 300+ 스텝에 -7% 슬리피지가
+// 났다). 작은 잔량은 청크 하한(SYNTH_CHUNK_MIN)으로 스텝 수가 자동으로 줄어든다.
+const SYNTH_STEPS = 24; // 합성 흡수를 나누는 고정 스텝 수(=최대 배치 왕복 수)
+const SYNTH_MAX_IMPACT = 0.03; // 합성 구간 누적 시장충격 상한(3%)
+const SYNTH_CHUNK_MIN = 50_000; // 합성 청크 최소 크기(작은 잔량은 이 크기로 몇 스텝만에 끝남)
+const MATCH_MAX_ITERS = 200; // walking 루프 상한(실사다리 ~수십 + 합성 ~24, 넉넉히)
+
+// 합성 maker(실제 spot_orders 행이 아님 — 원자 선점 UPDATE 를 하지 않는다). 가격/크기는 호출부가
+// 첫 합성 때 정한 청크와 스텝별 시장충격 가격을 넘긴다.
+function synthMaker(makerSide: 'buy' | 'sell', walkPrice: number, chunk: number): SpotOrderRow {
+  return {
+    id: '',
+    user_id: BOT_USER_IDS[0],
+    pair: PAIR,
+    side: makerSide,
+    price: walkPrice,
+    size: chunk,
+    orig_size: 0,
+    status: 'synthetic',
+    created_at: Date.now(),
+  };
+}
+
 // 반대편 봇 호가 중 최우선(가격-시간 우선) 하나. limitPrice 가 있으면 그 가격까지만 크로스.
 async function bestBotMaker(env: Env, takerSide: string, limitPrice: number | null): Promise<SpotOrderRow | null> {
   const makerSide = takerSide === 'long' ? 'sell' : 'buy';
@@ -1011,10 +1044,29 @@ export async function matchMarketOxOrder(
   let cost = 0;
   let feeTotal = 0;
   const makerNotional = new Map<string, number>(); // 상대편 봇도 수수료를 낸다(봇별 명목금액 집계)
+  const openMakerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy';
+  const openAdverse = isLong ? 1 : -1; // 사면 위로, 팔면 아래로 시장충격
+  let synthBase = 0; // 합성 흡수 시작가(첫 합성 때 ref)
+  let synthChunk = 0; // 첫 합성 때 잔량 기반으로 한 번만 정하는 청크
+  let synthIdx = 0; // 합성 스텝 인덱스(시장충격 램프용)
 
-  for (let i = 0; i < 500 && remaining > EPS; i++) {
-    const maker = await bestBotMaker(env, side, null);
-    if (!maker) break; // 유동성 소진
+  for (let i = 0; i < MATCH_MAX_ITERS && remaining > EPS; i++) {
+    let maker = await bestBotMaker(env, side, null);
+    let synthetic = false;
+    if (!maker) {
+      // 봇 사다리(스냅샷)를 다 소비 → 봇 무한 유동성으로 잔량을 마저 체결(고정 스텝·상한 시장충격).
+      // 잔고 가드는 아래 그대로 적용되므로, 감당 못 하면 affordable 만큼만 사고 자연히 멈춘다.
+      if (synthBase <= 0) {
+        const st = await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number }>();
+        synthBase = st?.ref_price ?? (filled > EPS ? cost / filled : 1);
+        synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
+      }
+      synthIdx++;
+      const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * synthIdx) / SYNTH_STEPS);
+      const synthPrice = roundOx(Math.max(0.0001, synthBase * (1 + openAdverse * impact)));
+      maker = synthMaker(openMakerSide, synthPrice, synthChunk);
+      synthetic = true;
+    }
 
     let chunk = Math.min(remaining, maker.size);
     const price = maker.price;
@@ -1042,14 +1094,16 @@ export async function matchMarketOxOrder(
       if (deduct.meta.changes !== 1) break;
     }
 
-    const makerRem = maker.size - chunk;
-    const claim = await env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open' AND size>=?")
-      .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
-      .run();
-    if (claim.meta.changes !== 1) {
-      // 선점 실패 → 방금 뺀 증거금+수수료를 그대로 환불(수수료만 남으면 체결 없이 돈이 새어나간다)
-      await env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(margin + chunkFee, uid).run();
-      continue;
+    if (!synthetic) {
+      const makerRem = maker.size - chunk;
+      const claim = await env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open' AND size>=?")
+        .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
+        .run();
+      if (claim.meta.changes !== 1) {
+        // 선점 실패 → 방금 뺀 증거금+수수료를 그대로 환불(수수료만 남으면 체결 없이 돈이 새어나간다)
+        await env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(margin + chunkFee, uid).run();
+        continue;
+      }
     }
 
     const existing = await env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
@@ -1112,17 +1166,39 @@ async function closePositionAgainstBook(
   const closeFeeRate = await feeRateOf(env, uid);
   let closeFeeTotal = 0;
   const closeMakerNotional = new Map<string, number>(); // 상대편 봇 수수료
+  const makerSide: 'buy' | 'sell' = closeTaker === 'long' ? 'sell' : 'buy';
+  const adverse = closeTaker === 'long' ? 1 : -1; // 사면(숏청산) 위로, 팔면(롱청산) 아래로 시장충격
+  let synthBase = 0; // 합성 흡수 시작가(첫 합성 때 ref)
+  let synthChunk = 0; // 첫 합성 때 잔량 기반으로 한 번만 정하는 청크
+  let synthIdx = 0; // 합성 스텝 인덱스(시장충격 램프용)
 
-  for (let i = 0; i < 500 && remaining > EPS; i++) {
-    const maker = await bestBotMaker(env, closeTaker, limitPrice);
-    if (!maker) break; // 크로스되는 호가 없음 → 남은 수량은 미청산(시장가면 버려지고, 지정가면 pending 에 대기)
+  for (let i = 0; i < MATCH_MAX_ITERS && remaining > EPS; i++) {
+    let maker = await bestBotMaker(env, closeTaker, limitPrice);
+    let synthetic = false;
+    if (!maker) {
+      // 지정가 청산(reduce-only)은 크로스되는 호가가 없으면 잔량을 대기시킨다(기존 동작 유지).
+      if (limitPrice != null) break;
+      // 시장가 청산: 봇 무한 유동성으로 잔량을 마저 흡수(고정 스텝·상한 시장충격).
+      if (synthBase <= 0) {
+        const st = await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number }>();
+        synthBase = st?.ref_price ?? (filled > EPS ? cost / filled : pos.entry_price);
+        synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
+      }
+      synthIdx++;
+      const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * synthIdx) / SYNTH_STEPS);
+      const synthPrice = roundOx(Math.max(0.0001, synthBase * (1 + adverse * impact)));
+      maker = synthMaker(makerSide, synthPrice, synthChunk);
+      synthetic = true;
+    }
 
     const chunk = Math.min(remaining, maker.size);
-    const makerRem = maker.size - chunk;
-    const claim = await env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open' AND size>=?")
-      .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
-      .run();
-    if (claim.meta.changes !== 1) continue; // 다른 경로가 먼저 선점 → 재시도
+    if (!synthetic) {
+      const makerRem = maker.size - chunk;
+      const claim = await env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open' AND size>=?")
+        .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
+        .run();
+      if (claim.meta.changes !== 1) continue; // 다른 경로가 먼저 선점 → 재시도(합성은 실제 행이 없어 선점 불필요)
+    }
 
     const fillPrice = maker.price;
     const chunkPnl = (fillPrice - pos.entry_price) * chunk * dir;
