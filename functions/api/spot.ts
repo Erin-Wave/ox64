@@ -1040,7 +1040,17 @@ export async function matchMarketOxOrder(
   // 수수료율은 이 주문 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 올라 청크별로
   // 요율이 달라지는 이상한 상태가 된다). 청크마다 증거금과 **함께** 차감해야 원자 가드가 성립한다.
   const feeRate = await feeRateOf(env, uid);
-  let remaining = size;
+
+  // ⚠ 목표 수량을 **감당 가능한 만큼으로 먼저 줄인다**. 이걸 안 하면, 감당도 못 할 큰 수량(예: 잔고 1만인데
+  // 5천5백만개)을 좇아 합성 유동성 가격이 시장충격으로 계속 위로 램프되는데, 정작 잔고가 바닥나 조금밖에
+  // 못 사면서 **평단만 크게 부풀려진다**(실측: 3% 위). 그 상태로 잔고가 0이 되면 기준가가 정상으로
+  // 돌아올 때 즉시 손실 → 고배율이면 바로 강제청산("넣었는데 풀려버림" 버그). 감당 가능 수량으로
+  // 목표를 클램프하면 시장충격이 실제 체결량에 비례하고, 평단이 시세 근처로 유지된다.
+  const bal0 = (await env.DB.prepare('SELECT balance FROM users WHERE id=?').bind(uid).first<{ balance: number }>())?.balance ?? 0;
+  const est = (await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number }>())?.ref_price ?? 1;
+  const perUnitEst = est / effLev + est * feeRate; // 1코인당 드는 돈(증거금+수수료)
+  const affordableUnits = perUnitEst > 0 ? ((bal0 + floorPnL) * 0.999) / perUnitEst : 0;
+  let remaining = Math.min(size, Math.max(0, affordableUnits));
   let filled = 0;
   let cost = 0;
   let feeTotal = 0;
