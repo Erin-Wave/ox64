@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { api, type LeaderRow } from '@/services/api';
-import { fmtUsd } from '@/format';
+import { api, type LeaderRow, type FeeRevenue } from '@/services/api';
+import { fmtUsd, fmtKor } from '@/format';
 import VipBadge from './VipBadge';
 
 const MEDAL = ['🥇', '🥈', '🥉'];
@@ -8,6 +8,7 @@ const MEDAL = ['🥇', '🥈', '🥉'];
 /** 친구들 자산(equity) 순위. 열려 있는 동안 5초마다 갱신. */
 export default function Leaderboard({ onClose }: { onClose: () => void }) {
   const [rows, setRows] = useState<LeaderRow[]>([]);
+  const [revenue, setRevenue] = useState<FeeRevenue | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -15,7 +16,11 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
     const load = () =>
       api
         .leaderboard()
-        .then((d) => alive && setRows(d.leaderboard))
+        .then((d) => {
+          if (!alive) return;
+          setRows(d.leaderboard);
+          setRevenue(d.revenue ?? null);
+        })
         .catch((e) => alive && setErr((e as Error).message));
     load();
     const t = setInterval(load, 5000);
@@ -43,6 +48,19 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
             ✕
           </button>
         </div>
+
+        {/* 거래소가 수수료로 벌어들인 총액 — 봇이 물량 대부분을 만들어서 섞으면 의미가 흐려지므로 분리 표기 */}
+        {revenue && (
+          <div className="border-b border-border bg-panel2 px-5 py-2.5">
+            <div className="flex items-baseline justify-between">
+              <span className="text-[11px] text-muted">🏦 거래소 수수료 수익</span>
+              <span className="text-sm font-extrabold text-accent">{fmtUsd(revenue.total)} USDT</span>
+            </div>
+            <div className="mt-0.5 text-[10px] text-muted">
+              유저 {fmtUsd(revenue.fromUsers)} · 봇 {fmtUsd(revenue.fromBots)} · 누적 거래대금 {fmtKor(revenue.volume)}
+            </div>
+          </div>
+        )}
 
         <div className="max-h-[70vh] overflow-auto p-2">
           {err && <p className="px-3 py-2 text-xs text-down">{err}</p>}

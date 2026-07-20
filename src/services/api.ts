@@ -66,6 +66,14 @@ export interface LeaderRow {
   vipTier: number;
 }
 
+/** 거래소가 수수료로 벌어들인 총액(봇/유저 분리) — /api/leaderboard 가 함께 내려준다. */
+export interface FeeRevenue {
+  total: number;
+  fromBots: number;
+  fromUsers: number;
+  volume: number;
+}
+
 export interface SpotBookLevel {
   /** 이 가격대에 내가 걸어둔 물량(호가창에서 내 주문을 표시하기 위해 서버가 따로 합산해 내려준다) */
   mine?: number;
@@ -134,7 +142,7 @@ export const api = {
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'setSlTp', positionId, ...p }) }),
   refill: () => req<AppState>('/refill', { method: 'POST' }),
-  leaderboard: () => req<{ leaderboard: LeaderRow[] }>('/leaderboard'),
+  leaderboard: () => req<{ leaderboard: LeaderRow[]; revenue: FeeRevenue }>('/leaderboard'),
   spotState: () => req<SpotState>('/spot'),
   /** OX 캔들. endTimeMs 를 주면 그 시각 "이전" 봉만 — 차트 왼쪽 스크롤 시 과거 구간 이어받기용. */
   spotCandles: (interval: string, limit = 500, endTimeMs?: number) =>
