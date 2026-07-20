@@ -66,10 +66,17 @@ const CANDLE_INTERVALS: readonly [string, number][] = [
   ['1d', 86400], ['3d', 259200], ['1w', 604800], ['1M', 2592000],
 ];
 
-/** 한 체결(price,size,now)을 모든 영속 인터벌의 캔들에 반영하는 upsert 문장들.
- * 버킷이 없으면 새로 만들고(open=high=low=close=price), 있으면 high/low/close/volume 만 갱신(open 유지).
- * 모든 spot_trades INSERT 경로가 이 문장들을 같은 batch 에 함께 넣어 차트 히스토리를 영구 보존한다. */
-function candleUpsertStmts(env: Env, price: number, size: number, now: number): D1PreparedStatement[] {
+/** 한 묶음의 체결(OHLCV)을 모든 영속 인터벌의 캔들에 반영하는 upsert 문장들.
+ * 버킷이 없으면 새로 만들고(open 은 이때만 기록), 있으면 high/low/close/volume 만 갱신(open 유지).
+ * 모든 spot_trades INSERT 경로가 이 문장들을 같은 batch 에 함께 넣어 차트 히스토리를 영구 보존한다.
+ * ⚠ 여기 넘기는 값은 반드시 같은 batch 에 INSERT 하는 spot_trades 들과 일치해야 한다 — 어긋나면
+ * 캔들과 체결내역이 서로 다른 시장을 보여주게 된다(마켓메이커 한 틱은 여러 건을 찍으므로 그 묶음의
+ * OHLC 를 그대로 넘긴다). now 가 과거면 이미 마감된 봉이 변조되므로 항상 현재 이후 시각일 것. */
+function candleUpsertStmts(
+  env: Env,
+  bar: { open: number; high: number; low: number; close: number; volume: number },
+  now: number,
+): D1PreparedStatement[] {
   return CANDLE_INTERVALS.map(([code, sec]) => {
     const bucket = Math.floor(now / (sec * 1000)) * (sec * 1000);
     return env.DB.prepare(
@@ -79,8 +86,13 @@ function candleUpsertStmts(env: Env, price: number, size: number, now: number): 
          low = MIN(spot_candles.low, excluded.low),
          close = excluded.close,
          volume = spot_candles.volume + excluded.volume`,
-    ).bind(PAIR, code, bucket, price, price, price, price, size);
+    ).bind(PAIR, code, bucket, bar.open, bar.high, bar.low, bar.close, bar.volume);
   });
+}
+
+/** 단일 가격 체결용 단축(진입/청산 등 개별 체결 — OHLC 가 전부 같은 가격). */
+function candleUpsertOne(env: Env, price: number, size: number, now: number): D1PreparedStatement[] {
+  return candleUpsertStmts(env, { open: price, high: price, low: price, close: price, volume: size }, now);
 }
 
 /** 최신 spot_trades 를 interval 버킷으로 묶어 OHLCV 를 만든다(1s 등 단기 인터벌 + 영속 캔들 폴백 전용).
@@ -215,20 +227,171 @@ function botQuoteStmt(env: Env, actor: string, side: 'buy' | 'sell', price: numb
 
 // ⚠ 한 틱에 찍는 합성 체결의 개수·크기 — 예전엔 5~45 짜리 1건이라 캔들 거래량이 수백에 그쳤다("봇이
 // 쫄보"). 실제 시장처럼 보이도록 매 틱 여러 건을 큰 물량으로 찍는다(테이프도 붐비고 거래량도 유의미).
+// 아래 심리 모델이 국면·변동성에 따라 이 값에 배수를 걸어 "패닉엔 거래량 폭증, 잔잔할 땐 한산"을 만든다.
 const BOT_TRADES_PER_TICK_MIN = 3;
 const BOT_TRADES_PER_TICK_MAX = 6;
 const BOT_TRADE_SIZE_MIN = 1000;
 const BOT_TRADE_SIZE_MAX = 8000;
 const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에 몰아 돌리는 틱 수(시장이 계속 살아있게)
 
+// ── 봇 매매 심리 모델 ─────────────────────────────────────────────────────
+// ⚠ 예전 기준가는 `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 추세도, 변동성 뭉침도,
+// 과열도 공포도 없는 무특징 노이즈. 매 틱이 직전과 완전히 독립이라 차트에 읽을 구조가 아예 없었고
+// ("사람 심리가 안 들어간 매매라 노잼"), 어떤 분석도 무의미했다. 지금은 실제 시장에서 관찰되는 정형화된
+// 사실(stylized facts)을 작은 상태기계로 재현한다 — 상태는 spot_bot_state 행에 얹어 틱 사이에 지속된다:
+//   1. 추세 지속(momentum)   — 수익률이 AR(1) 자기상관 → 한 번 잡힌 방향이 여러 틱 이어진다
+//   2. 변동성 클러스터링      — vol 이 AR(1) → 잔잔한 구간과 거친 구간이 뭉치고, 드물게 "뉴스" 충격
+//   3. 과열 후 평균회귀       — 적정가(anchor)에서 벌어질수록 되돌림이 제곱으로 강해진다(고점 공포/저점 매수)
+//   4. 탐욕-공포 국면 전환    — calm→rally→euphoria→panic→… 하락이 상승보다 빠르고 거칠다(비대칭)
+// 여기에 라운드넘버 자석(심리적 지지/저항), 팻테일(급등락), 그리고 거래량·체결 방향·호가 스프레드가
+// 국면에 함께 반응하는 것까지 묶었다. 전부 결정론적 알고리즘이다(LLM 아님).
+type Regime = 'calm' | 'rally' | 'euphoria' | 'pullback' | 'panic';
+
+interface BotState {
+  ref: number;
+  drift: number;      // 추세 강도(틱당 기대수익률)
+  vol: number;        // 변동성 배수
+  sentiment: number;  // 군중 심리 -1(공포) ~ +1(탐욕)
+  anchor: number;     // 완만히 따라오는 "적정가"
+  regime: Regime;
+  regimeTicks: number;
+}
+
+// 국면별 성격. bias=틱당 추가 드리프트, volMult=변동성 배수, sizeMult=거래량 배수,
+// takerBias=체결 방향 편향(+면 매수 우위), minTicks=최소 지속 틱(국면이 1틱만에 튕기지 않게).
+// ⚠ 비대칭: panic 은 euphoria 보다 |bias|·volMult·sizeMult 가 모두 크다 — 실제 시장처럼 "떨어질 땐
+// 빠르고 거칠게, 오를 땐 느리게".
+// ⚠ bias 는 국면 점유율(대략 calm 50% / rally 25% / pullback 16% / panic 6% / euphoria 3%)로 가중하면
+// 합이 거의 0 이 되도록 맞춰져 있다 — 안 맞추면 틱마다 미세한 편향이 누적돼 며칠 만에 가격이 0 으로
+// 붕괴하거나 발산한다(초기 튜닝에서 실제로 5일 만에 -40% 편향이 나왔다). 값을 바꿀 땐 반드시
+// 시뮬레이션으로 장기 안정성을 다시 확인할 것.
+const REGIME_PARAMS: Record<Regime, { bias: number; volMult: number; sizeMult: number; takerBias: number; minTicks: number }> = {
+  calm:     { bias:  0,       volMult: 0.65, sizeMult: 0.55, takerBias:  0.02, minTicks: 8 },
+  rally:    { bias:  0.0011,  volMult: 1.05, sizeMult: 1.10, takerBias:  0.20, minTicks: 6 },
+  euphoria: { bias:  0.0030,  volMult: 1.80, sizeMult: 2.20, takerBias:  0.36, minTicks: 4 },
+  pullback: { bias: -0.0007,  volMult: 1.20, sizeMult: 0.95, takerBias: -0.18, minTicks: 3 },
+  panic:    { bias: -0.0036,  volMult: 2.60, sizeMult: 2.90, takerBias: -0.40, minTicks: 4 },
+};
+
+const ROUND_STEP = 0.05; // 라운드넘버 자석이 잡아당기는 심리적 가격대 간격
+// 적정가(anchor)가 아주 약하게 끌려가는 장기 기준선. 국면 bias 를 아무리 맞춰도 랜덤워크는 며칠 단위로
+// 얼마든지 멀리 갈 수 있어서(0 에 붙거나 수십 배로 뜀), 반감기 ~14시간짜리 약한 복원력을 하나 둔다.
+// 며칠 단위 추세는 그대로 살아있고 "몇 주 뒤 가격이 무의미해지는" 것만 막는다.
+const BOT_BASE_PRICE = 1;
+const BOT_BASE_PULL = 0.00002;
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** 표준정규 난수(Box-Muller) — 균등분포보다 꼬리가 있어 가격 움직임이 자연스럽다. */
+function gauss(): number {
+  const u = Math.random() || 1e-9;
+  const v = Math.random() || 1e-9;
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+/** 국면 전이 — 최소 지속시간을 지킨 뒤 심리/과열도에 따라 확률적으로 넘어간다.
+ * 상승은 단계를 밟아 올라가지만(calm→rally→euphoria) 꼭대기에선 곧장 panic 으로 떨어질 수 있다. */
+function nextRegime(s: BotState, stretch: number, sentiment: number): { regime: Regime; regimeTicks: number } {
+  const age = s.regimeTicks + 1;
+  if (age < REGIME_PARAMS[s.regime].minTicks) return { regime: s.regime, regimeTicks: age };
+  const start = (regime: Regime) => ({ regime, regimeTicks: 0 });
+  const roll = Math.random();
+  switch (s.regime) {
+    case 'calm':
+      if (sentiment > 0.35 && roll < 0.26) return start('rally');
+      if (sentiment < -0.35 && roll < 0.20) return start('pullback');
+      if (roll < 0.04) return start(sentiment >= 0 ? 'rally' : 'pullback');
+      break;
+    case 'rally':
+      if (stretch > 0.022 && sentiment > 0.42 && roll < 0.34) return start('euphoria'); // 과열 진입(추격매수)
+      if (roll < 0.20) return start('pullback'); // 차익실현
+      if (roll < 0.28) return start('calm');
+      break;
+    case 'euphoria':
+      if (roll < 0.34) return start('panic'); // 꼭대기에서 곧장 급락 — 상승보다 하락이 빠르다
+      if (roll < 0.56) return start('pullback');
+      break;
+    case 'pullback':
+      if (stretch < -0.022 && sentiment < -0.42 && roll < 0.32) return start('panic'); // 투매 전환
+      if (roll < 0.30) return start('calm');
+      if (roll < 0.44) return start('rally'); // 저가 매수 유입
+      break;
+    case 'panic':
+      if (roll < 0.30) return start('calm'); // 진정
+      if (roll < 0.40) return start('rally'); // 데드캣 바운스
+      break;
+  }
+  return { regime: s.regime, regimeTicks: age };
+}
+
+/** 한 틱의 시장 심리를 굴려 다음 상태와 이번 틱의 체결 성격을 만든다(순수 함수, DB 접근 없음). */
+function nextMarketState(s: BotState): {
+  next: BotState;
+  ret: number;         // 이번 틱 수익률
+  sizeMult: number;    // 거래량 배수
+  buyProb: number;     // 체결이 매수(taker buy)일 확률
+  spreadMult: number;  // 호가 스프레드 배수
+} {
+  const anchor = s.anchor > 0 ? s.anchor : s.ref;
+  const stretch = (s.ref - anchor) / anchor; // 적정가 대비 과열(+)/과매도(-)
+
+  // 1) 변동성 클러스터링 — 직전 변동성을 대부분 물려받고(AR(1)) 드물게 뉴스 충격으로 튄다.
+  let vol = s.vol * 0.9 + 0.1 * Math.exp(gauss() * 0.45);
+  if (Math.random() < 0.02) vol *= 1.8 + Math.random() * 1.4;
+  vol = clamp(vol, 0.35, 4.5);
+
+  // 2) 추세 지속 — 방향이 한 번 잡히면 감쇠하며 몇 틱 이어진다.
+  const drift = s.drift * 0.86 + gauss() * 0.0007 * vol;
+
+  // 3) 군중 심리 — 최근 추세와 과열도가 쌓여 탐욕/공포가 된다(국면 전이의 방아쇠).
+  const sentiment = clamp(s.sentiment * 0.88 + 45 * drift + 3 * stretch, -1, 1);
+
+  const { regime, regimeTicks } = nextRegime(s, stretch, sentiment);
+  const P = REGIME_PARAMS[regime];
+
+  // 4) 평균회귀 — 벌어질수록 제곱으로 강해진다(무한 발산 방지 + "너무 올랐다" 심리).
+  const revert = -0.045 * stretch - 0.7 * stretch * Math.abs(stretch);
+
+  // 5) 라운드넘버 자석 — 심리적 지지/저항 근처에서 잠시 머뭇거린다.
+  const round = Math.round(s.ref / ROUND_STEP) * ROUND_STEP;
+  const toRound = (round - s.ref) / s.ref;
+  const magnet = Math.abs(toRound) < 0.004 ? toRound * 0.35 : 0;
+
+  // 6) 이번 틱 수익률 + 팻테일(가끔 튀는 급등락)
+  let ret = drift + revert + magnet + P.bias + gauss() * 0.0015 * vol * P.volMult;
+  if (Math.random() < 0.03) ret *= 2 + Math.random() * 2;
+
+  const ref = roundOx(clamp(s.ref * (1 + ret), 0.02, 1e6));
+
+  // 7) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증.
+  const intensity = clamp(0.5 + Math.abs(ret) / 0.003, 0.45, 6);
+  const nextAnchor = anchor * 0.99 + ref * 0.01;
+  return {
+    next: {
+      ref,
+      drift,
+      vol,
+      sentiment,
+      // 적정가는 가격을 느리게 따라가되(장기 추세 허용), 아주 약하게 기준선으로도 끌린다(무한 표류 방지).
+      anchor: nextAnchor + (BOT_BASE_PRICE - nextAnchor) * BOT_BASE_PULL,
+      regime,
+      regimeTicks,
+    },
+    ret,
+    sizeMult: P.sizeMult * intensity,
+    buyProb: clamp(0.5 + P.takerBias + (ret >= 0 ? 0.22 : -0.22), 0.06, 0.94),
+    spreadMult: 0.75 + 0.45 * vol, // 변동성이 크면 마켓메이커가 물러나 호가가 벌어진다
+  };
+}
+
 /**
- * 마켓메이커 한 틱(requote): 봇 호가를 새로 깔고, 큰 합성 체결을 여러 건 찍어 테이프/거래량을 만들고,
- * 유저 지정가 "벽"을 존중(클램프+소비)하고, 대기 중 유저 지정가를 walking 매칭한다. prevRef 기준으로
- * 랜덤워크한 새 ref 를 반환. now 는 이 틱의 기준 시각(cron 버스트는 조금씩 다른 값을 넘겨 캔들이 최근
- * 시간대에 자연스럽게 퍼지게 한다). ref_price 는 갱신하지만 last_run 은 건드리지 않는다(게이트는 호출자 담당).
+ * 마켓메이커 한 틱(requote): 봇 호가를 새로 깔고, 합성 체결을 여러 건 찍어 테이프/거래량을 만들고,
+ * 유저 지정가 "벽"을 존중(클램프+소비)하고, 대기 중 유저 지정가를 walking 매칭한다. prev 상태에서
+ * 심리 모델을 한 스텝 굴려 다음 상태를 반환. now 는 이 틱의 기준 시각(항상 현재 이후 — 과거면 마감된
+ * 봉이 변조된다). 심리 상태는 갱신하지만 last_run 은 건드리지 않는다(게이트는 호출자 담당).
  */
-async function marketMakerTick(env: Env, prevRef: number, now: number): Promise<number> {
-  const candidateRef = roundOx(Math.max(0.01, prevRef * (1 + (Math.random() - 0.5) * 0.012))); // ±0.6% 랜덤워크(4자리 틱 스냅)
+async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<BotState> {
+  const step = nextMarketState(prev);
+  const candidateRef = step.next.ref;
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
 
   // ⚠ 유저가 걸어둔 지정가 "벽"을 존중한다(가짜 high 버그 수정). 랜덤워크 기준가가 유저의 최우선 매도벽
@@ -252,6 +415,14 @@ async function marketMakerTick(env: Env, prevRef: number, now: number): Promise<
     press = 'down'; // 매수벽에 눌림 — 봇이 벽 가격에 매도호가를 놓아 벽을 소비
   }
 
+  // 기준가뿐 아니라 개별 합성 체결 가격도 같은 벽 안으로 가둔다 — 안 그러면 봉 안의 노이즈가 벽을 넘어
+  // 찍혀서 "벽은 안 팔렸는데 차트 고가만 벽 너머"인 가짜 꼬리가 생긴다(가짜 high 버그와 같은 원리).
+  function clampToWalls(p: number): number {
+    if (wallAsk != null && p > wallAsk) return roundOx(wallAsk);
+    if (wallBid != null && p < wallBid) return roundOx(wallBid);
+    return p;
+  }
+
   const stmts: D1PreparedStatement[] = [
     // ⚠ 매 틱 이 페어의 봇 호가를 "전부"(두 봇 모두) 비우고 한 액터가 일관된 사다리를 새로 깐다(호가 역전 방지).
     // spot_orders 엔 봇 호가만 있으니(유저 주문은 pending_orders) pair 전체를 지워도 유저 주문엔 영향 없다.
@@ -259,8 +430,10 @@ async function marketMakerTick(env: Env, prevRef: number, now: number): Promise<
   ];
   // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 타이트하게(최우선호가가 mid 에 바싹) 잡되 깊은
   // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
+  // ⚠ 변동성이 높은 국면(패닉/과열)에선 spreadMult 로 호가가 벌어진다 — 실제 마켓메이커가 리스크를 피해
+  // 물러나는 행동이라, 거친 구간에 시장가로 들어가면 슬리피지가 커진다.
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
-    const spread = 0.0012 + level * 0.0016 + Math.random() * 0.0008;
+    const spread = (0.0009 + level * 0.0013 + Math.random() * 0.0006) * step.spreadMult;
     const buySize = Number((2000 + Math.random() * 8000).toFixed(4));
     const sellSize = Number((2000 + Math.random() * 8000).toFixed(4));
     stmts.push(botQuoteStmt(env, actor, 'buy', roundOx(ref * (1 - spread)), buySize, now));
@@ -270,35 +443,97 @@ async function marketMakerTick(env: Env, prevRef: number, now: number): Promise<
   if (press === 'up') stmts.push(botQuoteStmt(env, actor, 'buy', ref, Number((2000 + Math.random() * 8000).toFixed(4)), now));
   else if (press === 'down') stmts.push(botQuoteStmt(env, actor, 'sell', ref, Number((2000 + Math.random() * 8000).toFixed(4)), now));
 
-  // 합성 체결을 여러 건(버스트) 큰 물량으로 찍는다 — 예전 1건(5~45)이 거래량 ~300 밖에 안 되던 원인.
-  // 체결가=ref, 방향은 ref 진행 방향으로 편향(70%)하되 섞어 테이프가 자연스럽게. 캔들은 총량으로 1회 upsert.
-  const nTrades = BOT_TRADES_PER_TICK_MIN + Math.floor(Math.random() * (BOT_TRADES_PER_TICK_MAX - BOT_TRADES_PER_TICK_MIN + 1));
-  const upBias = ref >= prevRef;
-  let vol = 0;
+  // 합성 체결을 여러 건 찍는다. ⚠ 예전엔 전부 같은 가격(ref)이라 봉 안에 구조가 없었다(몸통만 있고
+  // 꼬리가 없는 캔들) — 지금은 직전 기준가에서 새 기준가로 "걸어가면서" 노이즈를 얹어 찍으므로 봉마다
+  // 시가/고가/저가/종가가 제대로 생긴다. 마지막 체결은 정확히 ref(=종가)로 맞춰 기준가와 어긋나지 않게.
+  // 건수·크기는 심리 모델의 sizeMult(국면·움직임 크기)에 비례하고, 드물게 고래 물량이 섞인다.
+  const nTrades = clamp(
+    Math.round((BOT_TRADES_PER_TICK_MIN + Math.random() * (BOT_TRADES_PER_TICK_MAX - BOT_TRADES_PER_TICK_MIN)) * Math.sqrt(step.sizeMult)),
+    2,
+    12,
+  );
+  let volume = 0;
+  let high = ref;
+  let low = ref;
+  let open = ref;
   for (let i = 0; i < nTrades; i++) {
-    const sz = Number((BOT_TRADE_SIZE_MIN + Math.random() * (BOT_TRADE_SIZE_MAX - BOT_TRADE_SIZE_MIN)).toFixed(4));
-    vol += sz;
-    const takerSide = Math.random() < 0.7 ? (upBias ? 'buy' : 'sell') : upBias ? 'sell' : 'buy';
+    const progress = (i + 1) / nTrades;
+    const walk = prev.ref + (ref - prev.ref) * progress;
+    const jitter = 1 + gauss() * 0.0005 * step.next.vol;
+    const price = i === nTrades - 1 ? ref : clampToWalls(roundOx(walk * jitter));
+    if (i === 0) open = price;
+    high = Math.max(high, price);
+    low = Math.min(low, price);
+
+    let sz = (BOT_TRADE_SIZE_MIN + Math.random() * (BOT_TRADE_SIZE_MAX - BOT_TRADE_SIZE_MIN)) * step.sizeMult;
+    if (Math.random() < 0.04) sz *= 2.5 + Math.random() * 4; // 가끔 고래가 크게 친다(팻테일 거래량)
+    sz = Number(sz.toFixed(4));
+    volume += sz;
+
+    const takerSide = Math.random() < step.buyProb ? 'buy' : 'sell';
     stmts.push(
       env.DB.prepare(
         'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), PAIR, actor, actor, ref, sz, takerSide, now + i),
+      ).bind(crypto.randomUUID(), PAIR, actor, actor, price, sz, takerSide, now + i),
     );
   }
-  stmts.push(env.DB.prepare('UPDATE spot_bot_state SET ref_price = ? WHERE id = ?').bind(ref, PAIR));
-  stmts.push(...candleUpsertStmts(env, ref, vol, now)); // 영속 캔들: 이 틱 버스트의 총 거래량으로 1회 갱신
+  const next: BotState = { ...step.next, ref };
+  stmts.push(
+    env.DB.prepare(
+      'UPDATE spot_bot_state SET ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=? WHERE id=?',
+    ).bind(next.ref, next.drift, next.vol, next.sentiment, next.anchor, next.regime, next.regimeTicks, PAIR),
+  );
+  // 영속 캔들: 이 틱이 찍은 체결들의 OHLCV 로 1회 갱신(위 spot_trades 들과 정확히 일치해야 한다).
+  stmts.push(...candleUpsertStmts(env, { open, high, low, close: ref, volume }, now));
   await env.DB.batch(stmts);
 
   // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
   await sweepRestingOxPendings(env);
-  return ref;
+  return next;
+}
+
+// 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
+// 읽히고, 값이 비었거나(anchor=0=미초기화) 알 수 없는 regime 이면 안전한 기본값으로 떨어진다.
+const BOT_STATE_COLS = 'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks';
+const REGIMES: readonly Regime[] = ['calm', 'rally', 'euphoria', 'pullback', 'panic'];
+
+interface BotStateRow {
+  last_run: number;
+  ref_price: number;
+  drift: number;
+  vol: number;
+  sentiment: number;
+  anchor: number;
+  regime: string;
+  regime_ticks: number;
+}
+
+function toBotState(row: BotStateRow | null, ref: number): BotState {
+  return {
+    ref,
+    drift: row?.drift ?? 0,
+    vol: row && row.vol > 0 ? row.vol : 1,
+    sentiment: row?.sentiment ?? 0,
+    anchor: row?.anchor ?? 0,
+    regime: REGIMES.includes(row?.regime as Regime) ? (row!.regime as Regime) : 'calm',
+    regimeTicks: row?.regime_ticks ?? 0,
+  };
+}
+
+/** 기준가 확보 — 상태 행이 없거나 0 이면 마지막 체결가로, 그것도 없으면 1 로 시작. */
+async function resolveRef(env: Env, row: BotStateRow | null): Promise<number> {
+  if (row?.ref_price) return row.ref_price;
+  const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
+    .bind(PAIR)
+    .first<{ price: number }>();
+  return lastTrade?.price ?? 1;
 }
 
 /** 폴링(유저 접속) 시 호출 — 재호가 게이트를 통과할 때만 한 틱을 돈다. */
 export async function runMarketMaker(env: Env): Promise<void> {
-  const row = await env.DB.prepare('SELECT last_run, ref_price FROM spot_bot_state WHERE id = ?')
+  const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`)
     .bind(PAIR)
-    .first<{ last_run: number; ref_price: number }>();
+    .first<BotStateRow>();
   const now = Date.now();
   const last = row?.last_run ?? 0;
 
@@ -313,14 +548,7 @@ export async function runMarketMaker(env: Env): Promise<void> {
     .run();
   if (claim.meta.changes !== 1) return; // 다른 요청이 이 틱을 이미 선점 — 중복 requote 방지
 
-  let prevRef = row?.ref_price ?? 0;
-  if (!prevRef) {
-    const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
-      .bind(PAIR)
-      .first<{ price: number }>();
-    prevRef = lastTrade?.price ?? 1;
-  }
-  await marketMakerTick(env, prevRef, now);
+  await marketMakerTick(env, toBotState(row, await resolveRef(env, row)), now);
 }
 
 /**
@@ -337,27 +565,27 @@ export async function runMarketMaker(env: Env): Promise<void> {
  * 어차피 매 봉 채워지므로 빈 봉도 안 생긴다.
  */
 export async function runMarketMakerBurst(env: Env, ticks: number = BOT_BURST_TICKS): Promise<void> {
-  const row = await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id = ?').bind(PAIR).first<{ ref_price: number }>();
-  let ref = row?.ref_price ?? 0;
-  if (!ref) {
-    const lastTrade = await env.DB.prepare('SELECT price FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 1')
-      .bind(PAIR)
-      .first<{ price: number }>();
-    ref = lastTrade?.price ?? 1;
+  const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(PAIR).first<BotStateRow>();
+  const ref0 = await resolveRef(env, row);
+  // 상태 행이 아직 없으면 먼저 만든다 — marketMakerTick 의 심리상태 UPDATE 가 0행이 되어 국면이
+  // 매 틱 초기화되는 걸 막는다(cron 이 유일한 클럭인 초기 상태에서 실제로 문제가 된다).
+  if (!row) {
+    await env.DB.prepare('INSERT OR IGNORE INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?)')
+      .bind(PAIR, 0, ref0)
+      .run();
   }
+
   // 각 틱의 시각 = "그 틱을 실제로 실행하는 시점"(단조 증가). 버스트가 분 경계를 넘어가더라도
   // 소급 기록이 생기지 않는다. +10ms 는 틱 내부 체결(now+0..5)끼리 겹치지 않게 하는 최소 간격.
+  let state = toBotState(row, ref0);
   let prevTs = 0;
   for (let i = 0; i < ticks; i++) {
     const ts = Math.max(Date.now(), prevTs + 10);
     prevTs = ts;
-    ref = await marketMakerTick(env, ref, ts);
+    state = await marketMakerTick(env, state, ts);
   }
-  await env.DB.prepare(
-    'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run, ref_price = excluded.ref_price',
-  )
-    .bind(PAIR, Date.now(), ref)
-    .run();
+  // 심리 상태는 각 틱이 이미 기록했으므로 여기선 last_run 만 갱신한다(직후 폴링이 곧바로 겹쳐 requote 하지 않게).
+  await env.DB.prepare('UPDATE spot_bot_state SET last_run = ? WHERE id = ?').bind(Date.now(), PAIR).run();
 }
 
 /** 유저가 OX 를 실제로 레버리지 거래(order.ts open/close)할 때 그 체결을 합성 시장에도 반영한다.
@@ -402,7 +630,7 @@ export async function recordVirtualFill(
     env.DB.prepare(
       'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price',
     ).bind(PAIR, now, price),
-    ...candleUpsertStmts(env, price, size, now), // 영속 캔들 갱신
+    ...candleUpsertOne(env, price, size, now), // 영속 캔들 갱신
   ]);
 }
 
@@ -463,7 +691,7 @@ function spotTradeStmts(
     env.DB.prepare(
       'INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price',
     ).bind(PAIR, now, price),
-    ...candleUpsertStmts(env, price, size, now), // 유저 매칭체결도 영속 캔들에 반영
+    ...candleUpsertOne(env, price, size, now), // 유저 매칭체결도 영속 캔들에 반영
   ];
 }
 

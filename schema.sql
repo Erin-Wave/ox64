@@ -101,10 +101,20 @@ INSERT OR IGNORE INTO users (id, name, passcode_hash, balance, created_at, ox_ba
   ('bot-mm-1', 'MarketMaker1', 'disabled$$bot-account-no-login', 100000000, 0, 100000000),
   ('bot-mm-2', 'MarketMaker2', 'disabled$$bot-account-no-login', 100000000, 0, 100000000);
 
+-- ⚠ 이 행(pair 당 1개)은 시세뿐 아니라 봇의 "심리 상태"를 담는다. 예전엔 ref_price 하나로 IID 랜덤워크만
+-- 돌려서 추세도 변동성 뭉침도 없는 무특징 노이즈였다(사람이 읽을 구조가 없어 재미가 없었다). 지금은
+-- 추세(drift)·변동성(vol)·군중심리(sentiment)·적정가 앵커(anchor)·시장 국면(regime)을 지속시켜
+-- functions/api/spot.ts nextMarketState() 가 틱마다 이어받아 갱신한다(§ "봇 매매 심리 모델").
 CREATE TABLE IF NOT EXISTS spot_bot_state (
-  id        TEXT PRIMARY KEY,   -- pair (예: 'OXUSDT')
-  last_run  INTEGER NOT NULL,
-  ref_price REAL NOT NULL
+  id           TEXT PRIMARY KEY,   -- pair (예: 'OXUSDT')
+  last_run     INTEGER NOT NULL,
+  ref_price    REAL NOT NULL,
+  drift        REAL NOT NULL DEFAULT 0,       -- 추세 강도(틱당 기대수익률), AR(1) 로 몇 틱 지속
+  vol          REAL NOT NULL DEFAULT 1,       -- 변동성 배수(클러스터링 — 잔잔한 구간/거친 구간이 뭉침)
+  sentiment    REAL NOT NULL DEFAULT 0,       -- 군중 심리 -1(공포) ~ +1(탐욕)
+  anchor       REAL NOT NULL DEFAULT 0,       -- 완만히 따라오는 "적정가"(과열/과매도 판정 기준, 0=미초기화)
+  regime       TEXT NOT NULL DEFAULT 'calm',  -- calm|rally|euphoria|pullback|panic
+  regime_ticks INTEGER NOT NULL DEFAULT 0     -- 현재 국면이 지속된 틱 수(최소 지속시간 보장용)
 );
 
 -- ── OX 영속 캔들(차트 히스토리 영구 보존) ─────────────────────────────
@@ -162,3 +172,15 @@ CREATE TABLE IF NOT EXISTS spot_candles (
 -- 아래를 직접 실행할 것(코드가 이 컬럼을 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다 — limitClose
 -- INSERT 가 실패하지 않게). 이미 실행했다면 재실행 시 "duplicate column name" 에러(무시 가능).
 -- ALTER TABLE pending_orders ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0;
+
+-- ⚠ 일회성 마이그레이션 (2026-07-20 추가, 봇 매매 심리 모델): 기존 prod DB 의 spot_bot_state 에 봇의
+-- 심리/국면 상태 컬럼을 추가한다. CREATE TABLE IF NOT EXISTS 는 기존 테이블에 컬럼을 더해주지 않으므로
+-- 최초 1회만 아래를 직접 실행할 것 — 코드(nextMarketState)가 이 컬럼들을 SELECT/UPDATE 하므로 **코드
+-- 배포 전에 먼저 적용돼 있어야 한다**. 전부 DEFAULT 가 있어 기존 행도 그대로 동작하며(anchor=0 은
+-- "미초기화"라 첫 틱에 현재가로 자동 세팅), 이미 실행했다면 "duplicate column name" 에러(무시 가능).
+-- ALTER TABLE spot_bot_state ADD COLUMN drift REAL NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_bot_state ADD COLUMN vol REAL NOT NULL DEFAULT 1;
+-- ALTER TABLE spot_bot_state ADD COLUMN sentiment REAL NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_bot_state ADD COLUMN anchor REAL NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_bot_state ADD COLUMN regime TEXT NOT NULL DEFAULT 'calm';
+-- ALTER TABLE spot_bot_state ADD COLUMN regime_ticks INTEGER NOT NULL DEFAULT 0;
