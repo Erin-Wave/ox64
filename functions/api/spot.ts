@@ -371,6 +371,30 @@ function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): {
  * 수량은 가끔 섞일 뿐이다(가격과 달리 수량엔 라운드 넘버 심리가 약하다). 그래서 기본은 정수로만
  * 다듬고, 18% 만 눈에 띄게 떨어지는 수량으로 만든다.
  */
+/**
+ * 유저가 걸어둔 "벽"을 한 틱에 얼마나 소비할지.
+ *
+ * ⚠ 예전엔 벽 크기와 무관하게 항상 2,000~10,000 이라, 100만주 벽이면 뚫는 데 수십 분이 걸리고 그동안
+ * 가격이 벽에 붙어 굳어버렸다(기준가가 벽 안으로 클램프되므로). 실제 시장에서 큰 벽은 "저항"이지
+ * "무한 방벽"이 아니다 — 방향성이 강하면 큰 물량이 들어와 갉아먹고, 가끔은 고래가 한 번에 쓸어간다.
+ *
+ * 그래서 **벽 크기에 비례하는 비율**로 먹되,
+ *  - 국면 공격성(`REGIME_PARAMS.sizeMult`: calm 0.55 ~ panic 2.9)과 군중 심리 강도로 배수를 걸고,
+ *  - 낮은 확률로 "고래 스윕"이 터져 벽의 35~90% 를 한 틱에 쓸어간다.
+ * 작은 벽은 기존과 같은 절대량(2,000~10,000)이 하한이라 잔챙이는 예전처럼 바로 정리된다.
+ */
+const WALL_BITE_MIN = 0.05; // 한 틱에 먹는 벽의 최소 비율(공격성 배수 적용 전)
+const WALL_BITE_RAND = 0.07;
+const WALL_WHALE_CHANCE = 0.06;
+function wallAbsorbSize(wallSize: number, regime: Regime, sentiment: number): number {
+  if (!(wallSize > 0)) return humanSize(2000 + Math.random() * 8000);
+  const aggression = REGIME_PARAMS[regime].sizeMult * (0.7 + Math.abs(sentiment));
+  let pct = (WALL_BITE_MIN + Math.random() * WALL_BITE_RAND) * aggression;
+  if (Math.random() < WALL_WHALE_CHANCE) pct = 0.35 + Math.random() * 0.55; // 고래가 한 번에 쓸어감
+  const floor = 2000 + Math.random() * 8000; // 작은 벽은 예전처럼 통째로
+  return humanSize(Math.min(wallSize, Math.max(floor, wallSize * pct)));
+}
+
 function humanSize(raw: number): number {
   const v = Math.max(1, raw);
   if (Math.random() < 0.18) {
@@ -503,13 +527,29 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   // 위로 올라가거나 최우선 매수벽 아래로 내려가면, 실제 시장이라면 그 벽을 먼저 소비해야 하므로 기준가·
   // 합성체결을 벽 너머에 찍으면 안 된다. → 기준가를 [최우선 매수벽, 최우선 매도벽] 안으로 클램프하고,
   // 벽에 눌리면(press) 그 벽 가격에 봇 호가를 하나 놓아 아래 sweep 이 벽을 실제 체결로 조금씩 소비하게 한다.
-  const walls = await env.DB.prepare(
-    "SELECT MIN(CASE WHEN side='short' THEN limit_price END) AS ask, MAX(CASE WHEN side='long' THEN limit_price END) AS bid FROM pending_orders WHERE symbol=?",
-  )
-    .bind(PAIR)
-    .first<{ ask: number | null; bid: number | null }>();
-  const wallAsk = walls?.ask ?? null;
-  const wallBid = walls?.bid ?? null;
+  // ⚠ 가격뿐 아니라 **그 가격의 총 물량**까지 받아온다 — 벽을 얼마나 물어뜯을지가 벽 크기에 비례해야
+  // 하기 때문(아래 wallAbsorbSize). 예전엔 가격만 알아서 100만주 벽이든 5천주 벽이든 똑같이 5천주씩만
+  // 먹었고, 그래서 큰 벽 앞에서 몇십 분씩 가격이 굳어버렸다("봇이 쫄보라 큰 벽을 못 뚫는 느낌").
+  const wallRows = (
+    await env.DB.prepare(
+      "SELECT side, limit_price AS price, SUM(size) AS size FROM pending_orders WHERE symbol=? GROUP BY side, limit_price",
+    )
+      .bind(PAIR)
+      .all<{ side: string; price: number; size: number }>()
+  ).results;
+  let wallAsk: number | null = null;
+  let wallAskSize = 0;
+  let wallBid: number | null = null;
+  let wallBidSize = 0;
+  for (const r of wallRows) {
+    if (r.side === 'short' && (wallAsk == null || r.price < wallAsk)) {
+      wallAsk = r.price;
+      wallAskSize = r.size;
+    } else if (r.side === 'long' && (wallBid == null || r.price > wallBid)) {
+      wallBid = r.price;
+      wallBidSize = r.size;
+    }
+  }
   let ref = candidateRef;
   let press: 'up' | 'down' | null = null;
   if (wallAsk != null && ref > wallAsk) {
@@ -554,9 +594,13 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
     placeQuote('buy', ref * (1 - spread), depth);
     placeQuote('sell', ref * (1 + spread), depth);
   }
-  // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 하나 얹는다 — 아래 sweep 이 유저 벽을 그 가격에 소비.
-  if (press === 'up') stmts.push(botQuoteStmt(env, actor, 'buy', ref, humanSize(2000 + Math.random() * 8000), now));
-  else if (press === 'down') stmts.push(botQuoteStmt(env, actor, 'sell', ref, humanSize(2000 + Math.random() * 8000), now));
+  // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 얹는다 — 아래 sweep 이 유저 벽을 그 가격에 소비.
+  // 물량은 **벽 크기에 비례**한다(wallAbsorbSize) — 고정 크기면 큰 벽을 영원히 못 뚫는다.
+  if (press === 'up') {
+    stmts.push(botQuoteStmt(env, actor, 'buy', ref, wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment), now));
+  } else if (press === 'down') {
+    stmts.push(botQuoteStmt(env, actor, 'sell', ref, wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment), now));
+  }
 
   // 합성 체결을 여러 건 찍는다. ⚠ 예전엔 전부 같은 가격(ref)이라 봉 안에 구조가 없었다(몸통만 있고
   // 꼬리가 없는 캔들) — 지금은 직전 기준가에서 새 기준가로 "걸어가면서" 노이즈를 얹어 찍으므로 봉마다
