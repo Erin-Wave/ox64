@@ -3,7 +3,7 @@ import { useMarketStore, selectLastPrice, selectLastTakerSide, precisionOf } fro
 import { useTradingStore } from '@/store/useTradingStore';
 import { fmtPrice } from '@/format';
 import SymbolSelect from '@/components/SymbolSelect';
-import logo from '@/resources/images/icon_256.png';
+import Logo from './Logo';
 
 export default function Header({
   onOpenRank,
@@ -46,7 +46,8 @@ export default function Header({
     <header className="flex items-center justify-between gap-2 border-b border-border bg-panel px-2 py-1.5 sm:gap-3 sm:px-4 sm:py-2">
       {/* 좌: (데스크톱) 로고 · 심볼 · 현재가/연결상태 — (모바일) 심볼 + 현재가·연결점만 한 줄 */}
       <div className="flex min-w-0 items-center gap-1.5 sm:gap-4">
-        <img src={logo} alt="ox64" className="hidden h-9 w-9 shrink-0 sm:block sm:h-10 sm:w-10" />
+        {/* 워드마크는 5:1 비율이라 높이만 주고 폭은 auto — 정사각형에 넣으면 찌그러진다(Logo.tsx 참고) */}
+        <Logo className="hidden h-[15px] w-auto shrink-0 text-text sm:block sm:h-[18px]" />
         <div className="hidden h-6 w-px bg-border sm:block" />
         <SymbolSelect />
         {/* 연결 상태는 텍스트 없이 점 색으로만(초록=실시간, 회색=끊김) */}

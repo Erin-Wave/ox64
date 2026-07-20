@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useTradingStore } from '@/store/useTradingStore';
-import logo from '@/resources/images/icon_256.png';
+import Logo from './Logo';
 
 /** 이름 + 패스코드 로그인/가입 (OKX 스타일). 처음 쓰는 이름이면 자동 가입된다. */
 export default function Login() {
@@ -24,7 +24,7 @@ export default function Login() {
         className="w-full max-w-sm rounded-2xl border border-border bg-panel p-7 shadow-2xl"
       >
         <div className="mb-6 flex flex-col items-center text-center">
-          <img src={logo} alt="ox64" className="mb-4 h-20 w-20" />
+          <Logo className="mb-4 h-9 w-auto text-text" />
           <h1 className="text-2xl font-extrabold tracking-tight">ox64</h1>
           <p className="mt-1.5 text-xs leading-relaxed text-muted">
             이름과 패스코드로 입장하세요.
