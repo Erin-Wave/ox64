@@ -34,6 +34,22 @@ export function fmtBig(v: number | null | undefined): string {
   return n.toFixed(Math.abs(n) >= 100 ? 0 : Math.abs(n) >= 10 ? 1 : 2) + (unit[0] as string);
 }
 
+/** 큰 금액을 한국식 단위(만/억/조)로 — VIP 기준이 "100만/1억/100억/1조" 라 K/M/B/T 보다 직관적이다.
+ * ⚠ 반올림이 아니라 **내림**이다. VIP 진행도에 쓰는데 999,999 를 "100만" 으로 올려 보여주면 기준선을
+ * 이미 넘은 것처럼 읽혀서("100만인데 왜 아직 VIP0?") 혼란스럽다 — 모자란 쪽으로 표시하는 게 안전하다. */
+export function fmtKor(v: number | null | undefined): string {
+  if (v == null || !isFinite(v)) return '—';
+  const a = Math.abs(v);
+  const trunc = (n: number, d: number) => {
+    const f = Math.pow(10, d);
+    return (Math.trunc(n * f) / f).toFixed(d);
+  };
+  if (a >= 1e12) return trunc(v / 1e12, a >= 1e13 ? 1 : 2) + '조';
+  if (a >= 1e8) return trunc(v / 1e8, a >= 1e9 ? 1 : 2) + '억';
+  if (a >= 1e4) return trunc(v / 1e4, a >= 1e5 ? 0 : 1) + '만';
+  return Math.trunc(v).toLocaleString();
+}
+
 /** 수량(코인 개수 등)을 세자리 콤마로. 소수는 최대 8자리까지 표기하되 뒤 0 은 자동으로 떨어진다
  * (예 1234567 → "1,234,567", 0.0123 → "0.0123", 3000 → "3,000"). */
 export function fmtQty(v: number | null | undefined): string {

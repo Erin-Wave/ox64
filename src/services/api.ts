@@ -45,6 +45,8 @@ export interface AppState {
   vipTier: number;
   feeRate: number;
   vipNextAt: number | null;
+  /** 등급 기준표(서버가 내려줌 — 클라에 중복 정의하지 않는다) */
+  vipTiers: { tier: number; minVolume: number; rate: number }[];
   totalVolume: number;
   totalFees: number;
   positions: ApiPosition[];

@@ -9,9 +9,11 @@ import VipBadge from './VipBadge';
 export default function Header({
   onOpenRank,
   onOpenSettings,
+  onOpenVip,
 }: {
   onOpenRank: () => void;
   onOpenSettings: () => void;
+  onOpenVip: () => void;
 }) {
   const symbol = useMarketStore((s) => s.symbol);
   const lastPrice = useMarketStore(selectLastPrice);
@@ -29,6 +31,11 @@ export default function Header({
   const feeRate = useTradingStore((s) => s.feeRate);
   const vipNextAt = useTradingStore((s) => s.vipNextAt);
   const totalVolume = useTradingStore((s) => s.totalVolume);
+  const vipTiers = useTradingStore((s) => s.vipTiers);
+  // 현재 등급 구간을 얼마나 채웠는지(0~1). 최고 등급이면 항상 가득. VipModal 과 같은 식.
+  const vipFrom = vipTiers.find((t) => t.tier === vipTier)?.minVolume ?? 0;
+  const vipProgress =
+    vipNextAt == null ? 1 : Math.min(1, Math.max(0, (totalVolume - vipFrom) / Math.max(1, vipNextAt - vipFrom)));
   const prices = useMarketStore((s) => s.prices);
   const [showMenu, setShowMenu] = useState(false);
 
@@ -94,10 +101,22 @@ export default function Header({
             <>
               <div className="fixed inset-0 z-20" onClick={() => setShowMenu(false)} />
               <div className="absolute right-0 top-full z-30 mt-1 w-40 overflow-hidden rounded-lg border border-border bg-panel shadow-2xl">
-                <div className="flex items-center gap-1.5 border-b border-border px-3 py-2 text-xs font-medium text-text">
-                  <span className="truncate">{name}</span>
-                  <VipBadge tier={vipTier} feeRate={feeRate} nextAt={vipNextAt} totalVolume={totalVolume} />
-                </div>
+                <button
+                  onClick={() => {
+                    onOpenVip();
+                    setShowMenu(false);
+                  }}
+                  className="w-full border-b border-border px-3 py-2 text-left transition hover:bg-panel2"
+                >
+                  <div className="flex items-center gap-1.5 text-xs font-medium text-text">
+                    <span className="truncate">{name}</span>
+                    <VipBadge tier={vipTier} />
+                  </div>
+                  {/* 다음 등급까지 얼마나 왔는지 한눈에 — 자세한 건 눌러서 모달로 */}
+                  <div className="mt-1 h-1 w-full overflow-hidden rounded-full bg-elevated">
+                    <div className="h-full rounded-full bg-accent" style={{ width: `${vipProgress * 100}%` }} />
+                  </div>
+                </button>
                 <button
                   onClick={() => {
                     onOpenRank();
@@ -147,7 +166,7 @@ export default function Header({
               {name ? name.slice(0, 1).toUpperCase() : '?'}
             </span>
             <span className="max-w-[80px] truncate text-sm font-medium text-text">{name}</span>
-            <VipBadge tier={vipTier} feeRate={feeRate} nextAt={vipNextAt} totalVolume={totalVolume} />
+            <VipBadge tier={vipTier} feeRate={feeRate} nextAt={vipNextAt} totalVolume={totalVolume} onClick={onOpenVip} />
           </div>
           <button
             onClick={() => logout()}

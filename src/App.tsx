@@ -7,6 +7,7 @@ import PositionsPanel from '@/components/PositionsPanel';
 import Login from '@/components/Login';
 import Leaderboard from '@/components/Leaderboard';
 import Settings from '@/components/Settings';
+import VipModal from '@/components/VipModal';
 import { useTradingStore } from '@/store/useTradingStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useChartStore } from '@/store/useChartStore';
@@ -24,6 +25,7 @@ export default function App() {
 
   const [showRank, setShowRank] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showVip, setShowVip] = useState(false);
 
   // 현재 심볼 + 보유 포지션 심볼들의 가격 폴링 (다른 심볼 PnL 갱신)
   useMarkPrices();
@@ -51,7 +53,7 @@ export default function App() {
 
   return (
     <div className="flex h-screen flex-col bg-bg text-text">
-      <Header onOpenRank={() => setShowRank(true)} onOpenSettings={() => setShowSettings(true)} />
+      <Header onOpenRank={() => setShowRank(true)} onOpenSettings={() => setShowSettings(true)} onOpenVip={() => setShowVip(true)} />
 
       {/*
         모바일(기본): 세로 스크롤 스택 — 차트(45vh) → 주문 → 포지션.
@@ -74,6 +76,7 @@ export default function App() {
 
       {showRank && <Leaderboard onClose={() => setShowRank(false)} />}
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
+      {showVip && <VipModal onClose={() => setShowVip(false)} />}
     </div>
   );
 }

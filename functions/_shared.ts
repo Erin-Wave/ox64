@@ -457,6 +457,10 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
     vipTier: vip.tier,
     feeRate: vip.rate,
     vipNextAt: vip.nextAt,
+    // 등급 기준표도 함께 내려보낸다 — 클라가 진행률/등급표를 그리려면 각 구간의 하한이 필요한데,
+    // 클라에 같은 표를 또 적어두면 서버 기준이 바뀔 때 조용히 어긋난다(수수료는 서버가 떼므로
+    // 화면만 틀리게 된다). 5개짜리 작은 배열이라 폴링마다 실려도 무시할 만한 크기.
+    vipTiers: VIP_TIERS.map((t) => ({ tier: t.tier, minVolume: t.minVolume, rate: t.rate })),
     totalVolume: user.total_volume ?? 0,
     totalFees: user.total_fees ?? 0,
     positions: positions.map((p) => ({

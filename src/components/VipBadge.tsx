@@ -21,12 +21,15 @@ export default function VipBadge({
   nextAt,
   totalVolume,
   className = '',
+  onClick,
 }: {
   tier: number;
   feeRate?: number;
   nextAt?: number | null;
   totalVolume?: number;
   className?: string;
+  /** 주면 버튼이 되어 클릭 시 VIP 진행도 모달을 연다(랭킹의 "남의 등급"엔 안 준다). */
+  onClick?: () => void;
 }) {
   const style = TIER_STYLE[Math.max(0, Math.min(TIER_STYLE.length - 1, tier))];
   const parts: string[] = [`VIP${tier}`];
@@ -35,11 +38,16 @@ export default function VipBadge({
   if (nextAt != null && totalVolume != null) parts.push(`다음 등급까지 ${fmtBig(Math.max(0, nextAt - totalVolume))} USDT`);
   else if (nextAt == null) parts.push('최고 등급');
 
+  const cls = `shrink-0 rounded px-1.5 py-0.5 text-[10px] font-extrabold leading-none ring-1 ${style} ${className}`;
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} title={`${parts.join(' · ')} — 눌러서 진행도 보기`} className={`${cls} transition hover:brightness-125`}>
+        VIP{tier}
+      </button>
+    );
+  }
   return (
-    <span
-      title={parts.join(' · ')}
-      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-extrabold leading-none ring-1 ${style} ${className}`}
-    >
+    <span title={parts.join(' · ')} className={cls}>
       VIP{tier}
     </span>
   );
