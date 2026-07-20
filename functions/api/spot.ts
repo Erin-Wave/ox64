@@ -274,6 +274,44 @@ const REGIME_PARAMS: Record<Regime, { bias: number; volMult: number; sizeMult: n
 };
 
 const ROUND_STEP = 0.05; // 라운드넘버 자석이 잡아당기는 심리적 가격대 간격
+
+// ── 사람처럼 "떨어지는" 호가 가격·수량(price clustering) ──────────────────────
+// ⚠ 예전엔 호가를 전부 `ref * (1 ± spread)` 로만 찍어서 1.4067 / 1.4074 / 1.4081 처럼 어중간한 값이
+// 기계적으로 균일한 간격으로 늘어섰다 — 실제 호가창은 절대 그렇게 안 생겼다. 사람은 1.4000 / 1.4050
+// 같은 **딱 떨어지는 가격**에 주문을 몰아 걸고, 그런 라운드 가격일수록 물량이 훨씬 크다(심리적 지지·
+// 저항 "벽"). 수량도 4,712.3856 이 아니라 1,000 / 5,000 처럼 떨어지는 숫자를 넣는다.
+// 격자가 굵을수록(=더 라운드한 가격) 그 자리에 붙는 물량 배수(sizeMult)가 크다.
+const PRICE_GRIDS: readonly { step: number; sizeMult: number; pull: number }[] = [
+  { step: 0.05, sizeMult: 7.0, pull: 0.95 }, // 1.40 / 1.45 — 대형 심리 가격, 두꺼운 벽
+  { step: 0.01, sizeMult: 3.4, pull: 0.85 }, // 1.41 / 1.42
+  { step: 0.005, sizeMult: 1.9, pull: 0.65 }, // 1.4050
+  { step: 0.001, sizeMult: 1.3, pull: 0.8 }, // 1.4070 — 그나마 깔끔한 값
+];
+
+/**
+ * 목표 호가를 사람이 좋아하는 라운드 가격으로 끌어당긴다.
+ * ⚠ 매수는 내림(floor), 매도는 올림(ceil) — 항상 mid 에서 "멀어지는" 방향으로만 스냅되므로
+ * 최우선매수 > 최우선매도로 역전될 수 없다(호가 역전 방지의 핵심).
+ * depth(0=최우선호가 ~ 1=가장 깊은 레벨)가 클수록 굵은 격자까지 허용한다 — 최우선호가는 촘촘하게
+ * 경쟁하고, 멀리 있는 주문일수록 라운드 가격에 뭉치는 실제 호가창의 모습.
+ */
+function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): { price: number; sizeMult: number } {
+  const tol = 0.0009 + depth * 0.0022; // 이만큼 넘게 끌려가야 하면 그 격자는 포기(사다리가 뭉개지지 않게)
+  for (const g of PRICE_GRIDS) {
+    const snapped = side === 'buy' ? Math.floor(target / g.step) * g.step : Math.ceil(target / g.step) * g.step;
+    if (Math.abs(snapped - target) / target > tol) continue;
+    if (Math.random() > g.pull * (0.6 + 0.7 * depth)) continue;
+    return { price: roundOx(snapped), sizeMult: g.sizeMult };
+  }
+  return { price: roundOx(target), sizeMult: 1 }; // 어느 격자에도 안 붙으면 원래 값(어중간한 가격도 섞여야 자연스럽다)
+}
+
+/** 사람이 실제로 입력하는 수량처럼 떨어지는 숫자로 맞춘다(가끔은 좀 더 잘게 — 전부 딱 떨어져도 부자연스럽다). */
+function humanSize(raw: number): number {
+  const step = raw >= 20000 ? 5000 : raw >= 8000 ? 1000 : raw >= 2000 ? 500 : 100;
+  const s = Math.random() < 0.22 ? step / 5 : step;
+  return Math.max(s, Math.round(raw / s) * s);
+}
 // 적정가(anchor)가 아주 약하게 끌려가는 장기 기준선. 국면 bias 를 아무리 맞춰도 랜덤워크는 며칠 단위로
 // 얼마든지 멀리 갈 수 있어서(0 에 붙거나 수십 배로 뜀), 반감기 ~14시간짜리 약한 복원력을 하나 둔다.
 // 며칠 단위 추세는 그대로 살아있고 "몇 주 뒤 가격이 무의미해지는" 것만 막는다.
@@ -432,16 +470,26 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
   // ⚠ 변동성이 높은 국면(패닉/과열)에선 spreadMult 로 호가가 벌어진다 — 실제 마켓메이커가 리스크를 피해
   // 물러나는 행동이라, 거친 구간에 시장가로 들어가면 슬리피지가 커진다.
+  // ⚠ 가격은 humanQuotePrice 로 라운드 가격에 끌어당기고(가격 군집), 그 자리엔 물량을 몇 배로 얹는다
+  // (심리적 벽). 같은 가격으로 두 레벨이 겹치면 원래 목표가로 되돌려 사다리 깊이를 유지한다 —
+  // 겹친 채 두면 호가창에 보이는 단계 수가 줄어든다(loadSpotMarket 이 가격별로 SUM 하므로).
+  const usedPrices: Record<'buy' | 'sell', Set<number>> = { buy: new Set(), sell: new Set() };
+  const placeQuote = (side: 'buy' | 'sell', target: number, depth: number) => {
+    const q = humanQuotePrice(target, side, depth);
+    const price = usedPrices[side].has(q.price) ? roundOx(target) : q.price;
+    const sizeMult = usedPrices[side].has(q.price) ? 1 : q.sizeMult;
+    usedPrices[side].add(price);
+    stmts.push(botQuoteStmt(env, actor, side, price, humanSize((2000 + Math.random() * 8000) * sizeMult), now));
+  };
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
+    const depth = level / (BOT_LEVELS_PER_SIDE - 1);
     const spread = (0.0009 + level * 0.0013 + Math.random() * 0.0006) * step.spreadMult;
-    const buySize = Number((2000 + Math.random() * 8000).toFixed(4));
-    const sellSize = Number((2000 + Math.random() * 8000).toFixed(4));
-    stmts.push(botQuoteStmt(env, actor, 'buy', roundOx(ref * (1 - spread)), buySize, now));
-    stmts.push(botQuoteStmt(env, actor, 'sell', roundOx(ref * (1 + spread)), sellSize, now));
+    placeQuote('buy', ref * (1 - spread), depth);
+    placeQuote('sell', ref * (1 + spread), depth);
   }
   // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 하나 얹는다 — 아래 sweep 이 유저 벽을 그 가격에 소비.
-  if (press === 'up') stmts.push(botQuoteStmt(env, actor, 'buy', ref, Number((2000 + Math.random() * 8000).toFixed(4)), now));
-  else if (press === 'down') stmts.push(botQuoteStmt(env, actor, 'sell', ref, Number((2000 + Math.random() * 8000).toFixed(4)), now));
+  if (press === 'up') stmts.push(botQuoteStmt(env, actor, 'buy', ref, humanSize(2000 + Math.random() * 8000), now));
+  else if (press === 'down') stmts.push(botQuoteStmt(env, actor, 'sell', ref, humanSize(2000 + Math.random() * 8000), now));
 
   // 합성 체결을 여러 건 찍는다. ⚠ 예전엔 전부 같은 가격(ref)이라 봉 안에 구조가 없었다(몸통만 있고
   // 꼬리가 없는 캔들) — 지금은 직전 기준가에서 새 기준가로 "걸어가면서" 노이즈를 얹어 찍으므로 봉마다
@@ -460,14 +508,19 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
     const progress = (i + 1) / nTrades;
     const walk = prev.ref + (ref - prev.ref) * progress;
     const jitter = 1 + gauss() * 0.0005 * step.next.vol;
-    const price = i === nTrades - 1 ? ref : clampToWalls(roundOx(walk * jitter));
+    // 체결도 호가창과 같은 이유로 라운드 가격에 몰린다 — 실제 시장에서 체결은 "거기 걸려 있던 호가"
+    // 가격에 일어나는데, 그 호가들이 위 humanQuotePrice 로 라운드 가격에 뭉쳐 있기 때문. 테이프만
+    // 어중간한 값이면 호가창과 따로 노는 시장으로 보인다. 마지막 체결은 기준가(=종가)와 정확히 일치시킨다.
+    const raw = walk * jitter;
+    const snapped = Math.random() < 0.65 ? Math.round(raw / 0.001) * 0.001 : raw;
+    const price = i === nTrades - 1 ? ref : clampToWalls(roundOx(snapped));
     if (i === 0) open = price;
     high = Math.max(high, price);
     low = Math.min(low, price);
 
     let sz = (BOT_TRADE_SIZE_MIN + Math.random() * (BOT_TRADE_SIZE_MAX - BOT_TRADE_SIZE_MIN)) * step.sizeMult;
     if (Math.random() < 0.04) sz *= 2.5 + Math.random() * 4; // 가끔 고래가 크게 친다(팻테일 거래량)
-    sz = Number(sz.toFixed(4));
+    sz = humanSize(sz); // 체결 테이프도 사람이 넣은 듯 떨어지는 수량으로
     volume += sz;
 
     const takerSide = Math.random() < step.buyProb ? 'buy' : 'sell';
