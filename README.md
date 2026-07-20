@@ -30,7 +30,7 @@
 | 백엔드 | Cloudflare Pages Functions (`functions/`) |
 | DB | Cloudflare D1 (SQLite) |
 | 인증 | HMAC 서명 세션 쿠키 + PBKDF2 패스코드 해싱 |
-| 백그라운드 작업 | 별도 Cron Worker (`cron/`) — 강제청산 + OX 마켓메이커 봇을 접속자 없이도 5분마다 실행 |
+| 백그라운드 작업 | 별도 Cron Worker (`cron/`) — 강제청산 + OX 마켓메이커 봇을 접속자 없이도 1분마다 실행 |
 
 프론트(정적 SPA)와 백엔드(Pages Functions)를 **한 레포·한 배포**로 운영합니다(단, Pages 는 정기 실행을
 지원하지 않아 `cron/` 만 별도 Workers 프로젝트로 배포). 커스텀 도메인(`ox64.app`)만 접속되도록 `*.pages.dev`

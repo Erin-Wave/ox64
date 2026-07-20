@@ -326,10 +326,17 @@ export async function runMarketMaker(env: Env): Promise<void> {
 /**
  * cron 전용 — 접속자가 없어도 시장이 계속 살아있도록 한 번에 여러 틱을 몰아 돈다(게이트 무시).
  * cron 이 1분마다 부르므로 그 사이의 거래량·가격 움직임을 여기서 만든다(예전엔 5분마다 1틱뿐이라
- * 아무도 안 볼 때 차트가 사실상 멈춰 있었다). 각 틱의 체결 시각을 최근 구간에 조금씩 퍼뜨려 캔들이
- * 한 봉에만 뭉치지 않게 한다. 마지막에 last_run 을 갱신해 직후 폴링이 곧바로 겹쳐 requote 하지 않게 함.
+ * 아무도 안 볼 때 차트가 사실상 멈춰 있었다). 마지막에 last_run 을 갱신해 직후 폴링이 곧바로 겹쳐
+ * requote 하지 않게 함.
+ *
+ * ⚠ 체결 시각은 절대 과거로 소급하지 않는다(마감된 봉이 변하던 버그). 예전엔 각 틱의 시각을
+ * [now-55s, now] 에 퍼뜨려 "빈 봉"을 메웠는데(cron 이 5분 주기이던 시절의 잔재), cron 이 매 1분인
+ * 지금은 그 소급분이 **이미 마감된 직전 분봉 버킷**에 upsert 돼 high/low/close/volume 이 계속 갱신됐다
+ * → 차트(OX 는 1.5초마다 전체 setData)에서 "봉 마감됐는데 이전 봉이 막 바뀌는" 현상. 마감된 봉은
+ * 불변이어야 하므로 모든 틱을 현재 시각 이후(now+i)에만 찍는다. cron 이 매 분 도는 이상 1분봉은
+ * 어차피 매 봉 채워지므로 빈 봉도 안 생긴다.
  */
-export async function runMarketMakerBurst(env: Env, ticks: number = BOT_BURST_TICKS, spanMs: number = 55000): Promise<void> {
+export async function runMarketMakerBurst(env: Env, ticks: number = BOT_BURST_TICKS): Promise<void> {
   const row = await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id = ?').bind(PAIR).first<{ ref_price: number }>();
   let ref = row?.ref_price ?? 0;
   if (!ref) {
@@ -338,10 +345,12 @@ export async function runMarketMakerBurst(env: Env, ticks: number = BOT_BURST_TI
       .first<{ price: number }>();
     ref = lastTrade?.price ?? 1;
   }
-  const base = Date.now();
+  // 각 틱의 시각 = "그 틱을 실제로 실행하는 시점"(단조 증가). 버스트가 분 경계를 넘어가더라도
+  // 소급 기록이 생기지 않는다. +10ms 는 틱 내부 체결(now+0..5)끼리 겹치지 않게 하는 최소 간격.
+  let prevTs = 0;
   for (let i = 0; i < ticks; i++) {
-    // 체결 시각을 [base-spanMs, base] 에 고르게 퍼뜨려 최근 캔들들을 채운다(빈 봉 방지).
-    const ts = base - spanMs + Math.floor(((i + 1) / ticks) * spanMs);
+    const ts = Math.max(Date.now(), prevTs + 10);
+    prevTs = ts;
     ref = await marketMakerTick(env, ref, ts);
   }
   await env.DB.prepare(
