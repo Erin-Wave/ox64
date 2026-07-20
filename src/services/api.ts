@@ -136,6 +136,9 @@ export const api = {
   refill: () => req<AppState>('/refill', { method: 'POST' }),
   leaderboard: () => req<{ leaderboard: LeaderRow[] }>('/leaderboard'),
   spotState: () => req<SpotState>('/spot'),
-  spotCandles: (interval: string, limit = 500) =>
-    req<{ candles: Candle[] }>(`/spot?candles=1&interval=${encodeURIComponent(interval)}&limit=${limit}`),
+  /** OX 캔들. endTimeMs 를 주면 그 시각 "이전" 봉만 — 차트 왼쪽 스크롤 시 과거 구간 이어받기용. */
+  spotCandles: (interval: string, limit = 500, endTimeMs?: number) =>
+    req<{ candles: Candle[] }>(
+      `/spot?candles=1&interval=${encodeURIComponent(interval)}&limit=${limit}${endTimeMs ? `&endTime=${endTimeMs}` : ''}`,
+    ),
 };

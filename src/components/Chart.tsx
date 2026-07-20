@@ -47,6 +47,20 @@ function chartColors(theme: 'dark' | 'light' | 'high-contrast', colorScheme: Cha
   return DARK_SCHEMES[colorScheme];
 }
 
+// ⚠ 거래량 막대 색은 **반드시 캔들 색에서 파생**시킨다. 예전엔 `rgba(0,192,118,0.45)` 처럼 하드코딩해서
+// 테마/프리셋을 바꿔도 거래량만 바이낸스 배색으로 남아 캔들과 따로 놀았다(라이트 테마에선 특히 튐).
+// 색을 새로 쓰지 말고 항상 이 함수를 거칠 것.
+const VOL_ALPHA = 0.45;
+function withAlpha(hex: string, alpha: number): string {
+  const h = hex.replace('#', '');
+  const n = h.length === 3 ? h.split('').map((x) => x + x).join('') : h;
+  const v = parseInt(n, 16);
+  return `rgba(${(v >> 16) & 255},${(v >> 8) & 255},${v & 255},${alpha})`;
+}
+function volColors(c: ChartColors): { up: string; down: string } {
+  return { up: withAlpha(c.up, VOL_ALPHA), down: withAlpha(c.down, VOL_ALPHA) };
+}
+
 type BbSeries = { upper: ISeriesApi<'Line'>; basis: ISeriesApi<'Line'>; lower: ISeriesApi<'Line'> };
 type BbValues = { upper: number; basis: number; lower: number };
 type IndLegendValue = number | BbValues;
@@ -297,6 +311,10 @@ export default function Chart() {
       timeScale: { borderColor: c.border },
     });
     candle.applyOptions({ upColor: c.up, downColor: c.down, wickUpColor: c.up, wickDownColor: c.down });
+    // ⚠ 거래량 막대는 색이 각 데이터 포인트에 박혀 있어서 applyOptions 로는 안 바뀐다 — 테마가 바뀌면
+    // 전체를 새 색으로 다시 그려야 캔들과 싱크가 유지된다(안 하면 테마 전환 직후 거래량만 옛 색).
+    syncIndicators();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [theme, opts.colorScheme]);
 
   // ── 초봉(1s) 등 1분 미만 타임프레임에서는 축/레전드에 초 단위까지 표시 ──
@@ -378,11 +396,12 @@ export default function Chart() {
         // lastValueVisible=true → 우측 축에 최신 거래량 티커(1.23M 형식) 표시
         volRef.current = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: true });
       }
+      const vc = volColors(chartColors(useSettingsStore.getState().theme, o.colorScheme));
       volRef.current.setData(
         candles.map((c) => ({
           time: toChart(c.time),
           value: c.volume ?? 0,
-          color: c.close >= c.open ? 'rgba(0,192,118,0.45)' : 'rgba(246,70,93,0.45)',
+          color: c.close >= c.open ? vc.up : vc.down,
         })) as HistogramData[],
       );
     } else if (volRef.current) {
@@ -416,25 +435,37 @@ export default function Chart() {
       candle.applyOptions({ priceFormat: { type: 'price', precision: VIRTUAL_PREC, minMove: Math.pow(10, -VIRTUAL_PREC) } });
 
       let isFirstLoad = true;
+      let loadingMore = false;
+      let noMore = false;
+
+      const draw = (arr: Candle[]) => {
+        candle.setData(
+          arr.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
+        );
+        syncIndicatorsRef.current();
+      };
+
       const load = async () => {
         try {
-          const { candles } = await api.spotCandles(interval, 500);
-          if (cancelled) return;
-          candlesRef.current = candles;
-          for (const c of candles) volMap.current.set(c.time, c.volume ?? 0);
-          candle.setData(
-            candles.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
-          );
-          // 최초 1회만 표시 범위를 잡는다 — 매번(3초 폴링마다) 다시 잡으면 사용자가 확대/축소한
+          const { candles: fresh } = await api.spotCandles(interval, 500);
+          if (cancelled || fresh.length === 0) return;
+          // ⚠ 폴링 결과로 배열을 통째로 갈아끼우면 왼쪽 스크롤로 붙여둔 과거봉이 매번 날아간다
+          // (1.5초마다 리셋되니 사실상 과거 조회 불가) → 최신 구간만 교체하고 그보다 앞선 구간은 보존.
+          const prev = candlesRef.current;
+          const cut = fresh[0].time;
+          const merged = prev.length ? [...prev.filter((c) => c.time < cut), ...fresh] : fresh;
+          candlesRef.current = merged;
+          for (const c of fresh) volMap.current.set(c.time, c.volume ?? 0);
+          draw(merged);
+          // 최초 1회만 표시 범위를 잡는다 — 매번(1.5초 폴링마다) 다시 잡으면 사용자가 확대/축소한
           // 뷰가 계속 리셋되는 버그가 있었음(실제 심볼은 초기 로드 1번 + WS 업데이트뿐이라 이 문제가 없음).
-          if (candles.length && isFirstLoad) {
+          if (isFirstLoad) {
             isFirstLoad = false;
-            const len = candles.length;
+            const len = merged.length;
             const initBars = optsRef.current.visibleBars;
             chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - initBars), to: len + 2 });
           }
-          syncIndicatorsRef.current();
-          const l = candles.at(-1);
+          const l = merged.at(-1);
           setConnected(true);
           if (l) {
             setPrice(symbol, l.close);
@@ -447,11 +478,61 @@ export default function Chart() {
           setConnected(false);
         }
       };
+
+      // ── 과거봉 추가 로드 (왼쪽 스크롤) ── 실제 심볼과 동일한 동작. 예전엔 이 분기가 여기서
+      // 곧장 return 해버려서 OX 만 과거 조회가 통째로 없었다(맨 왼쪽까지 가도 아무 일도 안 일어남).
+      const loadOlder = async () => {
+        if (loadingMore || noMore || cancelled) return;
+        if (candlesRef.current.length === 0) return;
+        loadingMore = true;
+        try {
+          const oldest = candlesRef.current[0].time; // sec
+          const { candles: older } = await api.spotCandles(interval, 500, oldest * 1000);
+          if (cancelled) return;
+          // await 사이에 폴링이 배열을 갱신했을 수 있으므로 최신 상태를 다시 읽는다.
+          const cur = candlesRef.current;
+          const fresh = older.filter((c) => c.time < cur[0].time);
+          if (fresh.length === 0) {
+            noMore = true;
+            return;
+          }
+          const ts = chartRef.current?.timeScale();
+          const before = ts?.getVisibleLogicalRange();
+          candlesRef.current = [...fresh, ...cur];
+          for (const c of fresh) volMap.current.set(c.time, c.volume ?? 0);
+          draw(candlesRef.current);
+          // 프리펜드로 인덱스가 fresh.length 만큼 밀리므로 보이던 구간 그대로 유지
+          if (before && ts) ts.setVisibleLogicalRange({ from: before.from + fresh.length, to: before.to + fresh.length });
+          if (fresh.length < 450) noMore = true; // 과거 데이터 끝 근처
+        } catch {
+          /* 다음 스크롤 때 재시도 */
+        } finally {
+          loadingMore = false;
+        }
+      };
+
+      let lastBarsSaveV = 0;
+      const onRangeV = (range: { from: number; to: number } | null) => {
+        repositionCountdownRef.current();
+        if (range && range.from < 10) loadOlder();
+        if (range) {
+          const now = Date.now();
+          if (now - lastBarsSaveV > 500) {
+            lastBarsSaveV = now;
+            const bars = Math.round(range.to - range.from) - 2; // 초기 범위의 +2 여유분 제외
+            if (bars > 1) useChartStore.getState().setVisibleBars(bars);
+          }
+        }
+      };
+      const tsApiV = chartRef.current?.timeScale();
+      tsApiV?.subscribeVisibleLogicalRangeChange(onRangeV);
+
       load();
       const t = window.setInterval(load, 1500); // 3s→1.5s: OX 캔들/현재가 갱신을 더 촘촘히(체결 딜레이 감소 맥락)
       return () => {
         cancelled = true;
         window.clearInterval(t);
+        tsApiV?.unsubscribeVisibleLogicalRangeChange(onRangeV);
         setConnected(false);
       };
     }
@@ -550,10 +631,11 @@ export default function Chart() {
         setPrice(symbol, tick.candle.close);
         const bar = tick.candle;
         candle.update({ time: toChart(bar.time), open: bar.open, high: bar.high, low: bar.low, close: bar.close });
+        const vc = volColors(chartColors(useSettingsStore.getState().theme, optsRef.current.colorScheme));
         volRef.current?.update({
           time: toChart(bar.time),
           value: bar.volume ?? 0,
-          color: bar.close >= bar.open ? 'rgba(0,192,118,0.45)' : 'rgba(246,70,93,0.45)',
+          color: bar.close >= bar.open ? vc.up : vc.down,
         } as HistogramData);
         volMap.current.set(bar.time, bar.volume ?? 0);
         const arr = candlesRef.current;

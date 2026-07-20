@@ -54,7 +54,8 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     if (url.searchParams.get('candles')) {
       const interval = url.searchParams.get('interval') || '1m';
       const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit')) || 500));
-      return json({ candles: await loadSpotCandles(env, interval, limit) });
+      const endTime = Number(url.searchParams.get('endTime')) || undefined;
+      return json({ candles: await loadSpotCandles(env, interval, limit, endTime) });
     }
 
     return json(await loadSpotMarket(env, sess.uid));
@@ -139,19 +140,26 @@ async function bucketTradesToCandles(env: Env, bucketMs: number, limit: number) 
 /** OX 캔들 로드. 1m 이상은 영속 테이블(spot_candles)에서 읽어 히스토리가 시간이 지나도 사라지지 않게
  * 한다. 1s(및 <60s)는 단기 조회라 최신 거래 버킷팅. 영속 테이블이 아직 빈 인터벌(신규 배포 직후,
  * 거래가 아직 안 쌓인 상태)은 거래 버킷팅으로 폴백해 차트가 비지 않게 한다. */
-async function loadSpotCandles(env: Env, intervalCode: string, limit: number) {
+async function loadSpotCandles(env: Env, intervalCode: string, limit: number, endTimeMs?: number) {
   const sec = intervalSecFromCode(intervalCode);
   const bucketMs = sec * 1000;
-  if (sec < 60) return bucketTradesToCandles(env, bucketMs, limit);
+  // ⚠ 1s 등 <60s 는 영속 테이블이 없어(최신 거래 버킷팅) 과거 페이지가 존재하지 않는다 —
+  // endTime 이 오면 빈 배열을 돌려줘서 클라가 "더 없음"으로 확정하게 한다(무한 재시도 방지).
+  if (sec < 60) return endTimeMs ? [] : bucketTradesToCandles(env, bucketMs, limit);
 
+  // endTimeMs 가 오면 그 시각 "이전" 봉만 — 차트에서 왼쪽으로 스크롤할 때 과거 구간을 이어 받는다.
   const rows = (
     await env.DB.prepare(
-      'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? ORDER BY bucket DESC LIMIT ?',
+      endTimeMs
+        ? 'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
+        : 'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? ORDER BY bucket DESC LIMIT ?',
     )
-      .bind(PAIR, intervalCode, limit)
+      .bind(...(endTimeMs ? [PAIR, intervalCode, endTimeMs, limit] : [PAIR, intervalCode, limit]))
       .all<{ bucket: number; open: number; high: number; low: number; close: number; volume: number }>()
   ).results;
-  if (rows.length === 0) return bucketTradesToCandles(env, bucketMs, limit);
+  // 과거 페이지 요청인데 결과가 없으면 진짜로 더 없는 것 — 거래 버킷팅 폴백으로 최신 구간을
+  // 돌려주면 클라가 "받았다"고 착각해 같은 구간을 무한히 다시 붙인다.
+  if (rows.length === 0) return endTimeMs ? [] : bucketTradesToCandles(env, bucketMs, limit);
 
   return rows
     .reverse()
