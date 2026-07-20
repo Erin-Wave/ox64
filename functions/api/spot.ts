@@ -13,6 +13,8 @@ import {
   type PendingRow,
   type PositionRow,
   type D1PreparedStatement,
+  feeRateOf,
+  feeAccrualStmts,
 } from '../_shared';
 
 /**
@@ -777,8 +779,10 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
     .bind(first.user_id, PAIR, first.side)
     .first<{ leverage: number }>();
   const effLev = existing0 ? existing0.leverage : first.leverage;
+  const limitFeeRate = await feeRateOf(env, first.user_id); // 이 주문 전체에 한 번만 확정
   let filled = 0;
   let cost = 0;
+  let limitFeeTotal = 0;
 
   for (let i = 0; i < 500; i++) {
     // iter 0 은 위에서 이미 읽은 first 를 재사용(중복 read 제거), 이후엔 동시 체결 반영 위해 재조회.
@@ -838,17 +842,29 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
         now,
       ),
     ];
-    if (refund > EPS) stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(refund, p.user_id));
+    // 지정가도 체결 시점에 수수료를 뗀다. 증거금 환불(refund)과 상계해 한 번의 잔고 조정으로 처리 —
+    // 두 문장으로 나누면 배치 안에서 순서에 따라 음수 잔고가 잠깐 보이거나 문장이 늘어날 뿐이다.
+    const chunkFee = fillPrice * chunk * limitFeeRate;
+    const net = refund - chunkFee;
+    if (Math.abs(net) > EPS) {
+      stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(net, p.user_id));
+    }
     await env.DB.batch(stmts);
     filled += chunk;
     cost += fillPrice * chunk;
+    limitFeeTotal += chunkFee;
   }
 
   if (filled > EPS) {
     // 체결 이력(주문내역)엔 이번 호출의 총 체결을 가중평균가로 1건 기록(칸별로 쪼개면 내역이 넘침).
-    await env.DB.prepare(
-      'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), first.user_id, PAIR, first.side, cost / filled, filled, effLev, 'open', null, Date.now()).run();
+    const done = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), first.user_id, PAIR, first.side, cost / filled, filled, effLev, 'open', null, done),
+      // 잔고는 청크마다 상계 정산 — 여기선 누적 카운터+원장만(합계 1행)
+      ...feeAccrualStmts(env, first.user_id, PAIR, 'open', cost, limitFeeRate, limitFeeTotal, done),
+    ]);
   }
 }
 
@@ -871,9 +887,13 @@ export async function matchMarketOxOrder(
     .bind(uid, PAIR, side)
     .first<{ leverage: number }>();
   const effLev = existing0 ? existing0.leverage : leverage;
+  // 수수료율은 이 주문 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 올라 청크별로
+  // 요율이 달라지는 이상한 상태가 된다). 청크마다 증거금과 **함께** 차감해야 원자 가드가 성립한다.
+  const feeRate = await feeRateOf(env, uid);
   let remaining = size;
   let filled = 0;
   let cost = 0;
+  let feeTotal = 0;
 
   for (let i = 0; i < 500 && remaining > EPS; i++) {
     const maker = await bestBotMaker(env, side, null);
@@ -882,20 +902,25 @@ export async function matchMarketOxOrder(
     let chunk = Math.min(remaining, maker.size);
     const price = maker.price;
     let margin = (price * chunk) / effLev;
-    // 크로스: balance - margin >= -floorPnL (⟺ available >= margin). floorPnL>0(이익)이면 balance 가
-    // 음수까지 허용돼 미실현이익만큼 더 살 수 있고, floorPnL<0(손실)이면 가용이 줄어 덜 산다.
+    let chunkFee = price * chunk * feeRate;
+    // 크로스: balance - (margin+수수료) >= -floorPnL (⟺ available >= margin+수수료). floorPnL>0(이익)
+    // 이면 balance 가 음수까지 허용돼 미실현이익만큼 더 살 수 있고, floorPnL<0(손실)이면 덜 산다.
     let deduct = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
-      .bind(margin, uid, margin, -floorPnL)
+      .bind(margin + chunkFee, uid, margin + chunkFee, -floorPnL)
       .run();
     if (deduct.meta.changes !== 1) {
-      // 전량 감당 불가 → 가용(여유잔고+미실현이익)으로 살 수 있는 만큼만
+      // 전량 감당 불가 → 가용(여유잔고+미실현이익)으로 살 수 있는 만큼만.
+      // ⚠ 1 코인당 드는 돈은 증거금(price/effLev)뿐 아니라 수수료(price*rate)도 포함해야 한다 —
+      // 빼먹으면 딱 가용만큼 사려다 수수료 때문에 가드에 걸려 체결이 통째로 멈춘다.
       const u = await env.DB.prepare('SELECT balance FROM users WHERE id=?').bind(uid).first<{ balance: number }>();
-      const affordable = (((u?.balance ?? 0) + floorPnL) * effLev) / price;
+      const perUnit = price / effLev + price * feeRate;
+      const affordable = ((u?.balance ?? 0) + floorPnL) / perUnit;
       if (affordable <= EPS) break;
       chunk = Math.min(chunk, affordable);
       margin = (price * chunk) / effLev;
+      chunkFee = price * chunk * feeRate;
       deduct = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
-        .bind(margin, uid, margin, -floorPnL)
+        .bind(margin + chunkFee, uid, margin + chunkFee, -floorPnL)
         .run();
       if (deduct.meta.changes !== 1) break;
     }
@@ -905,7 +930,8 @@ export async function matchMarketOxOrder(
       .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
       .run();
     if (claim.meta.changes !== 1) {
-      await env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(margin, uid).run(); // 선점 실패 → 차감 환불
+      // 선점 실패 → 방금 뺀 증거금+수수료를 그대로 환불(수수료만 남으면 체결 없이 돈이 새어나간다)
+      await env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(margin + chunkFee, uid).run();
       continue;
     }
 
@@ -920,12 +946,18 @@ export async function matchMarketOxOrder(
     remaining -= chunk;
     filled += chunk;
     cost += price * chunk;
+    feeTotal += chunkFee;
   }
 
   if (filled > EPS) {
-    await env.DB.prepare(
-      'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), uid, PAIR, side, cost / filled, filled, effLev, 'open', null, Date.now()).run();
+    const done = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), uid, PAIR, side, cost / filled, filled, effLev, 'open', null, done),
+      // 잔고는 청크마다 이미 정산됐으므로 여기선 누적 카운터+원장만(합계 1행 — 청크 수만큼 불어나지 않게)
+      ...feeAccrualStmts(env, uid, PAIR, 'open', cost, feeRate, feeTotal, done),
+    ]);
   }
   return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
 }
@@ -957,6 +989,9 @@ async function closePositionAgainstBook(
   let filled = 0;
   let cost = 0;
   let pnlTotal = 0;
+  // 요율은 이 청산 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 바뀔 수 있다).
+  const closeFeeRate = await feeRateOf(env, uid);
+  let closeFeeTotal = 0;
 
   for (let i = 0; i < 500 && remaining > EPS; i++) {
     const maker = await bestBotMaker(env, closeTaker, limitPrice);
@@ -972,12 +1007,13 @@ async function closePositionAgainstBook(
     const fillPrice = maker.price;
     const chunkPnl = (fillPrice - pos.entry_price) * chunk * dir;
     const chunkMargin = marginPerUnit * chunk;
+    const chunkFee = fillPrice * chunk * closeFeeRate; // 청산 수수료는 환급액에서 뺀다
     const newFilled = filled + chunk;
     const fullyClosed = newFilled >= pos.size - EPS;
     const now = Date.now();
 
     await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(chunkMargin + chunkPnl, uid),
+      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(chunkMargin + chunkPnl - chunkFee, uid),
       fullyClosed
         ? env.DB.prepare('DELETE FROM positions WHERE id=? AND user_id=?').bind(pos.id, uid)
         : env.DB.prepare('UPDATE positions SET size=?, margin=? WHERE id=? AND user_id=?')
@@ -996,6 +1032,7 @@ async function closePositionAgainstBook(
     remaining -= chunk;
     cost += fillPrice * chunk;
     pnlTotal += chunkPnl;
+    closeFeeTotal += chunkFee;
     if (fullyClosed) break;
   }
 
@@ -1006,9 +1043,14 @@ async function closePositionAgainstBook(
       else await env.DB.prepare('UPDATE pending_orders SET size=? WHERE id=?').bind(pendingSize - filled, pendingId).run();
     }
     // 청산 체결 이력 1건(가중평균가·총 실현손익). side 는 포지션 방향(기존 close 기록과 동일 규약).
-    await env.DB.prepare(
-      'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), uid, PAIR, pos.side, cost / filled, filled, pos.leverage, 'close', pnlTotal, Date.now()).run();
+    const done = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), uid, PAIR, pos.side, cost / filled, filled, pos.leverage, 'close', pnlTotal, done),
+      // 잔고는 청크마다 이미 정산 — 여기선 누적 카운터+원장만(합계 1행)
+      ...feeAccrualStmts(env, uid, PAIR, 'close', cost, closeFeeRate, closeFeeTotal, done),
+    ]);
   }
   return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
 }

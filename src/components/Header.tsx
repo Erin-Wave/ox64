@@ -4,6 +4,7 @@ import { useTradingStore } from '@/store/useTradingStore';
 import { fmtPrice } from '@/format';
 import SymbolSelect from '@/components/SymbolSelect';
 import Logo from './Logo';
+import VipBadge from './VipBadge';
 
 export default function Header({
   onOpenRank,
@@ -24,6 +25,10 @@ export default function Header({
   const busy = useTradingStore((s) => s.busy);
   const name = useTradingStore((s) => s.name);
   const logout = useTradingStore((s) => s.logout);
+  const vipTier = useTradingStore((s) => s.vipTier);
+  const feeRate = useTradingStore((s) => s.feeRate);
+  const vipNextAt = useTradingStore((s) => s.vipNextAt);
+  const totalVolume = useTradingStore((s) => s.totalVolume);
   const prices = useMarketStore((s) => s.prices);
   const [showMenu, setShowMenu] = useState(false);
 
@@ -89,7 +94,10 @@ export default function Header({
             <>
               <div className="fixed inset-0 z-20" onClick={() => setShowMenu(false)} />
               <div className="absolute right-0 top-full z-30 mt-1 w-40 overflow-hidden rounded-lg border border-border bg-panel shadow-2xl">
-                <div className="truncate border-b border-border px-3 py-2 text-xs font-medium text-text">{name}</div>
+                <div className="flex items-center gap-1.5 border-b border-border px-3 py-2 text-xs font-medium text-text">
+                  <span className="truncate">{name}</span>
+                  <VipBadge tier={vipTier} feeRate={feeRate} nextAt={vipNextAt} totalVolume={totalVolume} />
+                </div>
                 <button
                   onClick={() => {
                     onOpenRank();
@@ -139,6 +147,7 @@ export default function Header({
               {name ? name.slice(0, 1).toUpperCase() : '?'}
             </span>
             <span className="max-w-[80px] truncate text-sm font-medium text-text">{name}</span>
+            <VipBadge tier={vipTier} feeRate={feeRate} nextAt={vipNextAt} totalVolume={totalVolume} />
           </div>
           <button
             onClick={() => logout()}

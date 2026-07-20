@@ -8,7 +8,16 @@
 // 를 따로 뒀다 — cron/ 의 별도 Worker(Cron Trigger, Pages 는 cron 미지원이라 분리 배포)가
 // 1시간마다 호출해 전 유저를 훑는다. 지정가/SL·TP 는 여전히 접속(폴링) 기반 그대로.
 
-import { type D1PreparedStatement, type Env, type PendingRow, type PositionRow, fetchPrices, isVirtualSymbol } from './_shared';
+import {
+  type D1PreparedStatement,
+  type Env,
+  type PendingRow,
+  type PositionRow,
+  fetchPrices,
+  isVirtualSymbol,
+  feeRateOf,
+  feeAccrualStmts,
+} from './_shared';
 import { matchLimitPendingAgainstBook, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
 
 // OX/USDT 는 진짜 상대 거래자가 없으니, 지정가/SL·TP 체결도 합성 시장(호가창·체결내역·다음 봇
@@ -65,6 +74,11 @@ async function liquidateIfBankrupt(
         'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
       ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, mark, pos.size, pos.leverage, 'liquidation', pnl, now),
     );
+    // ⚠ 강제청산은 **수수료를 걷지 않는다**(바로 아래에서 잔고를 0 으로 리셋하므로 실제로 걷을 수
+    // 없는 돈이다 — 부과하면 원장에 걷지도 못한 수익이 잡힌다). 다만 실제로 체결된 거래이므로
+    // 거래대금은 누적한다(VIP 등급 산정에 반영). fee=0 인 'liquidation' 원장 행이 남아 나중에
+    // "강제청산으로 얼마가 돌았는지"도 집계할 수 있다.
+    stmts.push(...feeAccrualStmts(env, uid, pos.symbol, 'liquidation', mark * pos.size, 0, 0, now));
   }
   for (const p of pendings) {
     stmts.push(env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid));
@@ -123,8 +137,12 @@ async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark:
   const marginReleased = (pos.margin * closeSize) / pos.size;
   const fullyClosed = closeSize >= pos.size - 1e-9;
   const now = Date.now();
+  const rate = await feeRateOf(env, uid);
+  const notional = p.limit_price * closeSize;
+  const fee = notional * rate;
   await env.DB.batch([
-    env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnl, uid),
+    env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnl - fee, uid),
+    ...feeAccrualStmts(env, uid, p.symbol, 'close', notional, rate, fee, now),
     fullyClosed
       ? env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid)
       : env.DB.prepare('UPDATE positions SET size = ?, margin = ? WHERE id = ? AND user_id = ?')
@@ -186,6 +204,16 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
     const ordId = crypto.randomUUID();
     const key = `${p.symbol}|${p.side}`;
     const existing = posBySymbolSide.get(key);
+    // 지정가는 **주문 낼 때가 아니라 체결될 때** 수수료를 뗀다(거래소 관행). 증거금은 주문 시점에
+    // 이미 잠갔으므로 여기선 수수료만 잔고에서 차감한다 — 명목금액의 0.03% 이하라 잔고가 모자라
+    // 실패할 여지는 사실상 없고(증거금 대비 수 %), 부족하면 크로스 평가자산이 줄어 강제청산이 처리한다.
+    const feeRate = await feeRateOf(env, uid);
+    const notional = p.limit_price * p.size;
+    const fee = notional * feeRate;
+    const feeStmts = [
+      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').bind(fee, uid),
+      ...feeAccrualStmts(env, uid, p.symbol, 'open', notional, feeRate, fee, now),
+    ];
 
     if (existing) {
       const newSize = existing.size + p.size;
@@ -194,6 +222,7 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
       const finalSl = p.stop_loss != null ? p.stop_loss : existing.stop_loss;
       const finalTp = p.take_profit != null ? p.take_profit : existing.take_profit;
       await env.DB.batch([
+        ...feeStmts,
         env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid),
         env.DB.prepare(
           'UPDATE positions SET entry_price = ?, size = ?, margin = ?, stop_loss = ?, take_profit = ? WHERE id = ? AND user_id = ?',
@@ -214,6 +243,7 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
     } else {
       const posId = crypto.randomUUID();
       await env.DB.batch([
+        ...feeStmts,
         env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid),
         env.DB.prepare(
           'INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
@@ -265,8 +295,12 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
     const pnl = (trigger - pos.entry_price) * pos.size * dir;
     const now = Date.now();
     const ordId = crypto.randomUUID();
+    const slRate = await feeRateOf(env, uid);
+    const slNotional = trigger * pos.size;
+    const slFee = slNotional * slRate;
     await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(pos.margin + pnl, uid),
+      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(pos.margin + pnl - slFee, uid),
+      ...feeAccrualStmts(env, uid, pos.symbol, 'close', slNotional, slRate, slFee, now),
       env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid),
       env.DB.prepare(
         'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',

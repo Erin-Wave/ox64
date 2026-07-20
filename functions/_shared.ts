@@ -290,6 +290,71 @@ export interface UserRow {
   refill_count: number;
   refill_date: string | null;
   ox_balance: number;
+  total_volume: number;
+  total_fees: number;
+}
+
+// ── 거래 수수료 / VIP 등급 ────────────────────────────────────────────────
+// 등급은 **누적 거래대금(notional = 체결가 × 수량, 레버리지가 곱해진 명목금액)** 으로 결정된다.
+// 증거금이 아니라 명목금액 기준이라 레버리지를 크게 쓸수록 등급이 빨리 오른다("레버리지 포함").
+// 진입·청산 양쪽 모두 각자의 명목금액만큼 누적된다(거래소 관행과 동일).
+export const VIP_TIERS = [
+  { tier: 0, minVolume: 0, rate: 0.0003 }, // ~100만 USDT        0.03%
+  { tier: 1, minVolume: 1e6, rate: 0.0002 }, // 100만~1억         0.02%
+  { tier: 2, minVolume: 1e8, rate: 0.0001 }, // 1억~100억         0.01%
+  { tier: 3, minVolume: 1e10, rate: 0.00005 }, // 100억~1조       0.005%
+  { tier: 4, minVolume: 1e12, rate: 0.00001 }, // 1조~            0.001%
+] as const;
+
+/** 누적 거래대금 → VIP 등급/수수료율/다음 등급 기준. 등급은 컬럼으로 저장하지 않고 항상 여기서
+ * 파생한다(총거래량 하나만 진실원본이라 등급이 어긋날 여지가 없다). */
+export function vipOf(totalVolume: number): { tier: number; rate: number; nextAt: number | null } {
+  const v = totalVolume > 0 ? totalVolume : 0;
+  let idx = 0;
+  for (let i = VIP_TIERS.length - 1; i >= 0; i--) {
+    if (v >= VIP_TIERS[i].minVolume) {
+      idx = i;
+      break;
+    }
+  }
+  return { tier: VIP_TIERS[idx].tier, rate: VIP_TIERS[idx].rate, nextAt: VIP_TIERS[idx + 1]?.minVolume ?? null };
+}
+
+/** 이 유저의 현재 수수료율(누적 거래대금 기준). 체결 직전에 읽어 그 체결에 적용한다. */
+export async function feeRateOf(env: Env, uid: string): Promise<number> {
+  const row = await env.DB.prepare('SELECT total_volume FROM users WHERE id = ?')
+    .bind(uid)
+    .first<{ total_volume: number }>();
+  return vipOf(row?.total_volume ?? 0).rate;
+}
+
+/**
+ * 체결 1건의 수수료 부기 문장들 — 누적 거래대금/수수료 카운터 갱신 + `fee_ledger` 원장 기록.
+ * ⚠ **잔고 차감은 여기서 하지 않는다**(호출부 담당) — 진입은 증거금과 함께 조건부 UPDATE 가드에
+ * 합산해야 원자성이 유지되고, 청산은 환급액(`margin + pnl - fee`)에서 빼야 하기 때문이다. 여기서 또
+ * 빼면 이중 차감된다. 체결을 쪼개서 처리하는 경로(OX 호가창 walking)는 청크마다 잔고만 정산하고
+ * 이 부기는 **합계로 1번만** 부른다(원장이 청크 수만큼 불어나지 않게).
+ */
+export function feeAccrualStmts(
+  env: Env,
+  uid: string,
+  symbol: string,
+  kind: string, // 'open' | 'close' | 'liquidation'
+  notional: number,
+  rate: number,
+  fee: number,
+  now: number,
+): D1PreparedStatement[] {
+  return [
+    env.DB.prepare('UPDATE users SET total_volume = total_volume + ?, total_fees = total_fees + ? WHERE id = ?').bind(
+      notional,
+      fee,
+      uid,
+    ),
+    env.DB.prepare(
+      'INSERT INTO fee_ledger (id, user_id, symbol, kind, notional, rate, fee, created_at) VALUES (?,?,?,?,?,?,?,?)',
+    ).bind(crypto.randomUUID(), uid, symbol, kind, notional, rate, fee, now),
+  ];
 }
 export interface SpotOrderRow {
   id: string;
@@ -356,10 +421,13 @@ export interface OrderRow {
  * 추가 시세 fetch 를 피한다. 안 넘기고 보유 심볼이 있으면 여기서 한 번 조회한다. 응답의 markPrices 는
  * 클라가 서버와 "동일한 시세"로 청산가/평가자산을 즉시(폴링 지연 없이) 계산하게 해준다(§청산가 표시). */
 export async function loadState(env: Env, uid: string, marks?: Record<string, number>) {
-  const user = await env.DB.prepare('SELECT id, name, balance, refill_count, refill_date FROM users WHERE id = ?')
+  const user = await env.DB.prepare(
+    'SELECT id, name, balance, refill_count, refill_date, total_volume, total_fees FROM users WHERE id = ?',
+  )
     .bind(uid)
     .first<UserRow>();
   if (!user) return null;
+  const vip = vipOf(user.total_volume ?? 0);
   const refillsLeft = user.refill_date === todayKst() ? Math.max(0, REFILL_DAILY_LIMIT - user.refill_count) : REFILL_DAILY_LIMIT;
   const positions = (
     await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? ORDER BY opened_at DESC')
@@ -385,6 +453,12 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
     balance: user.balance,
     refillsLeft,
     markPrices,
+    // VIP 등급은 누적 거래대금에서 파생(저장 안 함) — 클라는 뱃지/수수료 예상액 표시에만 쓴다.
+    vipTier: vip.tier,
+    feeRate: vip.rate,
+    vipNextAt: vip.nextAt,
+    totalVolume: user.total_volume ?? 0,
+    totalFees: user.total_fees ?? 0,
     positions: positions.map((p) => ({
       id: p.id,
       symbol: p.symbol,

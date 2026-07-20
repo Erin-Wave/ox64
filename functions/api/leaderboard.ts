@@ -1,4 +1,4 @@
-import { type Ctx, bad, json, safe, missingEnv, getSession, fetchPrices, BOT_USER_IDS, type PositionRow } from '../_shared';
+import { type Ctx, bad, json, safe, missingEnv, getSession, fetchPrices, BOT_USER_IDS, vipOf, type PositionRow } from '../_shared';
 
 /**
  * GET /api/leaderboard — 친구들 자산 순위.
@@ -17,13 +17,14 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
   const users = (
     await env.DB.prepare(
-      `SELECT id, name, balance FROM users WHERE id NOT IN (${BOT_USER_IDS.map(() => '?').join(',')})`,
+      `SELECT id, name, balance, total_volume FROM users WHERE id NOT IN (${BOT_USER_IDS.map(() => '?').join(',')})`,
     )
       .bind(...BOT_USER_IDS)
       .all<{
         id: string;
         name: string;
         balance: number;
+        total_volume: number;
       }>()
   ).results;
   const positions = (
@@ -54,6 +55,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
         equity: u.balance + (marginByUser[u.id] ?? 0) + unrealized,
         unrealized,
         openCount: openCountByUser[u.id] ?? 0,
+        vipTier: vipOf(u.total_volume ?? 0).tier,
         isMe: u.id === sess.uid,
       };
     })

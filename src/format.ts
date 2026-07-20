@@ -24,6 +24,16 @@ export function fmtVol(v: number | null | undefined): string {
   return v.toFixed(2);
 }
 
+/** 누적 거래대금처럼 아주 큰 금액을 짧게(K/M/B/T) — VIP 진행도 표시 전용.
+ * fmtVol 과 달리 T(조) 단위까지 가고, 정수부가 3자리 이상이면 소수를 떨어뜨려 폭을 줄인다. */
+export function fmtBig(v: number | null | undefined): string {
+  if (v == null || !isFinite(v)) return '—';
+  const a = Math.abs(v);
+  const unit = a >= 1e12 ? ['T', 1e12] : a >= 1e9 ? ['B', 1e9] : a >= 1e6 ? ['M', 1e6] : a >= 1e3 ? ['K', 1e3] : ['', 1];
+  const n = v / (unit[1] as number);
+  return n.toFixed(Math.abs(n) >= 100 ? 0 : Math.abs(n) >= 10 ? 1 : 2) + (unit[0] as string);
+}
+
 /** 수량(코인 개수 등)을 세자리 콤마로. 소수는 최대 8자리까지 표기하되 뒤 0 은 자동으로 떨어진다
  * (예 1234567 → "1,234,567", 0.0123 → "0.0123", 3000 → "3,000"). */
 export function fmtQty(v: number | null | undefined): string {

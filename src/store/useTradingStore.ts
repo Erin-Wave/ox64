@@ -24,6 +24,12 @@ interface TradingState {
   name: string | null;
   balance: number;
   refillsLeft: number;
+  // VIP 등급(누적 거래대금에서 서버가 파생) + 그 등급의 수수료율. 헤더 뱃지·주문 수수료 예상액 표시용.
+  vipTier: number;
+  feeRate: number;
+  vipNextAt: number | null;
+  totalVolume: number;
+  totalFees: number;
   positions: ApiPosition[];
   orders: ApiOrder[];
   pendingOrders: ApiPendingOrder[];
@@ -74,6 +80,11 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     name: st.name,
     balance: st.balance,
     refillsLeft: st.refillsLeft,
+    vipTier: st.vipTier ?? 0,
+    feeRate: st.feeRate ?? 0.0003,
+    vipNextAt: st.vipNextAt ?? null,
+    totalVolume: st.totalVolume ?? 0,
+    totalFees: st.totalFees ?? 0,
     positions: st.positions,
     orders: st.orders,
     pendingOrders: st.pendingOrders,
@@ -99,6 +110,11 @@ export const useTradingStore = create<TradingState>((set) => ({
   name: null,
   balance: 0,
   refillsLeft: 3,
+  vipTier: 0,
+  feeRate: 0.0003,
+  vipNextAt: null,
+  totalVolume: 0,
+  totalFees: 0,
   positions: [],
   orders: [],
   pendingOrders: [],
@@ -153,6 +169,11 @@ export const useTradingStore = create<TradingState>((set) => ({
       name: null,
       balance: 0,
       refillsLeft: 3,
+      vipTier: 0,
+      feeRate: 0.0003,
+      vipNextAt: null,
+      totalVolume: 0,
+      totalFees: 0,
       positions: [],
       orders: [],
       pendingOrders: [],

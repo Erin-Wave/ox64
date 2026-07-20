@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type LeaderRow } from '@/services/api';
 import { fmtUsd } from '@/format';
+import VipBadge from './VipBadge';
 
 const MEDAL = ['🥇', '🥈', '🥉'];
 
@@ -67,6 +68,7 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5 truncate text-sm font-semibold text-text">
                     {r.name}
+                    <VipBadge tier={r.vipTier ?? 0} />
                     {r.isMe && <span className="text-[10px] font-normal text-accent">(나)</span>}
                   </div>
                   <div className="text-[11px] text-muted">

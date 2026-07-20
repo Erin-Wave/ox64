@@ -41,6 +41,12 @@ export interface AppState {
   name: string;
   balance: number;
   refillsLeft: number;
+  /** VIP 등급(0~4) — 누적 거래대금에서 서버가 파생. 수수료율/진행도 표시에 사용 */
+  vipTier: number;
+  feeRate: number;
+  vipNextAt: number | null;
+  totalVolume: number;
+  totalFees: number;
   positions: ApiPosition[];
   orders: ApiOrder[];
   pendingOrders: ApiPendingOrder[];
@@ -55,6 +61,7 @@ export interface LeaderRow {
   unrealized: number;
   openCount: number;
   isMe: boolean;
+  vipTier: number;
 }
 
 export interface SpotBookLevel {

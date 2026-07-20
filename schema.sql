@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS users (
   created_at    INTEGER NOT NULL,
   refill_count  INTEGER NOT NULL DEFAULT 0,  -- 오늘(refill_date) 사용한 리필 횟수(최대 3)
   refill_date   TEXT,                         -- refill_count 가 적용되는 날짜(KST, YYYY-MM-DD). 날짜 바뀌면 0으로 취급
-  ox_balance    REAL NOT NULL DEFAULT 100    -- 가상 코인 OX 현물 보유량(가입 시 정해진 물량 지급, 유저간 매매로만 이동)
+  ox_balance    REAL NOT NULL DEFAULT 100,   -- 가상 코인 OX 현물 보유량(가입 시 정해진 물량 지급, 유저간 매매로만 이동)
+  total_volume  REAL NOT NULL DEFAULT 0,     -- 누적 거래대금(notional = 체결가 × 수량, 레버리지 포함) → VIP 등급 산정 기준
+  total_fees    REAL NOT NULL DEFAULT 0      -- 이 유저가 지금까지 낸 거래 수수료 합계(표시용)
 );
 
 CREATE TABLE IF NOT EXISTS positions (
@@ -134,6 +136,23 @@ CREATE TABLE IF NOT EXISTS spot_candles (
   PRIMARY KEY (pair, interval, bucket)   -- (pair,interval) 로 조회 + bucket 정렬을 이 인덱스로 커버
 );
 
+-- ── 거래 수수료 원장(플랫폼이 벌어들인 수수료) ────────────────────────────
+-- 체결 1건마다 1행. 유저별/심볼별/기간별로 SUM 해서 수수료 수익을 집계한다(users.total_fees 는
+-- 유저 표시용 캐시일 뿐, 수익의 진실원본은 이 테이블이다). VIP 등급은 users.total_volume 에서
+-- 파생하므로 별도 컬럼으로 저장하지 않는다(functions/_shared.ts vipOf).
+CREATE TABLE IF NOT EXISTS fee_ledger (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL,
+  symbol     TEXT NOT NULL,
+  kind       TEXT NOT NULL,       -- 'open' | 'close' (강제청산은 수수료를 걷지 않음 — 잔고가 0으로 리셋되므로)
+  notional   REAL NOT NULL,       -- 체결 명목금액 = 체결가 × 수량 (레버리지 포함)
+  rate       REAL NOT NULL,       -- 그 체결에 적용된 수수료율(체결 시점의 VIP 등급)
+  fee        REAL NOT NULL,       -- notional × rate
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fee_ledger_user ON fee_ledger(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
+
 -- ⚠ 일회성 마이그레이션 (2026-07-15 추가, SL/TP 지원): 이미 스키마가 적용된 기존
 -- prod DB 의 positions 테이블에 컬럼을 추가한다. CREATE TABLE IF NOT EXISTS 는
 -- 기존 테이블에 컬럼을 더해주지 않으므로 별도 ALTER 필요. 최초 1회
@@ -184,3 +203,11 @@ CREATE TABLE IF NOT EXISTS spot_candles (
 -- ALTER TABLE spot_bot_state ADD COLUMN anchor REAL NOT NULL DEFAULT 0;
 -- ALTER TABLE spot_bot_state ADD COLUMN regime TEXT NOT NULL DEFAULT 'calm';
 -- ALTER TABLE spot_bot_state ADD COLUMN regime_ticks INTEGER NOT NULL DEFAULT 0;
+
+-- ⚠ 일회성 마이그레이션 (2026-07-20 추가, 거래 수수료 + VIP 등급): 기존 prod DB 의 users 에 누적
+-- 거래대금/수수료 컬럼을 추가한다. CREATE TABLE IF NOT EXISTS 는 기존 테이블에 컬럼을 더해주지
+-- 않으므로 최초 1회만 아래를 직접 실행할 것 — 코드(loadState/feeAccrualStmts)가 참조하므로 **코드
+-- 배포 전에 먼저 적용돼 있어야 한다**. fee_ledger 는 신규 테이블이라 --file=./schema.sql 재적용만으로
+-- 생성된다(ALTER 불필요). 이미 실행했다면 "duplicate column name" 에러(무시 가능).
+-- ALTER TABLE users ADD COLUMN total_volume REAL NOT NULL DEFAULT 0;
+-- ALTER TABLE users ADD COLUMN total_fees REAL NOT NULL DEFAULT 0;

@@ -10,6 +10,8 @@ import {
   fetchPrice,
   loadState,
   unrealizedTotal,
+  feeRateOf,
+  feeAccrualStmts,
   type Env,
   type PositionRow,
   type PendingRow,
@@ -130,6 +132,11 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 잔고 차감 가드는 balance - margin >= -uPnL (⟺ available >= margin) 로 원자적으로 막는다.
     const uPnL = await unrealizedTotal(env, uid, marks);
     const available = user.balance + uPnL;
+    // 수수료 = 명목금액(체결가×수량) × VIP 등급 수수료율. 진입 시엔 증거금과 **함께** 차감해야
+    // 원자 가드가 성립한다(따로 빼면 증거금은 통과하고 수수료만 실패하는 틈이 생긴다).
+    const feeRate = await feeRateOf(env, uid);
+    const notional = price * size;
+    const fee = notional * feeRate;
 
     // 같은 심볼·같은 방향으로 이미 보유 중인 포지션이 있으면 새 행을 또 만들지 않고 그 포지션에
     // 물타기/불타기 방식으로 합친다(평단가 재계산) — 거래소들의 "원웨이 모드"와 동일한 동작.
@@ -145,7 +152,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     if (existing) {
       const addMargin = (price * size) / existing.leverage;
-      if (addMargin > available) return bad('증거금이 부족합니다');
+      if (addMargin + fee > available) return bad('증거금이 부족합니다');
 
       const newSize = existing.size + size;
       const newEntry = (existing.entry_price * existing.size + price * size) / newSize;
@@ -157,11 +164,12 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
       const res = await env.DB.batch([
         env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?').bind(
-          addMargin,
+          addMargin + fee,
           uid,
-          addMargin,
+          addMargin + fee,
           -uPnL,
         ),
+        ...feeAccrualStmts(env, uid, symbol, 'open', notional, feeRate, fee, now),
         env.DB.prepare(
           'UPDATE positions SET entry_price = ?, size = ?, margin = ?, stop_loss = ?, take_profit = ? WHERE id = ? AND user_id = ?',
         ).bind(newEntry, newSize, existing.margin + addMargin, finalSl, finalTp, existing.id, uid),
@@ -178,17 +186,18 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     const margin = (price * size) / leverage;
     if (!validSlTp(side, price, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
-    if (margin > available) return bad('증거금이 부족합니다');
+    if (margin + fee > available) return bad('증거금이 부족합니다');
 
     const posId = crypto.randomUUID();
     // 잔고 차감은 조건부 UPDATE 로 원자적 가드(balance - margin >= -uPnL ⟺ available >= margin, 크로스)
     const res = await env.DB.batch([
       env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?').bind(
-        margin,
+        margin + fee,
         uid,
-        margin,
+        margin + fee,
         -uPnL,
       ),
+      ...feeAccrualStmts(env, uid, symbol, 'open', notional, feeRate, fee, now),
       env.DB.prepare(
         'INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
       ).bind(posId, uid, symbol, side, price, size, leverage, margin, now, stopLoss, takeProfit),
@@ -234,9 +243,14 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const marginReleased = isPartial ? (pos.margin * closeSize) / pos.size : pos.margin;
     const now = Date.now();
     const ordId = crypto.randomUUID();
+    // 청산 수수료는 환급액에서 뺀다(증거금 + 손익 − 수수료).
+    const closeRate = await feeRateOf(env, uid);
+    const closeNotional = price * closeSize;
+    const closeFee = closeNotional * closeRate;
 
     await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnl, uid),
+      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnl - closeFee, uid),
+      ...feeAccrualStmts(env, uid, pos.symbol, 'close', closeNotional, closeRate, closeFee, now),
       isPartial
         ? env.DB
             .prepare('UPDATE positions SET size = ?, margin = ? WHERE id = ? AND user_id = ?')

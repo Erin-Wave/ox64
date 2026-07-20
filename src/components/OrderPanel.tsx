@@ -23,6 +23,8 @@ export default function OrderPanel() {
   const error = useTradingStore((s) => s.error);
   const positions = useTradingStore((s) => s.positions);
   const markPrices = useTradingStore((s) => s.markPrices);
+  const feeRate = useTradingStore((s) => s.feeRate);
+  const vipTier = useTradingStore((s) => s.vipTier);
 
   const [tab, setTab] = useState<Tab>('market');
   const [size, setSize] = useState('0.01'); // 항상 코인 수량이 진실원본, unit 은 표시만 바꿈
@@ -84,6 +86,8 @@ export default function OrderPanel() {
 
   const notional = refPrice ? refPrice * Number(size || 0) : 0;
   const margin = notional / leverage;
+  // 진입 수수료 = 명목가 × VIP 수수료율(서버가 체결 시 실제로 떼는 값과 같은 식). 청산할 때 한 번 더 든다.
+  const fee = notional * feeRate;
 
   // 크로스 마진 가용 증거금 = 여유잔고 + 전 포지션 미실현손익(서버 markPrices 기준 — 서버 가용 판정과
   // 동일 시세). 이익 중이면 그 미실현이익까지 새 주문에 쓸 수 있고, 손실 중이면 가용이 줄어든다.
@@ -100,10 +104,14 @@ export default function OrderPanel() {
   // 가용 증거금 기준 수량 설정(fraction = 증거금으로 쓸 가용 비율, 0~1).
   // SAFETY: 슬라이더 100% 그대로 계산하면 toFixed 반올림/서버 fetch 시점 가격차로
   // 증거금이 가용을 살짝 넘어 주문이 거부되는 경우가 있어 0.1% 여유를 둔다.
+  // ⚠ 서버 가드는 `증거금 + 수수료 <= 가용` 이므로 수수료도 넣고 역산해야 한다. 명목가 1 당 드는 돈은
+  // (1/leverage + feeRate) 이므로 명목가 = 가용 / (1/leverage + feeRate). 수수료를 빼먹으면 고배율에서
+  // 슬라이더 100% 가 그대로 거부된다(125배면 수수료가 증거금의 ~3.75% 라 0.1% 여유로는 못 덮는다).
   const SAFETY = 0.999;
   const applyPct = (fraction: number) => {
     if (!refPrice) return;
-    const sz = (available * leverage * fraction * SAFETY) / refPrice;
+    const costPerNotional = 1 / leverage + feeRate;
+    const sz = (available * fraction * SAFETY) / costPerNotional / refPrice;
     setSize(sz > 0 ? sz.toFixed(6) : '0');
   };
 
@@ -276,9 +284,15 @@ export default function OrderPanel() {
         </div>
         <div className="flex justify-between">
           <span className="text-muted">증거금</span>
-          <span className={margin > available ? 'text-down' : 'text-text'}>
+          <span className={margin + fee > available ? 'text-down' : 'text-text'}>
             {margin ? fmtUsd(margin) : '—'} USDT
           </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted">
+            수수료 <span className="text-[10px] text-muted">VIP{vipTier} · {(feeRate * 100).toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}%</span>
+          </span>
+          <span className="text-text">{fee ? fmtUsd(fee) : '—'} USDT</span>
         </div>
       </div>
 
