@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
@@ -27,6 +27,11 @@ export default function PositionsPanel() {
   const prices = useMarketStore((s) => s.prices);
   const precisions = useMarketStore((s) => s.precisions);
   const setSymbol = useMarketStore((s) => s.setSymbol);
+  const symbol = useMarketStore((s) => s.symbol);
+  const chartClickPrice = useMarketStore((s) => s.chartClickPrice);
+  const chartClickNonce = useMarketStore((s) => s.chartClickNonce);
+  const priceTarget = useMarketStore((s) => s.priceTarget);
+  const setPriceTarget = useMarketStore((s) => s.setPriceTarget);
   const standard = useSettingsStore((s) => s.tradingMode) === 'standard';
 
   const [tab, setTab] = useState<Tab>('positions');
@@ -38,14 +43,35 @@ export default function PositionsPanel() {
 
   // 지정가가 채워져 있으면 지정가 청산(reduce-only 주문 예약), 아니면 시장가 청산.
   // 수량이 비어 있으면 전량(시장가는 size 생략, 지정가는 보유수량 전체) — 보유량 초과는 서버가 거부.
+  // ⚠ 청산 후 입력값(수량·지정가)을 비우지 않는다 — 같은 수량으로 여러 번 나눠 털거나, 같은 가격에
+  // 지정가 청산을 다시 걸 때 매번 새로 타이핑해야 했다. 전량 청산되면 행 자체가 사라지므로 남은 값이
+  // 화면에 보일 일도 없다(상태는 포지션 id 키라 서로 섞이지 않는다).
   const doClose = (id: string, posSize: number) => {
     const amt = closeAmt[id] ? Number(closeAmt[id]) : NaN;
     const px = closePx[id] ? Number(closePx[id]) : NaN;
     if (px > 0) limitClose(id, amt > 0 ? amt : posSize, px);
     else closePosition(id, amt > 0 ? amt : undefined);
-    setCloseAmt((s) => ({ ...s, [id]: '' }));
-    setClosePx((s) => ({ ...s, [id]: '' }));
   };
+
+  // 차트/호가창 클릭 → 포커스해뒀던 "청산 지정가" 칸에 그 가격을 채운다(OrderPanel 지정가와 동일한 흐름).
+  // ⚠ 클릭 대상은 하나뿐이라(useMarketStore.priceTarget) 주문 지정가와 동시에 바뀌지 않는다.
+  // ⚠ 보고 있는 차트의 심볼과 포지션 심볼이 다르면 무시 — BTC 차트를 클릭했는데 OX 포지션의 청산가로
+  // 들어가면 엉뚱한 가격에 청산이 예약된다.
+  useEffect(() => {
+    if (chartClickNonce === 0 || chartClickPrice == null || !priceTarget.startsWith('close:')) return;
+    const id = priceTarget.slice('close:'.length);
+    const target = positions.find((p) => p.id === id);
+    if (!target || target.symbol !== symbol) return;
+    setClosePx((s) => ({ ...s, [id]: String(chartClickPrice) }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartClickNonce]);
+
+  // 대상 포지션이 사라지면(전량 청산·강제청산) 클릭 타깃을 주문 지정가로 되돌린다 — 안 그러면 청산
+  // 직후 첫 차트 클릭이 사라진 칸으로 향해 아무 데도 안 들어가고 삼켜진다.
+  useEffect(() => {
+    if (!priceTarget.startsWith('close:')) return;
+    if (!positions.some((p) => p.id === priceTarget.slice('close:'.length))) setPriceTarget('');
+  }, [positions, priceTarget, setPriceTarget]);
 
   const startEdit = (id: string, sl: number | null, tp: number | null) => {
     setEditingId(id);
@@ -257,10 +283,14 @@ export default function PositionsPanel() {
                               <input
                                 value={closePx[p.id] ?? ''}
                                 onChange={(e) => setClosePx((s) => ({ ...s, [p.id]: e.target.value }))}
+                                onFocus={() => setPriceTarget(`close:${p.id}`)} // 차트 클릭 가격을 이 칸으로
                                 placeholder="시장가"
                                 inputMode="decimal"
-                                title="청산 지정가(비우면 시장가, 채우면 그 가격에 지정가 청산 예약)"
-                                className="w-16 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                                title="청산 지정가(비우면 시장가, 채우면 그 가격에 지정가 청산 예약) — 이 칸을 클릭한 뒤 차트를 클릭하면 그 가격이 들어옵니다"
+                                // 차트 클릭을 받는 칸을 accent 링으로 표시(차트를 클릭하면 포커스가 풀려서 어디로 들어갈지 안 보인다)
+                                className={`w-16 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 placeholder:text-muted ${
+                                  priceTarget === `close:${p.id}` ? 'ring-accent' : 'ring-border'
+                                }`}
                               />
                             </>
                           )}

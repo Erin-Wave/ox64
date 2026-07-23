@@ -18,6 +18,11 @@ interface MarketState {
   connected: boolean;
   chartClickPrice: number | null; // 차트에서 마지막으로 클릭한 가격
   chartClickNonce: number; // 같은 가격을 다시 클릭해도 신호가 오도록 매번 증가
+  // 차트/호가창 클릭 가격을 받을 입력칸. '' = 주문패널 지정가(기본), 'close:<positionId>' = 그 포지션의
+  // 청산 지정가. ⚠ 클릭 대상이 하나여야 한다 — 안 그러면 한 번 클릭에 주문 지정가와 청산 지정가가 동시에
+  // 바뀐다. 각 입력칸이 포커스될 때 자기를 타깃으로 등록한다(차트를 클릭하면 포커스가 풀리므로
+  // document.activeElement 로는 판단할 수 없어 별도 상태로 기억한다).
+  priceTarget: string;
   recentTrades: Record<string, TickerTrade[]>; // 심볼별 최근 체결(최신이 [0]) — useTradeTape 가 채움
 
   setSymbol: (s: string) => void;
@@ -26,6 +31,7 @@ interface MarketState {
   setPrecision: (symbol: string, precision: number) => void;
   setConnected: (c: boolean) => void;
   setChartClickPrice: (price: number) => void;
+  setPriceTarget: (target: string) => void;
   pushTrade: (symbol: string, trade: TickerTrade) => void;
   setRecentTrades: (symbol: string, trades: TickerTrade[]) => void;
 }
@@ -55,6 +61,7 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   connected: false,
   chartClickPrice: null,
   chartClickNonce: 0,
+  priceTarget: '',
   recentTrades: {},
 
   setSymbol: (symbol) => {
@@ -71,6 +78,7 @@ export const useMarketStore = create<MarketState>((set, get) => ({
     set((s) => (s.precisions[symbol] === precision ? s : { precisions: { ...s.precisions, [symbol]: precision } })),
   setConnected: (connected) => set({ connected }),
   setChartClickPrice: (price) => set((s) => ({ chartClickPrice: price, chartClickNonce: s.chartClickNonce + 1 })),
+  setPriceTarget: (priceTarget) => set((s) => (s.priceTarget === priceTarget ? s : { priceTarget })),
   pushTrade: (symbol, trade) =>
     set((s) => ({ recentTrades: { ...s.recentTrades, [symbol]: [trade, ...(s.recentTrades[symbol] ?? [])].slice(0, MAX_TRADES) } })),
   setRecentTrades: (symbol, trades) => set((s) => ({ recentTrades: { ...s.recentTrades, [symbol]: trades } })),

@@ -15,6 +15,8 @@ export default function OrderPanel() {
   const lastPrice = useMarketStore(selectLastPrice);
   const chartClickPrice = useMarketStore((s) => s.chartClickPrice);
   const chartClickNonce = useMarketStore((s) => s.chartClickNonce);
+  const priceTarget = useMarketStore((s) => s.priceTarget);
+  const setPriceTarget = useMarketStore((s) => s.setPriceTarget);
   const tradingMode = useSettingsStore((s) => s.tradingMode);
   const openMarket = useTradingStore((s) => s.openMarket);
   const limitOpen = useTradingStore((s) => s.limitOpen);
@@ -56,9 +58,10 @@ export default function OrderPanel() {
   // 차트/호가창 클릭 → 그 가격을 지정가 입력에 채운다. ⚠ 예전엔 클릭만 해도 지정가 탭으로 강제
   // 전환해서, 시장가로 주문하려다 무심코 차트를 클릭하면 시장가 주문이 지정가로 걸리던 버그가 있었다.
   // 이제 이미 지정가 탭일 때만 값을 채운다(시장가 탭에서의 클릭은 조회일 뿐 주문 유형을 바꾸지 않음).
+  // priceTarget 이 '' 이 아니면 다른 입력칸(포지션의 청산 지정가)이 클릭을 가져간 상태다 — 여기선 무시.
   useEffect(() => {
     if (chartClickNonce === 0 || chartClickPrice == null || !standard) return;
-    if (tab !== 'limit') return;
+    if (tab !== 'limit' || priceTarget !== '') return;
     setLimitPrice(String(chartClickPrice));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartClickNonce]);
@@ -163,6 +166,7 @@ export default function OrderPanel() {
             <input
               value={limitPrice}
               onChange={(e) => setLimitPrice(e.target.value)}
+              onFocus={() => setPriceTarget('')} // 차트 클릭 가격을 이 칸으로 되돌린다
               inputMode="decimal"
               className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none"
             />
