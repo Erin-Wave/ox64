@@ -226,11 +226,12 @@ async function loadSpotMarket(env: Env, uid: string) {
 // 문장/수십 왕복이 나갔다. 지금은 (취소 1문 + 사다리 16문 + 합성체결 1문 + 기준가 1문)을 단 하나의
 // batch(왕복 1회)로 처리한다. 게이트 통과(재호가) 틱이 아니면 DB read 1회로 즉시 반환한다.
 //
-// ⚠ 봇 호가는 잔고 에스크로를 하지 않는다 — 봇 잔고(users.balance/ox_balance)는 랭킹에서 제외되고
-// 시세는 spot_bot_state, 호가는 spot_orders 에서 읽으므로 "어디서도 읽히지 않는 write-only" 값이었다.
-// 부기를 유지하느라 취소마다 환불·체결마다 정산하던 왕복이 순수 낭비여서 전부 제거했다(무한 유동성 풀).
-// 유저↔봇 체결의 물량 소비만 조건부 UPDATE 로 원자 처리하면 되고(matchLimitPendingAgainstBook 등),
-// 봇 잔고 숫자는 무의미하다.
+// ⚠ 봇 호가는 잔고 에스크로를 하지 않는다 — 호가를 걸 때 잠그고 취소할 때 환불하는 왕복이 틱마다
+// 수십 번씩 나가는데, 봇은 무한 유동성 공급자라 "돈이 모자라 호가를 못 깐다"는 상태가 애초에 없다.
+// 유저↔봇 체결의 물량 소비만 조건부 UPDATE 로 원자 처리하면 된다(matchLimitPendingAgainstBook 등).
+// 단, **체결된 뒤의 재고/현금 정산은 한다**(botFillStmts) — 에스크로(사전 잠금)와 달리 이미 도는
+// batch 에 문장 하나가 얹힐 뿐이라 왕복이 늘지 않고, 그래야 봇 잔고가 실제 매매를 반영한다.
+// 정산에 잔고 가드는 없다(무한 풀 — 음수 허용). 봇은 랭킹에서 제외되므로 이 숫자가 순위를 흔들지 않는다.
 // 재호가(requote) 주기 — 짧을수록 기준가·호가·체결 테이프가 자주 갱신되고, 크로스되는 유저 주문이
 // 그만큼 빨리 체결된다(sweepRestingOxPendings 가 매 재호가 직후 도므로). 체결 딜레이를 줄이려고
 // 3~8s → 0.9~2.2s → 0.45~1.1s 로 단계적으로 낮췄다 — runMarketMaker 는 /api/spot 폴링 시점에만 불리므로
@@ -301,20 +302,43 @@ const REGIME_PARAMS: Record<Regime, { bias: number; volMult: number; sizeMult: n
 
 const ROUND_STEP = 0.05; // 라운드넘버 자석이 잡아당기는 심리적 가격대 간격
 
+/** 한 주문에서 특정 봇이 상대편(maker)으로 잡은 체결의 합계 — 수수료(명목금액)와 재고(수량) 양쪽에 쓴다. */
+interface BotFill {
+  notional: number; // Σ 체결가×수량 — 수수료 산정 + 현금(USDT) 정산
+  size: number; // Σ 체결 수량 — 재고(OX) 정산
+}
+
+/** walking 루프의 청크 하나를 봇별 합계에 누적(체결 1건마다 부기하면 원장·문장이 청크 수만큼 불어난다). */
+function addBotFill(fills: Map<string, BotFill>, botId: string, notional: number, size: number): void {
+  const cur = fills.get(botId) ?? { notional: 0, size: 0 };
+  fills.set(botId, { notional: cur.notional + notional, size: cur.size + size });
+}
+
 /**
- * 봇도 거래 수수료를 낸다 — 합성 체결(봇끼리)이든 유저 상대 체결이든.
- * ⚠ 봇 잔고(users.balance)는 어디서도 읽히지 않는 무한 풀이라 잔고에서 빼는 건 의미가 없지만,
- * **수수료 원장(fee_ledger)엔 반드시 남겨야 "플랫폼이 번 돈"이 온전해진다** — 시장 물량의 대부분이
- * 봇에서 나오는데 봇만 면제하면 원장이 실제 거래량과 동떨어진다. 요율은 유저와 똑같이 누적
- * 거래대금에서 파생(vipOf)하므로 봇도 거래가 쌓일수록 등급이 오른다(특혜 없음).
- * 여러 봇이 섞인 체결은 봇별 명목금액을 모아 한 번에 처리한다(read 1회 + 봇당 2문장).
+ * 봇 체결의 부기 — (1) 수수료 원장 + (2) 재고/현금 정산. 합성 체결(봇끼리)이든 유저 상대 체결이든.
+ *
+ * **수수료**: 시장 물량의 대부분이 봇에서 나오는데 봇만 면제하면 원장이 실제 거래량과 동떨어진다.
+ * 요율은 유저와 똑같이 누적 거래대금에서 파생(vipOf)하므로 봇도 거래가 쌓일수록 등급이 오른다(특혜 없음).
+ *
+ * **재고/현금**(`botSide` = 이 체결에서 봇이 산 쪽인지 판 쪽인지):
+ *   - 봇이 매도(sell) → USDT +명목금액, OX −수량   /  봇이 매수(buy) → USDT −명목금액, OX +수량
+ *   - `null` 은 봇↔봇 합성 체결(양쪽이 같은 봇이라 재고·현금이 서로 상계) → 수수료만 기록.
+ * ⚠ 예전엔 이 정산을 아예 안 해서 `users.balance`/`ox_balance` 가 구조 개편(2026-07-18) 시점 값에
+ * **영구히 얼어붙어 있었다** — 봇이 아무리 사고팔아도 숫자가 그대로라 "봇 재고"라는 개념 자체가 없었다.
+ * ⚠ **잔고 가드는 절대 붙이지 않는다**(조건부 UPDATE 아님) — 봇은 설계상 무한 유동성 공급자라
+ * 현금/재고가 음수로 내려가도 체결은 계속돼야 한다. 가드를 붙이는 순간 대량 시장가 완결(SYNTH 경로)이
+ * 봇 잔고 바닥에서 끊기고, 봇 호가 에스크로를 되살리는 꼴이라 틱마다 왕복이 폭증한다.
+ * 음수는 정상이다 — 봇 재고는 "유저 전체 순포지션의 거울"이라 유저가 순매수면 봇 OX 가 마이너스로 간다.
+ *
+ * 여러 봇이 섞인 체결은 봇별로 모아 한 번에 처리한다(read 1회 + 봇당 2~3문장, 호출부 batch 에 얹힘).
  */
-async function botFeeStmts(
+async function botFillStmts(
   env: Env,
-  notionalByBot: Map<string, number>,
+  fills: Map<string, BotFill>,
+  botSide: 'buy' | 'sell' | null,
   now: number,
 ): Promise<D1PreparedStatement[]> {
-  const ids = [...notionalByBot.keys()].filter((id) => (notionalByBot.get(id) ?? 0) > EPS);
+  const ids = [...fills.keys()].filter((id) => (fills.get(id)?.notional ?? 0) > EPS);
   if (ids.length === 0) return [];
   const rows = (
     await env.DB.prepare(`SELECT id, total_volume FROM users WHERE id IN (${ids.map(() => '?').join(',')})`)
@@ -324,9 +348,17 @@ async function botFeeStmts(
   const volById = new Map(rows.map((r) => [r.id, r.total_volume ?? 0]));
   const out: D1PreparedStatement[] = [];
   for (const id of ids) {
-    const notional = notionalByBot.get(id)!;
+    const { notional, size } = fills.get(id)!;
     const rate = vipOf(volById.get(id) ?? 0).rate;
-    out.push(...feeAccrualStmts(env, id, PAIR, 'bot', notional, rate, notional * rate, now));
+    const fee = notional * rate;
+    out.push(...feeAccrualStmts(env, id, PAIR, 'bot', notional, rate, fee, now));
+    if (botSide) {
+      const cash = (botSide === 'buy' ? -notional : notional) - fee; // 수수료는 사든 팔든 낸다
+      const inv = botSide === 'buy' ? size : -size;
+      out.push(
+        env.DB.prepare('UPDATE users SET balance = balance + ?, ox_balance = ox_balance + ? WHERE id = ?').bind(cash, inv, id),
+      );
+    }
   }
   return out;
 }
@@ -653,7 +685,9 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   // 영속 캔들: 이 틱이 찍은 체결들의 OHLCV 로 1회 갱신(위 spot_trades 들과 정확히 일치해야 한다).
   stmts.push(...candleUpsertStmts(env, { open, high, low, close: ref, volume }, now));
   // 봇도 수수료를 낸다 — 이 틱의 합성 체결 명목금액에 대해(같은 batch, 왕복 추가 없음).
-  stmts.push(...(await botFeeStmts(env, new Map([[actor, notionalSum]]), now)));
+  // ⚠ 재고/현금 정산은 없다(botSide=null) — 합성 체결은 buyer_id=seller_id=actor 인 봇↔봇 거래라
+  // 사고팔린 게 같은 계정 안에서 상계된다(수수료만 실제로 나간다).
+  stmts.push(...(await botFillStmts(env, new Map([[actor, { notional: notionalSum, size: volume }]]), null, now)));
   await env.DB.batch(stmts);
 
   // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
@@ -773,9 +807,9 @@ export async function recordVirtualFill(
 
   // ⚠ 체결 테이프에만 기록하고 호가창(spot_orders)은 그대로 두면 "체결은 찍히는데 호가는 그대로"인
   // 이상한 상태가 됨 — 실제 매칭처럼 반대편 최우선호가부터 이 체결수량만큼 소비(줄이거나 다 채움)한다.
-  // 봇 잔고는 조정하지 않는다(무한 유동성 풀 — 다음 취소·재호가 때 자연히 정리됨).
   const oppositeSide = takerSide === 'buy' ? 'sell' : 'buy';
   const order = oppositeSide === 'sell' ? 'price ASC' : 'price DESC';
+  const fills = new Map<string, BotFill>(); // 상대편이 된 봇들(재고/현금/수수료 정산용)
   let remaining = size;
   for (let i = 0; i < 50 && remaining > EPS; i++) {
     const maker = await env.DB.prepare(
@@ -789,7 +823,14 @@ export async function recordVirtualFill(
     await env.DB.prepare('UPDATE spot_orders SET size = ?, status = ? WHERE id = ?')
       .bind(makerRemaining, makerRemaining <= EPS ? 'filled' : 'open', maker.id)
       .run();
+    // 재고 정산은 유저가 실제로 정산받은 가격(price)으로 — 호가창 소비는 "그만큼 물량이 나갔다"는 표시일 뿐,
+    // 유저의 손익은 이미 이 price 로 확정돼 있어서 maker.price 로 부기하면 양쪽 장부가 어긋난다.
+    addBotFill(fills, maker.user_id, price * consumed, consumed);
     remaining -= consumed;
+  }
+  // 호가창이 얇아 다 못 채운 잔량도 체결 자체는 성립한 물량이다(봇이 무한 풀로 받아준 셈) — 한 봇 앞으로 단다.
+  if (remaining > EPS) {
+    addBotFill(fills, BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)], price * remaining, remaining);
   }
 
   await env.DB.batch([
@@ -800,6 +841,8 @@ export async function recordVirtualFill(
       'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price',
     ).bind(PAIR, now, price),
     ...candleUpsertOne(env, price, size, now), // 영속 캔들 갱신
+    // 이 경로(호가창 walking 을 안 타는 SL/TP 정산 등)의 상대편도 봇이다 — 재고/현금/수수료를 똑같이 정산한다.
+    ...(await botFillStmts(env, fills, oppositeSide, now)),
   ]);
 }
 
@@ -808,8 +851,8 @@ export async function recordVirtualFill(
 // (1) 있지도 않은 물량이 즉시 체결되고 (2) 최우선 호가보다 유리한 유령가격에 체결되는 심각한
 // 버그가 있었다. 이제 유저 주문은 봇이 실제로 깐 호가(spot_orders)를 가격-시간 우선순위로
 // walking 하며 체결한다 — 있는 물량만, 실제 호가 가격에, 최우선호가보다 유리하게는 절대 안 체결.
-// 못 채운 잔량은 지정가면 호가창에 남아 대기(다음 유동성에 매칭), 시장가면 버린다. 봇은 무한
-// 유동성 풀이라 체결 시 상대(봇) 잔고를 따로 정산하지 않는다(봇 잔고는 어디서도 읽히지 않음).
+// 못 채운 잔량은 지정가면 호가창에 남아 대기(다음 유동성에 매칭), 시장가면 버린다.
+// 체결된 물량만큼 상대(봇)의 재고/현금도 정산한다(botFillStmts) — 잔고 가드는 없다(무한 유동성 풀).
 
 // 체결분을 유저 OX 레버리지 포지션에 반영하는 문장(positions 테이블만). 물타기면 병합.
 function oxPositionStmts(
@@ -883,10 +926,13 @@ const MATCH_MAX_ITERS = 200; // walking 루프 상한(실사다리 ~수십 + 합
 
 // 합성 maker(실제 spot_orders 행이 아님 — 원자 선점 UPDATE 를 하지 않는다). 가격/크기는 호출부가
 // 첫 합성 때 정한 청크와 스텝별 시장충격 가격을 넘긴다.
-function synthMaker(makerSide: 'buy' | 'sell', walkPrice: number, chunk: number): SpotOrderRow {
+// ⚠ 어느 봇 앞으로 다는지(actor)는 호출부가 스텝마다 번갈아 넘긴다 — 예전엔 BOT_USER_IDS[0] 하드코딩
+// 이라 대량 시장가의 합성 흡수 물량이 전부 1번 봇에 쌓여 봇별 누적 거래대금이 700배 넘게 벌어졌고
+// (실측 2.39조 vs 33.9억), 그 탓에 두 봇의 VIP 요율까지 갈라졌다(VIP4 vs VIP2).
+function synthMaker(actor: string, makerSide: 'buy' | 'sell', walkPrice: number, chunk: number): SpotOrderRow {
   return {
     id: '',
-    user_id: BOT_USER_IDS[0],
+    user_id: actor,
     pair: PAIR,
     side: makerSide,
     price: walkPrice,
@@ -930,7 +976,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
   let filled = 0;
   let cost = 0;
   let limitFeeTotal = 0;
-  const limitMakerNotional = new Map<string, number>(); // 상대편 봇 수수료
+  const limitMakerFills = new Map<string, BotFill>(); // 상대편 봇 수수료 + 재고/현금 정산
 
   for (let i = 0; i < 500; i++) {
     // iter 0 은 위에서 이미 읽은 first 를 재사용(중복 read 제거), 이후엔 동시 체결 반영 위해 재조회.
@@ -1001,7 +1047,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
     filled += chunk;
     cost += fillPrice * chunk;
     limitFeeTotal += chunkFee;
-    limitMakerNotional.set(maker.user_id, (limitMakerNotional.get(maker.user_id) ?? 0) + fillPrice * chunk);
+    addBotFill(limitMakerFills, maker.user_id, fillPrice * chunk, chunk);
   }
 
   if (filled > EPS) {
@@ -1013,7 +1059,8 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
       ).bind(crypto.randomUUID(), first.user_id, PAIR, first.side, cost / filled, filled, effLev, 'open', null, done),
       // 잔고는 청크마다 상계 정산 — 여기선 누적 카운터+원장만(합계 1행)
       ...feeAccrualStmts(env, first.user_id, PAIR, 'open', cost, limitFeeRate, limitFeeTotal, done),
-      ...(await botFeeStmts(env, limitMakerNotional, done)),
+      // 유저가 롱(매수)이면 봇이 판 쪽(sell) — 봇 현금 +, 재고 −.
+      ...(await botFillStmts(env, limitMakerFills, isLong ? 'sell' : 'buy', done)),
     ]);
   }
 }
@@ -1054,7 +1101,7 @@ export async function matchMarketOxOrder(
   let filled = 0;
   let cost = 0;
   let feeTotal = 0;
-  const makerNotional = new Map<string, number>(); // 상대편 봇도 수수료를 낸다(봇별 명목금액 집계)
+  const makerFills = new Map<string, BotFill>(); // 상대편 봇 수수료 + 재고/현금 정산(봇별 집계)
   const openMakerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy';
   const openAdverse = isLong ? 1 : -1; // 사면 위로, 팔면 아래로 시장충격
   let synthBase = 0; // 합성 흡수 시작가(첫 합성 때 ref)
@@ -1075,7 +1122,7 @@ export async function matchMarketOxOrder(
       synthIdx++;
       const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * synthIdx) / SYNTH_STEPS);
       const synthPrice = roundOx(Math.max(0.0001, synthBase * (1 + openAdverse * impact)));
-      maker = synthMaker(openMakerSide, synthPrice, synthChunk);
+      maker = synthMaker(BOT_USER_IDS[synthIdx % BOT_USER_IDS.length], openMakerSide, synthPrice, synthChunk);
       synthetic = true;
     }
 
@@ -1129,7 +1176,7 @@ export async function matchMarketOxOrder(
     filled += chunk;
     cost += price * chunk;
     feeTotal += chunkFee;
-    makerNotional.set(maker.user_id, (makerNotional.get(maker.user_id) ?? 0) + price * chunk);
+    addBotFill(makerFills, maker.user_id, price * chunk, chunk);
   }
 
   if (filled > EPS) {
@@ -1140,7 +1187,7 @@ export async function matchMarketOxOrder(
       ).bind(crypto.randomUUID(), uid, PAIR, side, cost / filled, filled, effLev, 'open', null, done),
       // 잔고는 청크마다 이미 정산됐으므로 여기선 누적 카운터+원장만(합계 1행 — 청크 수만큼 불어나지 않게)
       ...feeAccrualStmts(env, uid, PAIR, 'open', cost, feeRate, feeTotal, done),
-      ...(await botFeeStmts(env, makerNotional, done)),
+      ...(await botFillStmts(env, makerFills, openMakerSide, done)), // 봇은 유저 반대편(롱 진입이면 봇이 매도)
     ]);
   }
   return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
@@ -1176,7 +1223,7 @@ async function closePositionAgainstBook(
   // 요율은 이 청산 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 바뀔 수 있다).
   const closeFeeRate = await feeRateOf(env, uid);
   let closeFeeTotal = 0;
-  const closeMakerNotional = new Map<string, number>(); // 상대편 봇 수수료
+  const closeMakerFills = new Map<string, BotFill>(); // 상대편 봇 수수료 + 재고/현금 정산
   const makerSide: 'buy' | 'sell' = closeTaker === 'long' ? 'sell' : 'buy';
   const adverse = closeTaker === 'long' ? 1 : -1; // 사면(숏청산) 위로, 팔면(롱청산) 아래로 시장충격
   let synthBase = 0; // 합성 흡수 시작가(첫 합성 때 ref)
@@ -1198,7 +1245,7 @@ async function closePositionAgainstBook(
       synthIdx++;
       const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * synthIdx) / SYNTH_STEPS);
       const synthPrice = roundOx(Math.max(0.0001, synthBase * (1 + adverse * impact)));
-      maker = synthMaker(makerSide, synthPrice, synthChunk);
+      maker = synthMaker(BOT_USER_IDS[synthIdx % BOT_USER_IDS.length], makerSide, synthPrice, synthChunk);
       synthetic = true;
     }
 
@@ -1240,7 +1287,7 @@ async function closePositionAgainstBook(
     cost += fillPrice * chunk;
     pnlTotal += chunkPnl;
     closeFeeTotal += chunkFee;
-    closeMakerNotional.set(maker.user_id, (closeMakerNotional.get(maker.user_id) ?? 0) + fillPrice * chunk);
+    addBotFill(closeMakerFills, maker.user_id, fillPrice * chunk, chunk);
     if (fullyClosed) break;
   }
 
@@ -1258,7 +1305,7 @@ async function closePositionAgainstBook(
       ).bind(crypto.randomUUID(), uid, PAIR, pos.side, cost / filled, filled, pos.leverage, 'close', pnlTotal, done),
       // 잔고는 청크마다 이미 정산 — 여기선 누적 카운터+원장만(합계 1행)
       ...feeAccrualStmts(env, uid, PAIR, 'close', cost, closeFeeRate, closeFeeTotal, done),
-      ...(await botFeeStmts(env, closeMakerNotional, done)),
+      ...(await botFillStmts(env, closeMakerFills, makerSide, done)), // 롱 청산이면 유저가 팔고 봇이 산다(makerSide='buy')
     ]);
   }
   return { filled, avgPrice: filled > EPS ? cost / filled : 0 };

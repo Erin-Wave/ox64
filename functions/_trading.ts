@@ -85,6 +85,15 @@ async function liquidateIfBankrupt(
   }
   stmts.push(env.DB.prepare('UPDATE users SET balance = 0 WHERE id = ?').bind(uid));
   await env.DB.batch(stmts);
+
+  // ⚠ OX 강제청산도 상대편(봇)에겐 실제 체결이다 — 진입 때 봇이 팔았던 물량을 여기서 되사줘야
+  // 봇 재고가 "유저 전체 순포지션의 거울"로 유지된다. 이걸 빼면 유저가 청산될 때마다 봇 재고가
+  // 한쪽으로 영구히 어긋난다(진입 −수량은 기록되는데 청산 +수량이 영영 안 들어옴). 겸사겸사
+  // 청산 물량이 체결 테이프/차트에도 찍혀 실제 거래소처럼 "청산이 시장에 나온" 흔적이 남는다.
+  // 유저는 수수료를 안 내지만(위 참고) 봇은 낸다 — 봇 잔고는 무한 풀이라 실제로 걷히는 돈이다.
+  for (const pos of positions) {
+    await reflectVirtualFill(env, pos.symbol, uid, prices[pos.symbol]!, pos.side === 'long' ? 'sell' : 'buy', pos.size);
+  }
   return true;
 }
 
