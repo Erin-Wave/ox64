@@ -13,12 +13,16 @@ import {
   type Env,
   type PendingRow,
   type PositionRow,
+  type ConditionalRow,
   fetchPrices,
   isVirtualSymbol,
   feeRateOf,
   feeAccrualStmts,
+  unrealizedTotal,
 } from './_shared';
-import { matchLimitPendingAgainstBook, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
+import { matchLimitPendingAgainstBook, matchMarketOxOrder, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
+
+const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차(조건부 주문 부분체결 잔량 등)
 
 // OX/USDT 는 진짜 상대 거래자가 없으니, 지정가/SL·TP 체결도 합성 시장(호가창·체결내역·다음 봇
 // 기준가)에 반영해준다 — order.ts 의 reflectVirtualFill 과 동일한 이유(실패해도 무시, 표시용 부가효과).
@@ -164,8 +168,91 @@ async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark:
   await reflectVirtualFill(env, p.symbol, uid, p.limit_price, pos.side === 'long' ? 'sell' : 'buy', closeSize);
 }
 
+/** 조건부(스탑) 주문 정산 — 트리거 가격을 넘어서면 그 자리에서 **시장가**로 남은 수량만큼 진입한다.
+ * OX 는 봇 호가창 walking(matchMarketOxOrder), 실제 코인은 mark 가에 즉시 체결하되 **가용 증거금만큼만**
+ * 체결하고 못 채운 잔량은 조건을 살려둔다(size 를 줄임) — "예약 수량이 다 안 채워지면 계속 조건 유지".
+ * 트리거가 안 됐으면 아무것도 안 하고 그대로 대기. marks 는 크로스 가용(미실현손익) 계산용. */
+async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, mark: number, marks: Record<string, number>): Promise<void> {
+  const triggered = c.trigger_dir === 'above' ? mark >= c.trigger_price : mark <= c.trigger_price;
+  if (!triggered) return;
+
+  // OX/USDT — 봇 호가창을 walking 하며 있는 물량만 실제 호가 가격에 체결(내부에서 잔고/증거금/수수료/봇
+  // 재고·체결테이프·캔들까지 전부 정산). 부분 체결이면 filled 만큼만 나가고 잔량은 아래에서 조건 유지.
+  if (isVirtualSymbol(c.symbol)) {
+    const uPnL = await unrealizedTotal(env, uid, marks);
+    const { filled } = await matchMarketOxOrder(env, uid, c.side, c.size, c.leverage, null, null, uPnL);
+    const remaining = c.size - filled;
+    if (remaining <= EPS) {
+      await env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid).run();
+    } else if (filled > EPS) {
+      await env.DB.prepare('UPDATE conditional_orders SET size = ? WHERE id = ? AND user_id = ?').bind(remaining, c.id, uid).run();
+    }
+    return; // filled==0(감당 못 함/유동성 없음): 조건 그대로 유지 → 다음 폴링 재시도
+  }
+
+  // 실제 코인 — 외부 시세(mark)로 즉시 체결(무한 유동성). 단, 감당 가능한 만큼만 체결하고 잔량은 유지.
+  const price = mark;
+  const feeRate = await feeRateOf(env, uid);
+  const uPnL = await unrealizedTotal(env, uid, marks);
+  const user = await env.DB.prepare('SELECT balance FROM users WHERE id = ?').bind(uid).first<{ balance: number }>();
+  if (!user) return;
+  const existing = await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? AND symbol = ? AND side = ?')
+    .bind(uid, c.symbol, c.side)
+    .first<PositionRow>();
+  const effLev = existing ? existing.leverage : c.leverage; // 물타기 시 기존 포지션 레버리지 고정
+  const available = user.balance + uPnL;
+  const perUnit = price / effLev + price * feeRate; // 1코인당 드는 돈(증거금+수수료)
+  const affordable = perUnit > 0 ? (available * 0.999) / perUnit : 0;
+  const fillSize = Math.min(c.size, Math.max(0, affordable));
+  if (fillSize <= EPS) return; // 가용이 부족해 하나도 못 삼 → 조건 유지, 다음 폴링 재시도
+
+  const margin = (price * fillSize) / effLev;
+  const notional = price * fillSize;
+  const fee = notional * feeRate;
+  const now = Date.now();
+  const ordId = crypto.randomUUID();
+
+  // ⚠ 잔고 차감을 **먼저** 원자 가드로 확정하고, 성공했을 때만 포지션/원장을 기록한다 — batch 로 묶으면
+  // 잔고 가드가 0행이어도 포지션 INSERT 가 그대로 커밋돼 "증거금 없이 포지션만 생기는" 상태가 된다
+  // (D1 batch 는 조건부 UPDATE 0행을 실패로 안 봄 — editLimit 과 동일한 함정).
+  const charge = await env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?')
+    .bind(margin + fee, uid, margin + fee, -uPnL)
+    .run();
+  if (charge.meta.changes !== 1) return; // 레이스로 가용 부족 → 조건 유지
+
+  const stmts: D1PreparedStatement[] = [...feeAccrualStmts(env, uid, c.symbol, 'open', notional, feeRate, fee, now)];
+  if (existing) {
+    const newSize = existing.size + fillSize;
+    const newEntry = (existing.entry_price * existing.size + price * fillSize) / newSize;
+    stmts.push(
+      env.DB.prepare('UPDATE positions SET entry_price = ?, size = ?, margin = ? WHERE id = ? AND user_id = ?').bind(
+        newEntry,
+        newSize,
+        existing.margin + margin,
+        existing.id,
+        uid,
+      ),
+    );
+  } else {
+    stmts.push(
+      env.DB.prepare(
+        'INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), uid, c.symbol, c.side, price, fillSize, c.leverage, margin, now, null, null),
+    );
+  }
+  stmts.push(
+    env.DB.prepare(
+      'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+    ).bind(ordId, uid, c.symbol, c.side, price, fillSize, effLev, 'open', null, now),
+  );
+  const remaining = c.size - fillSize;
+  if (remaining <= EPS) stmts.push(env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid));
+  else stmts.push(env.DB.prepare('UPDATE conditional_orders SET size = ? WHERE id = ? AND user_id = ?').bind(remaining, c.id, uid));
+  await env.DB.batch(stmts);
+}
+
 // 반환값 = 이번에 받아온 마크가격 맵(loadState 로 넘겨 클라가 서버와 동일한 시세로 청산가/평가자산을
-// 즉시 계산하게 한다 — 추가 fetch 없이 재사용). 포지션/미체결이 없으면 빈 맵.
+// 즉시 계산하게 한다 — 추가 fetch 없이 재사용). 포지션/미체결/조건부가 없으면 빈 맵.
 export async function checkTriggers(env: Env, uid: string): Promise<Record<string, number>> {
   const pendings = (
     await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ?').bind(uid).all<PendingRow>()
@@ -173,9 +260,20 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
   const positions = (
     await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()
   ).results;
-  if (pendings.length === 0 && positions.length === 0) return {};
+  // 조건부(스탑) 주문 — 신규 테이블이라 배포 직후 아직 없을 수 있으므로 방어적으로 감싼다.
+  let conditionals: ConditionalRow[] = [];
+  try {
+    conditionals = (
+      await env.DB.prepare('SELECT * FROM conditional_orders WHERE user_id = ?').bind(uid).all<ConditionalRow>()
+    ).results;
+  } catch {
+    /* conditional_orders 테이블 미생성(마이그레이션 전) */
+  }
+  if (pendings.length === 0 && positions.length === 0 && conditionals.length === 0) return {};
 
-  const symbols = [...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol)])];
+  const symbols = [
+    ...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol), ...conditionals.map((c) => c.symbol)]),
+  ];
   const prices = await fetchPrices(env, symbols);
 
   if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return prices; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
@@ -316,6 +414,13 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
       ).bind(ordId, uid, pos.symbol, pos.side, trigger, pos.size, pos.leverage, 'close', pnl, now),
     ]);
     await reflectVirtualFill(env, pos.symbol, uid, trigger, pos.side === 'long' ? 'sell' : 'buy', pos.size);
+  }
+
+  // ── 조건부(스탑) 주문 트리거 ── 트리거 가격을 넘어서면 시장가로 진입(있는 만큼만, 잔량은 조건 유지).
+  for (const c of conditionals) {
+    const mark = prices[c.symbol];
+    if (mark == null) continue;
+    await settleConditionalOrder(env, uid, c, mark, prices);
   }
 
   return prices;

@@ -62,3 +62,32 @@ export function fmtUsd(v: number | null | undefined): string {
   if (v == null || !isFinite(v)) return '—';
   return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
+
+/** 퍼센트 값을 세자리 콤마 + 지정 소수자리로(예 ROE 1234.5 → "1,234.5"). % 기호는 호출부에서 붙인다.
+ * 고배율 ROE 는 수천~수만 %가 나와 콤마가 필요하다. */
+export function fmtPct(v: number | null | undefined, digits = 1): string {
+  if (v == null || !isFinite(v)) return '—';
+  return v.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+/** 편집 가능한 숫자 입력칸의 "표시값"에 세자리 콤마를 넣는다 — 상태(진실원본)는 콤마 없는 raw 문자열로
+ * 두고, value 로 넘길 때만 이걸 통과시킨다(onChange 에서는 unfmtNum 으로 콤마를 제거해 raw 로 저장).
+ * 정수부에만 콤마를 넣고 소수부·입력 중인 '.'·선행 '-' 는 그대로 둔다(부분 입력 "12." "0.00" 도 안 깨짐).
+ * 숫자로 변환하지 않고 문자열을 직접 다루므로 큰 수의 정밀도 손실도 없다. */
+export function fmtNumInput(s: string | number | null | undefined): string {
+  if (s == null) return '';
+  const cleaned = String(s).replace(/,/g, '');
+  if (cleaned === '') return '';
+  const neg = cleaned.startsWith('-') ? '-' : '';
+  const body = neg ? cleaned.slice(1) : cleaned;
+  const dot = body.indexOf('.');
+  const intPart = dot < 0 ? body : body.slice(0, dot);
+  const rest = dot < 0 ? '' : body.slice(dot); // '.' 포함
+  const grouped = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return `${neg}${grouped}${rest}`;
+}
+
+/** fmtNumInput 의 역 — 입력칸 onChange 에서 콤마를 제거해 raw 숫자 문자열로 되돌린다. */
+export function unfmtNum(s: string): string {
+  return s.replace(/,/g, '');
+}

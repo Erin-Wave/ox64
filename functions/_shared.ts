@@ -415,6 +415,17 @@ export interface OrderRow {
   pnl: number | null;
   created_at: number;
 }
+export interface ConditionalRow {
+  id: string;
+  user_id: string;
+  symbol: string;
+  side: string; // 'long' | 'short'
+  size: number; // 남은(미체결) 목표 수량
+  leverage: number;
+  trigger_price: number;
+  trigger_dir: string; // 'above'(>=) | 'below'(<=)
+  created_at: number;
+}
 
 /** 로그인 사용자의 전체 상태(잔고+포지션+주문) 조회.
  * marks: 이미 받아둔 마크가격 맵(대개 checkTriggers 가 방금 fetch 한 것) — 넘기면 그대로 재사용해
@@ -446,7 +457,20 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
       .bind(uid)
       .all<PendingRow>()
   ).results;
-  const heldSymbols = [...new Set([...positions.map((p) => p.symbol), ...pending.map((p) => p.symbol)])];
+  // 조건부(스탑) 주문 — 신규 테이블이라 배포 직후 아직 없을 수 있으므로 방어적으로 감싼다(없으면 빈 배열).
+  let conditionals: ConditionalRow[] = [];
+  try {
+    conditionals = (
+      await env.DB.prepare('SELECT * FROM conditional_orders WHERE user_id = ? ORDER BY created_at DESC')
+        .bind(uid)
+        .all<ConditionalRow>()
+    ).results;
+  } catch {
+    /* conditional_orders 테이블 미생성(마이그레이션 전) — 조건부 없음으로 처리 */
+  }
+  const heldSymbols = [
+    ...new Set([...positions.map((p) => p.symbol), ...pending.map((p) => p.symbol), ...conditionals.map((c) => c.symbol)]),
+  ];
   const markPrices = marks ?? (heldSymbols.length ? await fetchPrices(env, heldSymbols) : {});
   return {
     name: user.name,
@@ -496,6 +520,16 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
       takeProfit: p.take_profit,
       createdAt: p.created_at,
       reduceOnly: !!p.reduce_only,
+    })),
+    conditionalOrders: conditionals.map((c) => ({
+      id: c.id,
+      symbol: c.symbol,
+      side: c.side,
+      size: c.size,
+      leverage: c.leverage,
+      triggerPrice: c.trigger_price,
+      triggerDir: c.trigger_dir,
+      createdAt: c.created_at,
     })),
   };
 }

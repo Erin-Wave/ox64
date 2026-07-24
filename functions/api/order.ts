@@ -415,6 +415,47 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     return json(await loadState(env, uid, marks));
   }
 
+  // 조건부(스탑) 주문 생성 — 증거금을 미리 잠그지 않고(스탑 관행), 트리거 가격을 넘어서면 시장가로
+  // 진입한다(체결은 checkTriggers 의 settleConditionalOrder). 생성 직후 checkTriggers 를 한 번 돌려
+  // "이미 트리거 조건을 만족하는" 스탑은 그 자리에서 바로 체결시킨다(거래소 동일).
+  if (body.action === 'conditionalOpen') {
+    const { symbol, side } = body;
+    const size = Number(body.size);
+    const leverage = Math.round(Number(body.leverage));
+    let triggerPrice = Number(body.triggerPrice);
+    const triggerDir = body.triggerDir;
+    if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
+    if (side !== 'long' && side !== 'short') return bad('방향 오류');
+    if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
+    if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
+    if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
+    if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
+    if (isVirtualSymbol(symbol)) triggerPrice = Math.round(triggerPrice * 1e4) / 1e4; // OX 4자리 틱
+
+    const now = Date.now();
+    await env.DB.prepare(
+      'INSERT INTO conditional_orders (id, user_id, symbol, side, size, leverage, trigger_price, trigger_dir, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+    )
+      .bind(crypto.randomUUID(), uid, symbol, side, size, leverage, triggerPrice, triggerDir, now)
+      .run();
+
+    // 방금 넣은 조건부까지 포함해 평가(이미 트리거된 스탑이면 즉시 체결). marks 를 loadState 로 전달.
+    const marks = await checkTriggers(env, uid);
+    return json(await loadState(env, uid, marks));
+  }
+
+  if (body.action === 'cancelConditional') {
+    const marks = await checkTriggers(env, uid);
+    const conditionalId = typeof body.conditionalId === 'string' ? body.conditionalId : '';
+    const cond = await env.DB.prepare('SELECT id FROM conditional_orders WHERE id = ? AND user_id = ?')
+      .bind(conditionalId, uid)
+      .first<{ id: string }>();
+    if (!cond) return bad('주문을 찾을 수 없음', 404);
+    // 증거금을 잠그지 않았으므로 환불 없음, 행만 삭제.
+    await env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(conditionalId, uid).run();
+    return json(await loadState(env, uid, marks));
+  }
+
   if (body.action === 'setSlTp') {
     const marks = await checkTriggers(env, uid);
     const positionId = typeof body.positionId === 'string' ? body.positionId : '';

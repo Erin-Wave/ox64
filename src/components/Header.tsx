@@ -75,6 +75,7 @@ export default function Header({
           <span className="hidden text-[10px] text-muted sm:block">평가자산</span>
           <span className="mt-0 text-xs font-bold text-text sm:mt-0.5 sm:text-sm">
             {equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            <span className="ml-0.5 text-[10px] font-normal text-muted">USDT</span>
           </span>
         </div>
 

@@ -4,6 +4,7 @@ import {
   ApiError,
   type ApiOrder,
   type ApiPendingOrder,
+  type ApiConditionalOrder,
   type ApiPosition,
   type AppState,
   type SpotBookLevel,
@@ -34,6 +35,7 @@ interface TradingState {
   positions: ApiPosition[];
   orders: ApiOrder[];
   pendingOrders: ApiPendingOrder[];
+  conditionalOrders: ApiConditionalOrder[];
   // 서버가 내려준 보유 심볼 마크가격(크로스 가용 증거금 계산용 — 서버 강제청산/증거금 판정과 동일 시세).
   markPrices: Record<string, number>;
   busy: boolean;
@@ -70,6 +72,15 @@ interface TradingState {
   cancelLimit: (pendingId: string) => Promise<void>;
   editLimit: (pendingId: string, p: { limitPrice?: number; size?: number }) => Promise<void>;
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) => Promise<void>;
+  conditionalOpen: (p: {
+    symbol: string;
+    side: Side;
+    size: number;
+    leverage: number;
+    triggerPrice: number;
+    triggerDir: 'above' | 'below';
+  }) => Promise<void>;
+  cancelConditional: (conditionalId: string) => Promise<void>;
   refill: () => Promise<void>;
 
   spotRefresh: () => Promise<void>;
@@ -90,6 +101,7 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     positions: st.positions,
     orders: st.orders,
     pendingOrders: st.pendingOrders,
+    conditionalOrders: st.conditionalOrders ?? [],
     markPrices: st.markPrices ?? {},
     error: null,
   });
@@ -121,6 +133,7 @@ export const useTradingStore = create<TradingState>((set) => ({
   positions: [],
   orders: [],
   pendingOrders: [],
+  conditionalOrders: [],
   markPrices: {},
   busy: false,
   error: null,
@@ -181,6 +194,7 @@ export const useTradingStore = create<TradingState>((set) => ({
       positions: [],
       orders: [],
       pendingOrders: [],
+      conditionalOrders: [],
       markPrices: {},
       spotBook: { bids: [], asks: [] },
       spotTrades: [],
@@ -268,6 +282,28 @@ export const useTradingStore = create<TradingState>((set) => ({
     set({ busy: true, error: null });
     try {
       apply(set, await api.setSlTp(positionId, p));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  conditionalOpen: async (p) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.conditionalOpen(p));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  cancelConditional: async (conditionalId) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.cancelConditional(conditionalId));
     } catch (e) {
       set({ error: (e as Error).message });
     } finally {

@@ -64,6 +64,24 @@ CREATE INDEX IF NOT EXISTS idx_pending_user ON pending_orders(user_id);
 -- OX 호가창(loadSpotMarket UNION)·마켓메이커 sweep 이 매 폴링마다 symbol 로 조회하므로 인덱스를 둔다.
 CREATE INDEX IF NOT EXISTS idx_pending_symbol ON pending_orders(symbol);
 
+-- 조건부(스탑) 주문. 지정가와 달리 증거금을 미리 잠그지 않는다(스탑 주문 관행) — 트리거 가격을
+-- 넘어서면(trigger_dir='above' 면 mark>=trigger_price, 'below' 면 mark<=trigger_price) 그 자리에서
+-- **시장가**로 size 만큼 진입한다(checkTriggers, functions/_trading.ts). 시장가라 OX 는 봇 호가창을
+-- walking, 실제 코인은 mark 가에 즉시 체결하되 **가용 증거금만큼만** 체결하고 못 채운 잔량은 조건을
+-- 그대로 유지한다(size 를 줄이고 살려둠) → "예약 수량이 다 체결 안 되면 계속 조건이 살아있음".
+CREATE TABLE IF NOT EXISTS conditional_orders (
+  id            TEXT PRIMARY KEY,
+  user_id       TEXT NOT NULL,
+  symbol        TEXT NOT NULL,
+  side          TEXT NOT NULL,          -- 'long' | 'short' (진입 방향)
+  size          REAL NOT NULL,          -- 남은(미체결) 목표 수량 (부분 체결 시 줄어듦)
+  leverage      INTEGER NOT NULL,
+  trigger_price REAL NOT NULL,
+  trigger_dir   TEXT NOT NULL,          -- 'above'(가격이 이상이 되면) | 'below'(이하가 되면)
+  created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conditional_user ON conditional_orders(user_id);
+
 -- ── 가상 코인 현물 거래(OX/USDT, 예시 1종) — 외부 시세 없이 유저 대 유저 주문매칭 ──────
 -- 레버리지·마진 없음. 매수는 USDT(users.balance)를, 매도는 OX(users.ox_balance)를
 -- 주문 시점에 즉시 잠그고(조건부 UPDATE), functions/api/spot.ts 가 주문 직후 그 자리에서
@@ -211,3 +229,9 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- 생성된다(ALTER 불필요). 이미 실행했다면 "duplicate column name" 에러(무시 가능).
 -- ALTER TABLE users ADD COLUMN total_volume REAL NOT NULL DEFAULT 0;
 -- ALTER TABLE users ADD COLUMN total_fees REAL NOT NULL DEFAULT 0;
+
+-- ⚠ 마이그레이션 (2026-07-24 추가, 조건부(스탑) 주문): 위 conditional_orders 는 CREATE TABLE IF NOT
+-- EXISTS 라 `wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER
+-- 불필요). ⚠ **코드(loadState/checkTriggers)가 이 테이블을 SELECT 하므로 코드 배포 전에 먼저 생성돼
+-- 있어야 한다** — 없으면 /api/state 가 통째로 500 이 된다(loadState 는 방어적으로 try/catch 로 감싸
+-- 두긴 했으나, 그래도 배포 전에 테이블을 만들어 두는 게 원칙).

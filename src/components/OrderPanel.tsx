@@ -2,11 +2,12 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtUsd } from '@/format';
+import { fmtUsd, fmtNumInput, unfmtNum } from '@/format';
 import type { Side } from '@/types';
 
-type Tab = 'market' | 'limit';
+type Tab = 'market' | 'limit' | 'conditional';
 type Unit = 'coin' | 'usdt';
+type TriggerDir = 'above' | 'below';
 
 /** 주문 패널 (OKX 스타일). 체결가는 서버가 결정.
  * Easy 모드: 시장가만. Standard 모드: 시장가 + 지정가 + SL/TP. */
@@ -20,6 +21,7 @@ export default function OrderPanel() {
   const tradingMode = useSettingsStore((s) => s.tradingMode);
   const openMarket = useTradingStore((s) => s.openMarket);
   const limitOpen = useTradingStore((s) => s.limitOpen);
+  const conditionalOpen = useTradingStore((s) => s.conditionalOpen);
   const balance = useTradingStore((s) => s.balance);
   const busy = useTradingStore((s) => s.busy);
   const error = useTradingStore((s) => s.error);
@@ -34,6 +36,8 @@ export default function OrderPanel() {
   const [pct, setPct] = useState(0); // 수량 슬라이더(가용 잔고*레버리지 대비 비중, 0~100)
   const [leverage, setLeverage] = useState(10);
   const [limitPrice, setLimitPrice] = useState('');
+  const [triggerPrice, setTriggerPrice] = useState(''); // 조건부 주문 트리거 가격
+  const [triggerDir, setTriggerDir] = useState<TriggerDir>('above'); // 이 가격 이상/이하가 되면 시장가 진입
   const [useSlTp, setUseSlTp] = useState(false);
   const [stopLoss, setStopLoss] = useState('');
   const [takeProfit, setTakeProfit] = useState('');
@@ -49,9 +53,10 @@ export default function OrderPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [existingPosition?.leverage]);
 
-  // 지정가 탭을 처음 열 때 현재가로 기본값 채움
+  // 지정가/조건부 탭을 처음 열 때 현재가로 기본값 채움
   useEffect(() => {
     if (effectiveTab === 'limit' && !limitPrice && lastPrice) setLimitPrice(String(lastPrice));
+    if (effectiveTab === 'conditional' && !triggerPrice && lastPrice) setTriggerPrice(String(lastPrice));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveTab, lastPrice]);
 
@@ -61,13 +66,19 @@ export default function OrderPanel() {
   // priceTarget 이 '' 이 아니면 다른 입력칸(포지션의 청산 지정가)이 클릭을 가져간 상태다 — 여기선 무시.
   useEffect(() => {
     if (chartClickNonce === 0 || chartClickPrice == null || !standard) return;
-    if (tab !== 'limit' || priceTarget !== '') return;
-    setLimitPrice(String(chartClickPrice));
+    if (priceTarget !== '') return;
+    if (tab === 'limit') setLimitPrice(String(chartClickPrice));
+    else if (tab === 'conditional') setTriggerPrice(String(chartClickPrice));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartClickNonce]);
 
   const coin = symbol.replace('USDT', '');
-  const refPrice = effectiveTab === 'limit' ? Number(limitPrice) || lastPrice : lastPrice;
+  const refPrice =
+    effectiveTab === 'limit'
+      ? Number(limitPrice) || lastPrice
+      : effectiveTab === 'conditional'
+        ? Number(triggerPrice) || lastPrice
+        : lastPrice;
 
   const parseSlTp = () => ({
     stopLoss: useSlTp && stopLoss ? Number(stopLoss) : null,
@@ -77,6 +88,12 @@ export default function OrderPanel() {
   const submit = (side: Side) => {
     const sz = Number(size);
     if (!sz || sz <= 0 || busy) return;
+    if (effectiveTab === 'conditional') {
+      const tpx = Number(triggerPrice);
+      if (!tpx || tpx <= 0) return;
+      conditionalOpen({ symbol, side, size: sz, leverage, triggerPrice: tpx, triggerDir });
+      return;
+    }
     const { stopLoss: sl, takeProfit: tp } = parseSlTp();
     if (effectiveTab === 'limit') {
       const lp = Number(limitPrice);
@@ -115,17 +132,20 @@ export default function OrderPanel() {
     if (!refPrice) return;
     const costPerNotional = 1 / leverage + feeRate;
     const sz = (available * fraction * SAFETY) / costPerNotional / refPrice;
-    setSize(sz > 0 ? sz.toFixed(6) : '0');
+    // Number() 로 뒷자리 0 을 떨궈(55000000.000000 → 55000000) 표시가 깔끔하게(입력칸은 콤마도 붙는다).
+    setSize(sz > 0 ? String(Number(sz.toFixed(6))) : '0');
   };
 
-  // 수량 입력값 표시 단위 변환(코인 ↔ USDT). size(코인) 는 그대로 두고 표시만 바꾼다.
-  const displaySize = unit === 'coin' ? size : refPrice ? (Number(size || 0) * refPrice).toFixed(2) : '';
+  // 수량 입력값 표시 단위 변환(코인 ↔ USDT). size(코인) 는 raw 로 두고 표시만 바꾼다(콤마 포함).
+  const rawDisplay = unit === 'coin' ? size : refPrice ? (Number(size || 0) * refPrice).toFixed(2) : '';
+  const displaySize = fmtNumInput(rawDisplay);
   const onSizeInput = (v: string) => {
+    const raw = unfmtNum(v); // 표시용 콤마 제거 → raw 숫자 문자열
     if (unit === 'coin') {
-      setSize(v);
+      setSize(raw);
     } else if (refPrice) {
-      const usdt = Number(v);
-      setSize(usdt > 0 ? (usdt / refPrice).toFixed(6) : '0');
+      const usdt = Number(raw);
+      setSize(usdt > 0 ? String(Number((usdt / refPrice).toFixed(6))) : '0');
     }
   };
   const toggleUnit = () => setUnit((u) => (u === 'coin' ? 'usdt' : 'coin'));
@@ -151,6 +171,14 @@ export default function OrderPanel() {
           >
             지정가
           </button>
+          <button
+            onClick={() => setTab('conditional')}
+            className={`flex-1 rounded py-1 text-center font-semibold transition ${
+              effectiveTab === 'conditional' ? 'bg-elevated text-text' : 'text-muted hover:text-text'
+            }`}
+          >
+            조건부
+          </button>
         </div>
       ) : (
         <div className="flex gap-1 rounded-md bg-panel2 p-1 text-xs">
@@ -164,14 +192,54 @@ export default function OrderPanel() {
           <label className="mb-1 block text-xs text-muted">지정가</label>
           <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
             <input
-              value={limitPrice}
-              onChange={(e) => setLimitPrice(e.target.value)}
+              value={fmtNumInput(limitPrice)}
+              onChange={(e) => setLimitPrice(unfmtNum(e.target.value))}
               onFocus={() => setPriceTarget('')} // 차트 클릭 가격을 이 칸으로 되돌린다
               inputMode="decimal"
               className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none"
             />
             <span className="px-3 text-xs text-muted">USDT</span>
           </div>
+        </div>
+      )}
+
+      {/* 조건부(스탑) — 트리거 방향(이상/이하) + 트리거 가격. 넘어서면 시장가로 진입한다. */}
+      {effectiveTab === 'conditional' && (
+        <div>
+          <label className="mb-1 block text-xs text-muted">트리거 조건</label>
+          <div className="mb-1.5 flex gap-1 rounded-md bg-panel2 p-1 text-xs">
+            <button
+              onClick={() => setTriggerDir('above')}
+              className={`flex-1 rounded py-1 text-center font-semibold transition ${
+                triggerDir === 'above' ? 'bg-elevated text-up' : 'text-muted hover:text-text'
+              }`}
+            >
+              가격 이상 ≥
+            </button>
+            <button
+              onClick={() => setTriggerDir('below')}
+              className={`flex-1 rounded py-1 text-center font-semibold transition ${
+                triggerDir === 'below' ? 'bg-elevated text-down' : 'text-muted hover:text-text'
+              }`}
+            >
+              가격 이하 ≤
+            </button>
+          </div>
+          <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+            <input
+              value={fmtNumInput(triggerPrice)}
+              onChange={(e) => setTriggerPrice(unfmtNum(e.target.value))}
+              onFocus={() => setPriceTarget('')} // 차트 클릭 가격을 이 칸으로 되돌린다
+              inputMode="decimal"
+              placeholder="트리거 가격"
+              className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none placeholder:text-muted"
+            />
+            <span className="px-3 text-xs text-muted">USDT</span>
+          </div>
+          <p className="mt-1 text-[10px] leading-tight text-muted">
+            현재가가 트리거 가격 {triggerDir === 'above' ? '이상' : '이하'}이 되면 <span className="text-text">시장가</span>로 진입합니다.
+            물량이 부족해 일부만 체결되면 나머지는 조건이 계속 살아있습니다.
+          </p>
         </div>
       )}
 
@@ -239,8 +307,8 @@ export default function OrderPanel() {
         </div>
       </div>
 
-      {/* SL / TP (Standard 전용) */}
-      {standard && (
+      {/* SL / TP (Standard 전용, 조건부 주문 제외 — 조건부는 진입만 예약) */}
+      {standard && effectiveTab !== 'conditional' && (
         <div>
           <label className="mb-1 flex cursor-pointer items-center gap-2 text-xs text-muted">
             <input
@@ -255,8 +323,8 @@ export default function OrderPanel() {
             <div className="grid grid-cols-2 gap-2">
               <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
                 <input
-                  value={stopLoss}
-                  onChange={(e) => setStopLoss(e.target.value)}
+                  value={fmtNumInput(stopLoss)}
+                  onChange={(e) => setStopLoss(unfmtNum(e.target.value))}
                   inputMode="decimal"
                   placeholder="손절가"
                   className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
@@ -264,8 +332,8 @@ export default function OrderPanel() {
               </div>
               <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
                 <input
-                  value={takeProfit}
-                  onChange={(e) => setTakeProfit(e.target.value)}
+                  value={fmtNumInput(takeProfit)}
+                  onChange={(e) => setTakeProfit(unfmtNum(e.target.value))}
                   inputMode="decimal"
                   placeholder="익절가"
                   className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"

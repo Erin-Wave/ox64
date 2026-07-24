@@ -2,10 +2,10 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtPrice, fmtQty, fmtUsd } from '@/format';
+import { fmtPrice, fmtQty, fmtUsd, fmtPct, fmtNumInput, unfmtNum } from '@/format';
 import type { ApiOrder } from '@/services/api';
 
-type Tab = 'positions' | 'pending' | 'history';
+type Tab = 'positions' | 'pending' | 'conditional' | 'history';
 
 const KIND_LABEL: Record<ApiOrder['kind'], string> = { open: '진입', close: '청산', liquidation: '강제청산' };
 // sv-SE 로케일은 'YYYY-MM-DD HH:mm:ss' 형식으로 떨어져서 KST 타임존 지정과 함께 편하게 재사용.
@@ -16,11 +16,13 @@ const fmtTime = (ms: number) => new Date(ms).toLocaleString('sv-SE', { timeZone:
 export default function PositionsPanel() {
   const positions = useTradingStore((s) => s.positions);
   const pendingOrders = useTradingStore((s) => s.pendingOrders);
+  const conditionalOrders = useTradingStore((s) => s.conditionalOrders);
   const orders = useTradingStore((s) => s.orders);
   const balance = useTradingStore((s) => s.balance);
   const closePosition = useTradingStore((s) => s.closePosition);
   const limitClose = useTradingStore((s) => s.limitClose);
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
+  const cancelConditional = useTradingStore((s) => s.cancelConditional);
   const editLimit = useTradingStore((s) => s.editLimit);
   const setSlTp = useTradingStore((s) => s.setSlTp);
   const busy = useTradingStore((s) => s.busy);
@@ -142,6 +144,7 @@ export default function PositionsPanel() {
       <div className="flex items-center gap-1 border-b border-border px-2 py-1.5">
         {tabBtn('positions', `포지션 (${positions.length})`)}
         {standard && tabBtn('pending', `미체결 (${pendingOrders.length})`)}
+        {standard && tabBtn('conditional', `조건부 (${conditionalOrders.length})`)}
         {tabBtn('history', '주문내역')}
       </div>
 
@@ -211,15 +214,15 @@ export default function PositionsPanel() {
                           {editing ? (
                             <div className="flex items-center justify-end gap-1">
                               <input
-                                value={editSl}
-                                onChange={(e) => setEditSl(e.target.value)}
+                                value={fmtNumInput(editSl)}
+                                onChange={(e) => setEditSl(unfmtNum(e.target.value))}
                                 placeholder="SL"
                                 inputMode="decimal"
                                 className="w-16 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
                               />
                               <input
-                                value={editTp}
-                                onChange={(e) => setEditTp(e.target.value)}
+                                value={fmtNumInput(editTp)}
+                                onChange={(e) => setEditTp(unfmtNum(e.target.value))}
                                 placeholder="TP"
                                 inputMode="decimal"
                                 className="w-16 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
@@ -263,7 +266,7 @@ export default function PositionsPanel() {
                             {fmtUsd(pnl)}
                             <span className="ml-1 text-[10px] opacity-80">
                               ({pos ? '+' : ''}
-                              {roe?.toFixed(1)}%)
+                              {fmtPct(roe)}%)
                             </span>
                           </>
                         )}
@@ -273,16 +276,18 @@ export default function PositionsPanel() {
                           {standard && (
                             <>
                               <input
-                                value={closeAmt[p.id] ?? ''}
-                                onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: e.target.value }))}
+                                value={fmtNumInput(closeAmt[p.id] ?? '')}
+                                onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: unfmtNum(e.target.value) }))}
                                 placeholder={fmtQty(p.size)}
                                 inputMode="decimal"
                                 title="청산 수량(비우면 전량)"
-                                className="w-14 rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                                // 보유 수량 텍스트 길이에 맞춰 폭을 잡는다(콤마 포함 자릿수 + 패딩). 너무 짧던 w-14 대체.
+                                style={{ width: `calc(${Math.max(5, fmtQty(p.size).length)}ch + 1.25rem)` }}
+                                className="rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
                               />
                               <input
-                                value={closePx[p.id] ?? ''}
-                                onChange={(e) => setClosePx((s) => ({ ...s, [p.id]: e.target.value }))}
+                                value={fmtNumInput(closePx[p.id] ?? '')}
+                                onChange={(e) => setClosePx((s) => ({ ...s, [p.id]: unfmtNum(e.target.value) }))}
                                 onFocus={() => setPriceTarget(`close:${p.id}`)} // 차트 클릭 가격을 이 칸으로
                                 placeholder="시장가"
                                 inputMode="decimal"
@@ -362,8 +367,8 @@ export default function PositionsPanel() {
                       <td className="px-3 py-2.5 text-right text-text">
                         {pe ? (
                           <input
-                            value={editPendPx}
-                            onChange={(e) => setEditPendPx(e.target.value)}
+                            value={fmtNumInput(editPendPx)}
+                            onChange={(e) => setEditPendPx(unfmtNum(e.target.value))}
                             placeholder="지정가"
                             inputMode="decimal"
                             className="w-20 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
@@ -375,8 +380,8 @@ export default function PositionsPanel() {
                       <td className="px-3 py-2.5 text-right text-text">
                         {pe ? (
                           <input
-                            value={editPendSize}
-                            onChange={(e) => setEditPendSize(e.target.value)}
+                            value={fmtNumInput(editPendSize)}
+                            onChange={(e) => setEditPendSize(unfmtNum(e.target.value))}
                             placeholder="수량"
                             inputMode="decimal"
                             className="w-20 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
@@ -426,6 +431,65 @@ export default function PositionsPanel() {
                     </tr>
                   );
                 })}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+      {tab === 'conditional' &&
+        (conditionalOrders.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-xs text-muted">
+            조건부(스탑) 주문이 없습니다
+          </div>
+        ) : (
+          <div className="flex-1 overflow-auto">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-panel text-muted">
+                <tr className="text-left">
+                  <th className="px-3 py-2 font-medium">심볼</th>
+                  <th className="px-3 py-2 font-medium">방향</th>
+                  <th className="px-3 py-2 text-right font-medium">트리거 조건</th>
+                  <th className="px-3 py-2 text-right font-medium">남은 수량</th>
+                  <th className="px-3 py-2" />
+                </tr>
+              </thead>
+              <tbody>
+                {conditionalOrders.map((c) => (
+                  <tr key={c.id} className="border-b border-border/60">
+                    <td className="px-3 py-2.5 font-medium text-text">
+                      <button
+                        onClick={() => setSymbol(c.symbol)}
+                        title={`${c.symbol.replace('USDT', '')} 차트로 이동`}
+                        className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
+                      >
+                        {c.symbol.replace('USDT', '')}
+                      </button>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                          c.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
+                        }`}
+                      >
+                        {c.side === 'long' ? '롱' : '숏'} 진입 {c.leverage}x
+                      </span>
+                    </td>
+                    <td className="px-3 py-2.5 text-right text-text">
+                      <span className="text-muted">{c.triggerDir === 'above' ? '≥ ' : '≤ '}</span>
+                      {fmtPrice(c.triggerPrice, precisionOf(precisions, c.symbol))}
+                    </td>
+                    <td className="px-3 py-2.5 text-right text-text">{fmtQty(c.size)}</td>
+                    <td className="px-3 py-2.5 text-right">
+                      <button
+                        onClick={() => cancelConditional(c.id)}
+                        disabled={busy}
+                        className="rounded border border-border px-2 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
+                      >
+                        취소
+                      </button>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
