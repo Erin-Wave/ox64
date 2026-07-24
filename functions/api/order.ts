@@ -98,7 +98,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 수량 상한 = 1e15 (싼 코인은 정상적으로 수십억 개를 거래한다 — 예전 1,000,000 캡은 PEPE 등에서
     // "수량 오류"를 유발했다. 실제 한도는 증거금 <= 잔고 조건이 잡아준다; 이 캡은 부동소수 폭주 방지용).
     if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
-    if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
+    if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
 
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
@@ -310,7 +310,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
     if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
-    if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
+    if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
     if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
     // OX 는 4자리 틱(0.0001) 정합성 유지 — 유저가 더 세밀한 지정가를 넣어도 호가창/체결이 4자리를 넘지 않게.
     if (isVirtualSymbol(symbol)) limitPrice = Math.round(limitPrice * 1e4) / 1e4;
@@ -427,7 +427,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
     if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
-    if (!(leverage >= 1 && leverage <= 125)) return bad('레버리지 1~125');
+    if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
     if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
     if (isVirtualSymbol(symbol)) triggerPrice = Math.round(triggerPrice * 1e4) / 1e4; // OX 4자리 틱

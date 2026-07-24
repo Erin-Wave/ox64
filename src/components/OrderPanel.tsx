@@ -126,7 +126,7 @@ export default function OrderPanel() {
   // 증거금이 가용을 살짝 넘어 주문이 거부되는 경우가 있어 0.1% 여유를 둔다.
   // ⚠ 서버 가드는 `증거금 + 수수료 <= 가용` 이므로 수수료도 넣고 역산해야 한다. 명목가 1 당 드는 돈은
   // (1/leverage + feeRate) 이므로 명목가 = 가용 / (1/leverage + feeRate). 수수료를 빼먹으면 고배율에서
-  // 슬라이더 100% 가 그대로 거부된다(125배면 수수료가 증거금의 ~3.75% 라 0.1% 여유로는 못 덮는다).
+  // 슬라이더 100% 가 그대로 거부된다(200배면 수수료가 증거금의 ~6% 라 0.1% 여유로는 못 덮는다).
   const SAFETY = 0.999;
   const applyPct = (fraction: number) => {
     if (!refPrice) return;
@@ -255,7 +255,7 @@ export default function OrderPanel() {
         <input
           type="range"
           min={1}
-          max={125}
+          max={200}
           value={leverage}
           disabled={!!existingPosition}
           onChange={(e) => setLeverage(Number(e.target.value))}
