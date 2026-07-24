@@ -646,7 +646,9 @@ export default function Chart() {
     const sub = klineStream(symbol, interval).subscribe({
       next: (tick) => {
         setConnected(true);
-        setPrice(symbol, tick.candle.close);
+        // ⚠ 실제 코인의 mark(현재가/PnL 기준)는 바이낸스 WS 가 아니라 OKX(useMarkPrices)로 온다 —
+        // 서버 체결가가 OKX 라 여기서 바이낸스 close 로 덮어쓰면 진입 즉시 손익/평단이 튄다(§ useMarkPrices).
+        // 캔들 자체는 바이낸스 그대로 그린다(아래). setPrice 는 하지 않는다.
         const bar = tick.candle;
         candle.update({ time: toChart(bar.time), open: bar.open, high: bar.high, low: bar.low, close: bar.close });
         const vc = volColors(chartColors(useSettingsStore.getState().theme, optsRef.current.colorScheme));
