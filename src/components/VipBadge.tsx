@@ -1,4 +1,4 @@
-import { fmtBig, fmtFeeRate } from '@/format';
+import { fmtKor, fmtFeeRate } from '@/format';
 
 /**
  * VIP 등급 뱃지. 등급은 **누적 거래대금(레버리지가 곱해진 명목금액)** 으로 결정되며 서버가 파생해
@@ -44,8 +44,8 @@ export default function VipBadge({
   const style = TIER_STYLE[Math.max(0, Math.min(TIER_STYLE.length - 1, tier))];
   const parts: string[] = [`VIP${tier}`];
   if (feeRate != null) parts.push(`거래 수수료 ${fmtFeeRate(feeRate)}%`);
-  if (totalVolume != null) parts.push(`누적 거래대금 ${fmtBig(totalVolume)} USDT`);
-  if (nextAt != null && totalVolume != null) parts.push(`다음 등급까지 ${fmtBig(Math.max(0, nextAt - totalVolume))} USDT`);
+  if (totalVolume != null) parts.push(`누적 거래대금 ${fmtKor(totalVolume)} USDT`);
+  if (nextAt != null && totalVolume != null) parts.push(`다음 등급까지 ${fmtKor(Math.max(0, nextAt - totalVolume))} USDT`);
   else if (nextAt == null) parts.push('최고 등급');
 
   const cls = `shrink-0 rounded px-1.5 py-0.5 text-[10px] font-extrabold leading-none ring-1 ${style} ${className}`;
