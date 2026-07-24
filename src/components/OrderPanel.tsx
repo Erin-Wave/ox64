@@ -31,7 +31,11 @@ export default function OrderPanel() {
   const vipTier = useTradingStore((s) => s.vipTier);
 
   const [tab, setTab] = useState<Tab>('market');
-  const [size, setSize] = useState('0.01'); // 항상 코인 수량이 진실원본, unit 은 표시만 바꿈
+  // ⚠ 입력칸의 raw 문자열(현재 unit 기준)이 진실원본 — 코인 수량은 sizeCoin 으로 파생한다. 예전엔 코인 수량을
+  // 상태로 두고 USDT 표시를 (코인×가격)으로 매번 재계산했는데, 그 왕복(coin→toFixed(6)→usdt)에서 정밀도가
+  // 깨져 USDT 로 입력하면 타이핑이 엉뚱한 값으로 튀었다(예: BTC 에 "1 USDT" → 0.98 로 표시). 이제 입력칸엔
+  // 사용자가 친 값을 그대로 두고 sizeCoin 만 파생하므로 USDT 입력이 정상 동작한다.
+  const [amtInput, setAmtInput] = useState('0.01');
   const [unit, setUnit] = useState<Unit>('coin');
   const [pct, setPct] = useState(0); // 수량 슬라이더(가용 잔고*레버리지 대비 비중, 0~100)
   const [leverage, setLeverage] = useState(10);
@@ -80,13 +84,17 @@ export default function OrderPanel() {
         ? Number(triggerPrice) || lastPrice
         : lastPrice;
 
+  // 주문에 쓰는 코인 수량(진실원본은 입력칸 문자열 amtInput). USDT 단위면 현재 기준가로 나눠 코인으로 환산.
+  const amtNum = Number(amtInput || 0);
+  const sizeCoin = unit === 'coin' ? amtNum : refPrice ? amtNum / refPrice : 0;
+
   const parseSlTp = () => ({
     stopLoss: useSlTp && stopLoss ? Number(stopLoss) : null,
     takeProfit: useSlTp && takeProfit ? Number(takeProfit) : null,
   });
 
   const submit = (side: Side) => {
-    const sz = Number(size);
+    const sz = sizeCoin;
     if (!sz || sz <= 0 || busy) return;
     if (effectiveTab === 'conditional') {
       const tpx = Number(triggerPrice);
@@ -104,7 +112,7 @@ export default function OrderPanel() {
     }
   };
 
-  const notional = refPrice ? refPrice * Number(size || 0) : 0;
+  const notional = refPrice ? refPrice * sizeCoin : 0;
   const margin = notional / leverage;
   // 진입 수수료 = 명목가 × VIP 수수료율(서버가 체결 시 실제로 떼는 값과 같은 식). 청산할 때 한 번 더 든다.
   const fee = notional * feeRate;
@@ -128,27 +136,28 @@ export default function OrderPanel() {
   // (1/leverage + feeRate) 이므로 명목가 = 가용 / (1/leverage + feeRate). 수수료를 빼먹으면 고배율에서
   // 슬라이더 100% 가 그대로 거부된다(200배면 수수료가 증거금의 ~6% 라 0.1% 여유로는 못 덮는다).
   const SAFETY = 0.999;
+  // Number() 로 뒷자리 0 을 떨군다(55000000.000000 → 55000000). 코인은 최대 6자리, USDT 는 2자리로 표기.
+  const trimNum = (n: number, d: number) => (n > 0 ? String(Number(n.toFixed(d))) : '0');
   const applyPct = (fraction: number) => {
     if (!refPrice) return;
     const costPerNotional = 1 / leverage + feeRate;
-    const sz = (available * fraction * SAFETY) / costPerNotional / refPrice;
-    // Number() 로 뒷자리 0 을 떨궈(55000000.000000 → 55000000) 표시가 깔끔하게(입력칸은 콤마도 붙는다).
-    setSize(sz > 0 ? String(Number(sz.toFixed(6))) : '0');
+    const szCoin = (available * fraction * SAFETY) / costPerNotional / refPrice; // 코인 수량
+    // 슬라이더는 현재 unit 에 맞는 값으로 입력칸에 채운다(USDT 모드면 명목가로).
+    setAmtInput(unit === 'coin' ? trimNum(szCoin, 6) : trimNum(szCoin * refPrice, 2));
   };
 
-  // 수량 입력값 표시 단위 변환(코인 ↔ USDT). size(코인) 는 raw 로 두고 표시만 바꾼다(콤마 포함).
-  const rawDisplay = unit === 'coin' ? size : refPrice ? (Number(size || 0) * refPrice).toFixed(2) : '';
-  const displaySize = fmtNumInput(rawDisplay);
-  const onSizeInput = (v: string) => {
-    const raw = unfmtNum(v); // 표시용 콤마 제거 → raw 숫자 문자열
-    if (unit === 'coin') {
-      setSize(raw);
-    } else if (refPrice) {
-      const usdt = Number(raw);
-      setSize(usdt > 0 ? String(Number((usdt / refPrice).toFixed(6))) : '0');
+  // 입력칸 표시값(콤마 포함) — amtInput 을 그대로 보여준다(왕복 재계산 안 함 → USDT 입력이 안 깨진다).
+  const displaySize = fmtNumInput(amtInput);
+  const onSizeInput = (v: string) => setAmtInput(unfmtNum(v));
+  // 단위 전환 시 입력칸 값을 새 단위로 1회 환산한다(현재 수량 유지). 가격이 없으면 값만 유지.
+  const toggleUnit = () => {
+    const next: Unit = unit === 'coin' ? 'usdt' : 'coin';
+    if (refPrice && amtNum > 0) {
+      const converted = unit === 'coin' ? amtNum * refPrice : amtNum / refPrice;
+      setAmtInput(next === 'usdt' ? trimNum(converted, 2) : trimNum(converted, 6));
     }
+    setUnit(next);
   };
-  const toggleUnit = () => setUnit((u) => (u === 'coin' ? 'usdt' : 'coin'));
 
   return (
     <div className="flex h-full flex-col gap-2 p-2.5">
