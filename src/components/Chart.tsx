@@ -91,7 +91,9 @@ export default function Chart() {
   const orders = useTradingStore((s) => s.orders);
   const positions = useTradingStore((s) => s.positions);
   const pendingOrders = useTradingStore((s) => s.pendingOrders);
+  const conditionalOrders = useTradingStore((s) => s.conditionalOrders);
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
+  const cancelConditional = useTradingStore((s) => s.cancelConditional);
   const balance = useTradingStore((s) => s.balance);
   const prices = useMarketStore((s) => s.prices);
 
@@ -123,8 +125,9 @@ export default function Chart() {
   const countdownPosRef = useRef<{ top: number; width: number; up: boolean } | null>(null);
   const repositionCountdownRef = useRef<() => void>(() => {});
 
-  // 미체결(지정가) 주문선 옆의 취소(X) 버튼 위치 — 각 주문 지정가의 y좌표에 얹는다(카운트다운과 동일 패턴).
-  type PendBtn = { id: string; top: number; axisW: number; sell: boolean; reduceOnly: boolean; label: string };
+  // 미체결(지정가)·조건부 주문선 옆의 취소(X) 버튼 위치 — 각 주문 가격의 y좌표에 얹는다(카운트다운과 동일 패턴).
+  // conditional=true 면 조건부(스탑) 주문(취소는 cancelConditional 로 라우팅, 앰버색으로 구분).
+  type PendBtn = { id: string; top: number; axisW: number; sell: boolean; reduceOnly: boolean; conditional: boolean; label: string };
   const [pendBtns, setPendBtns] = useState<PendBtn[]>([]);
   const pendBtnsRef = useRef<PendBtn[]>([]);
   const repositionPendBtnsRef = useRef<() => void>(() => {});
@@ -177,7 +180,22 @@ export default function Chart() {
         axisW,
         sell: o.side === 'short',
         reduceOnly: o.reduceOnly,
+        conditional: false,
         label: `${o.reduceOnly ? '청산 ' : ''}${o.side === 'long' ? '매수' : '매도'} ${fmtQty(o.size)}`,
+      });
+    }
+    for (const c2 of conditionalOrders) {
+      if (c2.symbol !== symbol) continue;
+      const y = c.priceToCoordinate(c2.triggerPrice);
+      if (y == null) continue;
+      next.push({
+        id: c2.id,
+        top: y as number,
+        axisW,
+        sell: c2.side === 'short',
+        reduceOnly: false,
+        conditional: true,
+        label: `조건부 ${c2.side === 'long' ? '롱' : '숏'} ${c2.triggerDir === 'above' ? '≥' : '≤'} ${fmtQty(c2.size)}`,
       });
     }
     const prev = pendBtnsRef.current;
@@ -789,9 +807,22 @@ export default function Chart() {
           }),
         );
       }
+      // ── 조건부(스탑) 주문 수평선 — 트리거 가격에. 지정가/SL·TP(녹/적)와 구분되게 앰버색·점선. ──
+      for (const cd of conditionalOrders.filter((o) => o.symbol === symbol)) {
+        priceLines.current.push(
+          c.createPriceLine({
+            price: cd.triggerPrice,
+            color: '#f0b90b',
+            lineWidth: 1,
+            lineStyle: LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: `조건부 ${cd.side === 'long' ? '롱' : '숏'} ${cd.triggerDir === 'above' ? '≥' : '≤'} ${fmtQty(cd.size)}`,
+          }),
+        );
+      }
     }
     repositionPendBtnsRef.current(); // 주문선이 바뀌면 취소(X) 버튼 위치도 즉시 갱신
-  }, [positions, pendingOrders, prices, balance, symbol, opts.positionLine, opts.slTpLines, opts.pendingLine]);
+  }, [positions, pendingOrders, conditionalOrders, prices, balance, symbol, opts.positionLine, opts.slTpLines, opts.pendingLine]);
 
   // ── 다음 봉 카운트다운 ───────────────────────────────────────
   useEffect(() => {
@@ -989,18 +1020,20 @@ export default function Chart() {
             </span>
           </div>
         )}
-        {/* 미체결 지정가 주문선 옆 취소(X) 버튼 — 각 주문 지정가의 y좌표, 우측 가격축 바로 왼쪽에 얹는다. */}
+        {/* 미체결 지정가·조건부 주문선 옆 취소(X) 버튼 — 각 주문 가격의 y좌표, 우측 가격축 바로 왼쪽에 얹는다. */}
         {opts.pendingLine &&
           pendBtns.map((b) => (
             <button
               key={b.id}
-              onClick={() => cancelLimit(b.id)}
+              onClick={() => (b.conditional ? cancelConditional(b.id) : cancelLimit(b.id))}
               title={`${b.label} — 클릭하면 취소`}
               style={{ top: b.top - 8, right: b.axisW + 3 }}
               className={`pointer-events-auto absolute z-20 flex h-4 w-4 items-center justify-center rounded-sm text-[11px] font-bold leading-none ring-1 transition ${
-                b.sell
-                  ? 'bg-downDim text-down ring-down/40 hover:bg-down hover:text-white'
-                  : 'bg-upDim text-up ring-up/40 hover:bg-up hover:text-white'
+                b.conditional
+                  ? 'bg-[#f0b90b]/15 text-[#f0b90b] ring-[#f0b90b]/40 hover:bg-[#f0b90b] hover:text-black'
+                  : b.sell
+                    ? 'bg-downDim text-down ring-down/40 hover:bg-down hover:text-white'
+                    : 'bg-upDim text-up ring-up/40 hover:bg-up hover:text-white'
               }`}
             >
               ×
