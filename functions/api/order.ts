@@ -280,11 +280,22 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     const size = Number(body.size);
     let limitPrice = Number(body.limitPrice);
-    if (!(size > 0) || !isFinite(size) || size > pos.size + 1e-9) return bad('청산 수량 오류');
+    if (!(size > 0) || !isFinite(size)) return bad('청산 수량 오류');
     if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
     if (isVirtualSymbol(pos.symbol)) limitPrice = Math.round(limitPrice * 1e4) / 1e4; // OX 4자리 틱
 
     const closeSide = pos.side === 'long' ? 'short' : 'long'; // 롱 청산=매도(short), 숏 청산=매수(long)
+    // ⚠ 청산 가능 수량 = 보유수량 − 이미 걸어둔 지정가 청산(reduce-only) 합. 예전엔 `size > pos.size` 로만
+    // 검증해서, 100 짜리 포지션에 청산 예약 100 을 여러 번 쌓아 보유량을 초과하는 청산 주문이 가능했다
+    // (원웨이 모드라 symbol+closeSide 의 reduce_only 는 전부 이 포지션이 대상). 예약분을 빼고 검증한다.
+    const reservedRow = await env.DB.prepare(
+      'SELECT COALESCE(SUM(size), 0) AS reserved FROM pending_orders WHERE user_id = ? AND symbol = ? AND side = ? AND reduce_only = 1',
+    )
+      .bind(uid, pos.symbol, closeSide)
+      .first<{ reserved: number }>();
+    const closable = pos.size - (reservedRow?.reserved ?? 0);
+    if (size > closable + 1e-9) return bad('청산 가능 수량을 초과합니다 (이미 예약된 지정가 청산 포함)');
+
     const now = Date.now();
     const pendingId = crypto.randomUUID();
     // reduce_only=1, margin=0(증거금 안 잠금), SL/TP 없음(청산 주문엔 불필요).
@@ -388,7 +399,22 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (isVirtualSymbol(pending.symbol)) newLimit = Math.round(newLimit * 1e4) / 1e4; // OX 4자리 틱
 
     if (pending.reduce_only) {
-      // 지정가 청산 — 증거금 없음(margin=0), 값만 갱신.
+      // 지정가 청산 — 증거금 없음(margin=0), 값만 갱신. ⚠ 단, 대상 포지션의 청산 가능 수량을 초과하지
+      // 않게 검증한다(이 주문 제외한 다른 예약분 + 이 주문의 newSize ≤ 보유수량). 포지션이 이미 없으면
+      // 고아 주문이라 검증 스킵(다음 트리거에서 자동 정리됨).
+      const posSide = pending.side === 'short' ? 'long' : 'short'; // 청산 대상 포지션 방향(주문 side 의 반대)
+      const tgt = await env.DB.prepare('SELECT size FROM positions WHERE user_id = ? AND symbol = ? AND side = ?')
+        .bind(uid, pending.symbol, posSide)
+        .first<{ size: number }>();
+      if (tgt) {
+        const othersRow = await env.DB.prepare(
+          'SELECT COALESCE(SUM(size), 0) AS reserved FROM pending_orders WHERE user_id = ? AND symbol = ? AND side = ? AND reduce_only = 1 AND id != ?',
+        )
+          .bind(uid, pending.symbol, pending.side, pendingId)
+          .first<{ reserved: number }>();
+        const closable = tgt.size - (othersRow?.reserved ?? 0);
+        if (newSize > closable + 1e-9) return bad('청산 가능 수량을 초과합니다 (이미 예약된 지정가 청산 포함)');
+      }
       await env.DB.prepare('UPDATE pending_orders SET limit_price = ?, size = ? WHERE id = ? AND user_id = ?')
         .bind(newLimit, newSize, pendingId, uid)
         .run();

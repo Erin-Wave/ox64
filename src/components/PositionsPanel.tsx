@@ -48,10 +48,12 @@ export default function PositionsPanel() {
   // ⚠ 청산 후 입력값(수량·지정가)을 비우지 않는다 — 같은 수량으로 여러 번 나눠 털거나, 같은 가격에
   // 지정가 청산을 다시 걸 때 매번 새로 타이핑해야 했다. 전량 청산되면 행 자체가 사라지므로 남은 값이
   // 화면에 보일 일도 없다(상태는 포지션 id 키라 서로 섞이지 않는다).
-  const doClose = (id: string, posSize: number) => {
+  // 지정가 청산은 수량을 비우면 "청산 가능 수량"(보유 − 이미 예약된 지정가 청산)을 기본값으로 — 전량(posSize)을
+  // 보내면 이미 예약분이 있을 때 서버가 초과로 거부한다. 시장가 청산(px 없음)은 비우면 전량(서버가 보유량으로 캡).
+  const doClose = (id: string, closable: number) => {
     const amt = closeAmt[id] ? Number(closeAmt[id]) : NaN;
     const px = closePx[id] ? Number(closePx[id]) : NaN;
-    if (px > 0) limitClose(id, amt > 0 ? amt : posSize, px);
+    if (px > 0) limitClose(id, amt > 0 ? amt : closable, px);
     else closePosition(id, amt > 0 ? amt : undefined);
   };
 
@@ -180,6 +182,12 @@ export default function PositionsPanel() {
                   const prec = precisionOf(precisions, p.symbol);
                   const editing = editingId === p.id;
                   const liq = liqPriceOf(p);
+                  // 청산 가능 수량 = 보유수량 − 이미 걸어둔 지정가 청산(reduce-only) 합. 초과 예약 방지(서버도 검증).
+                  const closeSide = p.side === 'long' ? 'short' : 'long';
+                  const reservedClose = pendingOrders
+                    .filter((o) => o.reduceOnly && o.symbol === p.symbol && o.side === closeSide)
+                    .reduce((a, o) => a + o.size, 0);
+                  const closable = Math.max(0, p.size - reservedClose);
                   return (
                     <tr key={p.id} className="border-b border-border/60 transition hover:bg-panel2">
                       <td className="px-3 py-2.5 font-medium text-text">
@@ -278,9 +286,9 @@ export default function PositionsPanel() {
                               <input
                                 value={fmtNumInput(closeAmt[p.id] ?? '')}
                                 onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: unfmtNum(e.target.value) }))}
-                                placeholder={fmtQty(p.size)}
+                                placeholder={fmtQty(closable)}
                                 inputMode="decimal"
-                                title="청산 수량(비우면 전량)"
+                                title={`청산 수량(비우면 전량) · 청산 가능 ${fmtQty(closable)}${reservedClose > 0 ? ` (예약 ${fmtQty(reservedClose)} 제외)` : ''}`}
                                 // 보유 수량 텍스트 길이에 맞춰 폭을 잡는다(콤마 포함 자릿수 + 패딩). 너무 짧던 w-14 대체.
                                 style={{ width: `calc(${Math.max(5, fmtQty(p.size).length)}ch + 1.25rem)` }}
                                 className="rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
@@ -300,7 +308,7 @@ export default function PositionsPanel() {
                             </>
                           )}
                           <button
-                            onClick={() => (standard ? doClose(p.id, p.size) : closePosition(p.id))}
+                            onClick={() => (standard ? doClose(p.id, closable) : closePosition(p.id))}
                             disabled={busy}
                             title={standard ? '지정가 입력 시 지정가 청산, 비우면 시장가 청산' : '전량 시장가 청산'}
                             className="rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
