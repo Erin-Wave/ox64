@@ -522,7 +522,7 @@ function nextMarketState(s: BotState): {
   let ret = drift + revert + magnet + P.bias + gauss() * 0.0015 * vol * P.volMult;
   if (Math.random() < 0.03) ret *= 2 + Math.random() * 2;
 
-  const ref = roundOx(clamp(s.ref * (1 + ret), 0.02, 1e6));
+  const ref = roundOx(clamp(s.ref * (1 + ret), 0.0001, 1e6));
 
   // 7) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증.
   const intensity = clamp(0.5 + Math.abs(ret) / 0.003, 0.45, 6);
@@ -574,11 +574,18 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   let wallAskSize = 0;
   let wallBid: number | null = null;
   let wallBidSize = 0;
+  // ⚠ **marketable 주문은 벽으로 취급하지 않는다**(2026-07-24 버그 수정). 벽은 현재가 너머의 저항/지지
+  // (매도벽=현재가 이상, 매수벽=현재가 이하)여야 한다 — 유저가 현재가보다 낮게 건 매도(=지금 팔겠다는
+  // marketable 청산/지정가)나 현재가보다 높게 건 매수를 벽으로 잡으면, 기준가를 그 주문 가격으로 끌어내려
+  // /끌어올려 **시장이 그 주문 쪽으로 통째로 끌려가고**(예: 시세 1.0 인데 0.5 청산 예약 하나에 시장이 0.5 로
+  // 붕괴), 사다리가 그 가격에 깔려 정작 그 주문이 크로스가 안 돼 거의 안 팔리는 교착이 생긴다. marketable
+  // 주문은 벽에서 빼면 아래 sweep 이 정상 사다리에 walking 체결한다. 비-marketable 벽(진짜 저항/지지)은
+  // 그대로 존중 → "가짜 high"(벽 너머 유령체결) 방지 로직은 유지된다.
   for (const r of wallRows) {
-    if (r.side === 'short' && (wallAsk == null || r.price < wallAsk)) {
+    if (r.side === 'short' && r.price >= prev.ref && (wallAsk == null || r.price < wallAsk)) {
       wallAsk = r.price;
       wallAskSize = r.size;
-    } else if (r.side === 'long' && (wallBid == null || r.price > wallBid)) {
+    } else if (r.side === 'long' && r.price <= prev.ref && (wallBid == null || r.price > wallBid)) {
       wallBid = r.price;
       wallBidSize = r.size;
     }
@@ -907,41 +914,28 @@ function spotTradeStmts(
   ];
 }
 
-// ── 시장가 잔량 흡수용 합성 유동성 ─────────────────────────────────────────
-// ⚠ 봇 호가창은 한 틱 스냅샷이라 22단계 × 2천~1만 = 최대 십수만 개뿐이다. 5천만 개짜리 포지션을 시장가로
-// 청산하면 이 사다리를 다 소비한 뒤 bestBotMaker 가 null 을 반환해 루프가 break → **부분 청산 후 멈춤**
-// (유저가 버튼을 계속 눌러야 했다). 봇은 설계상 "무한 유동성 공급자"이므로, 시장가는 사다리를 다 먹은
-// 뒤에도 봇이 잔량을 받아줘야 한다. 단, 대량 시장가는 시장을 밀어야 하므로(시장충격) 체결가가 진행
-// 방향으로 점점 불리해진다(슬리피지). 지정가(limitPrice != null)는 여기 오지 않는다 — 크로스되는 호가가
-// 없으면 잔량은 대기하는 게 맞으므로 호출부에서 break 한다.
-// 합성 흡수는 **고정 스텝 수**로 완결한다(반복 횟수를 잔량과 무관하게 상한 짓는다 — remote D1 은 스텝마다
-// batch 왕복이라 잔량/40 식으로 나누면 수백 왕복이 나 느려지고 타임아웃 위험). 첫 합성 시 잔량을 이 개수로
-// 균등 분할해 청크를 한 번만 정한다. 시장충격은 스텝이 진행될수록 선형으로 커지되 SYNTH_MAX_IMPACT 로 상한
-// — 봇은 "깊은 유동성 풀"이라 대량이라도 슬리피지가 완만하다(예전 잔량/40 방식은 300+ 스텝에 -7% 슬리피지가
-// 났다). 작은 잔량은 청크 하한(SYNTH_CHUNK_MIN)으로 스텝 수가 자동으로 줄어든다.
-const SYNTH_STEPS = 24; // 합성 흡수를 나누는 고정 스텝 수(=최대 배치 왕복 수)
+// ── 시장가 잔량 흡수용 합성 유동성(스냅샷 매칭) ─────────────────────────────
+// ⚠ 봇 호가창은 한 틱 스냅샷이라 22단계 × 2천~1만 = 최대 십수만 개뿐이다. 봇은 설계상 "무한 유동성
+// 공급자"이므로, 시장가는 실제 사다리를 다 먹은 뒤에도 봇이 잔량을 받아줘야 한다(예전엔 사다리 소진 시
+// break → **부분 체결 후 멈춤**, 유저가 버튼을 계속 눌러야 했다). ⚠ 핵심 재설계(2026-07-24): 예전엔
+// **청크마다 DB batch/claim 을 remote D1 로 왕복**해서, 대량 주문이 수십~수백 왕복이 나고 리쿼트와 경합해
+// claim 실패로 스핀하며 정체됐다(체결이 조금씩·느리게·심하면 멈춤). 이제 matchMarketOxOrder·
+// closePositionAgainstBook 은 봇 호가를 **스냅샷 1회**로 읽어 **메모리에서 walking** 하고 결과를 **단일
+// batch**로 적용한다(왕복이 주문 크기와 무관하게 상수). 합성 흡수도 메모리에서 잔량을 SYNTH_STEPS 로
+// 균등 분할하고, 시장충격은 스텝이 진행될수록 선형으로 커지되 SYNTH_MAX_IMPACT 로 상한 — 봇은 "깊은
+// 유동성 풀"이라 대량이라도 슬리피지가 완만하다. 작은 잔량은 청크 하한(SYNTH_CHUNK_MIN)으로 스텝이 준다.
+// 지정가(limitPrice != null) 청산은 합성 안 함 — 크로스 호가 없으면 잔량은 대기하는 게 맞다.
+const SYNTH_STEPS = 24; // 합성 흡수를 나누는 고정 스텝 수
 const SYNTH_MAX_IMPACT = 0.03; // 합성 구간 누적 시장충격 상한(3%)
 const SYNTH_CHUNK_MIN = 50_000; // 합성 청크 최소 크기(작은 잔량은 이 크기로 몇 스텝만에 끝남)
-const MATCH_MAX_ITERS = 200; // walking 루프 상한(실사다리 ~수십 + 합성 ~24, 넉넉히)
-
-// 합성 maker(실제 spot_orders 행이 아님 — 원자 선점 UPDATE 를 하지 않는다). 가격/크기는 호출부가
-// 첫 합성 때 정한 청크와 스텝별 시장충격 가격을 넘긴다.
-// ⚠ 어느 봇 앞으로 다는지(actor)는 호출부가 스텝마다 번갈아 넘긴다 — 예전엔 BOT_USER_IDS[0] 하드코딩
-// 이라 대량 시장가의 합성 흡수 물량이 전부 1번 봇에 쌓여 봇별 누적 거래대금이 700배 넘게 벌어졌고
-// (실측 2.39조 vs 33.9억), 그 탓에 두 봇의 VIP 요율까지 갈라졌다(VIP4 vs VIP2).
-function synthMaker(actor: string, makerSide: 'buy' | 'sell', walkPrice: number, chunk: number): SpotOrderRow {
-  return {
-    id: '',
-    user_id: actor,
-    pair: PAIR,
-    side: makerSide,
-    price: walkPrice,
-    size: chunk,
-    orig_size: 0,
-    status: 'synthetic',
-    created_at: Date.now(),
-  };
-}
+const MAKER_SNAPSHOT_LIMIT = 60; // 스냅샷으로 읽어오는 봇 호가 레벨 수(실제 사다리는 ~22 + 벽)
+// ⚠ 유저 시장가 체결이 적정가(anchor)를 끌어당기는 비율 — "매수하면 오르고 유지된다"의 핵심.
+// 예전엔 유저 체결이 ref 만 밀고 anchor 는 그대로라, 다음 봇 틱의 평균회귀(적정가 대비 과열도로 되돌림)가
+// 그 움직임을 통째로 되돌려서 "긁었는데 오히려 급락"으로 보였다. 실제 시장에서 대량 주문은 정보/수요라
+// 적정가 자체를 옮긴다 — 유저 체결가 방향으로 anchor 를 절반쯤 당겨 시장충격이 "굳게" 한다(나머지 절반은
+// 평균회귀로 서서히 되돌아옴 = 현실적인 임팩트 감쇠). 봇 전용 시뮬레이션엔 이 경로가 없어 장기 안정성엔
+// 영향 없음(BOT_BASE_PULL 이 anchor 를 기준선으로 약하게 tether). 봇↔봇 합성체결엔 적용 안 함.
+const ANCHOR_TRADE_PULL = 0.5;
 
 // 반대편 봇 호가 중 최우선(가격-시간 우선) 하나. limitPrice 가 있으면 그 가격까지만 크로스.
 async function bestBotMaker(env: Env, takerSide: string, limitPrice: number | null): Promise<SpotOrderRow | null> {
@@ -1080,117 +1074,160 @@ export async function matchMarketOxOrder(
   floorPnL = 0, // 크로스 가용 = 여유잔고 + floorPnL(전 포지션 미실현손익). balance 는 -floorPnL 까지 허용.
 ): Promise<{ filled: number; avgPrice: number }> {
   const isLong = side === 'long';
-  const existing0 = await env.DB.prepare('SELECT leverage FROM positions WHERE user_id=? AND symbol=? AND side=?')
-    .bind(uid, PAIR, side)
-    .first<{ leverage: number }>();
-  const effLev = existing0 ? existing0.leverage : leverage;
-  // 수수료율은 이 주문 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 올라 청크별로
-  // 요율이 달라지는 이상한 상태가 된다). 청크마다 증거금과 **함께** 차감해야 원자 가드가 성립한다.
-  const feeRate = await feeRateOf(env, uid);
+  const openMakerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'; // 봇이 잡는 쪽(롱 진입이면 봇이 매도)
+  const openAdverse = isLong ? 1 : -1; // 사면 위로, 팔면 아래로 시장충격
 
-  // ⚠ 목표 수량을 **감당 가능한 만큼으로 먼저 줄인다**. 이걸 안 하면, 감당도 못 할 큰 수량(예: 잔고 1만인데
-  // 5천5백만개)을 좇아 합성 유동성 가격이 시장충격으로 계속 위로 램프되는데, 정작 잔고가 바닥나 조금밖에
-  // 못 사면서 **평단만 크게 부풀려진다**(실측: 3% 위). 그 상태로 잔고가 0이 되면 기준가가 정상으로
-  // 돌아올 때 즉시 손실 → 고배율이면 바로 강제청산("넣었는데 풀려버림" 버그). 감당 가능 수량으로
-  // 목표를 클램프하면 시장충격이 실제 체결량에 비례하고, 평단이 시세 근처로 유지된다.
+  // ── 1) 필요한 값을 몇 번의 read 로 한 번에 확보(예전엔 청크마다 read/batch 왕복이라 대량이 느리고
+  //        리쿼트와 경합해 정체됐다). 수수료율은 주문 전체에 한 번만 확정(청크마다 등급이 바뀌지 않게). ──
+  const existing0 = await env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
+    .bind(uid, PAIR, side)
+    .first<PositionRow>();
+  const effLev = existing0 ? existing0.leverage : leverage; // 물타기 시 기존 레버리지 고정
+  const feeRate = await feeRateOf(env, uid);
   const bal0 = (await env.DB.prepare('SELECT balance FROM users WHERE id=?').bind(uid).first<{ balance: number }>())?.balance ?? 0;
-  const est = (await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number }>())?.ref_price ?? 1;
-  const perUnitEst = est / effLev + est * feeRate; // 1코인당 드는 돈(증거금+수수료)
+  const st = await env.DB.prepare('SELECT ref_price, anchor FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number; anchor: number }>();
+  const est = st?.ref_price ?? 1;
+
+  // 감당 가능 수량으로 목표를 먼저 클램프(부풀린 평단→즉시 강제청산 방지, 기존 로직 유지).
+  const perUnitEst = est / effLev + est * feeRate;
   const affordableUnits = perUnitEst > 0 ? ((bal0 + floorPnL) * 0.999) / perUnitEst : 0;
-  let remaining = Math.min(size, Math.max(0, affordableUnits));
+  const target = Math.min(size, Math.max(0, affordableUnits));
+  if (target <= EPS) return { filled: 0, avgPrice: 0 };
+
+  // ── 2) 봇 호가 사다리를 "스냅샷"으로 한 번에 읽어와 메모리에서 walking(청크마다 왕복하지 않는다). ──
+  const makers = (
+    await env.DB.prepare(
+      `SELECT * FROM spot_orders WHERE pair=? AND side=? AND status='open' ORDER BY price ${isLong ? 'ASC' : 'DESC'}, created_at ASC LIMIT ${MAKER_SNAPSHOT_LIMIT}`,
+    )
+      .bind(PAIR, openMakerSide)
+      .all<SpotOrderRow>()
+  ).results;
+
+  type MemFill = { makerId: string | null; makerUserId: string; makerFullSize: number; price: number; size: number };
+  const planned: MemFill[] = [];
+  let remaining = target;
+  for (const m of makers) {
+    if (remaining <= EPS) break;
+    const take = Math.min(remaining, m.size);
+    planned.push({ makerId: m.id, makerUserId: m.user_id, makerFullSize: m.size, price: m.price, size: take });
+    remaining -= take;
+  }
+  // 실제 사다리를 다 먹으면 봇 무한 유동성(합성)으로 잔량 흡수 — 고정 스텝·상한 시장충격(슬리피지 완만).
+  if (remaining > EPS) {
+    const synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
+    for (let idx = 1; remaining > EPS && idx <= SYNTH_STEPS * 4; idx++) {
+      const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
+      const price = roundOx(Math.max(0.0001, est * (1 + openAdverse * impact)));
+      const take = Math.min(remaining, synthChunk);
+      planned.push({ makerId: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], makerFullSize: 0, price, size: take });
+      remaining -= take;
+    }
+  }
+
+  // ── 3) 가용 증거금 안에서 정밀 정산(사다리를 위로 갈수록 가격이 올라 실제 비용이 est 추정보다 크므로
+  //        마지막 체결은 감당 가능한 만큼만 잘라낸다). 봇별 정산·소비할 실제 호가·OHLC 를 함께 누적.
+  //  ⚠ budget 은 가용의 딱 100% 가 아니라 아주 살짝 아래로 둔다 — 감당분에 정확히 맞추면 아래 charge 의
+  //     원자 가드(balance - 총비용 >= -floorPnL)가 부동소수 오차로 실패해 체결이 통째로 0 이 된다. ──
+  const avail = bal0 + floorPnL;
+  const budget = avail * (1 - 1e-6);
   let filled = 0;
   let cost = 0;
   let feeTotal = 0;
-  const makerFills = new Map<string, BotFill>(); // 상대편 봇 수수료 + 재고/현금 정산(봇별 집계)
-  const openMakerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy';
-  const openAdverse = isLong ? 1 : -1; // 사면 위로, 팔면 아래로 시장충격
-  let synthBase = 0; // 합성 흡수 시작가(첫 합성 때 ref)
-  let synthChunk = 0; // 첫 합성 때 잔량 기반으로 한 번만 정하는 청크
-  let synthIdx = 0; // 합성 스텝 인덱스(시장충격 램프용)
-
-  for (let i = 0; i < MATCH_MAX_ITERS && remaining > EPS; i++) {
-    let maker = await bestBotMaker(env, side, null);
-    let synthetic = false;
-    if (!maker) {
-      // 봇 사다리(스냅샷)를 다 소비 → 봇 무한 유동성으로 잔량을 마저 체결(고정 스텝·상한 시장충격).
-      // 잔고 가드는 아래 그대로 적용되므로, 감당 못 하면 affordable 만큼만 사고 자연히 멈춘다.
-      if (synthBase <= 0) {
-        const st = await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number }>();
-        synthBase = st?.ref_price ?? (filled > EPS ? cost / filled : 1);
-        synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
-      }
-      synthIdx++;
-      const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * synthIdx) / SYNTH_STEPS);
-      const synthPrice = roundOx(Math.max(0.0001, synthBase * (1 + openAdverse * impact)));
-      maker = synthMaker(BOT_USER_IDS[synthIdx % BOT_USER_IDS.length], openMakerSide, synthPrice, synthChunk);
-      synthetic = true;
+  let spent = 0;
+  let openPx = 0;
+  let high = 0;
+  let low = Infinity;
+  let lastPx = est;
+  const makerFills = new Map<string, BotFill>();
+  const consume: { id: string; newSize: number }[] = [];
+  for (const f of planned) {
+    const perUnit = f.price / effLev + f.price * feeRate;
+    let sz = f.size;
+    if (spent + sz * perUnit > budget) {
+      const afford = (budget - spent) / perUnit;
+      if (afford <= EPS) break;
+      sz = Math.min(sz, afford);
     }
-
-    let chunk = Math.min(remaining, maker.size);
-    const price = maker.price;
-    let margin = (price * chunk) / effLev;
-    let chunkFee = price * chunk * feeRate;
-    // 크로스: balance - (margin+수수료) >= -floorPnL (⟺ available >= margin+수수료). floorPnL>0(이익)
-    // 이면 balance 가 음수까지 허용돼 미실현이익만큼 더 살 수 있고, floorPnL<0(손실)이면 덜 산다.
-    let deduct = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
-      .bind(margin + chunkFee, uid, margin + chunkFee, -floorPnL)
-      .run();
-    if (deduct.meta.changes !== 1) {
-      // 전량 감당 불가 → 가용(여유잔고+미실현이익)으로 살 수 있는 만큼만.
-      // ⚠ 1 코인당 드는 돈은 증거금(price/effLev)뿐 아니라 수수료(price*rate)도 포함해야 한다 —
-      // 빼먹으면 딱 가용만큼 사려다 수수료 때문에 가드에 걸려 체결이 통째로 멈춘다.
-      const u = await env.DB.prepare('SELECT balance FROM users WHERE id=?').bind(uid).first<{ balance: number }>();
-      const perUnit = price / effLev + price * feeRate;
-      const affordable = ((u?.balance ?? 0) + floorPnL) / perUnit;
-      if (affordable <= EPS) break;
-      chunk = Math.min(chunk, affordable);
-      margin = (price * chunk) / effLev;
-      chunkFee = price * chunk * feeRate;
-      deduct = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
-        .bind(margin + chunkFee, uid, margin + chunkFee, -floorPnL)
-        .run();
-      if (deduct.meta.changes !== 1) break;
-    }
-
-    if (!synthetic) {
-      const makerRem = maker.size - chunk;
-      const claim = await env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open' AND size>=?")
-        .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
-        .run();
-      if (claim.meta.changes !== 1) {
-        // 선점 실패 → 방금 뺀 증거금+수수료를 그대로 환불(수수료만 남으면 체결 없이 돈이 새어나간다)
-        await env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(margin + chunkFee, uid).run();
-        continue;
-      }
-    }
-
-    const existing = await env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
-      .bind(uid, PAIR, side)
-      .first<PositionRow>();
-    const now = Date.now();
-    await env.DB.batch([
-      ...oxPositionStmts(env, existing, uid, side, price, chunk, effLev, margin, sl, tp, now),
-      ...spotTradeStmts(env, isLong ? uid : maker.user_id, isLong ? maker.user_id : uid, price, chunk, isLong ? 'buy' : 'sell', now),
-    ]);
-    remaining -= chunk;
-    filled += chunk;
-    cost += price * chunk;
-    feeTotal += chunkFee;
-    addBotFill(makerFills, maker.user_id, price * chunk, chunk);
+    if (sz <= EPS) break;
+    spent += sz * perUnit;
+    filled += sz;
+    cost += f.price * sz;
+    feeTotal += f.price * sz * feeRate;
+    if (openPx === 0) openPx = f.price;
+    high = Math.max(high, f.price);
+    low = Math.min(low, f.price);
+    lastPx = f.price;
+    addBotFill(makerFills, f.makerUserId, f.price * sz, sz);
+    if (f.makerId) consume.push({ id: f.makerId, newSize: f.makerFullSize - sz }); // 남는 실제 호가 물량
+    if (sz < f.size - EPS) break; // 가용 소진 — 여기서 멈춤
   }
+  if (filled <= EPS) return { filled: 0, avgPrice: 0 };
 
-  if (filled > EPS) {
-    const done = Date.now();
-    await env.DB.batch([
-      env.DB.prepare(
-        'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), uid, PAIR, side, cost / filled, filled, effLev, 'open', null, done),
-      // 잔고는 청크마다 이미 정산됐으므로 여기선 누적 카운터+원장만(합계 1행 — 청크 수만큼 불어나지 않게)
-      ...feeAccrualStmts(env, uid, PAIR, 'open', cost, feeRate, feeTotal, done),
-      ...(await botFillStmts(env, makerFills, openMakerSide, done)), // 봇은 유저 반대편(롱 진입이면 봇이 매도)
-    ]);
+  const avgPrice = cost / filled;
+  const totalMargin = cost / effLev; // Σ(price*size)/effLev
+  const newRef = roundOx(lastPx);
+  const anchor0 = st?.anchor && st.anchor > 0 ? st.anchor : est;
+  const newAnchor = roundOx(anchor0 + (newRef - anchor0) * ANCHOR_TRADE_PULL); // 유저 임팩트가 적정가를 끌어당김
+  const now = Date.now();
+
+  // ── 4) 잔고를 **먼저** 원자 가드로 확정(charge-first) — batch 안에 조건부 UPDATE 를 넣으면 0행이어도
+  //        나머지가 커밋돼 "증거금 없이 포지션만" 생긴다(D1 batch 함정). target 을 이미 감당분으로 잘랐으니 통과. ──
+  const charge = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
+    .bind(totalMargin + feeTotal, uid, totalMargin + feeTotal, -floorPnL)
+    .run();
+  if (charge.meta.changes !== 1) return { filled: 0, avgPrice: 0 }; // 레이스로 가용 부족 → 다음 시도
+
+  // ── 5) 나머지를 단일 batch 로 적용(포지션 병합 + 소비한 실제 호가 + 체결테이프 + 기준가/적정가 + 캔들 + 부기). ──
+  const stmts: D1PreparedStatement[] = [];
+  // 소비한 실제 봇 호가를 best-effort 로 반영(리쿼트가 이미 취소했으면 0행이어도 무방 — 봇은 무한 유동성,
+  // 환불/재시도 없이 체결은 그대로 성립. 이 best-effort 가 예전 claim-실패-스핀 정체를 없앤다).
+  for (const c of consume) {
+    stmts.push(
+      env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open'").bind(
+        c.newSize,
+        c.newSize <= EPS ? 'filled' : 'open',
+        c.id,
+      ),
+    );
   }
-  return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
+  stmts.push(...oxPositionStmts(env, existing0, uid, side, avgPrice, filled, effLev, totalMargin, sl, tp, now));
+  // 체결 테이프는 1건(시장가=한 번의 체결 이벤트)으로 집계 기록. 봇 상대라 counterparty 는 표시용.
+  stmts.push(
+    env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
+      crypto.randomUUID(),
+      PAIR,
+      isLong ? uid : BOT_USER_IDS[0],
+      isLong ? BOT_USER_IDS[0] : uid,
+      newRef,
+      filled,
+      isLong ? 'buy' : 'sell',
+      now,
+    ),
+  );
+  stmts.push(
+    env.DB.prepare(
+      'INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor',
+    ).bind(PAIR, now, newRef, newAnchor),
+  );
+  stmts.push(...candleUpsertStmts(env, { open: openPx, high, low, close: newRef, volume: filled }, now));
+  stmts.push(
+    env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
+      crypto.randomUUID(),
+      uid,
+      PAIR,
+      side,
+      avgPrice,
+      filled,
+      effLev,
+      'open',
+      null,
+      now,
+    ),
+  );
+  stmts.push(...feeAccrualStmts(env, uid, PAIR, 'open', cost, feeRate, feeTotal, now));
+  stmts.push(...(await botFillStmts(env, makerFills, openMakerSide, now)));
+  await env.DB.batch(stmts);
+  return { filled, avgPrice };
 }
 
 /**
@@ -1214,101 +1251,143 @@ async function closePositionAgainstBook(
 ): Promise<{ filled: number; avgPrice: number }> {
   const closeTaker = pos.side === 'long' ? 'short' : 'long'; // 청산 방향(롱 청산=매도=short, 봇 매수호가 소비)
   const tapeSide: 'buy' | 'sell' = pos.side === 'long' ? 'sell' : 'buy'; // 체결내역 taker 방향(롱 청산=매도)
+  const makerSide: 'buy' | 'sell' = closeTaker === 'long' ? 'sell' : 'buy';
   const dir = pos.side === 'long' ? 1 : -1;
+  const adverse = closeTaker === 'long' ? 1 : -1; // 사면(숏청산) 위로, 팔면(롱청산) 아래로 시장충격
   const marginPerUnit = pos.size > EPS ? pos.margin / pos.size : 0;
+  // 요율은 이 청산 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 바뀔 수 있다).
+  const closeFeeRate = await feeRateOf(env, uid);
+
+  // ── 1) 봇 호가 사다리를 스냅샷으로 한 번에 읽어 메모리에서 walking(청크마다 왕복하지 않는다 —
+  //        예전엔 대량 청산이 청크마다 batch/claim 왕복이라 느리고 리쿼트와 경합해 정체됐다). ──
+  const st = await env.DB.prepare('SELECT ref_price, anchor FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number; anchor: number }>();
+  const est = st?.ref_price ?? pos.entry_price;
+  const cross = limitPrice == null ? '' : `AND price ${closeTaker === 'long' ? '<=' : '>='} ${Number(limitPrice)}`;
+  const makers = (
+    await env.DB.prepare(
+      `SELECT * FROM spot_orders WHERE pair=? AND side=? AND status='open' ${cross} ORDER BY price ${closeTaker === 'long' ? 'ASC' : 'DESC'}, created_at ASC LIMIT ${MAKER_SNAPSHOT_LIMIT}`,
+    )
+      .bind(PAIR, makerSide)
+      .all<SpotOrderRow>()
+  ).results;
+
+  type MemFill = { makerId: string | null; makerUserId: string; makerFullSize: number; price: number; size: number };
+  const planned: MemFill[] = [];
   let remaining = Math.min(closeSize, pos.size);
+  for (const m of makers) {
+    if (remaining <= EPS) break;
+    const take = Math.min(remaining, m.size);
+    planned.push({ makerId: m.id, makerUserId: m.user_id, makerFullSize: m.size, price: m.price, size: take });
+    remaining -= take;
+  }
+  // 시장가 청산은 봇 무한 유동성으로 잔량 흡수. ⚠ 지정가 청산(limitPrice != null)은 크로스되는 호가가
+  // 없으면 잔량을 대기시킨다(합성 안 함 — 기존 동작 유지).
+  if (remaining > EPS && limitPrice == null) {
+    const synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
+    for (let idx = 1; remaining > EPS && idx <= SYNTH_STEPS * 4; idx++) {
+      const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
+      const price = roundOx(Math.max(0.0001, est * (1 + adverse * impact)));
+      const take = Math.min(remaining, synthChunk);
+      planned.push({ makerId: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], makerFullSize: 0, price, size: take });
+      remaining -= take;
+    }
+  }
+
+  // ── 2) 메모리에서 정산(청산은 잔고를 환급하므로 감당 제약 없음 — 계획대로 전량 체결). ──
   let filled = 0;
   let cost = 0;
   let pnlTotal = 0;
-  // 요율은 이 청산 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 바뀔 수 있다).
-  const closeFeeRate = await feeRateOf(env, uid);
   let closeFeeTotal = 0;
-  const closeMakerFills = new Map<string, BotFill>(); // 상대편 봇 수수료 + 재고/현금 정산
-  const makerSide: 'buy' | 'sell' = closeTaker === 'long' ? 'sell' : 'buy';
-  const adverse = closeTaker === 'long' ? 1 : -1; // 사면(숏청산) 위로, 팔면(롱청산) 아래로 시장충격
-  let synthBase = 0; // 합성 흡수 시작가(첫 합성 때 ref)
-  let synthChunk = 0; // 첫 합성 때 잔량 기반으로 한 번만 정하는 청크
-  let synthIdx = 0; // 합성 스텝 인덱스(시장충격 램프용)
+  let openPx = 0;
+  let high = 0;
+  let low = Infinity;
+  let lastPx = est;
+  const closeMakerFills = new Map<string, BotFill>();
+  const consume: { id: string; newSize: number }[] = [];
+  for (const f of planned) {
+    filled += f.size;
+    cost += f.price * f.size;
+    pnlTotal += (f.price - pos.entry_price) * f.size * dir;
+    closeFeeTotal += f.price * f.size * closeFeeRate;
+    if (openPx === 0) openPx = f.price;
+    high = Math.max(high, f.price);
+    low = Math.min(low, f.price);
+    lastPx = f.price;
+    addBotFill(closeMakerFills, f.makerUserId, f.price * f.size, f.size);
+    if (f.makerId) consume.push({ id: f.makerId, newSize: f.makerFullSize - f.size });
+  }
+  if (filled <= EPS) return { filled: 0, avgPrice: 0 };
 
-  for (let i = 0; i < MATCH_MAX_ITERS && remaining > EPS; i++) {
-    let maker = await bestBotMaker(env, closeTaker, limitPrice);
-    let synthetic = false;
-    if (!maker) {
-      // 지정가 청산(reduce-only)은 크로스되는 호가가 없으면 잔량을 대기시킨다(기존 동작 유지).
-      if (limitPrice != null) break;
-      // 시장가 청산: 봇 무한 유동성으로 잔량을 마저 흡수(고정 스텝·상한 시장충격).
-      if (synthBase <= 0) {
-        const st = await env.DB.prepare('SELECT ref_price FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number }>();
-        synthBase = st?.ref_price ?? (filled > EPS ? cost / filled : pos.entry_price);
-        synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
-      }
-      synthIdx++;
-      const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * synthIdx) / SYNTH_STEPS);
-      const synthPrice = roundOx(Math.max(0.0001, synthBase * (1 + adverse * impact)));
-      maker = synthMaker(BOT_USER_IDS[synthIdx % BOT_USER_IDS.length], makerSide, synthPrice, synthChunk);
-      synthetic = true;
-    }
+  const marginReleased = marginPerUnit * filled;
+  const avgPrice = cost / filled;
+  const fullyClosed = filled >= pos.size - EPS;
+  const newRef = roundOx(lastPx);
+  const anchor0 = st?.anchor && st.anchor > 0 ? st.anchor : est;
+  const newAnchor = roundOx(anchor0 + (newRef - anchor0) * ANCHOR_TRADE_PULL); // 유저 청산 임팩트도 적정가를 끌어당김
+  const now = Date.now();
 
-    const chunk = Math.min(remaining, maker.size);
-    if (!synthetic) {
-      const makerRem = maker.size - chunk;
-      const claim = await env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open' AND size>=?")
-        .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
-        .run();
-      if (claim.meta.changes !== 1) continue; // 다른 경로가 먼저 선점 → 재시도(합성은 실제 행이 없어 선점 불필요)
-    }
-
-    const fillPrice = maker.price;
-    const chunkPnl = (fillPrice - pos.entry_price) * chunk * dir;
-    const chunkMargin = marginPerUnit * chunk;
-    const chunkFee = fillPrice * chunk * closeFeeRate; // 청산 수수료는 환급액에서 뺀다
-    const newFilled = filled + chunk;
-    const fullyClosed = newFilled >= pos.size - EPS;
-    const now = Date.now();
-
-    await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(chunkMargin + chunkPnl - chunkFee, uid),
-      fullyClosed
-        ? env.DB.prepare('DELETE FROM positions WHERE id=? AND user_id=?').bind(pos.id, uid)
-        : env.DB.prepare('UPDATE positions SET size=?, margin=? WHERE id=? AND user_id=?')
-            .bind(pos.size - newFilled, pos.margin - marginPerUnit * newFilled, pos.id, uid),
-      ...spotTradeStmts(
-        env,
-        tapeSide === 'buy' ? uid : maker.user_id,
-        tapeSide === 'buy' ? maker.user_id : uid,
-        fillPrice,
-        chunk,
-        tapeSide,
-        now,
+  // ── 3) 단일 batch 로 적용(잔고 환급 + 포지션 축소/삭제 + 소비 호가 + 테이프 + 기준가/적정가 + 캔들 +
+  //        pending 갱신 + 주문기록 + 부기). 환급은 조건부가 아니라 batch 에 넣어도 안전. ──
+  const stmts: D1PreparedStatement[] = [];
+  stmts.push(env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnlTotal - closeFeeTotal, uid));
+  stmts.push(
+    fullyClosed
+      ? env.DB.prepare('DELETE FROM positions WHERE id=? AND user_id=?').bind(pos.id, uid)
+      : env.DB.prepare('UPDATE positions SET size=?, margin=? WHERE id=? AND user_id=?').bind(pos.size - filled, pos.margin - marginReleased, pos.id, uid),
+  );
+  for (const c of consume) {
+    stmts.push(
+      env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open'").bind(
+        c.newSize,
+        c.newSize <= EPS ? 'filled' : 'open',
+        c.id,
       ),
-    ]);
-    filled = newFilled;
-    remaining -= chunk;
-    cost += fillPrice * chunk;
-    pnlTotal += chunkPnl;
-    closeFeeTotal += chunkFee;
-    addBotFill(closeMakerFills, maker.user_id, fillPrice * chunk, chunk);
-    if (fullyClosed) break;
+    );
   }
+  stmts.push(
+    env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
+      crypto.randomUUID(),
+      PAIR,
+      tapeSide === 'buy' ? uid : BOT_USER_IDS[0],
+      tapeSide === 'buy' ? BOT_USER_IDS[0] : uid,
+      newRef,
+      filled,
+      tapeSide,
+      now,
+    ),
+  );
+  stmts.push(
+    env.DB.prepare(
+      'INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor',
+    ).bind(PAIR, now, newRef, newAnchor),
+  );
+  stmts.push(...candleUpsertStmts(env, { open: openPx, high, low, close: newRef, volume: filled }, now));
+  if (pendingId) {
+    stmts.push(
+      filled >= pendingSize - EPS
+        ? env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId)
+        : env.DB.prepare('UPDATE pending_orders SET size=? WHERE id=?').bind(pendingSize - filled, pendingId),
+    );
+  }
+  stmts.push(
+    env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
+      crypto.randomUUID(),
+      uid,
+      PAIR,
+      pos.side,
+      avgPrice,
+      filled,
+      pos.leverage,
+      'close',
+      pnlTotal,
+      now,
+    ),
+  );
+  stmts.push(...feeAccrualStmts(env, uid, PAIR, 'close', cost, closeFeeRate, closeFeeTotal, now));
+  stmts.push(...(await botFillStmts(env, closeMakerFills, makerSide, now))); // 롱 청산이면 유저가 팔고 봇이 산다(makerSide='buy')
+  await env.DB.batch(stmts);
 
-  if (filled > EPS) {
-    if (pendingId) {
-      if (filled >= pendingSize - EPS)
-        await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run();
-      else await env.DB.prepare('UPDATE pending_orders SET size=? WHERE id=?').bind(pendingSize - filled, pendingId).run();
-    }
-    // 청산 체결 이력 1건(가중평균가·총 실현손익). side 는 포지션 방향(기존 close 기록과 동일 규약).
-    const done = Date.now();
-    await env.DB.batch([
-      env.DB.prepare(
-        'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), uid, PAIR, pos.side, cost / filled, filled, pos.leverage, 'close', pnlTotal, done),
-      // 잔고는 청크마다 이미 정산 — 여기선 누적 카운터+원장만(합계 1행)
-      ...feeAccrualStmts(env, uid, PAIR, 'close', cost, closeFeeRate, closeFeeTotal, done),
-      ...(await botFillStmts(env, closeMakerFills, makerSide, done)), // 롱 청산이면 유저가 팔고 봇이 산다(makerSide='buy')
-    ]);
-  }
-  return { filled, avgPrice: filled > EPS ? cost / filled : 0 };
+  return { filled, avgPrice };
 }
 
 /** OX 시장가 청산 — 봇 호가창을 walking 하며 있는 물량만큼만 청산(매물 없으면 부분). order.ts close 액션이 호출. */
