@@ -1,5 +1,5 @@
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtKor, fmtUsd } from '@/format';
+import { fmtKor, fmtUsd, fmtFeeRate } from '@/format';
 import VipBadge from './VipBadge';
 
 /**
@@ -19,7 +19,7 @@ export default function VipModal({ onClose }: { onClose: () => void }) {
   const totalFees = useTradingStore((s) => s.totalFees);
   const tiers = useTradingStore((s) => s.vipTiers);
 
-  const pct = (r: number) => (r * 100).toFixed(3).replace(/0+$/, '').replace(/\.$/, '') + '%';
+  const pct = (r: number) => fmtFeeRate(r) + '%';
 
   // 현재 등급 구간의 하한 → 그 구간을 얼마나 채웠는지. 최고 등급이면 진행도가 없다(항상 100%).
   const from = tiers.find((t) => t.tier === tier)?.minVolume ?? 0;

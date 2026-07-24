@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtUsd, fmtNumInput, unfmtNum } from '@/format';
+import { fmtUsd, fmtNumInput, unfmtNum, fmtFeeRate } from '@/format';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit' | 'conditional';
@@ -371,7 +371,7 @@ export default function OrderPanel() {
         </div>
         <div className="flex justify-between">
           <span className="text-muted">
-            수수료 <span className="text-[10px] text-muted">VIP{vipTier} · {(feeRate * 100).toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}%</span>
+            수수료 <span className="text-[10px] text-muted">VIP{vipTier} · {fmtFeeRate(feeRate)}%</span>
           </span>
           <span className="text-text">{fee ? fmtUsd(fee) : '—'} USDT</span>
         </div>
