@@ -98,10 +98,16 @@ export const usePuzzleStore = create<Store>((set, get) => ({
       const r = await puzzleApi.open(game.id, x, y);
       // 서버의 activeGame 은 status='active' 인 판만 찾아 내려주므로, 이 오픈으로 판이 끝났으면(won/lost)
       // 거기선 null 이 온다 — 로컬에 들고 있던 보드에 이번 칸 결과만 이어붙여 항상 완전한 상태를 유지한다.
+      // legend(범례)도 같은 이유로: 판이 안 끝났으면 서버가 다시 계산해 내려준 걸 쓰고, 끝났으면 로컬
+      // legend 에서 방금 완성된 보석 종류(label 로 매칭)의 found 만 +1 해서 흉내낸다.
+      const legend = r.activeGame
+        ? r.activeGame.legend
+        : game.legend.map((l) => (r.justCompleted && l.label === r.justCompleted.label ? { ...l, found: l.found + 1 } : l));
       const updatedGame: PuzzleGame = {
         ...game,
         cells: [...game.cells, r.cell],
         gemsFound: r.justCompleted ? game.gemsFound + 1 : game.gemsFound,
+        legend,
         spent: game.spent + (get().levels.find((l) => l.level === game.level)?.costPerOpen ?? 1),
         status: r.gameStatus,
       };

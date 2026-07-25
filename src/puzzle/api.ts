@@ -2,12 +2,29 @@
 // 분리된 별도 클라이언트다(재화가 다르고, 이 페이지는 트레이딩 상태를 로드할 필요가 없다). 로그인
 // 세션 쿠키(ox64_sess)만 /api/login 을 통해 공유한다 — 같은 계정으로 트레이딩·퍼즐 양쪽을 오간다.
 
+export interface Connects {
+  up: boolean;
+  down: boolean;
+  left: boolean;
+  right: boolean;
+}
 export interface PuzzleCell {
   x: number;
   y: number;
   gemId: string | null;
   label?: string | null;
   color?: string | null;
+  /** 이 칸이 속한 보석이 상하좌우 어느 방향으로 더 이어지는지(색+부위를 보고 유추하는 원작 방식) */
+  connects?: Connects;
+}
+/** 이 보드에 실제로 숨어있는 보석 종류 목록(위치는 안 줌) — 색/모양/개수 + 그중 몇 개를 찾았는지 */
+export interface PuzzleLegendItem {
+  typeKey: string;
+  label: string;
+  color: string;
+  shape: [number, number][];
+  total: number;
+  found: number;
 }
 export interface PuzzleGame {
   id: string;
@@ -16,8 +33,16 @@ export interface PuzzleGame {
   gemsTotal: number;
   gemsFound: number;
   cells: PuzzleCell[];
+  legend: PuzzleLegendItem[];
   spent: number;
   status: 'active' | 'won' | 'lost' | 'abandoned';
+}
+export interface PuzzleLevelType {
+  typeKey: string;
+  label: string;
+  color: string;
+  shape: [number, number][];
+  count: number;
 }
 export interface PuzzleLevelInfo {
   level: number;
@@ -25,6 +50,7 @@ export interface PuzzleLevelInfo {
   reward: number;
   gemsTotal: number;
   costPerOpen: number;
+  types: PuzzleLevelType[];
 }
 export interface PuzzleState {
   currency: number;

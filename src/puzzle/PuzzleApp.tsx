@@ -2,7 +2,9 @@ import { useEffect } from 'react';
 import Logo from '@/components/Logo';
 import PuzzleLogin from './PuzzleLogin';
 import Board from './Board';
+import Legend, { ShapeIcon } from './Legend';
 import { usePuzzleStore } from './usePuzzleStore';
+import type { PuzzleLevelInfo } from './api';
 
 export default function PuzzleApp() {
   const init = usePuzzleStore((s) => s.init);
@@ -98,6 +100,7 @@ function PuzzleGame() {
                 보석 {activeGame.gemsFound}/{activeGame.gemsTotal} · 사용한 재화 {activeGame.spent}
               </span>
             </div>
+            <Legend items={activeGame.legend} />
             <Board game={activeGame} onOpen={openCell} disabled={busy || activeGame.status !== 'active'} />
             <div className="flex items-center justify-between">
               {activeGame.status === 'active' ? (
@@ -160,7 +163,7 @@ function LevelSelect({
   busy,
   onStart,
 }: {
-  levels: { level: number; size: number; reward: number; gemsTotal: number; costPerOpen: number }[];
+  levels: PuzzleLevelInfo[];
   currency: number;
   busy: boolean;
   onStart: (level: number) => void;
@@ -172,12 +175,19 @@ function LevelSelect({
           key={l.level}
           onClick={() => onStart(l.level)}
           disabled={busy || currency <= 0}
-          className="flex flex-col gap-1 rounded-xl border border-border bg-panel p-3.5 text-left transition hover:border-accent disabled:cursor-not-allowed disabled:opacity-40"
+          className="flex flex-col gap-1.5 rounded-xl border border-border bg-panel p-3.5 text-left transition hover:border-accent disabled:cursor-not-allowed disabled:opacity-40"
         >
           <span className="text-sm font-extrabold">레벨 {l.level}</span>
           <span className="text-[11px] text-muted">
             {l.size}×{l.size} 보드 · 보석 {l.gemsTotal}개
           </span>
+          <div className="flex flex-wrap gap-1.5">
+            {l.types.map((t) => (
+              <span key={t.typeKey} className="flex items-center gap-1" title={`${t.label} x${t.count}`}>
+                <ShapeIcon shape={t.shape} color={t.color} cell={4} />
+              </span>
+            ))}
+          </div>
           <span className="text-[11px] text-accent">클리어 시 +{l.reward}</span>
         </button>
       ))}

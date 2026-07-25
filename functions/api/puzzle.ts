@@ -65,6 +65,7 @@ const GEM_TYPES = [
   { key: 'topaz', label: '토파즈', shape: SHAPES.cross, color: '#fbbf24' },
   { key: 'diamond', label: '다이아몬드', shape: SHAPES.big, color: '#e5e7eb' },
 ] as const;
+const GEM_TYPE_BY_KEY = new Map<string, (typeof GEM_TYPES)[number]>(GEM_TYPES.map((t) => [t.key, t]));
 
 // 레벨 1~10 난이도표 — 보드 크기·보석 구성(plan: [gemTypeIndex, 개수][])·클리어 보상이 완만하게 커진다.
 // ⚠ 힌트가 없는(칸을 열어야만 조각/빈땅을 아는) 설계라 실측 없이 잡은 초기값이다 — 실플레이 후
@@ -112,6 +113,7 @@ interface GemMeta {
   color: string;
   size: number;
   revealedCount: number;
+  cells: [number, number][]; // 이 보석 인스턴스가 차지하는 절대좌표 전체(연결 방향 계산용 — 안 연 칸도 포함)
 }
 
 function generateBoard(level: number): { size: number; board: Record<string, string>; gems: Record<string, GemMeta> } {
@@ -138,7 +140,14 @@ function generateBoard(level: number): { size: number; board: Record<string, str
           occupied.add(`${x},${y}`);
           board[`${x},${y}`] = gemId;
         }
-        gems[gemId] = { typeKey: type.key, label: type.label, color: type.color, size: cells.length, revealedCount: 0 };
+        gems[gemId] = {
+          typeKey: type.key,
+          label: type.label,
+          color: type.color,
+          size: cells.length,
+          revealedCount: 0,
+          cells: cells.map(([x, y]) => [x, y]),
+        };
         break;
         // 300회 시도해도 못 놓으면 그 보석 인스턴스는 조용히 스킵(낮은 밀도로 설계돼 거의 발생 안 함)
       }
@@ -170,10 +179,47 @@ interface PuzzleGameRow {
   updated_at: number;
 }
 
+// 열린 칸이 같은 보석의 어느 방향으로 더 이어지는지 알려주는 연결 정보(퍼즐 조각의 "부위") — 위치를
+// 직접 찍어주진 않되(안 연 칸이 어디인지는 여전히 몰라야 함), "이 조각은 오른쪽/아래로 이어진다"는
+// 방향은 알려줘서 색깔+모양으로 다음에 열 칸을 유추해가는 원작 방식을 재현한다.
+interface Connects {
+  up: boolean;
+  down: boolean;
+  left: boolean;
+  right: boolean;
+}
+function connectsFor(gem: GemMeta, x: number, y: number): Connects {
+  const set = new Set(gem.cells.map(([cx, cy]) => `${cx},${cy}`));
+  return {
+    up: set.has(`${x},${y - 1}`),
+    down: set.has(`${x},${y + 1}`),
+    left: set.has(`${x - 1},${y}`),
+    right: set.has(`${x + 1},${y}`),
+  };
+}
+
 async function ensureStats(env: Env, uid: string): Promise<PuzzleStatsRow> {
   await env.DB.prepare('INSERT OR IGNORE INTO puzzle_stats (user_id, created_at) VALUES (?, ?)').bind(uid, Date.now()).run();
   const row = await env.DB.prepare('SELECT * FROM puzzle_stats WHERE user_id = ?').bind(uid).first<PuzzleStatsRow>();
   return row!;
+}
+
+// 이 보드에 실제로 배치된 보석을 종류별로 묶은 목록("찾아야 할 보석" 범례) — 위치는 안 알려주고
+// 색깔·모양·개수·그중 몇 개를 찾았는지만 준다(원작처럼 색/부위를 보고 유추하되, 뭘 찾아야 하는지는
+// 처음부터 보여줌). 다 찾은 종류는 found===total 이 되고, 클라가 그 줄을 지워진 것처럼 표시한다.
+function legendOf(gems: Record<string, GemMeta>) {
+  const byType = new Map<string, { typeKey: string; label: string; color: string; shape: number[][]; total: number; found: number }>();
+  for (const g of Object.values(gems)) {
+    let entry = byType.get(g.typeKey);
+    if (!entry) {
+      const shape = (GEM_TYPE_BY_KEY.get(g.typeKey)?.shape ?? [[0, 0]]) as unknown as number[][];
+      entry = { typeKey: g.typeKey, label: g.label, color: g.color, shape, total: 0, found: 0 };
+      byType.set(g.typeKey, entry);
+    }
+    entry.total++;
+    if (g.revealedCount >= g.size) entry.found++;
+  }
+  return [...byType.values()];
 }
 
 function publicGame(row: PuzzleGameRow) {
@@ -185,13 +231,23 @@ function publicGame(row: PuzzleGameRow) {
     const gemId = board[coord] ?? null;
     if (gemId) {
       const g = gems[gemId];
-      return { x, y, gemId, label: g.label, color: g.color };
+      return { x, y, gemId, label: g.label, color: g.color, connects: connectsFor(g, x, y) };
     }
     return { x, y, gemId: null as string | null };
   });
   const gemsTotal = Object.keys(gems).length;
   const gemsFound = Object.values(gems).filter((g) => g.revealedCount >= g.size).length;
-  return { id: row.id, level: row.level, size: row.size, gemsTotal, gemsFound, cells, spent: row.spent, status: row.status };
+  return {
+    id: row.id,
+    level: row.level,
+    size: row.size,
+    gemsTotal,
+    gemsFound,
+    cells,
+    legend: legendOf(gems),
+    spent: row.spent,
+    status: row.status,
+  };
 }
 
 async function loadPuzzleState(env: Env, uid: string) {
@@ -212,12 +268,17 @@ async function loadPuzzleState(env: Env, uid: string) {
     refillsLeft,
     activeGame: activeRow ? publicGame(activeRow) : null,
     // 등급표(VIP_TIERS)와 같은 패턴 — 클라에 같은 표를 중복 정의하지 않고 서버 값을 그대로 쓴다.
+    // types: 이 레벨에 어떤 보석이 몇 개 나오는지(색/모양/개수) — 시작 전에도 "뭘 찾아야 하는지" 보여줌.
     levels: LEVELS.map((l) => ({
       level: l.level,
       size: l.size,
       reward: l.reward,
       gemsTotal: l.plan.reduce((s, [, c]) => s + c, 0),
       costPerOpen: OPEN_COST,
+      types: l.plan.map(([typeIdx, count]) => {
+        const t = GEM_TYPES[typeIdx];
+        return { typeKey: t.key, label: t.label, color: t.color, shape: t.shape as unknown as number[][], count };
+      }),
     })),
   };
 }
@@ -327,7 +388,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     return json({
       ...state,
       gameStatus: status,
-      cell: { x, y, gemId, label: gemId ? gems[gemId].label : null, color: gemId ? gems[gemId].color : null },
+      cell: gemId
+        ? { x, y, gemId, label: gems[gemId].label, color: gems[gemId].color, connects: connectsFor(gems[gemId], x, y) }
+        : { x, y, gemId: null },
       justCompleted,
       reward: status === 'won' ? reward : 0,
     });
