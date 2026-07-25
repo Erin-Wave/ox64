@@ -235,3 +235,38 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- 불필요). ⚠ **코드(loadState/checkTriggers)가 이 테이블을 SELECT 하므로 코드 배포 전에 먼저 생성돼
 -- 있어야 한다** — 없으면 /api/state 가 통째로 500 이 된다(loadState 는 방어적으로 try/catch 로 감싸
 -- 두긴 했으나, 그래도 배포 전에 테이블을 만들어 두는 게 원칙).
+
+-- ── 퍼즐게임(ox64.app/b, "스핑크스 보석찾기" 확장) — 코인 트레이딩과 완전히 분리된 별도 재화 ──────
+-- 격자 보드에 여러 칸을 차지하는 보석(모양별로 다름)이 숨겨져 있고, 칸을 하나씩 열 때마다(코스트 1
+-- 소모) 그 칸이 보석 조각인지 빈 땅인지 알려준다. 한 보석의 모든 칸을 다 열어야 그 보석을 "획득"한
+-- 것으로 치고, 목표 보석을 전부 획득하면 클리어(재화 보상). 재화가 0이 되면 게임오버. 트레이딩과
+-- 동일하게 **서버 권위** — 보드의 정답 배치는 서버(D1)만 알고, 클라이언트는 칸을 열 때마다 서버에
+-- 물어 결과만 받는다(개발자도구로 미리 볼 수 없게). 계정은 기존 users 테이블(이름+패스코드 로그인)을
+-- 그대로 재사용하고, 재화(puzzle_stats.currency)만 완전히 새로운 컬럼/테이블로 분리한다.
+CREATE TABLE IF NOT EXISTS puzzle_stats (
+  user_id      TEXT PRIMARY KEY,
+  currency     INTEGER NOT NULL DEFAULT 60,  -- 보석 재화(영구 누적). 칸 열 때마다 차감, 클리어 시 보상으로 증가
+  best_level   INTEGER NOT NULL DEFAULT 0,
+  games_played INTEGER NOT NULL DEFAULT 0,
+  games_won    INTEGER NOT NULL DEFAULT 0,
+  refill_count INTEGER NOT NULL DEFAULT 0,   -- 오늘(refill_date) 사용한 리필 횟수(재화 0일 때만 가능)
+  refill_date  TEXT,
+  created_at   INTEGER NOT NULL
+);
+
+-- 진행 중/완료된 게임 1판당 1행. board/gems 는 서버만 사용하는 정답 배치라 클라 응답에 절대 포함하지
+-- 않는다(publicGame() 이 revealed 된 칸만 걸러 내려줌). status: active|won|lost|abandoned.
+CREATE TABLE IF NOT EXISTS puzzle_games (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL,
+  level      INTEGER NOT NULL,
+  size       INTEGER NOT NULL,          -- 보드 한 변 길이(NxN)
+  board      TEXT NOT NULL,             -- JSON: {"x,y": gemInstanceId, ...} (빈 칸은 키 자체가 없음) — 정답, 비공개
+  gems       TEXT NOT NULL,             -- JSON: gemInstanceId -> {typeKey,label,color,size,revealedCount}
+  revealed   TEXT NOT NULL,             -- JSON: 이미 연 좌표 배열 ["x,y", ...]
+  spent      INTEGER NOT NULL DEFAULT 0,-- 이 판에서 쓴 코스트 합계(표시용)
+  status     TEXT NOT NULL DEFAULT 'active',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_puzzle_games_user ON puzzle_games(user_id, status);

@@ -27,7 +27,7 @@
 ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
-├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks=봇 심리상태]) — wrangler d1 execute 또는 D1 Console 로 적용
+├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks=봇 심리상태]/puzzle_stats/puzzle_games[퍼즐게임, §7]) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조(rgb(var(--color-x) / <alpha-value>)) — 실제 값은 src/index.css 테마 블록
 ├── cron/                   ── 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker (메인 Pages 프로젝트와 별도 배포) ──
@@ -44,13 +44,15 @@ ox64/
 │       ├── order.ts        POST /api/order  (open/close/limitClose/limitOpen/cancelLimit/editLimit/setSlTp/conditionalOpen/cancelConditional — 서버가 체결가 fetch·손익 계산·D1 원자 갱신. close 는 OX 면 봇 호가창 walking 청산, limitClose 는 지정가 청산=reduce-only, editLimit 는 미체결 주문의 지정가·수량 수정, conditionalOpen 은 조건부/스탑 주문 예약)
 │       ├── refill.ts       POST /api/refill (강제청산 안전망 — 1일 최대 3회, 1회 +10,000 USDT)
 │       ├── spot.ts         GET /api/spot (OX/USDT 호가창·체결내역 "표시용" 시장 데이터, ?candles=1 로 캔들도) + runMarketMaker() (봇이 심리 모델(nextMarketState: 추세/변동성 클러스터링/과열회귀/탐욕-공포 국면)로 기준가를 옮기고 그 주변에 호가 사다리를 깔아 만드는 합성 시세·호가·체결 — **한 틱=단일 batch(취소+사다리+합성체결+기준가)로 왕복 1회**, 봇 호가는 잔고 에스크로 안 함(무한 유동성 풀 — 단 체결된 뒤의 재고/현금은 `botFillStmts` 가 정산). OX 는 레버리지 롱/숏도 order.ts 로 실제 코인과 동일하게 거래됨, 체결가만 여기서 옴)
-│       └── leaderboard.ts  GET  /api/leaderboard (친구 자산 순위=잔고+미실현PnL, 서버 시세)
+│       ├── leaderboard.ts  GET  /api/leaderboard (친구 자산 순위=잔고+미실현PnL, 서버 시세)
+│       └── puzzle.ts       GET/POST /api/puzzle — "스핑크스 보석찾기" 퍼즐게임(§7, ox64.app/b). 트레이딩과 별도 재화(puzzle_stats), 보드 정답(puzzle_games.board)은 서버만 알고 클라 응답엔 "이미 연 칸"만 내려줌
 ├── public/
 │   ├── favicon.png         아이콘(원본 src/resources/images/icon2_256.png)
+│   ├── _redirects          `/* /index.html 200` — SPA 폴백(Functions/정적파일이 먼저 매칭되므로 /api/* 는 영향 없음). /b 로 직접 진입/새로고침해도 index.html 이 서빙되게 함
 │   └── fonts/              ProximaNova-{Light,Regular,Semibold,Extrabold}.ttf
 └── src/                    ── 프론트 ──
     ├── App.tsx             세션확인→Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달
-    ├── main.tsx            useSettingsStore 를 App 보다 먼저 import(저장된 테마 즉시 적용, FOUC 방지)
+    ├── main.tsx            location.pathname 으로 트레이딩(App)과 퍼즐게임(puzzle/PuzzleApp, /b) 을 분기(라우터 없음, 동적 import 로 서로의 번들이 안 섞이게). useSettingsStore 를 먼저 import(저장된 테마 즉시 적용, FOUC 방지)
     ├── index.css           Tailwind + 테마 CSS 변수(:root/[data-theme=light|high-contrast]) + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position[stopLoss/takeProfit]/PendingOrder/Side)
     ├── symbols.ts          거래 심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS(OXUSDT)/isVirtualSymbol(체결가 소스만 다르다는 표시, 거래 로직은 동일) + 타임프레임 그룹(분/시간/일+) + KST_OFFSET(+9h 고정)
@@ -83,6 +85,12 @@ ox64/
         ├── OrderPanel.tsx      Easy=슬라이더로 비중만 정해 롱/숏 버튼 / Standard=시장가+지정가+조건부 탭·SL·TP 입력·수량 텍스트입력+단위(코인/USDT) 전환 (레버리지는 공통, 체결가는 서버가 fetch). **⚠ 수량 입력의 진실원본은 입력칸 문자열(`amtInput`, 현재 unit 기준)이고 코인 수량은 `sizeCoin` 으로 파생** — 예전엔 코인 수량을 상태로 두고 USDT 표시를 coin×가격으로 매 렌더 재계산했는데, 그 왕복에서 정밀도가 깨져(coin toFixed(6)) USDT 로 입력하면 타이핑이 엉뚱한 값으로 튀었다(BTC 에 "1 USDT" → 0.98). 단위 전환·슬라이더는 현재 unit 값으로 입력칸을 1회 채운다. **OXUSDT 도 이 컴포넌트 하나로 처리**(가상 전용 분기 없음 — 실제 코인과 완전히 동일한 레버리지 거래)
         ├── PositionsPanel.tsx  탭: 포지션(청산가 표시·(Standard 전용) 부분청산 수량 입력 + **지정가 청산 입력(비우면 시장가, 칸을 포커스하면 차트·호가창 클릭 가격이 여기로 들어옴 — accent 링으로 표시)**·SL/TP 인라인 편집, 청산 실행 후에도 수량·지정가 입력값 유지, Easy 는 전량 시장가청산 버튼만) / (Standard) 미체결 지정가(reduce-only 는 "롱/숏 청산" 뱃지) / 주문내역(전체 체결 이력, 강제청산 하이라이트). **OXUSDT 도 이 컴포넌트 하나로 처리**(가상 전용 분기 없음)
         └── Leaderboard.tsx     친구 자산 순위 모달(5초 폴링) + 상단에 거래소 수수료 수익(유저분/봇분/누적 거래대금)
+    └── puzzle/                 ── 퍼즐게임(/b, §7) — App.tsx/useTradingStore 와 완전히 분리된 독립 진입점 ──
+        ├── api.ts              /api/puzzle 전용 클라이언트(src/services/api.ts 재사용 안 함 — 별도 번들 유지)
+        ├── usePuzzleStore.ts   zustand: currency/activeGame/levels + init/login/logout/start/open/abandon/refill. open() 은 서버 activeGame(= status active 인 판만 반환)에 의존하지 않고 로컬 보드에 이번 칸 결과만 이어붙임(승/패로 막 끝난 판도 화면에서 안 사라지게)
+        ├── PuzzleLogin.tsx     이름+패스코드 로그인(트레이딩과 같은 계정/세션 쿠키 재사용)
+        ├── Board.tsx           보드 격자 렌더링 — 서버가 내려준 "이미 연 칸"만 그리고, 안 연 칸은 전부 빈 버튼(정답 없음)
+        └── PuzzleApp.tsx       진입 컴포넌트 — 로그인 게이트 → 레벨 선택(1~10) or 보드+HUD(재화/보석 진행도/포기·클리어·게임오버)
 ```
 
 ## 3. 데이터 흐름
@@ -379,6 +387,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   - **⚠ `spot_bot_state` 봇 심리 컬럼(2026-07-20)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE spot_bot_state ADD COLUMN drift REAL NOT NULL DEFAULT 0"` 및 동일 형식으로 `vol REAL NOT NULL DEFAULT 1` / `sentiment REAL NOT NULL DEFAULT 0` / `anchor REAL NOT NULL DEFAULT 0` / `regime TEXT NOT NULL DEFAULT 'calm'` / `regime_ticks INTEGER NOT NULL DEFAULT 0`. **코드(`nextMarketState` 상태 로드/저장)가 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다** — prod 엔 이미 적용 완료. 전부 DEFAULT 가 있어 기존 행도 그대로 동작(anchor=0 은 "미초기화"라 첫 틱에 현재가로 자동 세팅).
   - **⚠ `pending_orders.reduce_only`(지정가 청산, 2026-07-19)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE pending_orders ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0"`. **코드(limitClose INSERT)가 이 컬럼을 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다** — prod 엔 이미 적용 완료. 재실행 시 "duplicate column name"(무시 가능).
   - **⚠ `conditional_orders`(조건부/스탑 주문, 2026-07-24)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용(멱등) 또는 `npx wrangler d1 execute ox64 --remote --command "CREATE TABLE IF NOT EXISTS conditional_orders (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, size REAL NOT NULL, leverage INTEGER NOT NULL, trigger_price REAL NOT NULL, trigger_dir TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_conditional_user ON conditional_orders(user_id);"` 로 생성. **코드(loadState/checkTriggers)가 이 테이블을 SELECT 하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 단, loadState/checkTriggers 는 이 조회를 try/catch 로 감싸 미생성 시에도 앱 전체가 500 이 되진 않게 방어함(조건부 기능만 비활성). conditionalOpen(INSERT)만 테이블 없으면 500.
+  - **⚠ `puzzle_stats`/`puzzle_games`(퍼즐게임, §7, 2026-07-25)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/puzzle` 코드가 이 테이블들을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩(`/api/state` 등) 과는 완전히 분리된 라우트라 이 테이블이 없어도 트레이딩 쪽은 영향 없고, `/api/puzzle` 만 500 이 된다(방어적 try/catch 없음 — 격리돼 있어 불필요 판단).
 - **Secret**: `SESSION_SECRET` = `wrangler pages secret put SESSION_SECRET --project-name ox64` 로 production 에 설정됨(랜덤 32B hex). wrangler.toml 엔 두지 않음.
 - 재적용 명령: 스키마 `npx wrangler d1 execute ox64 --remote --file=./schema.sql` / 시크릿 `echo <값> | npx wrangler pages secret put SESSION_SECRET --project-name ox64`.
 - **Pages 빌드 설정**(Git 연동): Build command=`npm run build`, Output dir=`dist`(wrangler.toml `pages_build_output_dir`). Functions 는 `functions/` 자동 번들. 바인딩/시크릿은 **새 배포부터** 적용.
@@ -415,7 +424,55 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - **⚠ 격자 스냅 부동소수 함정(가격이 한 틱 밀리는 버그)**: `Math.floor(price / step) * step` 은 **정확히 격자 위에 있는 가격을 한 칸 아래로 떨어뜨린다** — `1.45/0.0001 = 14499.999999999998`, `2.3/0.01 = 229.99999999999997` 이라 floor 가 한 칸 작은 정수를 준다. 그래서 유저가 1.45 에 건 주문이 호가창에 1.4499 로 표시됐다("분명 1.1 에 올렸는데 미세하게 다르게 올라간다"던 버그). 격자 연산은 **나눈 값이 정수에서 1e-9 이내면 그 정수로 간주**하고(`OrderBook.snapToGrid` / `spot.ts humanQuotePrice`) 곱한 뒤 `toFixed` 로 자릿수를 정리할 것.
 - **⚠ 봇 실패를 조용히 삼키지 말 것**: `/api/spot` 의 `runMarketMaker` 호출은 실패해도 유저 요청을 막지 않게 try/catch 로 감싸는데, 예전엔 **완전히 무시**해서 봇이 죽어도 화면상 멀쩡해 보였다(로컬에서 `spot_bot_state` 컬럼 마이그레이션 누락으로 배치가 통째로 롤백되는데 옛 호가가 남아 정상처럼 보임 → 원인 찾는 데 한참 걸림). 지금은 `console.error` 로 남긴다(`wrangler tail` 로 확인).
 
-## 7. 다음 작업 후보 (백로그)
+## 7. 퍼즐게임 (ox64.app/b, `functions/api/puzzle.ts` + `src/puzzle/`)
+
+> "헬로타운 스핑크스 보석찾기" 이벤트를 확장한 미니 퍼즐게임. **코인 트레이딩과 완전히 무관** —
+> 같은 계정(이름+패스코드, 세션 쿠키 공유)을 그대로 쓰지만 재화·기록은 `users.balance`(USDT)와
+> 전혀 다른 별도 D1 테이블(`puzzle_stats`/`puzzle_games`)이다. 트레이딩 쪽 번들이 딸려오지 않도록
+> `src/main.tsx` 가 `location.pathname` 만으로 완전히 분리된 진입점을 동적 import 한다(라우터 없음).
+
+- **규칙**: NxN 격자에 여러 칸을 차지하는 보석(모양별로 다름 — 배틀쉽처럼 1~6칸)이 숨어 있다. 칸을
+  하나씩 열 때마다(코스트 1 소모) 그 칸이 "보석 조각"인지 "빈 땅"인지만 알려준다(위치 힌트 없음 —
+  원작과 동일, 지뢰찾기식 숫자 힌트 없음). 한 보석의 모든 칸을 다 열어야 그 보석을 "획득"한 걸로
+  치고, 레벨의 목표 보석을 전부 획득하면 클리어(재화 보상). **재화가 0이 되면 게임오버**. 클리어
+  없이도 다음 판을 몇 번이든 다시 시작할 수 있다("무한 도전" — 원작의 일일 시도 횟수 제한이 없음).
+- **⚠ 서버 권위 = 보드 정답은 서버만 안다**: `puzzle_games.board`(좌표→보석ID JSON)는 클라 응답에
+  절대 포함하지 않는다. `publicGame()` 이 `revealed`(이미 연 칸) 배열만 걸러 `{x,y,gemId,label,color}`
+  로 내려준다 — 개발자도구로 안 연 칸의 정답을 미리 볼 방법이 없다. 트레이딩의 "체결가는 서버가
+  fetch" 원칙과 동일한 사상.
+- **재화(`puzzle_stats.currency`)**: 신규 유저 시작값 60, 영구 누적(USDT 잔고와 완전 별도 컬럼).
+  칸 오픈마다 `OPEN_COST`(현재 레벨 무관 고정 1) 만큼 원자적 조건부 UPDATE(`currency >= cost`)로
+  차감 — 실패하면(잔고 부족) 그 오픈 자체가 거부된다(게임 상태 불변). 클리어 시 레벨별 `reward`
+  (레벨1=12 ~ 레벨10=105)를 더한다. 힌트가 없는 설계라 운이 나쁘면 코스트를 많이 써서 재화가
+  마이너스 추세로 갈 수 있다 — 이건 원작의 긴장감과 같은 의도된 리스크(트레이딩의 강제청산과 유사한
+  포지션). **재화가 0일 때만** `refill`(+40, 1일 최대 5회, KST 날짜 기준 — `functions/api/refill.ts`
+  와 동일한 리필 패턴)로 재도전 가능.
+- **레벨 1~10**: 보드 크기(6×6~12×12)·보석 구성(`LEVELS[].plan`, `functions/api/puzzle.ts`)·클리어
+  보상이 완만하게 커진다. 등급표(VIP_TIERS)와 같은 패턴으로 **서버가 `GET /api/puzzle` 의 `levels`
+  필드로 기준표를 내려주고 클라는 그걸 그대로 렌더**(중복 정의 없음). ⚠ 힌트 없는 탐색형 게임이라
+  실측 밸런스가 아니라 초기 추정값이다 — 체감 난이도를 보고 `LEVELS` 배열(보드 크기/보석 개수/보상)
+  만 조정하면 된다(한곳에 모아둠).
+- **보석 모양(`SHAPES`)**: single(1칸)/domino(2)/tromino(3)/square(4)/cross(5)/big(6). 배치
+  (`generateBoard`)는 각 인스턴스마다 무작위 회전(0/90/180/270)+반전 후 빈 칸에 겹치지 않게 최대
+  300회 시도해서 놓는다 — 실패하면(공간 부족) 그 보석 인스턴스만 조용히 스킵(낮은 밀도로 설계돼
+  거의 발생 안 함).
+- **한 계정당 활성 게임 1판**: `start` 액션은 그 유저의 기존 `status='active'` 판을 전부
+  `abandoned` 로 접고 새 판을 만든다(이미 쓴 코스트는 환불하지 않음 — 언제든 새로 시작 가능해야
+  "무한 도전"이 성립하므로 페널티는 그 판에서 쓴 코스트로 충분). `abandon` 액션은 명시적 포기(같은
+  처리, 자산에 영향 없음).
+- **⚠ 클라가 서버의 `activeGame` 스냅샷에 의존하지 않는 이유**: `loadPuzzleState().activeGame` 은
+  `status='active'` 인 판만 찾는다 — 그래서 방금 오픈으로 승/패가 확정된 판은 거기서 `null` 이 된다.
+  `open` 응답은 그 오픈의 결과를 `gameStatus`/`cell`/`justCompleted`/`reward` 로 별도로 실어보내고,
+  클라(`usePuzzleStore.open`)는 로컬에 들고 있던 보드에 이 결과만 이어붙인다 — 그래야 클리어/게임오버
+  직후에도 마지막 보드 상태가 화면에서 사라지지 않고 "클리어!"/"게임 오버" 배너와 함께 보인다.
+- **라우팅**: 별도 라우터 라이브러리 없음. `src/main.tsx` 가 `location.pathname === '/b'` 면
+  `src/puzzle/PuzzleApp.tsx` 를, 아니면 `src/App.tsx` 를 동적 `import()` 한다 — 빌드 시 별개
+  청크(`PuzzleApp-*.js`)로 분리돼 트레이딩 스토어/서비스가 퍼즐 페이지 번들에 안 딸려온다. Cloudflare
+  Pages 는 정적 SPA 기본 동작상 `/` 외 경로 새로고침이 404 날 수 있어 `public/_redirects`
+  (`/* /index.html 200`)로 폴백시킨다(Functions·정적파일이 `_redirects` 보다 먼저 매칭되므로
+  `/api/*` 는 영향 없음).
+
+## 8. 다음 작업 후보 (백로그)
 
 - [x] 서버 권위 백엔드(D1) + 친구 랭킹
 - [x] 이름+패스코드 로그인

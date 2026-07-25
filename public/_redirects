@@ -1,0 +1,4 @@
+# SPA 폴백 — /api/* 는 Functions 가 먼저 처리하므로 여기서 안 걸린다(정적파일/함수가 _redirects 보다 우선).
+# /b (퍼즐게임)처럼 index.html 외 경로로 직접 진입/새로고침해도 200으로 index.html 을 서빙해 React가
+# main.tsx 의 pathname 분기로 알맞은 화면을 그리게 한다.
+/*  /index.html  200
