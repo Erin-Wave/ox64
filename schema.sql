@@ -270,3 +270,51 @@ CREATE TABLE IF NOT EXISTS puzzle_games (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_puzzle_games_user ON puzzle_games(user_id, status);
+
+-- ── "5분 던전"(ox64.app/5m) — 실시간 협동 카드게임, 트레이딩·퍼즐 어느 쪽과도 완전히 분리 ──────
+-- 원작 "5-Minute Dungeon" 의 핵심 루프(아이콘 매칭으로 몬스터 격파, 개인 덱 히든드로우, 손패 공개,
+-- 실제 5분 벽시계 타이머, 함정/포션/보스)를 재현한 축소판(영웅 3종, 던전 1개). 새 인프라(Durable
+-- Objects/WebSocket) 없이 기존 D1 + 1초 폴링(OX 마켓메이커와 동일 패턴)으로 동기화한다. 재화 없음 —
+-- 승패 통계만 기록. 계정은 기존 users 테이블(이름+패스코드)을 그대로 재사용한다.
+CREATE TABLE IF NOT EXISTS dungeon_stats (
+  user_id      TEXT PRIMARY KEY,
+  games_played INTEGER NOT NULL DEFAULT 0,
+  wins         INTEGER NOT NULL DEFAULT 0,
+  best_clear_ms INTEGER,                  -- 클리어까지 걸린 시간(ms) 중 최단 기록, 없으면 NULL
+  created_at   INTEGER NOT NULL
+);
+
+-- 방 1개당 1행. deck_json(남은 몬스터/이벤트 덱 순서)은 서버만 알고 클라 응답엔 절대 포함하지
+-- 않는다(현재 공개 카드만 current_json 으로 내려줌). version 은 낙관적 동시성 카운터 —
+-- 여러 플레이어가 동시에 카드를 내도 `UPDATE ... WHERE code=? AND version=?` 조건부 갱신으로
+-- 경합을 원자적으로 막는다(0행이면 재조회 후 재시도, 트레이딩의 "조건부 UPDATE" 관용구와 동일 사상).
+CREATE TABLE IF NOT EXISTS dungeon_rooms (
+  code         TEXT PRIMARY KEY,        -- 6자 방 코드
+  host_user_id TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'lobby',  -- lobby|active|won|lost
+  hp           INTEGER NOT NULL DEFAULT 5,      -- 파티 공용 체력(함정으로만 감소)
+  ends_at      INTEGER,                          -- 5분 타이머 만료 시각(ms epoch), start 시점에 설정
+  deck_json    TEXT,                             -- JSON: 남은 몬스터/이벤트 카드 배열(비공개, 서버 전용)
+  current_json TEXT,                             -- JSON: 현재 공개된 카드 + 요구치 진행도
+  version      INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL,
+  started_at   INTEGER
+);
+
+-- 방(room_code) x 유저 1행. hand_json(손패)은 파티 전원에게 공개되지만, deck_json(남은 개인 덱
+-- 순서)은 응답에서 절대 내려주지 않는다(개수만) — 진짜 카드게임처럼 다음에 뭘 뽑을지 본인도 모름.
+CREATE TABLE IF NOT EXISTS dungeon_players (
+  room_code    TEXT NOT NULL,
+  user_id      TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  hero_id      TEXT NOT NULL,
+  hand_json    TEXT NOT NULL DEFAULT '[]',
+  deck_json    TEXT NOT NULL DEFAULT '[]',     -- 남은 덱(비공개, 서버 전용)
+  discard_json TEXT NOT NULL DEFAULT '[]',     -- 버림더미(덱 소진 시 재셔플 원본)
+  exhausted    INTEGER NOT NULL DEFAULT 0,     -- 1이면 드로우 불가(지친 상태)
+  used_special INTEGER NOT NULL DEFAULT 0,     -- 런당 1회 고유 특수카드 사용 여부
+  version      INTEGER NOT NULL DEFAULT 0,
+  joined_at    INTEGER NOT NULL,
+  PRIMARY KEY (room_code, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dungeon_players_room ON dungeon_players(room_code);

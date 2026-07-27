@@ -27,7 +27,7 @@
 ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
-├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks=봇 심리상태]/puzzle_stats/puzzle_games[퍼즐게임, §7]) — wrangler d1 execute 또는 D1 Console 로 적용
+├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks=봇 심리상태]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조(rgb(var(--color-x) / <alpha-value>)) — 실제 값은 src/index.css 테마 블록
 ├── cron/                   ── 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker (메인 Pages 프로젝트와 별도 배포) ──
@@ -37,6 +37,8 @@ ox64/
 │   ├── _middleware.ts      전역 미들웨어 — Host 가 ox64.app/localhost 가 아니면(*.pages.dev 포함) ox64.app 으로 301 리다이렉트(Pages 는 pages.dev 서브도메인을 끄는 대시보드 옵션이 없어서 미들웨어로 처리)
 │   ├── _shared.ts          인증(HMAC 토큰/PBKDF2)·바이낸스 서버측 시세·D1 타입·loadState(positions/orders/pendingOrders)
 │   ├── _trading.ts         checkTriggers(env,uid) — 접속(폴링) 시 강제청산→지정가→SL/TP 순으로 평가 / sweepForcedLiquidations(env) — 전 유저의 강제청산만 평가(cron/ 워커가 접속 여부 무관하게 호출)
+│   ├── _dungeonData.ts     "5분 던전"(§8) 콘텐츠 정의 — 영웅 3종 덱 구성표(HEROES/heroDeckSpec), 몬스터/함정/포션/보스 풀(MONSTER_POOL 등). 서버 권위 콘텐츠(원작 카드 텍스트를 그대로 베끼지 않은 오리지널 구성)
+│   ├── _dungeonEngine.ts   "5분 던전" 순수 게임 로직(D1 I/O 없음) — 셔플/덱빌드/드로우(drawUpTo)/요구치 판정(isReqMet)/함정 자동발동(applyTrap). _trading.ts 와 같은 "로직은 순수 함수로 분리" 패턴
 │   └── api/
 │       ├── login.ts        POST /api/login  (없는 이름=가입, 있으면 패스코드 검증→세션쿠키 30일 Max-Age=자동로그인)
 │       ├── logout.ts       POST /api/logout (쿠키 제거)
@@ -45,14 +47,15 @@ ox64/
 │       ├── refill.ts       POST /api/refill (강제청산 안전망 — 1일 최대 3회, 1회 +10,000 USDT)
 │       ├── spot.ts         GET /api/spot (OX/USDT 호가창·체결내역 "표시용" 시장 데이터, ?candles=1 로 캔들도) + runMarketMaker() (봇이 심리 모델(nextMarketState: 추세/변동성 클러스터링/과열회귀/탐욕-공포 국면)로 기준가를 옮기고 그 주변에 호가 사다리를 깔아 만드는 합성 시세·호가·체결 — **한 틱=단일 batch(취소+사다리+합성체결+기준가)로 왕복 1회**, 봇 호가는 잔고 에스크로 안 함(무한 유동성 풀 — 단 체결된 뒤의 재고/현금은 `botFillStmts` 가 정산). OX 는 레버리지 롱/숏도 order.ts 로 실제 코인과 동일하게 거래됨, 체결가만 여기서 옴)
 │       ├── leaderboard.ts  GET  /api/leaderboard (친구 자산 순위=잔고+미실현PnL, 서버 시세)
-│       └── puzzle.ts       GET/POST /api/puzzle — "스핑크스 보석찾기" 퍼즐게임(§7, ox64.app/b). 트레이딩과 별도 재화(puzzle_stats), 보드 정답(puzzle_games.board)은 서버만 알고 클라 응답엔 "이미 연 칸"만 내려줌
+│       ├── puzzle.ts       GET/POST /api/puzzle — "스핑크스 보석찾기" 퍼즐게임(§7, ox64.app/b). 트레이딩과 별도 재화(puzzle_stats), 보드 정답(puzzle_games.board)은 서버만 알고 클라 응답엔 "이미 연 칸"만 내려줌
+│       └── dungeon.ts      GET/POST /api/dungeon — "5분 던전"(§8, ox64.app/5m) 방 생성/참가/영웅선택/시작/카드플레이/휴식/특수카드/나가기. GET 폴링(1초)이 곧 동기화 수단(Durable Objects/WebSocket 없이 D1만으로)
 ├── public/
 │   ├── favicon.png         아이콘(원본 src/resources/images/icon2_256.png)
-│   ├── _redirects          `/* /index.html 200` — SPA 폴백(Functions/정적파일이 먼저 매칭되므로 /api/* 는 영향 없음). /b 로 직접 진입/새로고침해도 index.html 이 서빙되게 함
+│   ├── _redirects          `/* /index.html 200` — SPA 폴백(Functions/정적파일이 먼저 매칭되므로 /api/* 는 영향 없음). /b, /5m 로 직접 진입/새로고침해도 index.html 이 서빙되게 함
 │   └── fonts/              ProximaNova-{Light,Regular,Semibold,Extrabold}.ttf
 └── src/                    ── 프론트 ──
     ├── App.tsx             세션확인→Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달
-    ├── main.tsx            location.pathname 으로 트레이딩(App)과 퍼즐게임(puzzle/PuzzleApp, /b) 을 분기(라우터 없음, 동적 import 로 서로의 번들이 안 섞이게). useSettingsStore 를 먼저 import(저장된 테마 즉시 적용, FOUC 방지)
+    ├── main.tsx            location.pathname 으로 트레이딩(App)·퍼즐게임(puzzle/PuzzleApp, /b)·5분 던전(dungeon/DungeonApp, /5m) 을 분기(라우터 없음, 동적 import 로 서로의 번들이 안 섞이게). useSettingsStore 를 먼저 import(저장된 테마 즉시 적용, FOUC 방지)
     ├── index.css           Tailwind + 테마 CSS 변수(:root/[data-theme=light|high-contrast]) + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position[stopLoss/takeProfit]/PendingOrder/Side)
     ├── symbols.ts          거래 심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS(OXUSDT)/isVirtualSymbol(체결가 소스만 다르다는 표시, 거래 로직은 동일) + 타임프레임 그룹(분/시간/일+) + KST_OFFSET(+9h 고정)
@@ -91,6 +94,15 @@ ox64/
         ├── PuzzleLogin.tsx     이름+패스코드 로그인(트레이딩과 같은 계정/세션 쿠키 재사용)
         ├── Board.tsx           보드 격자 렌더링 — 서버가 내려준 "이미 연 칸"만 그리고, 안 연 칸은 전부 빈 버튼(정답 없음)
         └── PuzzleApp.tsx       진입 컴포넌트 — 로그인 게이트 → 레벨 선택(1~10) or 보드+HUD(재화/보석 진행도/포기·클리어·게임오버)
+    └── dungeon/                ── "5분 던전"(/5m, §8) — 트레이딩·퍼즐 어느 쪽과도 완전히 분리된 독립 진입점 ──
+        ├── api.ts              /api/dungeon 전용 클라이언트(별도 번들 유지)
+        ├── data.ts             표시 전용 메타(아이콘 이모지/색) — 실제 덱 구성·판정은 서버(functions/_dungeonData.ts)가 유일한 진실원본
+        ├── useDungeonStore.ts  zustand: room/players/heroes/stats + create/join/chooseHero/start/playCard/rest/useSpecial/leave + 1초 폴링(startPolling/stopPolling, useSpotPoll 과 동일한 "D1+폴링" 동기화 패턴)
+        ├── DungeonLogin.tsx    이름+패스코드 로그인(트레이딩과 같은 계정/세션 쿠키 재사용)
+        ├── Lobby.tsx           방 없음(생성/코드 참가) 또는 로비(영웅 선택+시작 대기) 화면
+        ├── GameBoard.tsx       진행 중/종료 화면 — 현재 카드 요구치 진행도, 파티 전원 공개 손패(클릭해 카드 내기), 5분 카운트다운, 휴식/특수카드 버튼
+        ├── Card.tsx            카드 1장 시각 컴포넌트(아이콘 이모지 + 기여값)
+        └── DungeonApp.tsx      진입 컴포넌트 — 로그인 게이트 → 로비 or 게임보드
 ```
 
 ## 3. 데이터 흐름
@@ -388,6 +400,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   - **⚠ `pending_orders.reduce_only`(지정가 청산, 2026-07-19)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE pending_orders ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0"`. **코드(limitClose INSERT)가 이 컬럼을 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다** — prod 엔 이미 적용 완료. 재실행 시 "duplicate column name"(무시 가능).
   - **⚠ `conditional_orders`(조건부/스탑 주문, 2026-07-24)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용(멱등) 또는 `npx wrangler d1 execute ox64 --remote --command "CREATE TABLE IF NOT EXISTS conditional_orders (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, size REAL NOT NULL, leverage INTEGER NOT NULL, trigger_price REAL NOT NULL, trigger_dir TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_conditional_user ON conditional_orders(user_id);"` 로 생성. **코드(loadState/checkTriggers)가 이 테이블을 SELECT 하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 단, loadState/checkTriggers 는 이 조회를 try/catch 로 감싸 미생성 시에도 앱 전체가 500 이 되진 않게 방어함(조건부 기능만 비활성). conditionalOpen(INSERT)만 테이블 없으면 500.
   - **⚠ `puzzle_stats`/`puzzle_games`(퍼즐게임, §7, 2026-07-25)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/puzzle` 코드가 이 테이블들을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩(`/api/state` 등) 과는 완전히 분리된 라우트라 이 테이블이 없어도 트레이딩 쪽은 영향 없고, `/api/puzzle` 만 500 이 된다(방어적 try/catch 없음 — 격리돼 있어 불필요 판단).
+  - **⚠ `dungeon_stats`/`dungeon_rooms`/`dungeon_players`(5분 던전, §8, 2026-07-27)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/dungeon` 코드가 이 테이블들을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩·퍼즐 라우트와 완전히 분리돼 있어 없어도 그쪽엔 영향 없고 `/api/dungeon` 만 500 이 된다(방어적 try/catch 없음 — 격리돼 있어 불필요 판단).
 - **Secret**: `SESSION_SECRET` = `wrangler pages secret put SESSION_SECRET --project-name ox64` 로 production 에 설정됨(랜덤 32B hex). wrangler.toml 엔 두지 않음.
 - 재적용 명령: 스키마 `npx wrangler d1 execute ox64 --remote --file=./schema.sql` / 시크릿 `echo <값> | npx wrangler pages secret put SESSION_SECRET --project-name ox64`.
 - **Pages 빌드 설정**(Git 연동): Build command=`npm run build`, Output dir=`dist`(wrangler.toml `pages_build_output_dir`). Functions 는 `functions/` 자동 번들. 바인딩/시크릿은 **새 배포부터** 적용.
@@ -486,7 +499,64 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   (`/* /index.html 200`)로 폴백시킨다(Functions·정적파일이 `_redirects` 보다 먼저 매칭되므로
   `/api/*` 는 영향 없음).
 
-## 8. 다음 작업 후보 (백로그)
+## 8. 5분 던전 (ox64.app/5m, `functions/api/dungeon.ts` + `src/dungeon/`)
+
+> 원작 "5-Minute Dungeon"(2~5인이 손패를 실시간으로 동시에 내어 몬스터가 요구하는 아이콘 조합을
+> 맞추고, 5분 벽시계가 다 되기 전에 던전을 클리어하는 협동 카드게임)을 재현한 온라인 실시간
+> 멀티플레이. **코인 트레이딩·퍼즐 어느 쪽과도 완전히 무관** — 같은 계정(이름+패스코드, 세션 쿠키
+> 공유)을 그대로 쓰지만 재화 없이 승패 통계만 별도 D1 테이블(`dungeon_stats`)에 기록한다. 원작
+> 카드의 정확한 텍스트/수량은 기억에 확신이 없어 그대로 베끼지 않았다 — **메커니즘**(아이콘 매칭,
+> 개인 덱 히든드로우, 손패 공개, 함정/포션/보스, 5분 타이머, 파티 체력)은 재현하되 영웅 이름·카드
+> 구성·몬스터 목록은 이 프로젝트 오리지널이다. 축소판(영웅 3종, 던전 1개 = 몬스터10+함정2+포션2+
+> 보스1)으로 핵심 루프를 검증한 뒤 확장할 것(§9 백로그).
+
+- **⚠ 동기화 = Durable Objects/WebSocket 이 아니라 D1 + 1초 폴링**: 진짜 실시간(수십 ms) 응답을
+  주는 Durable Objects 는 Cloudflare Workers **유료 플랜**이 필요하고 별도 Worker 배포도 필요하다
+  (D1·Pages·기존 cron 워커는 전부 무료 플랜으로 충분했던 것과 다름). 대신 기존 OX 마켓메이커
+  (`useSpotPoll`)와 완전히 같은 "D1 + 짧은 폴링" 패턴을 재사용해 무료 플랜을 유지하고 새 인프라
+  없이(같은 Pages 배포 안에서) 구현했다 — 최대 ~1초 지연은 있지만 친구끼리 하는 캐주얼 게임엔
+  체감상 거의 문제가 없다. `useDungeonStore.startPolling`이 로그인 중 항상 1초 간격으로
+  `GET /api/dungeon` 을 호출하고, 모든 액션(POST)도 자기 응답으로 즉시 상태를 갱신한다(폴링을
+  기다리지 않음 — 트레이딩 스토어의 액션 응답 패턴과 동일).
+- **파티**: 방 코드(6자, 헷갈리는 O/0/I/1 제외)로 모인 1~4명, 각자 영웅 1종 선택(방 내 중복 불가).
+  한 유저는 항상 최대 1개 방에만 속한다(`dungeon_players` 에서 `user_id` 로 자기 방을 역참조 —
+  클라가 코드를 안 보내도 서버가 세션으로 "내 방"을 찾는다, 코드 위조로 남의 방을 조작할 수 없음).
+- **영웅 3종**(`functions/_dungeonData.ts HEROES`), 각 15장 개인 덱(주 아이콘 6+2+1값 9장 + 보조
+  아이콘 3장 + 와일드 2장 + 고유 특수카드 1장): 바바리안(힘, 특수="결전의 함성"=요구치 한 항목에
+  즉시 3 기여) · 위저드(마법, 특수="치유의 주문"=파티 체력 +2) · 닌자(민첩, 특수="그림자 밟기"=손패
+  무료 보충). 특수카드는 런당 1회, 손패에 있지만 `useSpecial` 액션으로만 발동(일반 카드처럼 못 냄).
+- **손패는 파티 전원에게 공개**(원작처럼 다 같이 보고 소리치며 조합 — `PlayerOut.hand` 를 서버가
+  모두에게 그대로 내려준다). 단 **개인 덱의 남은 순서와 몬스터/이벤트 덱의 남은 순서는 서버만
+  안다**(`dungeon_players.deck_json`/`dungeon_rooms.deck_json`, 응답엔 개수만) — 트레이딩의 "체결가는
+  서버가 fetch"·퍼즐의 "보드 정답은 서버만 앎"과 같은 서버 권위 원칙.
+- **몬스터/함정/포션/보스**(`MONSTER_POOL`/`TRAP_POOL`/`POTION_POOL`/`BOSS`): 몬스터·포션은
+  `{아이콘:수량}` 요구치를 공개하고, 파티원 누구나 자기 손패에서 맞는 아이콘 카드를 버려 기여 →
+  총합 충족 시 즉시 격파(포션은 격파 시 파티 체력 +1, 최대 7)하고 다음 카드 공개. **함정은 공개
+  즉시 자동 발동**(파티 체력 -1 + 전원 손패에서 무작위 1장씩 버림+리드로우)한 뒤 조용히 다음 카드로
+  넘어간다(연쇄 함정도 처리, `revealNext`). **보스는 덱의 항상 마지막 카드**(원작 관행)이고 2페이즈
+  (1페이즈 클리어 시 더 큰 요구치의 2페이즈로, 진행도 초기화) — 2페이즈까지 클리어하면 승리.
+- **⚠ 동시성 = `version` 컬럼 낙관적 동시성 제어(다인원 조건부 UPDATE)**: 트레이딩 전반의
+  `UPDATE ... WHERE balance>=margin` 원자 가드 관용구를 다인원 상태로 일반화했다 — 여러 파티원이
+  동시에 카드를 내도(`playCards`) `UPDATE dungeon_rooms SET ... WHERE code=? AND version=?` 로
+  경합을 막고, 0행이면 재조회 후 재시도(`applyContribution`, 최대 5회). **⚠ D1 batch 는 조건부
+  UPDATE 가 0행이어도 "성공"으로 본다**(editLimit/conditionalOpen 과 같은 교훈, §4) — 그래서 카드
+  격파→다음 카드 공개(+함정 연쇄로 다른 파티원 손패 변경)·승패 확정은 **반드시 버전 가드 UPDATE 를
+  단독으로 먼저 실행해 성공(`meta.changes>0`)을 확인한 뒤에만** 다른 플레이어 손패 갱신·통계 반영
+  같은 후속 쓰기를 수행한다 — 성공 전엔 아무 것도 안 쓰므로 재시도가 항상 안전하다. 실측(로컬 D1,
+  두 세션 동시 `playCards`): 1+1 기여가 유실·중복 없이 정확히 2로 누적됨을 확인.
+- **5분 타이머 = 폴링 시점 평가**(`expireIfNeeded`): `dungeon_rooms.ends_at` 을 그대로 클라에 실어
+  보내 로컬에서 카운트다운만 그리고(Chart.tsx 카운트다운과 동일 패턴), 서버는 다음 poll/action
+  요청이 들어올 때 `Date.now() > ends_at` 이면 그 자리에서 `status='lost'` 로 전환한다. 강제청산과
+  달리 **돈이 걸려있지 않으므로 cron 불필요**(checkTriggers 의 "접속 시점에 평가" 철학 재사용).
+- **승패**: 보스 2페이즈까지 클리어하면 승리(`status='won'`, 클리어 소요시간을 `dungeon_stats
+  .best_clear_ms` 최단기록으로 갱신). 타이머 만료 / 파티 체력 0 / 전원 동시 지침(덱+버림더미+손패가
+  모두 빈 상태, `allExhausted`) 중 하나면 패배(`status='lost'`). 승패 확정 시 파티 전원의
+  `dungeon_stats.games_played`(+wins)를 한 batch 로 갱신.
+- **방 나가기**: 로비/종료(승·패) 상태에서만 가능(`leave`), 진행 중(active)엔 이탈 불가(막판에
+  파티원이 빠져 판이 깨지는 것 방지). 방장이 나가면 다음 참가자에게 방장이 승계되고, 마지막 인원이
+  나가면 방이 삭제된다.
+
+## 9. 다음 작업 후보 (백로그)
 
 - [x] 서버 권위 백엔드(D1) + 친구 랭킹
 - [x] 이름+패스코드 로그인
@@ -535,5 +605,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - [x] **OX 시장가 매칭 스냅샷 재설계 + 급락/정체 수정** — `matchMarketOxOrder`/`closePositionAgainstBook` 을 청크별 remote 왕복(리쿼트 경합 스핀으로 대량이 조금씩·느리게·멈춤)에서 **스냅샷 1회 → 메모리 walking → 단일 batch** 로(주문 크기 무관 상수 왕복, 1천만개도 단일 요청 전량 체결). 유저 체결이 anchor 를 끌어당겨(`ANCHOR_TRADE_PULL`) 매수→상승·유지(급락 방지). 가격 하한 0.02→0.0001(0.02 밑으로 못 내려가던 버그). marketable 주문을 벽에서 제외(시장이 예약가로 끌려가 교착되던 버그). budget 안전여유로 감당분 charge 부동소수 실패 방지
 - [x] **세자리 콤마 전면 적용** — 편집 입력칸(주문/청산/SL·TP 수량·가격)에 표시용 콤마(`fmtNumInput`/`unfmtNum`, 상태는 raw 유지), 미실현PnL ROE% 콤마(`fmtPct`), 헤더 평가자산 뒤 "USDT", 청산수량 입력폭을 보유수량 텍스트 길이에 맞춰 확대
 - [x] **USDT 단위 수량 입력 수정** — 입력칸 문자열(`amtInput`)을 진실원본으로 삼고 코인 수량(`sizeCoin`)을 파생 → USDT 로 입력할 때 왕복 재계산(coin toFixed(6))으로 값이 튀던 버그 해결. 청산 가능 수량 초과 청산 주문 거부(예약된 reduce-only 합산 검증)
+- [x] **ox64.app/5m 5분 던전 추가** — 원작 실시간 협동 카드게임 재현(영웅 3종 축소판), Durable Objects 대신 D1+1초 폴링으로 동기화(무료 플랜 유지), `version` 컬럼 낙관적 동시성으로 다인원 카드 기여 경합 처리
+- [ ] 5분 던전 콘텐츠 확장(영웅/던전 추가, 원작 풀버전 6영웅+4던전 목표)
 - [ ] 펀딩비 반영
 - [ ] 랭킹 새로고침 최적화(현재 5초 폴링 → 서버 캐시/집계)
