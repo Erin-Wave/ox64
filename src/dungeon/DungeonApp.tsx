@@ -16,8 +16,9 @@ export default function DungeonApp() {
     init();
   }, [init]);
 
-  // 로그인된 동안엔 항상 1초 폴링 — 방 생성/참가/시작/카드 플레이 전부 이 폴링으로 파티원과 동기화된다
-  // (Durable Objects/WebSocket 대신 기존 OX 마켓메이커와 동일한 "D1 + 1초 폴링" 패턴, CLAUDE.md 참고).
+  // 로그인된 동안 폴링 루프를 굴린다 — 방 생성/참가/시작/카드 플레이 전부 이 폴링으로 파티원과
+  // 동기화된다(Durable Objects/WebSocket 대신 기존 OX 마켓메이커와 동일한 "D1 + 폴링" 패턴).
+  // 간격은 고정이 아니라 방 상태에 따라 매 틱 다시 계산된다(useDungeonStore.delayFor).
   useEffect(() => {
     if (authed) startPolling();
     else stopPolling();
@@ -39,7 +40,8 @@ function DungeonGame() {
   const room = useDungeonStore((s) => s.room);
   const logout = useDungeonStore((s) => s.logout);
 
-  const inParty = room && room.status !== 'lobby';
+  // 로비(방 없음/대기)와 실제 플레이 화면을 방 상태로만 가른다 — 별도 화면 상태값을 두지 않는다.
+  const inRun = room && room.status !== 'lobby';
 
   return (
     <div className="flex min-h-screen flex-col bg-bg text-text">
@@ -49,6 +51,9 @@ function DungeonGame() {
           <span className="text-sm font-bold">5분 던전</span>
         </div>
         <div className="flex items-center gap-3 text-xs">
+          <a href="/b" className="text-muted underline decoration-dotted underline-offset-2 hover:text-text">
+            보석찾기
+          </a>
           <a href="/" className="text-muted underline decoration-dotted underline-offset-2 hover:text-text">
             트레이딩
           </a>
@@ -58,7 +63,7 @@ function DungeonGame() {
         </div>
       </header>
 
-      <main className="mx-auto flex w-full flex-1 flex-col gap-4 px-4 py-5">{inParty ? <GameBoard /> : <Lobby />}</main>
+      <main className="mx-auto w-full flex-1 px-3 py-4 sm:px-4 sm:py-5">{inRun ? <GameBoard /> : <Lobby />}</main>
     </div>
   );
 }

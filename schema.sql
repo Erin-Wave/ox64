@@ -273,9 +273,9 @@ CREATE INDEX IF NOT EXISTS idx_puzzle_games_user ON puzzle_games(user_id, status
 
 -- ── "5분 던전"(ox64.app/5m) — 실시간 협동 카드게임, 트레이딩·퍼즐 어느 쪽과도 완전히 분리 ──────
 -- 원작 "5-Minute Dungeon" 의 핵심 루프(아이콘 매칭으로 몬스터 격파, 개인 덱 히든드로우, 손패 공개,
--- 실제 5분 벽시계 타이머, 함정/포션/보스)를 재현한 축소판(영웅 3종, 던전 1개). 새 인프라(Durable
--- Objects/WebSocket) 없이 기존 D1 + 1초 폴링(OX 마켓메이커와 동일 패턴)으로 동기화한다. 재화 없음 —
--- 승패 통계만 기록. 계정은 기존 users 테이블(이름+패스코드)을 그대로 재사용한다.
+-- 실제 5분 벽시계 타이머, 함정/포션/보스)를 재현했다(아이콘 5종·영웅 6종·몬스터 24종·던전 4개).
+-- 새 인프라(Durable Objects/WebSocket) 없이 기존 D1 + 짧은 폴링(OX 마켓메이커와 동일 패턴)으로
+-- 동기화한다. 재화 없음 — 승패 통계만 기록. 계정은 기존 users 테이블(이름+패스코드)을 재사용한다.
 CREATE TABLE IF NOT EXISTS dungeon_stats (
   user_id      TEXT PRIMARY KEY,
   games_played INTEGER NOT NULL DEFAULT 0,
@@ -292,13 +292,18 @@ CREATE TABLE IF NOT EXISTS dungeon_rooms (
   code         TEXT PRIMARY KEY,        -- 6자 방 코드
   host_user_id TEXT NOT NULL,
   status       TEXT NOT NULL DEFAULT 'lobby',  -- lobby|active|won|lost
-  hp           INTEGER NOT NULL DEFAULT 5,      -- 파티 공용 체력(함정으로만 감소)
+  hp           INTEGER NOT NULL DEFAULT 5,      -- 파티 공용 체력(함정으로만 감소, 포션으로 회복)
   ends_at      INTEGER,                          -- 5분 타이머 만료 시각(ms epoch), start 시점에 설정
   deck_json    TEXT,                             -- JSON: 남은 몬스터/이벤트 카드 배열(비공개, 서버 전용)
   current_json TEXT,                             -- JSON: 현재 공개된 카드 + 요구치 진행도
   version      INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL,
-  started_at   INTEGER
+  started_at   INTEGER,
+  dungeon_id   TEXT,                             -- 선택한 던전(_dungeonData.ts DUNGEONS), 로비에서 방장이 고름
+  log_json     TEXT,                             -- JSON: 최근 이벤트 로그(함정 발동/격파/페이즈…) — 폴링이라
+                                                 --       놓친 사건을 파티원이 따라잡을 수 있게 방에 남긴다
+  total_events INTEGER,                          -- 시작 시점 덱 길이(진행도 "X/Y" 표시용)
+  ward         INTEGER NOT NULL DEFAULT 0        -- 남은 함정 무효화 횟수(팔라딘 "수호의 방벽")
 );
 
 -- 방(room_code) x 유저 1행. hand_json(손패)은 파티 전원에게 공개되지만, deck_json(남은 개인 덱
@@ -315,6 +320,18 @@ CREATE TABLE IF NOT EXISTS dungeon_players (
   used_special INTEGER NOT NULL DEFAULT 0,     -- 런당 1회 고유 특수카드 사용 여부
   version      INTEGER NOT NULL DEFAULT 0,
   joined_at    INTEGER NOT NULL,
+  contributed  REAL NOT NULL DEFAULT 0,        -- 이번 판에서 요구치에 기여한 총량(종료 화면 통계용)
   PRIMARY KEY (room_code, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_dungeon_players_room ON dungeon_players(room_code);
+
+-- ⚠ 일회성 마이그레이션 (2026-07-27 추가, 5분 던전 콘텐츠 확장): 위 CREATE TABLE 에는 이미 포함돼
+-- 있지만, 이미 테이블이 만들어진 기존 DB(=prod)에는 CREATE TABLE IF NOT EXISTS 가 컬럼을 더해주지
+-- 않으므로 최초 1회만 아래를 직접 실행할 것. **코드(loadDungeonState/start/applyContribution)가 이
+-- 컬럼들을 SELECT/UPDATE 하므로 코드 배포 전에 먼저 적용돼 있어야 한다.** 이미 실행했다면 재실행 시
+-- "duplicate column name" 에러(무시 가능).
+-- ALTER TABLE dungeon_rooms ADD COLUMN dungeon_id TEXT;
+-- ALTER TABLE dungeon_rooms ADD COLUMN log_json TEXT;
+-- ALTER TABLE dungeon_rooms ADD COLUMN total_events INTEGER;
+-- ALTER TABLE dungeon_rooms ADD COLUMN ward INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE dungeon_players ADD COLUMN contributed REAL NOT NULL DEFAULT 0;
