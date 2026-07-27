@@ -69,7 +69,8 @@ function Btn({
       disabled={disabled}
       title={title}
       className={
-        'relative flex h-14 w-[4.6rem] flex-col items-center justify-center gap-0.5 rounded-md border text-[11px] font-bold leading-tight transition ' +
+        // 폰에서도 손가락으로 누를 수 있는 크기를 유지한다(터치 타깃 최소 44px 권장)
+        'relative flex h-12 w-[4.2rem] flex-col items-center justify-center gap-0.5 rounded-md border text-[10px] font-bold leading-tight transition sm:h-14 sm:w-[4.6rem] sm:text-[11px] ' +
         (active ? 'border-accent bg-panel2 ' : 'border-border bg-panel2/60 hover:border-accent ') +
         'disabled:cursor-not-allowed disabled:opacity-35'
       }
@@ -117,8 +118,9 @@ export default function Hud(p: HudProps) {
         </div>
       )}
 
-      {/* 하단 콘솔: 미니맵 / 선택 정보 / 커맨드 카드 */}
-      <div className="flex shrink-0 items-stretch gap-2 border-t border-border bg-panel p-2">
+      {/* 하단 콘솔: 미니맵 / 선택 정보 / 커맨드 카드.
+          좁은 화면에선 미니맵을 줄이고 선택 정보를 숨겨 커맨드 카드가 밀려나지 않게 한다. */}
+      <div className="flex shrink-0 items-stretch gap-1.5 border-t border-border bg-panel p-1.5 sm:gap-2 sm:p-2">
         <canvas
           ref={p.minimapRef}
           width={p.minimapSize}
@@ -128,11 +130,11 @@ export default function Hud(p: HudProps) {
           onPointerUp={p.onMinimapUp}
           onPointerLeave={p.onMinimapUp}
           onContextMenu={(e) => e.preventDefault()}
-          className="shrink-0 cursor-pointer rounded border border-border"
-          style={{ width: p.minimapSize, height: p.minimapSize }}
+          className="aspect-square h-[104px] w-[104px] shrink-0 cursor-pointer rounded border border-border sm:h-[168px] sm:w-[168px]"
+          style={{ touchAction: 'none' }}
         />
 
-        <div className="min-w-0 flex-1 rounded border border-border bg-panel2/40 p-2">
+        <div className="hidden min-w-0 flex-1 rounded border border-border bg-panel2/40 p-2 md:block">
           {sel.ids.length === 0 ? (
             <p className="text-[11px] leading-relaxed text-muted">
               좌클릭·드래그로 선택하고 우클릭으로 이동/공격/채집합니다. 일꾼을 고른 뒤 <b className="text-text">건설(B)</b>로 건물을
@@ -190,7 +192,7 @@ export default function Hud(p: HudProps) {
           )}
         </div>
 
-        <div className="flex shrink-0 flex-wrap content-start gap-1.5" style={{ width: '15.2rem' }}>
+        <div className="flex min-w-0 flex-1 flex-wrap content-start gap-1 overflow-y-auto sm:gap-1.5 md:flex-none md:overflow-visible" style={{ maxWidth: '100%' }}>
           {p.buildMenu
             ? BUILD_ORDER.map((t) => {
                 const b = BUILDINGS[t];

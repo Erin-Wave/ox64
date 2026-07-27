@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Component, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import Logo from '@/components/Logo';
 import { Game } from './game';
 import { AI } from './ai';
@@ -23,6 +23,35 @@ function loadRecord(): { win: number; lose: number } {
   }
 }
 
+/** 게임 루프 중 예외가 나면 화면이 통째로 하얘져서 원인을 알 수 없다 — 최소한 무엇이
+ * 터졌는지는 보여주고 다시 시작할 길을 준다(특히 폰에선 콘솔을 볼 방법이 마땅치 않다). */
+class ErrorBoundary extends Component<{ children: ReactNode }, { err: Error | null }> {
+  state: { err: Error | null } = { err: null };
+  static getDerivedStateFromError(err: Error) {
+    return { err };
+  }
+  componentDidCatch(err: Error) {
+    console.error('[s1]', err);
+  }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-bg px-6 text-center text-text">
+        <p className="text-lg font-bold text-down">게임이 중단됐습니다</p>
+        <p className="max-w-md break-words rounded-lg bg-panel px-3 py-2 font-mono text-[11px] text-muted">
+          {this.state.err.message}
+        </p>
+        <button
+          onClick={() => location.reload()}
+          className="rounded-lg bg-accent px-5 py-2.5 text-sm font-bold text-black hover:brightness-110"
+        >
+          새로고침
+        </button>
+      </div>
+    );
+  }
+}
+
 export default function ScApp() {
   const [started, setStarted] = useState(false);
   const [record, setRecord] = useState(loadRecord);
@@ -30,20 +59,28 @@ export default function ScApp() {
 
   if (!started) return <Menu record={record} onStart={() => setStarted(true)} />;
   return (
-    <Match
-      key={seed}
-      onExit={(result) => {
-        if (result) {
-          const next = { ...loadRecord() };
-          if (result === 'won') next.win++;
-          else next.lose++;
-          localStorage.setItem(RECORD_KEY, JSON.stringify(next));
-          setRecord(next);
-        }
-        setStarted(false);
-      }}
-      onRestart={() => setSeed((s) => s + 1)}
-    />
+    <ErrorBoundary>
+      <Match
+        key={seed}
+        onExit={(result) => {
+          if (result) {
+            const next = { ...loadRecord() };
+            if (result === 'won') next.win++;
+            else next.lose++;
+            // 사파리 시크릿 모드 등에서 setItem 이 예외를 던진다 — 전적 못 적는 건 사소한 일이라
+            // 그것 때문에 화면이 죽으면 안 된다.
+            try {
+              localStorage.setItem(RECORD_KEY, JSON.stringify(next));
+            } catch {
+              /* 저장 실패는 무시 */
+            }
+            setRecord(next);
+          }
+          setStarted(false);
+        }}
+        onRestart={() => setSeed((s) => s + 1)}
+      />
+    </ErrorBoundary>
   );
 }
 
@@ -98,6 +135,10 @@ function Menu({ record, onStart }: { record: { win: number; lose: number }; onSt
               <b className="text-text">우클릭</b> — 상황에 맞는 명령 (빈 땅=이동, 적=공격, 미네랄=채집, 건물 선택 중이면 랠리)
             </li>
             <li>
+              <b className="text-accent">폰·태블릿</b> — 우클릭이 없으니 <b className="text-text">내 유닛을 탭하면 선택</b>,{' '}
+              <b className="text-text">그 외를 탭하면 명령</b>입니다 (드래그는 범위 선택, 화면 이동은 미니맵)
+            </li>
+            <li>
               <b className="text-text">A</b> 공격 이동 · <b className="text-text">S</b> 정지 · <b className="text-text">H</b> 사수 ·{' '}
               <b className="text-text">B</b> 건설 메뉴 · <b className="text-text">Esc</b> 취소
             </li>
@@ -145,6 +186,8 @@ function Match({ onExit, onRestart }: { onExit: (r: 'won' | 'lost' | null) => vo
   const attackModeRef = useRef(false);
   const groupsRef = useRef<Map<string, number[]>>(new Map());
   const minimapDragRef = useRef(false);
+  /** 터치로 조작 중인지 — 우클릭이 없는 기기라 탭 하나가 선택과 명령을 겸해야 한다 */
+  const touchRef = useRef(false);
   const lastClickRef = useRef({ t: 0, id: -1 });
   const noticeRef = useRef<{ text: string; until: number } | null>(null);
 
@@ -162,6 +205,7 @@ function Match({ onExit, onRestart }: { onExit: (r: 'won' | 'lost' | null) => vo
     status: 'playing' as 'playing' | 'won' | 'lost',
   });
   const [buildMenu, setBuildMenu] = useState(false);
+  const [loopErr, setLoopErr] = useState<string | null>(null);
   const buildMenuRef = useRef(false);
   buildMenuRef.current = buildMenu;
 
@@ -203,22 +247,42 @@ function Match({ onExit, onRestart }: { onExit: (r: 'won' | 'lost' | null) => vo
     let hudAcc = 0;
     let mapAcc = 0;
 
+    // ⚠ 게임 루프는 React 렌더 밖(rAF)이라 **에러 바운더리가 못 잡는다** — 여기서 예외가 나면
+    // 화면만 멈추고 원인은 아무 데도 안 남는다. 직접 감싸서 무엇이 터졌는지 화면에 띄운다.
     const loop = (now: number) => {
       raf = requestAnimationFrame(loop);
+      try {
+        frame(now);
+      } catch (err) {
+        cancelAnimationFrame(raf);
+        console.error('[s1] loop', err);
+        setLoopErr(err instanceof Error ? `${err.message}` : String(err));
+      }
+    };
+
+    const frame = (now: number) => {
       const dtMs = Math.min(now - prev, 200);
       prev = now;
       const g = gameRef.current;
       const canvas = canvasRef.current;
       if (!g || !canvas) return;
 
-      // 캔버스 크기 동기화(레이아웃 변화/DPR 대응)
+      // 캔버스 크기 동기화(레이아웃 변화/DPR 대응).
+      // ⚠ **크기가 몇 px 흔들리는 정도로는 다시 잡지 않는다.** canvas.width 대입은 백버퍼를
+      // 통째로 재할당하는데, 모바일은 스크롤에 따라 주소창이 접혔다 펴지며 clientHeight 가
+      // 프레임마다 바뀐다 — 그대로 두면 초당 60번 대형 버퍼를 재할당해 탭이 메모리로 죽는다
+      // (모바일에서 시작 몇 초 뒤 흰 화면으로 튕기던 원인). 아래 touch-action/dvh 로 주소창이
+      // 움직이는 것 자체도 막지만, 방어를 이중으로 둔다.
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const cw = canvas.clientWidth;
       const ch = canvas.clientHeight;
-      if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr)) {
-        canvas.width = Math.round(cw * dpr);
-        canvas.height = Math.round(ch * dpr);
+      const wantW = Math.round(cw * dpr);
+      const wantH = Math.round(ch * dpr);
+      if (Math.abs(canvas.width - wantW) > 8 || Math.abs(canvas.height - wantH) > 8) {
+        canvas.width = wantW;
+        canvas.height = wantH;
       }
+      if (cw === 0 || ch === 0) return; // 레이아웃 전(폭 0)엔 그리지 않는다
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -235,7 +299,9 @@ function Match({ onExit, onRestart }: { onExit: (r: 'won' | 'lost' | null) => vo
       if (k.has('arrowright')) dx += 1;
       if (k.has('arrowup')) dy -= 1;
       if (k.has('arrowdown')) dy += 1;
-      if (mouseRef.current.inside && !dragRef.current) {
+      // 화면 가장자리 스크롤은 마우스 전용 — 터치에선 손을 뗀 뒤에도 마지막 좌표가 남아
+      // 화면이 혼자 계속 밀린다(미니맵으로 이동하면 된다).
+      if (mouseRef.current.inside && !dragRef.current && !touchRef.current) {
         if (mouseRef.current.x < EDGE) dx -= 1;
         else if (mouseRef.current.x > cw - EDGE) dx += 1;
         if (mouseRef.current.y < EDGE) dy -= 1;
@@ -414,6 +480,7 @@ function Match({ onExit, onRestart }: { onExit: (r: 'won' | 'lost' | null) => vo
     if (!g || g.status !== 'playing') return;
     const { sx, sy, wx, wy } = toWorld(e);
     e.currentTarget.setPointerCapture(e.pointerId);
+    if (e.pointerType === 'touch') touchRef.current = true;
 
     if (e.button === 2) {
       // 우클릭 — 모드 취소가 최우선, 아니면 명령
@@ -486,8 +553,28 @@ function Match({ onExit, onRestart }: { onExit: (r: 'won' | 'lost' | null) => vo
     const add = e.shiftKey;
 
     if (w < 5 && h < 5) {
+      const wx = cam.x + drag.x1;
+      const wy = cam.y + drag.y1;
+      const ent = g.entityAt(wx, wy);
+
+      // ⚠ 터치엔 우클릭이 없다 — 탭 하나로 선택과 명령을 겸해야 한다.
+      // 규칙: **내 유닛/건물을 탭하면 선택, 그 외(빈 땅·적·자원)를 탭하면 지금 선택한 것들에게
+      // 명령**. 데스크톱은 기존대로 좌클릭=선택 / 우클릭=명령을 그대로 쓴다.
+      if (touchRef.current) {
+        const mine = ent && ent.owner === PLAYER;
+        if (mine) {
+          g.selection = add ? [...new Set([...g.selection, ent.id])] : [ent.id];
+          return;
+        }
+        if (g.selection.length > 0) {
+          g.commandRight(g.selection, wx, wy, ent);
+          return;
+        }
+        g.selection = [];
+        return;
+      }
+
       // 클릭 한 번 — 더블클릭이면 화면 안의 같은 종류를 전부 잡는다(원작 감각)
-      const ent = g.entityAt(cam.x + drag.x1, cam.y + drag.y1);
       if (!ent) {
         if (!add) g.selection = [];
         return;
@@ -562,12 +649,37 @@ function Match({ onExit, onRestart }: { onExit: (r: 'won' | 'lost' | null) => vo
 
   const over = hud.status !== 'playing';
 
+  if (loopErr) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-bg px-6 text-center text-text">
+        <p className="text-lg font-bold text-down">게임이 중단됐습니다</p>
+        <p className="max-w-md break-words rounded-lg bg-panel px-3 py-2 font-mono text-[11px] text-muted">{loopErr}</p>
+        <button
+          onClick={() => location.reload()}
+          className="rounded-lg bg-accent px-5 py-2.5 text-sm font-bold text-black hover:brightness-110"
+        >
+          새로고침
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div ref={wrapRef} className="flex h-screen select-none flex-col overflow-hidden bg-bg text-text">
-      <div className="relative flex-1">
+    // ⚠ 높이는 100dvh(주소창을 뺀 실제 보이는 높이) — 모바일에서 100vh 는 주소창 영역을 포함해
+    // 스크롤이 생기고, 그 스크롤이 주소창을 접었다 폈다 하며 뷰포트 높이를 계속 바꾼다.
+    // 지원 안 하는 브라우저는 인라인 값이 무시되고 h-screen(100vh)으로 폴백된다.
+    <div
+      ref={wrapRef}
+      className="flex h-screen select-none flex-col overflow-hidden bg-bg text-text"
+      style={{ height: '100dvh', overscrollBehavior: 'none' }}
+    >
+      <div className="relative min-h-0 flex-1">
         <canvas
           ref={canvasRef}
           className="h-full w-full cursor-crosshair"
+          // 터치 제스처(스크롤·핀치줌·더블탭 확대)를 브라우저가 가져가지 않게 한다 —
+          // 이게 없으면 드래그 선택이 페이지 스크롤로 먹히고 주소창이 계속 움직인다.
+          style={{ touchAction: 'none' }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
