@@ -7,6 +7,7 @@ import './index.css';
 // 분기해 트레이딩 쪽 번들(zustand 트레이딩 스토어 등)이 이 페이지들에 딸려오지 않게 한다.
 const isPuzzle = location.pathname === '/b' || location.pathname.startsWith('/b/');
 const isDungeon = location.pathname === '/5m' || location.pathname.startsWith('/5m/');
+const isRts = location.pathname === '/s1' || location.pathname.startsWith('/s1/');
 
 async function render() {
   const root = createRoot(document.getElementById('root')!);
@@ -26,6 +27,12 @@ async function render() {
         <DungeonApp />
       </StrictMode>,
     );
+  } else if (isRts) {
+    document.title = 'ox64 · 미니 RTS';
+    const { default: ScApp } = await import('./sc/ScApp');
+    // ⚠ StrictMode 를 쓰지 않는다 — 개발 모드에서 이펙트를 두 번 실행시키는데, 여기선 그게
+    // 게임 루프(rAF)와 Game 인스턴스를 두 벌 만들어 시뮬레이션이 두 배 속도로 도는 것처럼 보인다.
+    root.render(<ScApp />);
   } else {
     const { default: App } = await import('./App');
     root.render(
