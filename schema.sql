@@ -70,10 +70,13 @@ CREATE INDEX IF NOT EXISTS idx_pending_symbol ON pending_orders(symbol);
 -- walking, 실제 코인은 mark 가에 즉시 체결하되 **가용 증거금만큼만** 체결하고 못 채운 잔량은 조건을
 -- 그대로 유지한다(size 를 줄이고 살려둠) → "예약 수량이 다 체결 안 되면 계속 조건이 살아있음".
 --
--- repeating=1 이면 **무한(반복) 조건부** — 체결돼도 주문이 사라지지 않고 armed=0(재무장 대기)이 된다.
--- 가격이 트리거 반대편(rearm_price, 기본=trigger_price)으로 돌아오면 armed=1 로 복구돼 다음에 다시
--- 트리거될 때 또 실행된다. ⚠ 재무장 없이 조건만 유지하면 트리거 아래에 머무는 동안 폴링마다 계속
--- 사들여(2.5초에 한 번씩) 순식간에 파산한다 — "떨어질 때마다"는 "떨어져 있는 동안 계속"이 아니다.
+-- repeating=1 이면 **무한(반복) 조건부** — 체결돼도 주문이 사라지지 않는다. 두 가지 반복 방식이 있다:
+--   repeat_mode='continuous' (기본) : 조건이 참인 **동안 계속** 실행한다(폴링마다 1회 = 유저 접속 중
+--     최대 1초에 1회). "1.5 이하로 떨어져 있는 동안 계속 사 모은다"는 물타기/DCA 용도.
+--     ⚠ 자동으로 안 멈춘다 — cooldown_ms(재실행 간격)·max_fills(최대 횟수)가 유일한 브레이크이고,
+--     둘 다 안 걸면 조건이 참인 동안 잔고가 바닥날 때까지 계속 진입한다(의도된 동작).
+--   repeat_mode='rearm' : 한 번 실행되면 armed=0 이 되고, 가격이 트리거 반대편(rearm_price,
+--     기본=trigger_price)으로 돌아왔을 때만 다시 무장한다 → "내려갈 때마다 한 번씩".
 CREATE TABLE IF NOT EXISTS conditional_orders (
   id            TEXT PRIMARY KEY,
   user_id       TEXT NOT NULL,
@@ -84,11 +87,14 @@ CREATE TABLE IF NOT EXISTS conditional_orders (
   trigger_price REAL NOT NULL,
   trigger_dir   TEXT NOT NULL,          -- 'above'(가격이 이상이 되면) | 'below'(이하가 되면)
   created_at    INTEGER NOT NULL,
-  repeating     INTEGER NOT NULL DEFAULT 0,  -- 1이면 무한(반복) 조건부 — 체결돼도 삭제하지 않고 재무장 대기
-  armed         INTEGER NOT NULL DEFAULT 1,  -- 1=트리거 대기 / 0=재무장 대기(반대편으로 돌아와야 다시 무장)
-  rearm_price   REAL,                        -- 재무장 가격(NULL=trigger_price). below 면 이 값 이상, above 면 이하로 돌아올 때 재무장
+  repeating     INTEGER NOT NULL DEFAULT 0,  -- 1이면 무한(반복) 조건부 — 체결돼도 삭제하지 않는다
+  armed         INTEGER NOT NULL DEFAULT 1,  -- (rearm 모드 전용) 1=트리거 대기 / 0=재무장 대기
+  rearm_price   REAL,                        -- (rearm 모드 전용) 재무장 가격(NULL=trigger_price)
   fill_count    INTEGER NOT NULL DEFAULT 0,  -- 지금까지 실행된 횟수(표시용)
-  max_fills     INTEGER                      -- 최대 실행 횟수(NULL=무제한). 도달하면 주문 삭제
+  max_fills     INTEGER,                     -- 최대 실행 횟수(NULL=무제한). 도달하면 주문 삭제
+  repeat_mode   TEXT NOT NULL DEFAULT 'continuous', -- 'continuous'(조건 참인 동안 계속) | 'rearm'(되돌아와야 재실행)
+  cooldown_ms   INTEGER NOT NULL DEFAULT 0,  -- (continuous 전용) 최소 재실행 간격 ms. 0=폴링마다
+  last_fill_at  INTEGER                      -- 마지막 실행 시각(ms) — cooldown 판정 + 표시용
 );
 CREATE INDEX IF NOT EXISTS idx_conditional_user ON conditional_orders(user_id);
 
@@ -257,6 +263,10 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- ALTER TABLE conditional_orders ADD COLUMN rearm_price REAL;
 -- ALTER TABLE conditional_orders ADD COLUMN fill_count INTEGER NOT NULL DEFAULT 0;
 -- ALTER TABLE conditional_orders ADD COLUMN max_fills INTEGER;
+-- (같은 날 추가 — 반복 방식/재실행 간격)
+-- ALTER TABLE conditional_orders ADD COLUMN repeat_mode TEXT NOT NULL DEFAULT 'continuous';
+-- ALTER TABLE conditional_orders ADD COLUMN cooldown_ms INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE conditional_orders ADD COLUMN last_fill_at INTEGER;
 
 -- ── 퍼즐게임(ox64.app/b, "스핑크스 보석찾기" 확장) — 코인 트레이딩과 완전히 분리된 별도 재화 ──────
 -- 격자 보드에 여러 칸을 차지하는 보석(모양별로 다름)이 숨겨져 있고, 칸을 하나씩 열 때마다(코스트 1

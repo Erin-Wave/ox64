@@ -19,6 +19,7 @@ import {
   feeRateOf,
   feeAccrualStmts,
   unrealizedTotal,
+  repeatModeOf,
 } from './_shared';
 import { matchLimitPendingAgainstBook, matchMarketOxOrder, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
 
@@ -175,20 +176,19 @@ function rearmPriceOf(c: ConditionalRow): number {
 }
 
 /** 체결 뒤 조건부 주문 행을 어떻게 남길지 결정하는 문장 1개.
- * - 무한(repeating): size 는 "1회 실행 수량"이라 차감하지 않고, 실행 횟수를 올린 뒤 armed=0(재무장 대기)로
- *   되돌린다. max_fills 에 도달했으면 주문을 삭제한다.
+ * - 무한(repeating): size 는 "1회 실행 수량"이라 차감하지 않고 실행 횟수/마지막 실행 시각만 갱신한다.
+ *   `continuous` 는 **무장을 유지**해 조건이 참인 동안 다음 폴링에서 또 실행되고, `rearm` 은 armed=0 으로
+ *   내려 가격이 되돌아올 때까지 쉰다. max_fills 에 도달했으면 주문을 삭제한다.
  * - 1회성: 기존대로 남은 수량을 차감하고, 다 채웠으면 삭제(부분 체결이면 조건이 계속 살아있음). */
 function conditionalAfterFillStmt(env: Env, uid: string, c: ConditionalRow, filled: number): D1PreparedStatement {
   if (c.repeating) {
     const fills = (c.fill_count ?? 0) + 1;
     const done = c.max_fills != null && fills >= c.max_fills;
-    return done
-      ? env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid)
-      : env.DB.prepare('UPDATE conditional_orders SET armed = 0, fill_count = ? WHERE id = ? AND user_id = ?').bind(
-          fills,
-          c.id,
-          uid,
-        );
+    if (done) return env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid);
+    const stayArmed = repeatModeOf(c) === 'continuous' ? 1 : 0;
+    return env.DB.prepare(
+      'UPDATE conditional_orders SET armed = ?, fill_count = ?, last_fill_at = ? WHERE id = ? AND user_id = ?',
+    ).bind(stayArmed, fills, Date.now(), c.id, uid);
   }
   const remaining = c.size - filled;
   return remaining <= EPS
@@ -201,12 +201,15 @@ function conditionalAfterFillStmt(env: Env, uid: string, c: ConditionalRow, fill
  * 체결하고 못 채운 잔량은 조건을 살려둔다(size 를 줄임) — "예약 수량이 다 안 채워지면 계속 조건 유지".
  * 트리거가 안 됐으면 아무것도 안 하고 그대로 대기. marks 는 크로스 가용(미실현손익) 계산용.
  *
- * ⚠ 무한(반복) 조건부는 체결 후 사라지지 않고 armed=0 이 되어 **가격이 트리거 반대편으로 돌아올 때만**
- * 다시 무장한다. 재무장을 두지 않으면 "1.5 이하로 떨어지면 매수"가 1.5 아래에 머무는 동안 폴링마다
- * (2.5초에 한 번) 계속 사들여 순식간에 파산한다 — "떨어질 때마다" ≠ "떨어져 있는 동안 계속". */
+ * ⚠ 무한(반복) 조건부는 체결 후에도 사라지지 않는다:
+ *   - `continuous`(기본): 조건이 참인 **동안 계속** 실행 — 폴링마다 1회(cooldown_ms 로 간격 제한 가능).
+ *     "1.5 이하로 떨어져 있는 동안 계속 사 모은다". 자동으로 멈추지 않으므로 브레이크는
+ *     cooldown_ms/max_fills 뿐이고, 둘 다 없으면 잔고가 바닥날 때까지 진입한다(유저가 택한 동작).
+ *   - `rearm`: 한 번 실행되면 무장을 풀고, 가격이 트리거 반대편으로 돌아왔을 때만 다시 무장 → "내려갈 때마다 한 번". */
 async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, mark: number, marks: Record<string, number>): Promise<void> {
-  // 재무장 대기 중(무한 조건부가 방금 실행된 상태) — 반대편으로 돌아왔으면 다시 무장만 하고 끝낸다.
-  if (c.repeating && (c.armed ?? 1) === 0) {
+  const mode = repeatModeOf(c);
+  // 재무장 대기 중(rearm 모드가 방금 실행된 상태) — 반대편으로 돌아왔으면 다시 무장만 하고 끝낸다.
+  if (c.repeating && mode === 'rearm' && (c.armed ?? 1) === 0) {
     const rearm = rearmPriceOf(c);
     const back = c.trigger_dir === 'above' ? mark <= rearm : mark >= rearm;
     if (back) {
@@ -217,6 +220,12 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
 
   const triggered = c.trigger_dir === 'above' ? mark >= c.trigger_price : mark <= c.trigger_price;
   if (!triggered) return;
+
+  // 연속 모드의 재실행 간격 — 0 이면 폴링마다(가장 빠름). 마지막 실행 후 이 시간이 안 지났으면 건너뛴다.
+  if (c.repeating && mode === 'continuous') {
+    const cooldown = c.cooldown_ms ?? 0;
+    if (cooldown > 0 && c.last_fill_at != null && Date.now() - c.last_fill_at < cooldown) return;
+  }
 
   // OX/USDT — 봇 호가창을 walking 하며 있는 물량만 실제 호가 가격에 체결(내부에서 잔고/증거금/수수료/봇
   // 재고·체결테이프·캔들까지 전부 정산). 부분 체결이면 filled 만큼만 나가고 잔량은 아래에서 조건 유지.

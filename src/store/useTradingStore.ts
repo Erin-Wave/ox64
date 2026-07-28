@@ -79,10 +79,26 @@ interface TradingState {
     leverage: number;
     triggerPrice: number;
     triggerDir: 'above' | 'below';
-    repeating?: boolean; // 무한(반복) 조건부 — 재무장 후 다시 트리거될 때마다 실행
+    repeating?: boolean; // 무한(반복) 조건부
+    repeatMode?: 'continuous' | 'rearm';
     rearmPrice?: number | null;
+    cooldownSec?: number | null;
     maxFills?: number | null;
   }) => Promise<void>;
+  editConditional: (
+    conditionalId: string,
+    p: {
+      triggerPrice?: number;
+      size?: number;
+      triggerDir?: 'above' | 'below';
+      leverage?: number;
+      repeating?: boolean;
+      repeatMode?: 'continuous' | 'rearm';
+      rearmPrice?: number | null;
+      cooldownSec?: number | null;
+      maxFills?: number | null;
+    },
+  ) => Promise<void>;
   cancelConditional: (conditionalId: string) => Promise<void>;
   refill: () => Promise<void>;
 
@@ -296,6 +312,17 @@ export const useTradingStore = create<TradingState>((set) => ({
     set({ busy: true, error: null });
     try {
       apply(set, await api.conditionalOpen(p));
+    } catch (e) {
+      set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  editConditional: async (conditionalId, p) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.editConditional(conditionalId, p));
     } catch (e) {
       set({ error: (e as Error).message });
     } finally {

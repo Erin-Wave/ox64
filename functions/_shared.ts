@@ -439,11 +439,18 @@ export interface ConditionalRow {
   created_at: number;
   // ── 무한(반복) 조건부 (2026-07-28) ──
   // ⚠ 마이그레이션 전 DB 에선 컬럼 자체가 없어 undefined 로 들어온다 → 읽을 땐 항상 `?? 기본값`.
-  repeating?: number | null; // 1이면 체결돼도 삭제하지 않고 재무장 대기로 되돌린다
-  armed?: number | null; // 1=트리거 대기 / 0=재무장 대기(트리거 반대편으로 돌아와야 다시 무장)
-  rearm_price?: number | null; // 재무장 가격(NULL 이면 trigger_price)
+  repeating?: number | null; // 1이면 체결돼도 삭제하지 않는다
+  repeat_mode?: string | null; // 'continuous'(조건 참인 동안 계속) | 'rearm'(되돌아와야 재실행)
+  armed?: number | null; // (rearm 전용) 1=트리거 대기 / 0=재무장 대기
+  rearm_price?: number | null; // (rearm 전용) 재무장 가격(NULL 이면 trigger_price)
+  cooldown_ms?: number | null; // (continuous 전용) 최소 재실행 간격 ms(0=폴링마다)
+  last_fill_at?: number | null; // 마지막 실행 시각(ms)
   fill_count?: number | null; // 지금까지 실행된 횟수
   max_fills?: number | null; // 최대 실행 횟수(NULL=무제한)
+}
+/** 무한 조건부의 반복 방식 — 컬럼이 없거나 값이 이상하면 기본 'continuous'(조건 참인 동안 계속). */
+export function repeatModeOf(c: ConditionalRow): 'continuous' | 'rearm' {
+  return c.repeat_mode === 'rearm' ? 'rearm' : 'continuous';
 }
 
 /** 로그인 사용자의 전체 상태(잔고+포지션+주문) 조회.
@@ -551,8 +558,11 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
       createdAt: c.created_at,
       // 무한(반복) 조건부 — 마이그레이션 전 DB 는 컬럼이 없어 undefined 라 기본값으로 방어한다.
       repeating: !!(c.repeating ?? 0),
+      repeatMode: repeatModeOf(c),
       armed: (c.armed ?? 1) !== 0,
       rearmPrice: c.rearm_price ?? null,
+      cooldownMs: c.cooldown_ms ?? 0,
+      lastFillAt: c.last_fill_at ?? null,
       fillCount: c.fill_count ?? 0,
       maxFills: c.max_fills ?? null,
     })),

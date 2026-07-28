@@ -46,11 +46,15 @@ export interface ApiConditionalOrder {
   triggerPrice: number;
   triggerDir: 'above' | 'below'; // 'above'=가격 이상, 'below'=가격 이하가 되면 시장가 진입
   createdAt: number;
-  /** 무한(반복) 조건부 — 체결돼도 주문이 남아, 재무장 후 다시 트리거될 때마다 또 실행된다 */
+  /** 무한(반복) 조건부 — 체결돼도 주문이 사라지지 않는다 */
   repeating: boolean;
-  /** true=트리거 대기 / false=재무장 대기(가격이 rearmPrice 로 돌아와야 다시 무장) */
+  /** 'continuous'=조건이 참인 동안 계속 실행(폴링마다) / 'rearm'=되돌아왔다 다시 트리거될 때만 */
+  repeatMode: 'continuous' | 'rearm';
+  /** (rearm 전용) true=트리거 대기 / false=재무장 대기(가격이 rearmPrice 로 돌아와야 다시 무장) */
   armed: boolean;
   rearmPrice: number | null; // null 이면 트리거 가격에서 재무장
+  cooldownMs: number; // (continuous 전용) 최소 재실행 간격(0=폴링마다)
+  lastFillAt: number | null;
   fillCount: number; // 지금까지 실행된 횟수
   maxFills: number | null; // 최대 실행 횟수(null=무제한)
 }
@@ -166,13 +170,32 @@ export const api = {
     leverage: number;
     triggerPrice: number;
     triggerDir: 'above' | 'below';
-    /** true 면 무한(반복) 조건부 — 체결돼도 사라지지 않고 재무장 후 다시 트리거될 때마다 실행 */
+    /** true 면 무한(반복) 조건부 — 체결돼도 사라지지 않는다 */
     repeating?: boolean;
-    /** 재무장 가격(생략=트리거 가격). below 면 트리거 이상, above 면 트리거 이하여야 함 */
+    /** 'continuous'(기본)=조건이 참인 동안 계속 / 'rearm'=되돌아왔다 다시 트리거될 때만 */
+    repeatMode?: 'continuous' | 'rearm';
+    /** (rearm) 재무장 가격(생략=트리거 가격). below 면 트리거 이상, above 면 트리거 이하여야 함 */
     rearmPrice?: number | null;
+    /** (continuous) 최소 재실행 간격(초, 0=폴링마다) */
+    cooldownSec?: number | null;
     /** 최대 실행 횟수(생략/null=무제한) */
     maxFills?: number | null;
   }) => req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'conditionalOpen', ...p }) }),
+  /** 조건부 주문 수정 — 보낸 필드만 바뀐다(증거금을 잠그지 않는 주문이라 정산 없이 UPDATE) */
+  editConditional: (
+    conditionalId: string,
+    p: {
+      triggerPrice?: number;
+      size?: number;
+      triggerDir?: 'above' | 'below';
+      leverage?: number;
+      repeating?: boolean;
+      repeatMode?: 'continuous' | 'rearm';
+      rearmPrice?: number | null;
+      cooldownSec?: number | null;
+      maxFills?: number | null;
+    },
+  ) => req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'editConditional', conditionalId, ...p }) }),
   cancelConditional: (conditionalId: string) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'cancelConditional', conditionalId }) }),
   refill: () => req<AppState>('/refill', { method: 'POST' }),

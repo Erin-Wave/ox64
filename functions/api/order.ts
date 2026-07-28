@@ -12,10 +12,12 @@ import {
   unrealizedTotal,
   feeRateOf,
   feeAccrualStmts,
+  repeatModeOf,
   type Env,
   type PositionRow,
   type PendingRow,
   type UserRow,
+  type ConditionalRow,
 } from '../_shared';
 import { checkTriggers } from '../_trading';
 import {
@@ -70,6 +72,55 @@ function num(v: unknown): number | null {
   if (v == null) return null;
   const n = Number(v);
   return isFinite(n) ? n : null;
+}
+
+/** 무한(반복) 조건부 옵션 파싱 — conditionalOpen/editConditional 이 공유한다.
+ * 필드가 `undefined`(=아예 안 보냄)면 prev 값을 유지하고, `null`/`''` 이면 "해제"로 본다.
+ * 검증 실패 시 사람이 읽을 에러 문구(string)를 반환한다. */
+type RepeatOpts = { repeatMode: string; rearmPrice: number | null; cooldownMs: number; maxFills: number | null };
+function parseRepeatOpts(
+  body: Record<string, unknown>,
+  triggerPrice: number,
+  triggerDir: string,
+  isOx: boolean,
+  prev?: RepeatOpts,
+): RepeatOpts | string {
+  const base: RepeatOpts = prev ?? { repeatMode: 'continuous', rearmPrice: null, cooldownMs: 0, maxFills: null };
+
+  let repeatMode = base.repeatMode;
+  if (body.repeatMode !== undefined) {
+    repeatMode = String(body.repeatMode);
+    if (repeatMode !== 'continuous' && repeatMode !== 'rearm') return '반복 방식 오류';
+  }
+
+  let rearmPrice = base.rearmPrice;
+  if (body.rearmPrice !== undefined) {
+    rearmPrice = body.rearmPrice === null || body.rearmPrice === '' ? null : Number(body.rearmPrice);
+  }
+  if (rearmPrice != null) {
+    if (!(rearmPrice > 0) || !isFinite(rearmPrice)) return '재무장 가격 오류';
+    // 재무장은 "트리거 반대편으로 돌아오는 것"이라 트리거 가격보다 반대 방향이어야 한다.
+    // below(이하로 떨어지면 진입) → 다시 오를 때 재무장이므로 재무장가 >= 트리거가.
+    if (triggerDir === 'below' && rearmPrice < triggerPrice) return '재무장 가격은 트리거 가격 이상이어야 합니다';
+    if (triggerDir === 'above' && rearmPrice > triggerPrice) return '재무장 가격은 트리거 가격 이하여야 합니다';
+    if (isOx) rearmPrice = Math.round(rearmPrice * 1e4) / 1e4;
+  }
+
+  // 클라는 사람이 읽기 쉬운 "초"로 보내고 서버는 ms 로 저장한다(0=폴링마다 = 가장 빠름).
+  let cooldownMs = base.cooldownMs;
+  if (body.cooldownSec !== undefined) {
+    const sec = body.cooldownSec === null || body.cooldownSec === '' ? 0 : Number(body.cooldownSec);
+    if (!isFinite(sec) || sec < 0 || sec > 86400) return '재실행 간격은 0~86,400초';
+    cooldownMs = Math.round(sec * 1000);
+  }
+
+  let maxFills = base.maxFills;
+  if (body.maxFills !== undefined) {
+    maxFills = body.maxFills === null || body.maxFills === '' ? null : Math.round(Number(body.maxFills));
+  }
+  if (maxFills != null && (!(maxFills >= 1) || !isFinite(maxFills) || maxFills > 100000)) return '최대 실행 횟수는 1~100,000';
+
+  return { repeatMode, rearmPrice, cooldownMs, maxFills };
 }
 
 async function handle(request: Request, env: Ctx['env']): Promise<Response> {
@@ -458,30 +509,14 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
     if (isVirtualSymbol(symbol)) triggerPrice = Math.round(triggerPrice * 1e4) / 1e4; // OX 4자리 틱
 
-    // ── 무한(반복) 조건부 ── 체결돼도 주문이 남아, 가격이 트리거 반대편(재무장 가격)으로 돌아왔다가
-    // 다시 트리거될 때마다 또 시장가로 진입한다. size 는 "1회 실행 수량"이 된다(차감하지 않음).
+    // ── 무한(반복) 조건부 ── 체결돼도 주문이 남는다. size 는 "1회 실행 수량"이 된다(차감하지 않음).
     const repeating = body.repeating === true || body.repeating === 1;
-    let rearmPrice: number | null = null;
-    let maxFills: number | null = null;
-    if (repeating) {
-      if (body.rearmPrice != null && body.rearmPrice !== '') {
-        rearmPrice = Number(body.rearmPrice);
-        if (!(rearmPrice > 0) || !isFinite(rearmPrice)) return bad('재무장 가격 오류');
-        // 재무장은 "트리거 반대편으로 돌아오는 것"이라 트리거 가격보다 안쪽(트리거 반대 방향)이어야 한다.
-        // below(이하로 떨어지면 진입) → 다시 오를 때 재무장이므로 재무장가 >= 트리거가.
-        if (triggerDir === 'below' && rearmPrice < triggerPrice) return bad('재무장 가격은 트리거 가격 이상이어야 합니다');
-        if (triggerDir === 'above' && rearmPrice > triggerPrice) return bad('재무장 가격은 트리거 가격 이하여야 합니다');
-        if (isVirtualSymbol(symbol)) rearmPrice = Math.round(rearmPrice * 1e4) / 1e4;
-      }
-      if (body.maxFills != null && body.maxFills !== '') {
-        maxFills = Math.round(Number(body.maxFills));
-        if (!(maxFills >= 1) || !isFinite(maxFills) || maxFills > 100000) return bad('최대 실행 횟수는 1~100,000');
-      }
-    }
+    const rep = parseRepeatOpts(body, triggerPrice, triggerDir, isVirtualSymbol(symbol));
+    if (typeof rep === 'string') return bad(rep);
 
     const now = Date.now();
     await env.DB.prepare(
-      'INSERT INTO conditional_orders (id, user_id, symbol, side, size, leverage, trigger_price, trigger_dir, created_at, repeating, armed, rearm_price, fill_count, max_fills) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO conditional_orders (id, user_id, symbol, side, size, leverage, trigger_price, trigger_dir, created_at, repeating, armed, rearm_price, fill_count, max_fills, repeat_mode, cooldown_ms, last_fill_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     )
       .bind(
         crypto.randomUUID(),
@@ -495,13 +530,74 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
         now,
         repeating ? 1 : 0,
         1, // armed — 이미 조건을 만족하는 상태로 만들면 아래 checkTriggers 에서 곧바로 1회 실행된다
-        rearmPrice,
+        rep.rearmPrice,
         0,
-        maxFills,
+        rep.maxFills,
+        rep.repeatMode,
+        rep.cooldownMs,
+        null,
       )
       .run();
 
     // 방금 넣은 조건부까지 포함해 평가(이미 트리거된 스탑이면 즉시 체결). marks 를 loadState 로 전달.
+    const marks = await checkTriggers(env, uid);
+    return json(await loadState(env, uid, marks));
+  }
+
+  // 조건부 주문 수정 — 트리거가/수량/조건(이상·이하)/레버리지 + 반복 설정을 취소 없이 바꾼다.
+  // 증거금을 잠그지 않는 주문이라 editLimit 과 달리 잔고 정산이 없다(단순 UPDATE).
+  if (body.action === 'editConditional') {
+    const conditionalId = typeof body.conditionalId === 'string' ? body.conditionalId : '';
+    const cond = await env.DB.prepare('SELECT * FROM conditional_orders WHERE id = ? AND user_id = ?')
+      .bind(conditionalId, uid)
+      .first<ConditionalRow>();
+    if (!cond) return bad('주문을 찾을 수 없음', 404);
+    const isOx = isVirtualSymbol(cond.symbol);
+
+    // 안 보낸 필드는 기존 값 유지.
+    let triggerPrice = body.triggerPrice != null && body.triggerPrice !== '' ? Number(body.triggerPrice) : cond.trigger_price;
+    if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
+    if (isOx) triggerPrice = Math.round(triggerPrice * 1e4) / 1e4;
+    const size = body.size != null && body.size !== '' ? Number(body.size) : cond.size;
+    if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
+    const triggerDir = body.triggerDir != null && body.triggerDir !== '' ? String(body.triggerDir) : cond.trigger_dir;
+    if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
+    const leverage = body.leverage != null && body.leverage !== '' ? Math.round(Number(body.leverage)) : cond.leverage;
+    if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
+    const repeating = body.repeating === undefined ? !!cond.repeating : body.repeating === true || body.repeating === 1;
+
+    const rep = parseRepeatOpts(body, triggerPrice, triggerDir, isOx, {
+      repeatMode: repeatModeOf(cond),
+      rearmPrice: cond.rearm_price ?? null,
+      cooldownMs: cond.cooldown_ms ?? 0,
+      maxFills: cond.max_fills ?? null,
+    });
+    if (typeof rep === 'string') return bad(rep);
+    const done = cond.fill_count ?? 0;
+    if (rep.maxFills != null && rep.maxFills <= done)
+      return bad(`최대 실행 횟수는 이미 실행한 횟수(${done}회)보다 커야 합니다`);
+
+    // ⚠ armed=1 로 되살린다 — 재무장 대기 중에 조건을 고쳤는데 계속 잠들어 있으면 "수정했는데 안 걸린다"가 된다.
+    const upd = await env.DB.prepare(
+      'UPDATE conditional_orders SET trigger_price = ?, size = ?, trigger_dir = ?, leverage = ?, repeating = ?, repeat_mode = ?, rearm_price = ?, cooldown_ms = ?, max_fills = ?, armed = 1 WHERE id = ? AND user_id = ?',
+    )
+      .bind(
+        triggerPrice,
+        size,
+        triggerDir,
+        leverage,
+        repeating ? 1 : 0,
+        rep.repeatMode,
+        rep.rearmPrice,
+        rep.cooldownMs,
+        rep.maxFills,
+        conditionalId,
+        uid,
+      )
+      .run();
+    if (upd.meta.changes !== 1) return bad('주문을 찾을 수 없음', 404); // 그 사이 체결/취소됨
+
+    // 수정 직후 재평가 — 새 조건을 이미 만족하면 그 자리에서 체결(conditionalOpen 과 동일).
     const marks = await checkTriggers(env, uid);
     return json(await loadState(env, uid, marks));
   }

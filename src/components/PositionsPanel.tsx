@@ -23,6 +23,7 @@ export default function PositionsPanel() {
   const limitClose = useTradingStore((s) => s.limitClose);
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
   const cancelConditional = useTradingStore((s) => s.cancelConditional);
+  const editConditional = useTradingStore((s) => s.editConditional);
   const editLimit = useTradingStore((s) => s.editLimit);
   const setSlTp = useTradingStore((s) => s.setSlTp);
   const busy = useTradingStore((s) => s.busy);
@@ -104,6 +105,45 @@ export default function PositionsPanel() {
     const size = editPendSize ? Number(editPendSize) : NaN;
     editLimit(id, { limitPrice: px > 0 ? px : undefined, size: size > 0 ? size : undefined });
     setEditPendId(null);
+  };
+
+  // 조건부 주문 수정 — 트리거가/수량/조건(이상·이하) + 반복 설정을 인라인 편집한다(증거금을 잠그지
+  // 않는 주문이라 서버도 단순 UPDATE). 편집 중인 행만 입력칸으로 바뀐다.
+  const [editCondId, setEditCondId] = useState<string | null>(null);
+  const [editCondPx, setEditCondPx] = useState('');
+  const [editCondSize, setEditCondSize] = useState('');
+  const [editCondDir, setEditCondDir] = useState<'above' | 'below'>('above');
+  const [editCondRepeat, setEditCondRepeat] = useState(false);
+  const [editCondMode, setEditCondMode] = useState<'continuous' | 'rearm'>('continuous');
+  const [editCondCooldown, setEditCondCooldown] = useState('');
+  const [editCondRearm, setEditCondRearm] = useState('');
+  const [editCondMax, setEditCondMax] = useState('');
+  const startEditCond = (c: (typeof conditionalOrders)[number]) => {
+    setEditCondId(c.id);
+    setEditCondPx(String(c.triggerPrice));
+    setEditCondSize(String(c.size));
+    setEditCondDir(c.triggerDir);
+    setEditCondRepeat(c.repeating);
+    setEditCondMode(c.repeatMode);
+    setEditCondCooldown(c.cooldownMs > 0 ? String(c.cooldownMs / 1000) : '');
+    setEditCondRearm(c.rearmPrice != null ? String(c.rearmPrice) : '');
+    setEditCondMax(c.maxFills != null ? String(c.maxFills) : '');
+  };
+  const saveEditCond = (id: string) => {
+    const px = editCondPx ? Number(editCondPx) : NaN;
+    const size = editCondSize ? Number(editCondSize) : NaN;
+    editConditional(id, {
+      triggerPrice: px > 0 ? px : undefined,
+      size: size > 0 ? size : undefined,
+      triggerDir: editCondDir,
+      repeating: editCondRepeat,
+      repeatMode: editCondMode,
+      // 해당 모드에서 의미 없는 값은 null 로 보내 해제한다(서버가 undefined=유지, null=해제로 구분).
+      rearmPrice: editCondRepeat && editCondMode === 'rearm' && editCondRearm ? Number(editCondRearm) : null,
+      cooldownSec: editCondRepeat && editCondMode === 'continuous' && editCondCooldown ? Number(editCondCooldown) : 0,
+      maxFills: editCondRepeat && editCondMax ? Number(editCondMax) : null,
+    });
+    setEditCondId(null);
   };
 
   // 각 포지션의 미실현 PnL(현재 시세 기준) — 청산가 계산에서 "다른 포지션들"의 몫을 뺄 때 재사용.
@@ -463,76 +503,220 @@ export default function PositionsPanel() {
                 </tr>
               </thead>
               <tbody>
-                {conditionalOrders.map((c) => (
-                  <tr key={c.id} className="border-b border-border/60">
-                    <td className="px-3 py-2.5 font-medium text-text">
-                      <button
-                        onClick={() => setSymbol(c.symbol)}
-                        title={`${c.symbol.replace('USDT', '')} 차트로 이동`}
-                        className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
-                      >
-                        {c.symbol.replace('USDT', '')}
-                      </button>
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <span
-                        className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
-                          c.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
-                        }`}
-                      >
-                        {c.side === 'long' ? '롱' : '숏'} 진입 {c.leverage}x
-                      </span>
-                    </td>
-                    <td className="px-3 py-2.5 text-right text-text">
-                      <span className="text-muted">{c.triggerDir === 'above' ? '≥ ' : '≤ '}</span>
-                      {fmtPrice(c.triggerPrice, precisionOf(precisions, c.symbol))}
-                      {/* 무한 조건부가 방금 실행된 상태면, 다시 무장되는 가격을 함께 보여준다 */}
-                      {c.repeating && !c.armed && (
-                        <div className="text-[10px] text-muted">
-                          재무장 {c.triggerDir === 'above' ? '≤ ' : '≥ '}
-                          {fmtPrice(c.rearmPrice ?? c.triggerPrice, precisionOf(precisions, c.symbol))}
+                {conditionalOrders.map((c) => {
+                  const editing = editCondId === c.id;
+                  const prec = precisionOf(precisions, c.symbol);
+                  const inputCls =
+                    'w-20 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border';
+                  return (
+                    <tr key={c.id} className="border-b border-border/60">
+                      <td className="px-3 py-2.5 font-medium text-text">
+                        <button
+                          onClick={() => setSymbol(c.symbol)}
+                          title={`${c.symbol.replace('USDT', '')} 차트로 이동`}
+                          className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
+                        >
+                          {c.symbol.replace('USDT', '')}
+                        </button>
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <span
+                          className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                            c.side === 'long' ? 'bg-upDim text-up' : 'bg-downDim text-down'
+                          }`}
+                        >
+                          {c.side === 'long' ? '롱' : '숏'} 진입 {c.leverage}x
+                        </span>
+                      </td>
+                      <td className="px-3 py-2.5 text-right text-text">
+                        {editing ? (
+                          <div className="flex items-center justify-end gap-1">
+                            {/* 이상/이하 토글 — 클릭하면 반대로 바뀐다 */}
+                            <button
+                              onClick={() => setEditCondDir(editCondDir === 'above' ? 'below' : 'above')}
+                              title="트리거 조건 전환(이상 ↔ 이하)"
+                              className="rounded bg-panel2 px-1.5 py-0.5 text-[11px] font-semibold text-accent ring-1 ring-border"
+                            >
+                              {editCondDir === 'above' ? '≥' : '≤'}
+                            </button>
+                            <input
+                              value={fmtNumInput(editCondPx)}
+                              onChange={(e) => setEditCondPx(unfmtNum(e.target.value))}
+                              inputMode="decimal"
+                              className={inputCls}
+                            />
+                          </div>
+                        ) : (
+                          <>
+                            <span className="text-muted">{c.triggerDir === 'above' ? '≥ ' : '≤ '}</span>
+                            {fmtPrice(c.triggerPrice, prec)}
+                            {/* 재무장 대기 중이면 다시 무장되는 가격을 함께 보여준다 */}
+                            {c.repeating && c.repeatMode === 'rearm' && !c.armed && (
+                              <div className="text-[10px] text-muted">
+                                재무장 {c.triggerDir === 'above' ? '≤ ' : '≥ '}
+                                {fmtPrice(c.rearmPrice ?? c.triggerPrice, prec)}
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5 text-right text-text">
+                        {editing ? (
+                          <input
+                            value={fmtNumInput(editCondSize)}
+                            onChange={(e) => setEditCondSize(unfmtNum(e.target.value))}
+                            inputMode="decimal"
+                            className={inputCls}
+                          />
+                        ) : (
+                          <>
+                            {fmtQty(c.size)}
+                            {c.repeating && <div className="text-[10px] text-muted">1회당</div>}
+                          </>
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5">
+                        {editing ? (
+                          <div className="flex flex-col items-start gap-1">
+                            <label className="flex cursor-pointer items-center gap-1 text-[11px] text-muted">
+                              <input
+                                type="checkbox"
+                                checked={editCondRepeat}
+                                onChange={(e) => setEditCondRepeat(e.target.checked)}
+                                className="accent-up"
+                              />
+                              무한 반복
+                            </label>
+                            {editCondRepeat && (
+                              <>
+                                <div className="flex gap-1">
+                                  <button
+                                    onClick={() => setEditCondMode('continuous')}
+                                    title="조건을 만족하는 동안 계속 실행"
+                                    className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                                      editCondMode === 'continuous' ? 'bg-elevated text-accent' : 'bg-panel2 text-muted'
+                                    }`}
+                                  >
+                                    계속
+                                  </button>
+                                  <button
+                                    onClick={() => setEditCondMode('rearm')}
+                                    title="되돌아왔다 다시 트리거될 때 1회씩"
+                                    className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                                      editCondMode === 'rearm' ? 'bg-elevated text-accent' : 'bg-panel2 text-muted'
+                                    }`}
+                                  >
+                                    되돌아올 때
+                                  </button>
+                                </div>
+                                <div className="flex items-center gap-1">
+                                  {editCondMode === 'continuous' ? (
+                                    <input
+                                      value={fmtNumInput(editCondCooldown)}
+                                      onChange={(e) => setEditCondCooldown(unfmtNum(e.target.value))}
+                                      inputMode="decimal"
+                                      placeholder="간격s"
+                                      title="재실행 간격(초). 0/비움=최대 속도"
+                                      className="w-14 rounded bg-panel2 px-1 py-0.5 text-right text-[10px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                                    />
+                                  ) : (
+                                    <input
+                                      value={fmtNumInput(editCondRearm)}
+                                      onChange={(e) => setEditCondRearm(unfmtNum(e.target.value))}
+                                      inputMode="decimal"
+                                      placeholder="재무장가"
+                                      title="재무장 가격(비움=트리거 가격)"
+                                      className="w-16 rounded bg-panel2 px-1 py-0.5 text-right text-[10px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                                    />
+                                  )}
+                                  <input
+                                    value={fmtNumInput(editCondMax)}
+                                    onChange={(e) => setEditCondMax(unfmtNum(e.target.value))}
+                                    inputMode="numeric"
+                                    placeholder="최대"
+                                    title="최대 실행 횟수(비움=무제한)"
+                                    className="w-14 rounded bg-panel2 px-1 py-0.5 text-right text-[10px] text-text outline-none ring-1 ring-border placeholder:text-muted"
+                                  />
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        ) : c.repeating ? (
+                          <div className="flex flex-col gap-0.5">
+                            <span
+                              className={`w-fit rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                                c.repeatMode === 'continuous'
+                                  ? 'bg-downDim text-down'
+                                  : c.armed
+                                    ? 'bg-accent/15 text-accent'
+                                    : 'bg-panel2 text-muted'
+                              }`}
+                              title={
+                                c.repeatMode === 'continuous'
+                                  ? `조건을 만족하는 동안 계속 실행${c.cooldownMs > 0 ? ` (${c.cooldownMs / 1000}초 간격)` : ' (최대 속도)'}`
+                                  : c.armed
+                                    ? '무장 상태 — 트리거되면 실행됩니다'
+                                    : '재무장 대기 — 가격이 되돌아와야 다시 실행됩니다'
+                              }
+                            >
+                              {c.repeatMode === 'continuous' ? '계속 ∞' : '되돌아올 때 ∞'}
+                            </span>
+                            <span className="text-[10px] text-muted">
+                              {c.maxFills != null ? `${c.fillCount}/${c.maxFills}회` : `${c.fillCount}회 실행`}
+                              {c.repeatMode === 'continuous'
+                                ? c.cooldownMs > 0
+                                  ? ` · ${c.cooldownMs / 1000}초 간격`
+                                  : ' · 최대 속도'
+                                : c.armed
+                                  ? ' · 대기 중'
+                                  : ' · 재무장 대기'}
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="text-[11px] text-muted">1회</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          {editing ? (
+                            <>
+                              <button
+                                onClick={() => saveEditCond(c.id)}
+                                disabled={busy}
+                                className="rounded bg-elevated px-1.5 py-0.5 text-[11px] text-accent hover:bg-panel2 disabled:opacity-40"
+                              >
+                                저장
+                              </button>
+                              <button
+                                onClick={() => setEditCondId(null)}
+                                className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted hover:text-text"
+                              >
+                                취소
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => startEditCond(c)}
+                                disabled={busy}
+                                className="rounded border border-border px-2 py-1 text-muted transition hover:border-accent hover:text-accent disabled:opacity-40"
+                              >
+                                수정
+                              </button>
+                              <button
+                                onClick={() => cancelConditional(c.id)}
+                                disabled={busy}
+                                className="rounded border border-border px-2 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
+                              >
+                                취소
+                              </button>
+                            </>
+                          )}
                         </div>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5 text-right text-text">
-                      {fmtQty(c.size)}
-                      {c.repeating && <div className="text-[10px] text-muted">1회당</div>}
-                    </td>
-                    <td className="px-3 py-2.5">
-                      {c.repeating ? (
-                        <div className="flex flex-col gap-0.5">
-                          <span
-                            className={`w-fit rounded px-1.5 py-0.5 text-[11px] font-semibold ${
-                              c.armed ? 'bg-accent/15 text-accent' : 'bg-panel2 text-muted'
-                            }`}
-                            title={
-                              c.armed
-                                ? '무장 상태 — 트리거되면 실행됩니다'
-                                : '재무장 대기 — 가격이 되돌아와야 다시 실행됩니다'
-                            }
-                          >
-                            {c.maxFills != null ? `반복 ${c.fillCount}/${c.maxFills}` : '무한 ∞'}
-                          </span>
-                          <span className="text-[10px] text-muted">
-                            {c.armed ? '대기 중' : '재무장 대기'}
-                            {c.maxFills == null && c.fillCount > 0 && ` · ${c.fillCount}회 실행`}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-[11px] text-muted">1회</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5 text-right">
-                      <button
-                        onClick={() => cancelConditional(c.id)}
-                        disabled={busy}
-                        className="rounded border border-border px-2 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
-                      >
-                        취소
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

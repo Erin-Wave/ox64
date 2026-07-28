@@ -8,6 +8,7 @@ import type { Side } from '@/types';
 type Tab = 'market' | 'limit' | 'conditional';
 type Unit = 'coin' | 'usdt';
 type TriggerDir = 'above' | 'below';
+type RepeatMode = 'continuous' | 'rearm';
 
 /** 주문 패널 (OKX 스타일). 체결가는 서버가 결정.
  * Easy 모드: 시장가만. Standard 모드: 시장가 + 지정가 + SL/TP. */
@@ -42,10 +43,12 @@ export default function OrderPanel() {
   const [limitPrice, setLimitPrice] = useState('');
   const [triggerPrice, setTriggerPrice] = useState(''); // 조건부 주문 트리거 가격
   const [triggerDir, setTriggerDir] = useState<TriggerDir>('above'); // 이 가격 이상/이하가 되면 시장가 진입
-  // 무한(반복) 조건부 — 체결돼도 주문이 사라지지 않고, 가격이 트리거 반대편(재무장 가격)으로 돌아왔다
-  // 다시 트리거될 때마다 또 실행된다("1.5 이하로 떨어질 때마다 123개 매수").
+  // 무한(반복) 조건부 — 체결돼도 주문이 사라지지 않는다. 기본 'continuous' 는 조건이 참인 **동안 계속**
+  // 실행(폴링마다 1회 ≈ 1초)이고, 'rearm' 은 가격이 되돌아왔다 다시 트리거될 때만 1회씩 실행한다.
   const [repeating, setRepeating] = useState(false);
-  const [rearmPrice, setRearmPrice] = useState(''); // 비우면 트리거 가격에서 재무장
+  const [repeatMode, setRepeatMode] = useState<RepeatMode>('continuous');
+  const [rearmPrice, setRearmPrice] = useState(''); // (rearm) 비우면 트리거 가격에서 재무장
+  const [cooldownSec, setCooldownSec] = useState(''); // (continuous) 비우면 0 = 폴링마다
   const [maxFills, setMaxFills] = useState(''); // 비우면 무제한
   const [useSlTp, setUseSlTp] = useState(false);
   const [stopLoss, setStopLoss] = useState('');
@@ -112,8 +115,10 @@ export default function OrderPanel() {
         triggerPrice: tpx,
         triggerDir,
         repeating,
-        // 무한일 때만 의미가 있는 값들. 비워두면 재무장가=트리거가, 실행 횟수 무제한.
-        rearmPrice: repeating && rearmPrice ? Number(rearmPrice) : null,
+        // 무한일 때만 의미가 있는 값들. 비워두면 간격 0(폴링마다)·재무장가=트리거가·횟수 무제한.
+        repeatMode,
+        rearmPrice: repeating && repeatMode === 'rearm' && rearmPrice ? Number(rearmPrice) : null,
+        cooldownSec: repeating && repeatMode === 'continuous' && cooldownSec ? Number(cooldownSec) : 0,
         maxFills: repeating && maxFills ? Number(maxFills) : null,
       });
       return;
@@ -269,48 +274,106 @@ export default function OrderPanel() {
             </span>
           </label>
           {repeating && (
-            <div className="mt-1.5 grid grid-cols-2 gap-2">
-              <div>
-                <label className="mb-1 block text-[10px] text-muted">재무장 가격 (선택)</label>
-                <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-                  <input
-                    value={fmtNumInput(rearmPrice)}
-                    onChange={(e) => setRearmPrice(unfmtNum(e.target.value))}
-                    inputMode="decimal"
-                    placeholder={triggerPrice ? fmtNumInput(triggerPrice) : '트리거 가격'}
-                    title={`가격이 이 값 ${triggerDir === 'below' ? '이상으로 올라야' : '이하로 내려야'} 다시 무장됩니다(비우면 트리거 가격)`}
-                    className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
-                  />
+            <>
+              {/* 반복 방식 — 연속(조건 참인 동안 계속) / 되돌아올 때만(재무장) */}
+              <div className="mt-1.5 flex gap-1 rounded-md bg-panel2 p-1 text-[11px]">
+                <button
+                  onClick={() => setRepeatMode('continuous')}
+                  title="트리거 조건을 만족하는 동안 폴링마다(약 1초) 계속 진입합니다"
+                  className={`flex-1 rounded py-1 text-center font-semibold transition ${
+                    repeatMode === 'continuous' ? 'bg-elevated text-accent' : 'text-muted hover:text-text'
+                  }`}
+                >
+                  조건 만족 중 계속
+                </button>
+                <button
+                  onClick={() => setRepeatMode('rearm')}
+                  title="한 번 실행하면 쉬고, 가격이 되돌아왔다 다시 트리거될 때 1회씩 실행합니다"
+                  className={`flex-1 rounded py-1 text-center font-semibold transition ${
+                    repeatMode === 'rearm' ? 'bg-elevated text-accent' : 'text-muted hover:text-text'
+                  }`}
+                >
+                  되돌아올 때마다 1회
+                </button>
+              </div>
+              <div className="mt-1.5 grid grid-cols-2 gap-2">
+                {repeatMode === 'continuous' ? (
+                  <div>
+                    <label className="mb-1 block text-[10px] text-muted">재실행 간격 (초)</label>
+                    <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                      <input
+                        value={fmtNumInput(cooldownSec)}
+                        onChange={(e) => setCooldownSec(unfmtNum(e.target.value))}
+                        inputMode="decimal"
+                        placeholder="0 (최대 속도)"
+                        title="다음 실행까지 최소 몇 초를 쉴지. 0/비움이면 폴링마다(약 1초에 1회) 계속 진입합니다"
+                        className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="mb-1 block text-[10px] text-muted">재무장 가격 (선택)</label>
+                    <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                      <input
+                        value={fmtNumInput(rearmPrice)}
+                        onChange={(e) => setRearmPrice(unfmtNum(e.target.value))}
+                        inputMode="decimal"
+                        placeholder={triggerPrice ? fmtNumInput(triggerPrice) : '트리거 가격'}
+                        title={`가격이 이 값 ${triggerDir === 'below' ? '이상으로 올라야' : '이하로 내려야'} 다시 무장됩니다(비우면 트리거 가격)`}
+                        className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                      />
+                    </div>
+                  </div>
+                )}
+                <div>
+                  <label className="mb-1 block text-[10px] text-muted">최대 실행 횟수 (선택)</label>
+                  <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                    <input
+                      value={fmtNumInput(maxFills)}
+                      onChange={(e) => setMaxFills(unfmtNum(e.target.value))}
+                      inputMode="numeric"
+                      placeholder="무제한"
+                      title="이 횟수만큼 실행하면 주문이 자동으로 사라집니다(비우면 무제한)"
+                      className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                    />
+                  </div>
                 </div>
               </div>
-              <div>
-                <label className="mb-1 block text-[10px] text-muted">최대 실행 횟수 (선택)</label>
-                <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-                  <input
-                    value={fmtNumInput(maxFills)}
-                    onChange={(e) => setMaxFills(unfmtNum(e.target.value))}
-                    inputMode="numeric"
-                    placeholder="무제한"
-                    title="이 횟수만큼 실행하면 주문이 자동으로 사라집니다(비우면 무제한)"
-                    className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
-                  />
-                </div>
-              </div>
-            </div>
+            </>
           )}
           <p className="mt-1 text-[10px] leading-tight text-muted">
             현재가가 트리거 가격 {triggerDir === 'above' ? '이상' : '이하'}이 되면 <span className="text-text">시장가</span>로 진입합니다.
             물량이 부족해 일부만 체결되면 나머지는 조건이 계속 살아있습니다.
           </p>
-          {repeating && (
+          {repeating && repeatMode === 'continuous' && (
+            <p className="mt-1 rounded bg-downDim p-1.5 text-[10px] leading-tight text-muted">
+              현재가가 트리거 가격 {triggerDir === 'above' ? '이상' : '이하'}
+              <span className="text-text">인 동안 계속</span>{' '}
+              {Number(cooldownSec) > 0 ? `${fmtNumInput(cooldownSec)}초마다` : '약 1초마다'} 같은 수량으로 진입합니다.
+              <span className="text-down">
+                {' '}
+                ⚠ 스스로 멈추지 않습니다 — 조건이 계속 만족되면 잔고가 바닥날 때까지 사들이고, 매번 증거금·수수료가
+                나갑니다. 브레이크는 위 <span className="font-semibold">재실행 간격</span>·
+                <span className="font-semibold">최대 실행 횟수</span>뿐입니다(주문은 조건부 탭에서 언제든 수정·취소 가능).
+              </span>
+            </p>
+          )}
+          {repeating && repeatMode === 'rearm' && (
             <p className="mt-1 rounded bg-panel2 p-1.5 text-[10px] leading-tight text-muted">
-              체결돼도 주문이 사라지지 않습니다. 한 번 실행되면 <span className="text-text">재무장 대기</span> 상태가 되고, 현재가가{' '}
+              한 번 실행되면 <span className="text-text">재무장 대기</span> 상태가 되고, 현재가가{' '}
               <span className="text-text">
                 {rearmPrice ? fmtNumInput(rearmPrice) : triggerPrice ? fmtNumInput(triggerPrice) : '트리거 가격'}
                 {triggerDir === 'below' ? ' 이상' : ' 이하'}
               </span>
               으로 돌아오면 다시 무장돼, 그 다음 트리거 때 같은 수량으로 또 진입합니다.
               <span className="text-down"> ⚠ 실행할 때마다 증거금·수수료가 나갑니다.</span>
+            </p>
+          )}
+          {repeating && (
+            <p className="mt-1 text-[10px] leading-tight text-muted">
+              ※ 반복 실행은 <span className="text-text">앱을 켜두고 있는 동안</span>만 진행됩니다(지정가·SL/TP 와 동일 —
+              서버가 접속 시점에 조건을 평가).
             </p>
           )}
         </div>
