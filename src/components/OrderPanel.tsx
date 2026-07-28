@@ -42,6 +42,11 @@ export default function OrderPanel() {
   const [limitPrice, setLimitPrice] = useState('');
   const [triggerPrice, setTriggerPrice] = useState(''); // 조건부 주문 트리거 가격
   const [triggerDir, setTriggerDir] = useState<TriggerDir>('above'); // 이 가격 이상/이하가 되면 시장가 진입
+  // 무한(반복) 조건부 — 체결돼도 주문이 사라지지 않고, 가격이 트리거 반대편(재무장 가격)으로 돌아왔다
+  // 다시 트리거될 때마다 또 실행된다("1.5 이하로 떨어질 때마다 123개 매수").
+  const [repeating, setRepeating] = useState(false);
+  const [rearmPrice, setRearmPrice] = useState(''); // 비우면 트리거 가격에서 재무장
+  const [maxFills, setMaxFills] = useState(''); // 비우면 무제한
   const [useSlTp, setUseSlTp] = useState(false);
   const [stopLoss, setStopLoss] = useState('');
   const [takeProfit, setTakeProfit] = useState('');
@@ -99,7 +104,18 @@ export default function OrderPanel() {
     if (effectiveTab === 'conditional') {
       const tpx = Number(triggerPrice);
       if (!tpx || tpx <= 0) return;
-      conditionalOpen({ symbol, side, size: sz, leverage, triggerPrice: tpx, triggerDir });
+      conditionalOpen({
+        symbol,
+        side,
+        size: sz,
+        leverage,
+        triggerPrice: tpx,
+        triggerDir,
+        repeating,
+        // 무한일 때만 의미가 있는 값들. 비워두면 재무장가=트리거가, 실행 횟수 무제한.
+        rearmPrice: repeating && rearmPrice ? Number(rearmPrice) : null,
+        maxFills: repeating && maxFills ? Number(maxFills) : null,
+      });
       return;
     }
     const { stopLoss: sl, takeProfit: tp } = parseSlTp();
@@ -245,10 +261,58 @@ export default function OrderPanel() {
             />
             <span className="px-3 text-xs text-muted">USDT</span>
           </div>
+          {/* 무한(반복) 조건부 — 체결돼도 주문이 남아 재무장 후 다시 트리거될 때마다 실행 */}
+          <label className="mt-2 flex cursor-pointer items-center gap-2 text-xs text-muted">
+            <input type="checkbox" checked={repeating} onChange={(e) => setRepeating(e.target.checked)} className="accent-up" />
+            <span>
+              무한 반복 <span className="text-[10px]">(트리거될 때마다 실행)</span>
+            </span>
+          </label>
+          {repeating && (
+            <div className="mt-1.5 grid grid-cols-2 gap-2">
+              <div>
+                <label className="mb-1 block text-[10px] text-muted">재무장 가격 (선택)</label>
+                <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                  <input
+                    value={fmtNumInput(rearmPrice)}
+                    onChange={(e) => setRearmPrice(unfmtNum(e.target.value))}
+                    inputMode="decimal"
+                    placeholder={triggerPrice ? fmtNumInput(triggerPrice) : '트리거 가격'}
+                    title={`가격이 이 값 ${triggerDir === 'below' ? '이상으로 올라야' : '이하로 내려야'} 다시 무장됩니다(비우면 트리거 가격)`}
+                    className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] text-muted">최대 실행 횟수 (선택)</label>
+                <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                  <input
+                    value={fmtNumInput(maxFills)}
+                    onChange={(e) => setMaxFills(unfmtNum(e.target.value))}
+                    inputMode="numeric"
+                    placeholder="무제한"
+                    title="이 횟수만큼 실행하면 주문이 자동으로 사라집니다(비우면 무제한)"
+                    className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
           <p className="mt-1 text-[10px] leading-tight text-muted">
             현재가가 트리거 가격 {triggerDir === 'above' ? '이상' : '이하'}이 되면 <span className="text-text">시장가</span>로 진입합니다.
             물량이 부족해 일부만 체결되면 나머지는 조건이 계속 살아있습니다.
           </p>
+          {repeating && (
+            <p className="mt-1 rounded bg-panel2 p-1.5 text-[10px] leading-tight text-muted">
+              체결돼도 주문이 사라지지 않습니다. 한 번 실행되면 <span className="text-text">재무장 대기</span> 상태가 되고, 현재가가{' '}
+              <span className="text-text">
+                {rearmPrice ? fmtNumInput(rearmPrice) : triggerPrice ? fmtNumInput(triggerPrice) : '트리거 가격'}
+                {triggerDir === 'below' ? ' 이상' : ' 이하'}
+              </span>
+              으로 돌아오면 다시 무장돼, 그 다음 트리거 때 같은 수량으로 또 진입합니다.
+              <span className="text-down"> ⚠ 실행할 때마다 증거금·수수료가 나갑니다.</span>
+            </p>
+          )}
         </div>
       )}
 

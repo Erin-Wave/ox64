@@ -432,11 +432,18 @@ export interface ConditionalRow {
   user_id: string;
   symbol: string;
   side: string; // 'long' | 'short'
-  size: number; // 남은(미체결) 목표 수량
+  size: number; // 1회성=남은(미체결) 목표 수량 / 무한=1회 실행 수량(고정)
   leverage: number;
   trigger_price: number;
   trigger_dir: string; // 'above'(>=) | 'below'(<=)
   created_at: number;
+  // ── 무한(반복) 조건부 (2026-07-28) ──
+  // ⚠ 마이그레이션 전 DB 에선 컬럼 자체가 없어 undefined 로 들어온다 → 읽을 땐 항상 `?? 기본값`.
+  repeating?: number | null; // 1이면 체결돼도 삭제하지 않고 재무장 대기로 되돌린다
+  armed?: number | null; // 1=트리거 대기 / 0=재무장 대기(트리거 반대편으로 돌아와야 다시 무장)
+  rearm_price?: number | null; // 재무장 가격(NULL 이면 trigger_price)
+  fill_count?: number | null; // 지금까지 실행된 횟수
+  max_fills?: number | null; // 최대 실행 횟수(NULL=무제한)
 }
 
 /** 로그인 사용자의 전체 상태(잔고+포지션+주문) 조회.
@@ -542,6 +549,12 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
       triggerPrice: c.trigger_price,
       triggerDir: c.trigger_dir,
       createdAt: c.created_at,
+      // 무한(반복) 조건부 — 마이그레이션 전 DB 는 컬럼이 없어 undefined 라 기본값으로 방어한다.
+      repeating: !!(c.repeating ?? 0),
+      armed: (c.armed ?? 1) !== 0,
+      rearmPrice: c.rearm_price ?? null,
+      fillCount: c.fill_count ?? 0,
+      maxFills: c.max_fills ?? null,
     })),
   };
 }

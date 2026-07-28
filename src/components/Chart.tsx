@@ -195,7 +195,9 @@ export default function Chart() {
         sell: c2.side === 'short',
         reduceOnly: false,
         conditional: true,
-        label: `조건부 ${c2.side === 'long' ? '롱' : '숏'} ${c2.triggerDir === 'above' ? '≥' : '≤'} ${fmtQty(c2.size)}`,
+        label: `조건부${c2.repeating ? '∞' : ''} ${c2.side === 'long' ? '롱' : '숏'} ${
+          c2.triggerDir === 'above' ? '≥' : '≤'
+        } ${fmtQty(c2.size)}${c2.repeating && !c2.armed ? ' (재무장 대기)' : ''}`,
       });
     }
     const prev = pendBtnsRef.current;
@@ -818,9 +820,25 @@ export default function Chart() {
             lineWidth: 1,
             lineStyle: LineStyle.Dashed,
             axisLabelVisible: true,
-            title: `조건부 ${cd.side === 'long' ? '롱' : '숏'} ${cd.triggerDir === 'above' ? '≥' : '≤'} ${fmtQty(cd.size)}`,
+            title: `조건부${cd.repeating ? '∞' : ''} ${cd.side === 'long' ? '롱' : '숏'} ${
+              cd.triggerDir === 'above' ? '≥' : '≤'
+            } ${fmtQty(cd.size)}`,
           }),
         );
+        // 무한 조건부가 재무장 대기 중이면 "여기까지 돌아오면 다시 무장" 지점도 흐린 점선으로 보여준다
+        // (트리거선만 있으면 왜 지금은 안 걸리는지 화면에서 알 수 없다). 재무장가=트리거가면 생략.
+        if (cd.repeating && !cd.armed && cd.rearmPrice != null && cd.rearmPrice !== cd.triggerPrice) {
+          priceLines.current.push(
+            c.createPriceLine({
+              price: cd.rearmPrice,
+              color: '#f0b90b80',
+              lineWidth: 1,
+              lineStyle: LineStyle.Dotted,
+              axisLabelVisible: true,
+              title: `재무장 ${cd.triggerDir === 'above' ? '≤' : '≥'}`,
+            }),
+          );
+        }
       }
     }
     repositionPendBtnsRef.current(); // 주문선이 바뀌면 취소(X) 버튼 위치도 즉시 갱신

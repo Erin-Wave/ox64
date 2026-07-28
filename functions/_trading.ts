@@ -168,11 +168,53 @@ async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark:
   await reflectVirtualFill(env, p.symbol, uid, p.limit_price, pos.side === 'long' ? 'sell' : 'buy', closeSize);
 }
 
+/** 무한 조건부의 "재무장" 가격 — 트리거 반대편으로 여기까지 돌아오면 다시 무장한다(미설정=트리거 가격). */
+function rearmPriceOf(c: ConditionalRow): number {
+  const r = c.rearm_price;
+  return r != null && isFinite(r) && r > 0 ? r : c.trigger_price;
+}
+
+/** 체결 뒤 조건부 주문 행을 어떻게 남길지 결정하는 문장 1개.
+ * - 무한(repeating): size 는 "1회 실행 수량"이라 차감하지 않고, 실행 횟수를 올린 뒤 armed=0(재무장 대기)로
+ *   되돌린다. max_fills 에 도달했으면 주문을 삭제한다.
+ * - 1회성: 기존대로 남은 수량을 차감하고, 다 채웠으면 삭제(부분 체결이면 조건이 계속 살아있음). */
+function conditionalAfterFillStmt(env: Env, uid: string, c: ConditionalRow, filled: number): D1PreparedStatement {
+  if (c.repeating) {
+    const fills = (c.fill_count ?? 0) + 1;
+    const done = c.max_fills != null && fills >= c.max_fills;
+    return done
+      ? env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid)
+      : env.DB.prepare('UPDATE conditional_orders SET armed = 0, fill_count = ? WHERE id = ? AND user_id = ?').bind(
+          fills,
+          c.id,
+          uid,
+        );
+  }
+  const remaining = c.size - filled;
+  return remaining <= EPS
+    ? env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid)
+    : env.DB.prepare('UPDATE conditional_orders SET size = ? WHERE id = ? AND user_id = ?').bind(remaining, c.id, uid);
+}
+
 /** 조건부(스탑) 주문 정산 — 트리거 가격을 넘어서면 그 자리에서 **시장가**로 남은 수량만큼 진입한다.
  * OX 는 봇 호가창 walking(matchMarketOxOrder), 실제 코인은 mark 가에 즉시 체결하되 **가용 증거금만큼만**
  * 체결하고 못 채운 잔량은 조건을 살려둔다(size 를 줄임) — "예약 수량이 다 안 채워지면 계속 조건 유지".
- * 트리거가 안 됐으면 아무것도 안 하고 그대로 대기. marks 는 크로스 가용(미실현손익) 계산용. */
+ * 트리거가 안 됐으면 아무것도 안 하고 그대로 대기. marks 는 크로스 가용(미실현손익) 계산용.
+ *
+ * ⚠ 무한(반복) 조건부는 체결 후 사라지지 않고 armed=0 이 되어 **가격이 트리거 반대편으로 돌아올 때만**
+ * 다시 무장한다. 재무장을 두지 않으면 "1.5 이하로 떨어지면 매수"가 1.5 아래에 머무는 동안 폴링마다
+ * (2.5초에 한 번) 계속 사들여 순식간에 파산한다 — "떨어질 때마다" ≠ "떨어져 있는 동안 계속". */
 async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, mark: number, marks: Record<string, number>): Promise<void> {
+  // 재무장 대기 중(무한 조건부가 방금 실행된 상태) — 반대편으로 돌아왔으면 다시 무장만 하고 끝낸다.
+  if (c.repeating && (c.armed ?? 1) === 0) {
+    const rearm = rearmPriceOf(c);
+    const back = c.trigger_dir === 'above' ? mark <= rearm : mark >= rearm;
+    if (back) {
+      await env.DB.prepare('UPDATE conditional_orders SET armed = 1 WHERE id = ? AND user_id = ?').bind(c.id, uid).run();
+    }
+    return;
+  }
+
   const triggered = c.trigger_dir === 'above' ? mark >= c.trigger_price : mark <= c.trigger_price;
   if (!triggered) return;
 
@@ -181,13 +223,9 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
   if (isVirtualSymbol(c.symbol)) {
     const uPnL = await unrealizedTotal(env, uid, marks);
     const { filled } = await matchMarketOxOrder(env, uid, c.side, c.size, c.leverage, null, null, uPnL);
-    const remaining = c.size - filled;
-    if (remaining <= EPS) {
-      await env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid).run();
-    } else if (filled > EPS) {
-      await env.DB.prepare('UPDATE conditional_orders SET size = ? WHERE id = ? AND user_id = ?').bind(remaining, c.id, uid).run();
-    }
-    return; // filled==0(감당 못 함/유동성 없음): 조건 그대로 유지 → 다음 폴링 재시도
+    // filled==0(감당 못 함/유동성 없음): 아무것도 안 건드림 → 조건(및 무장 상태) 그대로 유지, 다음 폴링 재시도.
+    if (filled > EPS) await conditionalAfterFillStmt(env, uid, c, filled).run();
+    return;
   }
 
   // 실제 코인 — 외부 시세(mark)로 즉시 체결(무한 유동성). 단, 감당 가능한 만큼만 체결하고 잔량은 유지.
@@ -245,9 +283,7 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
       'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
     ).bind(ordId, uid, c.symbol, c.side, price, fillSize, effLev, 'open', null, now),
   );
-  const remaining = c.size - fillSize;
-  if (remaining <= EPS) stmts.push(env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid));
-  else stmts.push(env.DB.prepare('UPDATE conditional_orders SET size = ? WHERE id = ? AND user_id = ?').bind(remaining, c.id, uid));
+  stmts.push(conditionalAfterFillStmt(env, uid, c, fillSize));
   await env.DB.batch(stmts);
 }
 

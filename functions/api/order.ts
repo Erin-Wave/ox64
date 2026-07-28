@@ -458,11 +458,47 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
     if (isVirtualSymbol(symbol)) triggerPrice = Math.round(triggerPrice * 1e4) / 1e4; // OX 4자리 틱
 
+    // ── 무한(반복) 조건부 ── 체결돼도 주문이 남아, 가격이 트리거 반대편(재무장 가격)으로 돌아왔다가
+    // 다시 트리거될 때마다 또 시장가로 진입한다. size 는 "1회 실행 수량"이 된다(차감하지 않음).
+    const repeating = body.repeating === true || body.repeating === 1;
+    let rearmPrice: number | null = null;
+    let maxFills: number | null = null;
+    if (repeating) {
+      if (body.rearmPrice != null && body.rearmPrice !== '') {
+        rearmPrice = Number(body.rearmPrice);
+        if (!(rearmPrice > 0) || !isFinite(rearmPrice)) return bad('재무장 가격 오류');
+        // 재무장은 "트리거 반대편으로 돌아오는 것"이라 트리거 가격보다 안쪽(트리거 반대 방향)이어야 한다.
+        // below(이하로 떨어지면 진입) → 다시 오를 때 재무장이므로 재무장가 >= 트리거가.
+        if (triggerDir === 'below' && rearmPrice < triggerPrice) return bad('재무장 가격은 트리거 가격 이상이어야 합니다');
+        if (triggerDir === 'above' && rearmPrice > triggerPrice) return bad('재무장 가격은 트리거 가격 이하여야 합니다');
+        if (isVirtualSymbol(symbol)) rearmPrice = Math.round(rearmPrice * 1e4) / 1e4;
+      }
+      if (body.maxFills != null && body.maxFills !== '') {
+        maxFills = Math.round(Number(body.maxFills));
+        if (!(maxFills >= 1) || !isFinite(maxFills) || maxFills > 100000) return bad('최대 실행 횟수는 1~100,000');
+      }
+    }
+
     const now = Date.now();
     await env.DB.prepare(
-      'INSERT INTO conditional_orders (id, user_id, symbol, side, size, leverage, trigger_price, trigger_dir, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO conditional_orders (id, user_id, symbol, side, size, leverage, trigger_price, trigger_dir, created_at, repeating, armed, rearm_price, fill_count, max_fills) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     )
-      .bind(crypto.randomUUID(), uid, symbol, side, size, leverage, triggerPrice, triggerDir, now)
+      .bind(
+        crypto.randomUUID(),
+        uid,
+        symbol,
+        side,
+        size,
+        leverage,
+        triggerPrice,
+        triggerDir,
+        now,
+        repeating ? 1 : 0,
+        1, // armed — 이미 조건을 만족하는 상태로 만들면 아래 checkTriggers 에서 곧바로 1회 실행된다
+        rearmPrice,
+        0,
+        maxFills,
+      )
       .run();
 
     // 방금 넣은 조건부까지 포함해 평가(이미 트리거된 스탑이면 즉시 체결). marks 를 loadState 로 전달.

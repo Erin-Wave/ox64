@@ -79,6 +79,9 @@ interface TradingState {
     leverage: number;
     triggerPrice: number;
     triggerDir: 'above' | 'below';
+    repeating?: boolean; // 무한(반복) 조건부 — 재무장 후 다시 트리거될 때마다 실행
+    rearmPrice?: number | null;
+    maxFills?: number | null;
   }) => Promise<void>;
   cancelConditional: (conditionalId: string) => Promise<void>;
   refill: () => Promise<void>;

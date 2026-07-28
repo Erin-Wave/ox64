@@ -69,16 +69,26 @@ CREATE INDEX IF NOT EXISTS idx_pending_symbol ON pending_orders(symbol);
 -- **시장가**로 size 만큼 진입한다(checkTriggers, functions/_trading.ts). 시장가라 OX 는 봇 호가창을
 -- walking, 실제 코인은 mark 가에 즉시 체결하되 **가용 증거금만큼만** 체결하고 못 채운 잔량은 조건을
 -- 그대로 유지한다(size 를 줄이고 살려둠) → "예약 수량이 다 체결 안 되면 계속 조건이 살아있음".
+--
+-- repeating=1 이면 **무한(반복) 조건부** — 체결돼도 주문이 사라지지 않고 armed=0(재무장 대기)이 된다.
+-- 가격이 트리거 반대편(rearm_price, 기본=trigger_price)으로 돌아오면 armed=1 로 복구돼 다음에 다시
+-- 트리거될 때 또 실행된다. ⚠ 재무장 없이 조건만 유지하면 트리거 아래에 머무는 동안 폴링마다 계속
+-- 사들여(2.5초에 한 번씩) 순식간에 파산한다 — "떨어질 때마다"는 "떨어져 있는 동안 계속"이 아니다.
 CREATE TABLE IF NOT EXISTS conditional_orders (
   id            TEXT PRIMARY KEY,
   user_id       TEXT NOT NULL,
   symbol        TEXT NOT NULL,
   side          TEXT NOT NULL,          -- 'long' | 'short' (진입 방향)
-  size          REAL NOT NULL,          -- 남은(미체결) 목표 수량 (부분 체결 시 줄어듦)
+  size          REAL NOT NULL,          -- 1회성: 남은(미체결) 목표 수량(부분 체결 시 줄어듦) / 무한: 1회 실행 수량(고정)
   leverage      INTEGER NOT NULL,
   trigger_price REAL NOT NULL,
   trigger_dir   TEXT NOT NULL,          -- 'above'(가격이 이상이 되면) | 'below'(이하가 되면)
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  repeating     INTEGER NOT NULL DEFAULT 0,  -- 1이면 무한(반복) 조건부 — 체결돼도 삭제하지 않고 재무장 대기
+  armed         INTEGER NOT NULL DEFAULT 1,  -- 1=트리거 대기 / 0=재무장 대기(반대편으로 돌아와야 다시 무장)
+  rearm_price   REAL,                        -- 재무장 가격(NULL=trigger_price). below 면 이 값 이상, above 면 이하로 돌아올 때 재무장
+  fill_count    INTEGER NOT NULL DEFAULT 0,  -- 지금까지 실행된 횟수(표시용)
+  max_fills     INTEGER                      -- 최대 실행 횟수(NULL=무제한). 도달하면 주문 삭제
 );
 CREATE INDEX IF NOT EXISTS idx_conditional_user ON conditional_orders(user_id);
 
@@ -235,6 +245,18 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- 불필요). ⚠ **코드(loadState/checkTriggers)가 이 테이블을 SELECT 하므로 코드 배포 전에 먼저 생성돼
 -- 있어야 한다** — 없으면 /api/state 가 통째로 500 이 된다(loadState 는 방어적으로 try/catch 로 감싸
 -- 두긴 했으나, 그래도 배포 전에 테이블을 만들어 두는 게 원칙).
+
+-- ⚠ 일회성 마이그레이션 (2026-07-28 추가, 무한(반복) 조건부 주문): 위 CREATE TABLE 에는 이미 포함돼
+-- 있지만, conditional_orders 가 이미 만들어진 기존 DB(=prod)에는 CREATE TABLE IF NOT EXISTS 가 컬럼을
+-- 더해주지 않으므로 최초 1회만 아래를 직접 실행할 것. **코드(loadState/checkTriggers/conditionalOpen)가
+-- 이 컬럼들을 SELECT/INSERT/UPDATE 하므로 코드 배포 전에 먼저 적용돼 있어야 한다** — 읽기 경로는 값이
+-- 없어도 기본값(?? 0/1)으로 방어하지만, conditionalOpen 의 INSERT 는 컬럼이 없으면 그대로 실패한다.
+-- 이미 실행했다면 재실행 시 "duplicate column name" 에러(무시 가능).
+-- ALTER TABLE conditional_orders ADD COLUMN repeating INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE conditional_orders ADD COLUMN armed INTEGER NOT NULL DEFAULT 1;
+-- ALTER TABLE conditional_orders ADD COLUMN rearm_price REAL;
+-- ALTER TABLE conditional_orders ADD COLUMN fill_count INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE conditional_orders ADD COLUMN max_fills INTEGER;
 
 -- ── 퍼즐게임(ox64.app/b, "스핑크스 보석찾기" 확장) — 코인 트레이딩과 완전히 분리된 별도 재화 ──────
 -- 격자 보드에 여러 칸을 차지하는 보석(모양별로 다름)이 숨겨져 있고, 칸을 하나씩 열 때마다(코스트 1

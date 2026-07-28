@@ -457,7 +457,8 @@ export default function PositionsPanel() {
                   <th className="px-3 py-2 font-medium">심볼</th>
                   <th className="px-3 py-2 font-medium">방향</th>
                   <th className="px-3 py-2 text-right font-medium">트리거 조건</th>
-                  <th className="px-3 py-2 text-right font-medium">남은 수량</th>
+                  <th className="px-3 py-2 text-right font-medium">수량</th>
+                  <th className="px-3 py-2 font-medium">반복</th>
                   <th className="px-3 py-2" />
                 </tr>
               </thead>
@@ -485,8 +486,42 @@ export default function PositionsPanel() {
                     <td className="px-3 py-2.5 text-right text-text">
                       <span className="text-muted">{c.triggerDir === 'above' ? '≥ ' : '≤ '}</span>
                       {fmtPrice(c.triggerPrice, precisionOf(precisions, c.symbol))}
+                      {/* 무한 조건부가 방금 실행된 상태면, 다시 무장되는 가격을 함께 보여준다 */}
+                      {c.repeating && !c.armed && (
+                        <div className="text-[10px] text-muted">
+                          재무장 {c.triggerDir === 'above' ? '≤ ' : '≥ '}
+                          {fmtPrice(c.rearmPrice ?? c.triggerPrice, precisionOf(precisions, c.symbol))}
+                        </div>
+                      )}
                     </td>
-                    <td className="px-3 py-2.5 text-right text-text">{fmtQty(c.size)}</td>
+                    <td className="px-3 py-2.5 text-right text-text">
+                      {fmtQty(c.size)}
+                      {c.repeating && <div className="text-[10px] text-muted">1회당</div>}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      {c.repeating ? (
+                        <div className="flex flex-col gap-0.5">
+                          <span
+                            className={`w-fit rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                              c.armed ? 'bg-accent/15 text-accent' : 'bg-panel2 text-muted'
+                            }`}
+                            title={
+                              c.armed
+                                ? '무장 상태 — 트리거되면 실행됩니다'
+                                : '재무장 대기 — 가격이 되돌아와야 다시 실행됩니다'
+                            }
+                          >
+                            {c.maxFills != null ? `반복 ${c.fillCount}/${c.maxFills}` : '무한 ∞'}
+                          </span>
+                          <span className="text-[10px] text-muted">
+                            {c.armed ? '대기 중' : '재무장 대기'}
+                            {c.maxFills == null && c.fillCount > 0 && ` · ${c.fillCount}회 실행`}
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="text-[11px] text-muted">1회</span>
+                      )}
+                    </td>
                     <td className="px-3 py-2.5 text-right">
                       <button
                         onClick={() => cancelConditional(c.id)}

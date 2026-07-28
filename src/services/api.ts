@@ -41,11 +41,18 @@ export interface ApiConditionalOrder {
   id: string;
   symbol: string;
   side: Side;
-  size: number; // 남은(미체결) 목표 수량
+  size: number; // 1회성=남은(미체결) 목표 수량 / 무한=1회 실행 수량
   leverage: number;
   triggerPrice: number;
   triggerDir: 'above' | 'below'; // 'above'=가격 이상, 'below'=가격 이하가 되면 시장가 진입
   createdAt: number;
+  /** 무한(반복) 조건부 — 체결돼도 주문이 남아, 재무장 후 다시 트리거될 때마다 또 실행된다 */
+  repeating: boolean;
+  /** true=트리거 대기 / false=재무장 대기(가격이 rearmPrice 로 돌아와야 다시 무장) */
+  armed: boolean;
+  rearmPrice: number | null; // null 이면 트리거 가격에서 재무장
+  fillCount: number; // 지금까지 실행된 횟수
+  maxFills: number | null; // 최대 실행 횟수(null=무제한)
 }
 export interface AppState {
   name: string;
@@ -159,6 +166,12 @@ export const api = {
     leverage: number;
     triggerPrice: number;
     triggerDir: 'above' | 'below';
+    /** true 면 무한(반복) 조건부 — 체결돼도 사라지지 않고 재무장 후 다시 트리거될 때마다 실행 */
+    repeating?: boolean;
+    /** 재무장 가격(생략=트리거 가격). below 면 트리거 이상, above 면 트리거 이하여야 함 */
+    rearmPrice?: number | null;
+    /** 최대 실행 횟수(생략/null=무제한) */
+    maxFills?: number | null;
   }) => req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'conditionalOpen', ...p }) }),
   cancelConditional: (conditionalId: string) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'cancelConditional', conditionalId }) }),
