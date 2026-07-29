@@ -279,7 +279,7 @@ export default function OrderPanel() {
               <div className="mt-1.5 flex gap-1 rounded-md bg-panel2 p-1 text-[11px]">
                 <button
                   onClick={() => setRepeatMode('continuous')}
-                  title="트리거 조건을 만족하는 동안 폴링마다(약 1초) 계속 진입합니다"
+                  title="트리거 조건을 만족하는 동안 계속 진입합니다(앱을 켜두면 약 1초마다, 닫아두면 서버 cron 이 1분마다 평가)"
                   className={`flex-1 rounded py-1 text-center font-semibold transition ${
                     repeatMode === 'continuous' ? 'bg-elevated text-accent' : 'text-muted hover:text-text'
                   }`}
@@ -306,7 +306,7 @@ export default function OrderPanel() {
                         onChange={(e) => setCooldownSec(unfmtNum(e.target.value))}
                         inputMode="decimal"
                         placeholder="0 (최대 속도)"
-                        title="다음 실행까지 최소 몇 초를 쉴지. 0/비움이면 폴링마다(약 1초에 1회) 계속 진입합니다"
+                        title="다음 실행까지 최소 몇 초를 쉴지. 0/비움이면 평가할 때마다(앱을 켜뒀으면 약 1초에 1회) 계속 진입합니다"
                         className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
                       />
                     </div>
@@ -372,8 +372,8 @@ export default function OrderPanel() {
           )}
           {repeating && (
             <p className="mt-1 text-[10px] leading-tight text-muted">
-              ※ 반복 실행은 <span className="text-text">앱을 켜두고 있는 동안</span>만 진행됩니다(지정가·SL/TP 와 동일 —
-              서버가 접속 시점에 조건을 평가).
+              ※ <span className="text-text">앱을 완전히 닫아둬도</span> 서버가 계속 조건을 평가합니다(지정가·SL/TP 와 동일).
+              단 평가 주기는 앱을 켜뒀을 때 약 1초, 닫아뒀을 때 약 1분(1분마다 몰아서 여러 번)입니다.
             </p>
           )}
         </div>

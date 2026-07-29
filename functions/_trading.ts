@@ -1,12 +1,13 @@
-// ── 지정가/스탑로스/테이크프로핏 체결 체크 ──────────────────────────────
+// ── 지정가/스탑로스/테이크프로핏/조건부 체결 체크 ──────────────────────────
 // Cloudflare Pages Functions 는 정기 실행(cron)을 지원하지 않는다. 그래서 이 유저의
-// state/order 요청이 들어올 때마다(클라이언트가 몇 초 간격으로 폴링) 호출해
-// 조건이 맞으면 그 자리에서 체결시키는 방식으로 대체한다 — 아무도 앱을 켜두지
-// 않은 동안은 체결되지 않는다(지인 대상 모의투자라 허용 가능한 트레이드오프).
+// state/order 요청이 들어올 때마다(클라이언트가 몇 초 간격으로 폴링) checkTriggers() 를
+// 호출해 조건이 맞으면 그 자리에서 체결시킨다 — "접속 중이면 ~1초 안에 체결"이 이 경로.
 //
-// ⚠ 단, 강제청산(계좌 파산)만큼은 접속 여부와 무관하게 걸리길 원해서 sweepForcedLiquidations()
-// 를 따로 뒀다 — cron/ 의 별도 Worker(Cron Trigger, Pages 는 cron 미지원이라 분리 배포)가
-// 1시간마다 호출해 전 유저를 훑는다. 지정가/SL·TP 는 여전히 접속(폴링) 기반 그대로.
+// ⚠ 그리고 **접속자가 아무도 없어도** 같은 평가가 돌아야 하므로 sweepTriggers() 를 따로 뒀다
+// — cron/ 의 별도 Worker(Cron Trigger, Pages 는 cron 미지원이라 분리 배포)가 매 1분 호출해
+// 포지션/미체결/조건부가 있는 **전 유저**를 훑는다(강제청산·지정가·SL/TP·조건부 전부).
+// 예전엔 이 sweep 이 강제청산만 봐서, 무한 조건부를 걸어놔도 앱을 닫으면 매수가 멈췄다.
+// 두 경로는 runTriggers() 하나를 공유하므로 "접속 중에만 되는 기능"이 생길 여지가 없다.
 
 import {
   type D1PreparedStatement,
@@ -102,30 +103,73 @@ async function liquidateIfBankrupt(
   return true;
 }
 
-/** cron/ Worker 가 접속자 유무와 무관하게 주기 호출 — 포지션이 있는 전 유저를 훑어
- * 강제청산만 평가한다(지정가/SL·TP 는 범위 밖 — 그건 접속 시 checkTriggers 가 처리). */
-export async function sweepForcedLiquidations(env: Env): Promise<{ checked: number; liquidated: number }> {
-  const positions = (await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()).results;
-  if (positions.length === 0) return { checked: 0, liquidated: 0 };
+/** 조건부(스탑) 주문 로드 — 신규 테이블이라 마이그레이션 전이면 아직 없을 수 있어 방어적으로 감싼다
+ * (없으면 조건부 기능만 조용히 비활성, 앱 전체가 500 이 되진 않게). uid 생략 = 전 유저(cron sweep). */
+async function loadConditionals(env: Env, uid?: string): Promise<ConditionalRow[]> {
+  try {
+    const q = uid
+      ? env.DB.prepare('SELECT * FROM conditional_orders WHERE user_id = ?').bind(uid)
+      : env.DB.prepare('SELECT * FROM conditional_orders');
+    return (await q.all<ConditionalRow>()).results;
+  } catch {
+    return []; // conditional_orders 테이블 미생성(마이그레이션 전)
+  }
+}
 
-  const byUser = new Map<string, PositionRow[]>();
-  for (const p of positions) {
-    const arr = byUser.get(p.user_id);
-    if (arr) arr.push(p);
-    else byUser.set(p.user_id, [p]);
+/**
+ * cron/ Worker 가 접속자 유무와 무관하게 주기 호출 — 포지션·미체결·조건부가 있는 **전 유저**를 훑어
+ * checkTriggers 와 **똑같은 평가**(강제청산 → 지정가 → SL/TP → 조건부)를 돌린다. 즉 앱을 완전히
+ * 닫아둬도 조건부(특히 무한 반복)·지정가·SL/TP 가 계속 체결된다. 접속 중일 때와의 차이는 **주기뿐**
+ * 이다(폴링 ~1초 vs cron 라운드 ~수십초, cron/index.ts 참고).
+ *
+ * `cachedPrices` = 같은 cron 실행 안에서 이미 받아둔 시세 맵(있으면 재사용). **실제 코인**은 외부
+ * 거래소 fetch 라 한 번의 cron 안에서 여러 번 받아봐야 의미가 없어 재사용하고, **OX** 는 봇 기준가
+ * (D1 read)라 항상 새로 읽는다 — cron 이 유일한 클럭일 때 봇이 만든 가격 경로를 라운드마다 다시
+ * 샘플링해야 "떨어질 때마다 산다" 같은 조건이 그 사이 지나간 딥을 놓치지 않는다.
+ * 반환한 prices 를 다음 라운드에 그대로 넘기면 된다.
+ */
+export async function sweepTriggers(
+  env: Env,
+  cachedPrices?: Record<string, number>,
+): Promise<{ checked: number; liquidated: number; prices: Record<string, number> }> {
+  const positions = (await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()).results;
+  const pendings = (await env.DB.prepare('SELECT * FROM pending_orders').all<PendingRow>()).results;
+  const conditionals = await loadConditionals(env);
+  if (positions.length === 0 && pendings.length === 0 && conditionals.length === 0) {
+    return { checked: 0, liquidated: 0, prices: cachedPrices ?? {} };
   }
 
-  const symbols = [...new Set(positions.map((p) => p.symbol))];
-  const prices = await fetchPrices(env, symbols);
+  interface UserWork {
+    positions: PositionRow[];
+    pendings: PendingRow[];
+    conditionals: ConditionalRow[];
+  }
+  const byUser = new Map<string, UserWork>();
+  const workOf = (uid: string): UserWork => {
+    let w = byUser.get(uid);
+    if (!w) byUser.set(uid, (w = { positions: [], pendings: [], conditionals: [] }));
+    return w;
+  };
+  for (const p of positions) workOf(p.user_id).positions.push(p);
+  for (const p of pendings) workOf(p.user_id).pendings.push(p);
+  for (const c of conditionals) workOf(c.user_id).conditionals.push(c);
+
+  const symbols = [
+    ...new Set([...positions.map((p) => p.symbol), ...pendings.map((p) => p.symbol), ...conditionals.map((c) => c.symbol)]),
+  ];
+  const stale = symbols.filter((s) => isVirtualSymbol(s) || cachedPrices?.[s] == null);
+  const prices = { ...cachedPrices, ...(await fetchPrices(env, stale)) };
 
   let liquidated = 0;
-  for (const [uid, userPositions] of byUser) {
-    const pendings = (
-      await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ?').bind(uid).all<PendingRow>()
-    ).results;
-    if (await liquidateIfBankrupt(env, uid, userPositions, pendings, prices)) liquidated++;
+  for (const [uid, w] of byUser) {
+    // 한 유저가 터져도 나머지는 계속 평가한다(다음 라운드/다음 cron 에서 재시도).
+    try {
+      if (await runTriggers(env, uid, w.pendings, w.positions, w.conditionals, prices)) liquidated++;
+    } catch (e) {
+      console.error(`[sweepTriggers] uid=${uid}`, e);
+    }
   }
-  return { checked: byUser.size, liquidated };
+  return { checked: byUser.size, liquidated, prices };
 }
 
 /** 실제 코인 지정가 청산(reduce-only) 정산 — mark 가 지정가를 크로스하면 대상 포지션을 그 지정가에 청산.
@@ -305,23 +349,29 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
   const positions = (
     await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()
   ).results;
-  // 조건부(스탑) 주문 — 신규 테이블이라 배포 직후 아직 없을 수 있으므로 방어적으로 감싼다.
-  let conditionals: ConditionalRow[] = [];
-  try {
-    conditionals = (
-      await env.DB.prepare('SELECT * FROM conditional_orders WHERE user_id = ?').bind(uid).all<ConditionalRow>()
-    ).results;
-  } catch {
-    /* conditional_orders 테이블 미생성(마이그레이션 전) */
-  }
+  const conditionals = await loadConditionals(env, uid);
   if (pendings.length === 0 && positions.length === 0 && conditionals.length === 0) return {};
 
   const symbols = [
     ...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol), ...conditionals.map((c) => c.symbol)]),
   ];
   const prices = await fetchPrices(env, symbols);
+  await runTriggers(env, uid, pendings, positions, conditionals, prices);
+  return prices;
+}
 
-  if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return prices; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
+/** 트리거 평가 본체 — 한 유저의 데이터·시세를 이미 손에 쥔 상태에서 강제청산 → 지정가 → SL/TP →
+ * 조건부 순으로 평가한다. 접속 폴링(checkTriggers)과 cron sweep(sweepTriggers)이 **이 함수를 공유**해서
+ * "접속 중에만 되는 기능"이 갈라지지 않게 한다. 반환값 = 강제청산이 실행됐는지. */
+async function runTriggers(
+  env: Env,
+  uid: string,
+  pendings: PendingRow[],
+  positions: PositionRow[],
+  conditionals: ConditionalRow[],
+  prices: Record<string, number>,
+): Promise<boolean> {
+  if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return true; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
 
   // ── 지정가 체결 ── long: mark<=limit(싸게 매수), short: mark>=limit(비싸게 매도)
   // 체결가는 limit_price 그대로 사용(생성 시 이미 그 가격 기준으로 증거금을 잠갔으므로 재계산 불필요).
@@ -468,5 +518,5 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
     await settleConditionalOrder(env, uid, c, mark, prices);
   }
 
-  return prices;
+  return false;
 }
