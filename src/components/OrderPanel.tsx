@@ -158,7 +158,13 @@ export default function OrderPanel() {
   // 슬라이더 100% 가 그대로 거부된다(200배면 수수료가 증거금의 ~6% 라 0.1% 여유로는 못 덮는다).
   const SAFETY = 0.999;
   // Number() 로 뒷자리 0 을 떨군다(55000000.000000 → 55000000). 코인은 최대 6자리, USDT 는 2자리로 표기.
-  const trimNum = (n: number, d: number) => (n > 0 ? String(Number(n.toFixed(d))) : '0');
+  // ⚠ 1e21 이상은 toFixed/String 이 지수 표기("1e+21")를 돌려줘 입력칸이 사람이 읽을 수 없게 된다
+  // (싼 코인+고배율+거대 잔고면 슬라이더 100% 가 실제로 이 영역에 들어간다) → Intl 로 전체 자릿수 전개.
+  const trimNum = (n: number, d: number) => {
+    if (!(n > 0)) return '0';
+    if (n >= 1e21) return n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 });
+    return String(Number(n.toFixed(d)));
+  };
   const applyPct = (fraction: number) => {
     if (!refPrice) return;
     const costPerNotional = 1 / leverage + feeRate;

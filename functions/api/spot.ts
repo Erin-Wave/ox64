@@ -16,6 +16,7 @@ import {
   feeRateOf,
   feeAccrualStmts,
   vipOf,
+  sizeEps,
 } from '../_shared';
 
 /**
@@ -1016,7 +1017,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
     const newPendingMargin = Math.max(0, p.margin - lockedForChunk);
     const now = Date.now();
     const stmts: D1PreparedStatement[] = [
-      newPendingSize <= EPS
+      newPendingSize <= sizeEps(p.size) // 잔량 판정도 수량 비례(대량 주문의 먼지 잔량이 영원히 남지 않게)
         ? env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId)
         : env.DB.prepare('UPDATE pending_orders SET size=?, margin=? WHERE id=?').bind(newPendingSize, newPendingMargin, pendingId),
       ...oxPositionStmts(env, existing, p.user_id, p.side, fillPrice, chunk, effLev, posMargin, p.stop_loss, p.take_profit, now),
@@ -1318,9 +1319,13 @@ async function closePositionAgainstBook(
   }
   if (filled <= EPS) return { filled: 0, avgPrice: 0 };
 
-  const marginReleased = marginPerUnit * filled;
   const avgPrice = cost / filled;
-  const fullyClosed = filled >= pos.size - EPS;
+  // ⚠ 전량 판정 오차는 **수량 비례**(sizeEps) — 1e15 개를 여러 청크로 walking 하면 합산 오차가 0.1~1 단위로
+  // 나와서, 고정 1e-9 로 비교하면 전량을 청산해도 "먼지 잔량"이 남은 것으로 보고 포지션이 안 지워진다
+  // (청산 버튼을 눌러도 수량이 0 이 안 됨). 전량이면 증거금도 비율 계산이 아니라 잠긴 전액을 그대로 환급한다
+  // (비율 계산의 반올림 손실이 잔고에 남지 않게).
+  const fullyClosed = filled >= pos.size - sizeEps(pos.size);
+  const marginReleased = fullyClosed ? pos.margin : marginPerUnit * filled;
   const newRef = roundOx(lastPx);
   const anchor0 = st?.anchor && st.anchor > 0 ? st.anchor : est;
   const newAnchor = roundOx(anchor0 + (newRef - anchor0) * ANCHOR_TRADE_PULL); // 유저 청산 임팩트도 적정가를 끌어당김
@@ -1364,7 +1369,7 @@ async function closePositionAgainstBook(
   stmts.push(...candleUpsertStmts(env, { open: openPx, high, low, close: newRef, volume: filled }, now));
   if (pendingId) {
     stmts.push(
-      filled >= pendingSize - EPS
+      filled >= pendingSize - sizeEps(pendingSize)
         ? env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId)
         : env.DB.prepare('UPDATE pending_orders SET size=? WHERE id=?').bind(pendingSize - filled, pendingId),
     );

@@ -21,6 +21,7 @@ import {
   feeAccrualStmts,
   unrealizedTotal,
   repeatModeOf,
+  sizeEps,
 } from './_shared';
 import { matchLimitPendingAgainstBook, matchMarketOxOrder, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
 
@@ -192,8 +193,9 @@ async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark:
   const closeSize = Math.min(p.size, pos.size);
   const dir = pos.side === 'long' ? 1 : -1;
   const pnl = (p.limit_price - pos.entry_price) * closeSize * dir;
-  const marginReleased = (pos.margin * closeSize) / pos.size;
-  const fullyClosed = closeSize >= pos.size - 1e-9;
+  // 전량 판정 오차는 수량 비례(sizeEps) — 대량(1e15+) 포지션은 고정 1e-9 로는 전량을 인정 못 해 먼지가 남는다.
+  const fullyClosed = closeSize >= pos.size - sizeEps(pos.size);
+  const marginReleased = fullyClosed ? pos.margin : (pos.margin * closeSize) / pos.size;
   const now = Date.now();
   const rate = await feeRateOf(env, uid);
   const notional = p.limit_price * closeSize;
@@ -235,7 +237,7 @@ function conditionalAfterFillStmt(env: Env, uid: string, c: ConditionalRow, fill
     ).bind(stayArmed, fills, Date.now(), c.id, uid);
   }
   const remaining = c.size - filled;
-  return remaining <= EPS
+  return remaining <= sizeEps(c.size) // 잔량 판정도 수량 비례(대량 예약이 먼지 잔량으로 영원히 남지 않게)
     ? env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(c.id, uid)
     : env.DB.prepare('UPDATE conditional_orders SET size = ? WHERE id = ? AND user_id = ?').bind(remaining, c.id, uid);
 }

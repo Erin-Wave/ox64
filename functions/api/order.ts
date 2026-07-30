@@ -13,6 +13,8 @@ import {
   feeRateOf,
   feeAccrualStmts,
   repeatModeOf,
+  MAX_ORDER_SIZE,
+  sizeEps,
   type Env,
   type PositionRow,
   type PendingRow,
@@ -72,6 +74,11 @@ function num(v: unknown): number | null {
   if (v == null) return null;
   const n = Number(v);
   return isFinite(n) ? n : null;
+}
+/** 주문 수량 형식 검증 — 양수·유한·상한(MAX_ORDER_SIZE) 이내. 상한은 부동소수 폭주만 막는 안전장치이고
+ * 실제 한도는 증거금 가드가 잡는다(_shared.MAX_ORDER_SIZE 참고 — 캡이 낮으면 정상 거래가 "수량 오류"로 막힌다). */
+function badSize(size: number): boolean {
+  return !(size > 0) || !isFinite(size) || size > MAX_ORDER_SIZE;
 }
 
 /** 무한(반복) 조건부 옵션 파싱 — conditionalOpen/editConditional 이 공유한다.
@@ -146,9 +153,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const leverage = Math.round(Number(body.leverage));
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
-    // 수량 상한 = 1e15 (싼 코인은 정상적으로 수십억 개를 거래한다 — 예전 1,000,000 캡은 PEPE 등에서
-    // "수량 오류"를 유발했다. 실제 한도는 증거금 <= 잔고 조건이 잡아준다; 이 캡은 부동소수 폭주 방지용).
-    if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
+    if (badSize(size)) return bad('수량 오류');
     if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
 
     const stopLoss = num(body.stopLoss);
@@ -274,7 +279,9 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 부분 청산: size 를 지정하면 그만큼만, 생략하면 전량.
     const reqSize = num(body.size);
     if (reqSize != null && !(reqSize > 0)) return bad('청산 수량 오류');
-    if (reqSize != null && reqSize > pos.size + 1e-9) return bad('보유 수량보다 많습니다');
+    // 오차는 크기 비례(sizeEps) — 수량이 1e15 개쯤 되면 화면 표기·재계산 왕복에서 생기는 오차 자체가
+    // 1e-9 보다 커서, 고정 오차로 비교하면 "전량 청산"이 보유량 초과로 거부된다.
+    if (reqSize != null && reqSize > pos.size + sizeEps(pos.size)) return bad('보유 수량보다 많습니다');
     const closeSize = reqSize == null ? pos.size : reqSize;
 
     // OX/USDT 시장가 청산 = 봇 호가창을 walking 하며 "있는 물량만" 실제 호가 가격에 청산(매물 없으면 부분).
@@ -287,7 +294,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     }
 
     // 실제 코인: 외부 시세로 즉시 청산(로컬 호가창이 없어 mark 정산이 표준, 유동성 사실상 무한).
-    const isPartial = closeSize < pos.size - 1e-9;
+    const isPartial = closeSize < pos.size - sizeEps(pos.size);
     const price = await fetchPrice(env, pos.symbol); // 서버 청산가
     const dir = pos.side === 'long' ? 1 : -1;
     const pnl = (price - pos.entry_price) * closeSize * dir;
@@ -345,7 +352,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .bind(uid, pos.symbol, closeSide)
       .first<{ reserved: number }>();
     const closable = pos.size - (reservedRow?.reserved ?? 0);
-    if (size > closable + 1e-9) return bad('청산 가능 수량을 초과합니다 (이미 예약된 지정가 청산 포함)');
+    if (size > closable + sizeEps(pos.size)) return bad('청산 가능 수량을 초과합니다 (이미 예약된 지정가 청산 포함)');
 
     const now = Date.now();
     const pendingId = crypto.randomUUID();
@@ -371,7 +378,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     let limitPrice = Number(body.limitPrice);
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
-    if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
+    if (badSize(size)) return bad('수량 오류');
     if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
     if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
     // OX 는 4자리 틱(0.0001) 정합성 유지 — 유저가 더 세밀한 지정가를 넣어도 호가창/체결이 4자리를 넘지 않게.
@@ -446,7 +453,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     let newLimit = body.limitPrice != null ? Number(body.limitPrice) : pending.limit_price;
     const newSize = body.size != null ? Number(body.size) : pending.size;
     if (!(newLimit > 0) || !isFinite(newLimit)) return bad('지정가 오류');
-    if (!(newSize > 0) || !isFinite(newSize) || newSize > 1e15) return bad('수량 오류');
+    if (badSize(newSize)) return bad('수량 오류');
     if (isVirtualSymbol(pending.symbol)) newLimit = Math.round(newLimit * 1e4) / 1e4; // OX 4자리 틱
 
     if (pending.reduce_only) {
@@ -464,7 +471,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
           .bind(uid, pending.symbol, pending.side, pendingId)
           .first<{ reserved: number }>();
         const closable = tgt.size - (othersRow?.reserved ?? 0);
-        if (newSize > closable + 1e-9) return bad('청산 가능 수량을 초과합니다 (이미 예약된 지정가 청산 포함)');
+        if (newSize > closable + sizeEps(tgt.size)) return bad('청산 가능 수량을 초과합니다 (이미 예약된 지정가 청산 포함)');
       }
       await env.DB.prepare('UPDATE pending_orders SET limit_price = ?, size = ? WHERE id = ? AND user_id = ?')
         .bind(newLimit, newSize, pendingId, uid)
@@ -503,7 +510,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const triggerDir = body.triggerDir;
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
-    if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
+    if (badSize(size)) return bad('수량 오류');
     if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
     if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
@@ -559,7 +566,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
     if (isOx) triggerPrice = Math.round(triggerPrice * 1e4) / 1e4;
     const size = body.size != null && body.size !== '' ? Number(body.size) : cond.size;
-    if (!(size > 0) || !isFinite(size) || size > 1e15) return bad('수량 오류');
+    if (badSize(size)) return bad('수량 오류');
     const triggerDir = body.triggerDir != null && body.triggerDir !== '' ? String(body.triggerDir) : cond.trigger_dir;
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
     const leverage = body.leverage != null && body.leverage !== '' ? Math.round(Number(body.leverage)) : cond.leverage;
