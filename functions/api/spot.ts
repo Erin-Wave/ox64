@@ -270,6 +270,11 @@ const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에
 const TRADE_RETENTION_MS = 6 * 3600 * 1000;
 // 프루닝을 매 틱 넣으면 배치 문장만 늘어난다(지워지는 총량은 어차피 같다) — 가끔만 넣어 잘라낸다.
 const TRADE_PRUNE_CHANCE = 0.05; // ≈20틱마다 1회
+// ⚠ 죽은 봇 호가(체결로 'filled' 이 된 행 + 과거 'cancelled' 마킹 잔재)를 **조금씩** 걷어내는 청크 크기.
+// 한 문장에서 전부 지우려 하면 안 된다 — prod 엔 잔재가 1,358만 행이라 30초 쿼리 한도를 넘겨 batch 가
+// 통째로 실패한다(실제로 밟았다). 틱마다 이만큼만 지우면 백로그가 하루 남짓에 자연히 빠지고,
+// 다 빠진 뒤엔 인덱스 범위에 아무것도 없어 사실상 공짜다.
+const STALE_SWEEP_CHUNK = 200;
 
 // ── 봇 매매 심리 모델 ─────────────────────────────────────────────────────
 // ⚠ 예전 기준가는 `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 추세도, 변동성 뭉침도,
@@ -625,9 +630,12 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
     // 죽은 호가가 영구히 쌓였다(prod 실측 2026-07-31: 1,358만 행, 하루 +86만 행 = +200MB/일 로 DB 3.38GB 의
     // 대부분을 차지하고 10GB 한도까지 한 달 남은 상태였다). 이 테이블에 살아있는 호가는 항상 ~45개뿐이고
     // 아무도 옛 호가를 읽지 않으므로(모든 SELECT 가 status='open' 필터, 체결 이력은 spot_trades 가 보관)
-    // 히스토리를 남길 이유가 전혀 없다. status 조건 없이 지우는 건 부분/전량 체결로 'filled' 이 된 행까지
-    // 같이 청소하기 위함이다(그 행들도 예전엔 영구 잔류했다).
-    env.DB.prepare('DELETE FROM spot_orders WHERE pair = ?').bind(PAIR),
+    // 히스토리를 남길 이유가 전혀 없다.
+    // ⚠⚠ **반드시 status='open' 으로 범위를 좁힐 것**(= 인덱스로 ~45행만 지운다). `WHERE pair=?` 로
+    // 넓게 지우면 이미 쌓인 수천만 행을 한 문장에서 전부 지우려 들어 **30초 쿼리 한도를 넘기고 batch 가
+    // 통째로 실패**한다 — 배포 직후 실제로 이걸 밟아서 마켓메이커와 cron sweep 이 동시에 멈췄다.
+    // 과거 잔재는 아래 STALE_SWEEP_CHUNK 로 조금씩 걷어낸다.
+    env.DB.prepare("DELETE FROM spot_orders WHERE pair = ? AND status = 'open'").bind(PAIR),
   ];
   // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 타이트하게(최우선호가가 mid 에 바싹) 잡되 깊은
   // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
@@ -711,6 +719,12 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   if (Math.random() < TRADE_PRUNE_CHANCE) {
     stmts.push(
       env.DB.prepare('DELETE FROM spot_trades WHERE pair = ? AND created_at < ?').bind(PAIR, now - TRADE_RETENTION_MS),
+    );
+    // 죽은 봇 호가 잔재도 같은 주기로 조금씩(STALE_SWEEP_CHUNK) 걷어낸다 — 위 주석 참고.
+    stmts.push(
+      env.DB.prepare(
+        `DELETE FROM spot_orders WHERE id IN (SELECT id FROM spot_orders WHERE pair = ? AND status <> 'open' LIMIT ${STALE_SWEEP_CHUNK})`,
+      ).bind(PAIR),
     );
   }
   // 봇도 수수료를 낸다 — 이 틱의 합성 체결 명목금액에 대해(같은 batch, 왕복 추가 없음).
