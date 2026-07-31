@@ -53,16 +53,25 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     const reqPair = url.searchParams.get('pair') || VIRTUAL_PAIRS[0];
     if (!VIRTUAL_PAIRS.includes(reqPair)) return bad('알 수 없는 페어');
 
-    try {
-      await runMarketMaker(env, reqPair);
-    } catch (e) {
-      // 봇 실패가 유저 요청을 막으면 안 되지만(다음 폴링에서 재시도), ⚠ 조용히 삼키면 봇이 몇 시간째
-      // 죽어 있어도 아무도 모른다 — 실제로 배치 문장 수 초과로 호가가 안 깔리는데 화면상 멀쩡해 보여
-      // 원인을 찾는 데 한참 걸렸다. 최소한 로그는 남긴다(wrangler tail / 대시보드에서 확인 가능).
-      console.error(`[ox64] runMarketMaker(${reqPair}) failed:`, e instanceof Error ? e.message : e);
+    // ⚠ **캔들 조회는 마켓메이커를 굴리지 않는다**(2026-07-31). 예전엔 이 핸들러에 들어오면 종류 구분 없이
+    // 봇을 한 틱 돌렸는데, 캔들은 차트가 읽어가는 조회일 뿐 시장을 움직일 이유가 없다. 그리고 가상 코인이
+    // 둘이 된 뒤로 **심볼 드롭다운이 코인마다 24h 변동률용 캔들을 5초 주기로 긁으므로**(SymbolSelect),
+    // 그대로 두면 드롭다운을 열어둔 것만으로 코인 수 × 요청 수만큼 봇이 돌아간다(코인 수에 비례해 늘어나는
+    // 바로 그 낭비). 시장 클럭은 호가창 폴링(useSpotPoll → 아래 loadSpotMarket 경로)만 담당한다 —
+    // 지금 보고 있는 코인은 그 폴링이 1초 주기로 돌므로 체결 지연도 그대로다.
+    const wantCandles = url.searchParams.get('candles');
+    if (!wantCandles) {
+      try {
+        await runMarketMaker(env, reqPair);
+      } catch (e) {
+        // 봇 실패가 유저 요청을 막으면 안 되지만(다음 폴링에서 재시도), ⚠ 조용히 삼키면 봇이 몇 시간째
+        // 죽어 있어도 아무도 모른다 — 실제로 배치 문장 수 초과로 호가가 안 깔리는데 화면상 멀쩡해 보여
+        // 원인을 찾는 데 한참 걸렸다. 최소한 로그는 남긴다(wrangler tail / 대시보드에서 확인 가능).
+        console.error(`[ox64] runMarketMaker(${reqPair}) failed:`, e instanceof Error ? e.message : e);
+      }
     }
 
-    if (url.searchParams.get('candles')) {
+    if (wantCandles) {
       const interval = url.searchParams.get('interval') || '1m';
       const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit')) || 500));
       const endTime = Number(url.searchParams.get('endTime')) || undefined;
