@@ -467,7 +467,7 @@ export default function Chart() {
 
       const load = async () => {
         try {
-          const { candles: fresh } = await api.spotCandles(interval, 500);
+          const { candles: fresh } = await api.spotCandles(symbol, interval, 500);
           if (cancelled || fresh.length === 0) return;
           // ⚠ 폴링 결과로 배열을 통째로 갈아끼우면 왼쪽 스크롤로 붙여둔 과거봉이 매번 날아간다
           // (1.5초마다 리셋되니 사실상 과거 조회 불가) → 최신 구간만 교체하고 그보다 앞선 구간은 보존.
@@ -507,7 +507,7 @@ export default function Chart() {
         loadingMore = true;
         try {
           const oldest = candlesRef.current[0].time; // sec
-          const { candles: older } = await api.spotCandles(interval, 500, oldest * 1000);
+          const { candles: older } = await api.spotCandles(symbol, interval, 500, oldest * 1000);
           if (cancelled) return;
           // await 사이에 폴링이 배열을 갱신했을 수 있으므로 최신 상태를 다시 읽는다.
           const cur = candlesRef.current;

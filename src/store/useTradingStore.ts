@@ -102,7 +102,9 @@ interface TradingState {
   cancelConditional: (conditionalId: string) => Promise<void>;
   refill: () => Promise<void>;
 
-  spotRefresh: () => Promise<void>;
+  spotRefresh: (pair: string) => Promise<void>;
+  /** 페어를 바꿀 때 이전 코인의 호가/체결을 즉시 비운다(§ useSpotPoll). */
+  spotClear: () => void;
 }
 
 function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
@@ -352,9 +354,13 @@ export const useTradingStore = create<TradingState>((set) => ({
     }
   },
 
-  spotRefresh: async () => {
+  // ⚠ 가상 코인이 둘 이상이면 심볼을 바꾼 직후 첫 폴링 응답이 오기 전까지 **이전 코인의 호가창이
+  // 그대로 보인다**(EW 를 눌렀는데 OX 호가가 잠깐 보이는 식). 값이 아예 없는 게 틀린 값보다 낫다.
+  spotClear: () => set({ spotBook: { bids: [], asks: [] }, spotTrades: [] }),
+
+  spotRefresh: async (pair: string) => {
     try {
-      applySpot(set, await api.spotState());
+      applySpot(set, await api.spotState(pair));
     } catch {
       /* 다음 폴링에서 재시도 — 마지막 알려진 값 유지 */
     }

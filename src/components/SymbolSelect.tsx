@@ -28,7 +28,7 @@ export default function SymbolSelect() {
   const setSymbol = useMarketStore((s) => s.setSymbol);
   const [open, setOpen] = useState(false);
   const [stats, setStats] = useState<Record<string, Stat>>({});
-  const [oxStat, setOxStat] = useState<Stat | null>(null);
+  const [virtualStats, setVirtualStats] = useState<Record<string, Stat>>({});
   const [sortKey, setSortKey] = useState<SortKey>('symbol');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
 
@@ -56,24 +56,26 @@ export default function SymbolSelect() {
     };
   }, [open]);
 
-  // 가상 마켓(OX/USDT)은 바이낸스에 없으므로 서버에서 직접: 최근 체결가(가격) + 1시간봉 24개(≈24h)로
+  // 가상 마켓은 바이낸스에 없으므로 서버에서 직접: 최근 체결가(가격) + 1시간봉 24개(≈24h)로
   // 변동률을 계산해 실제 코인과 동일하게 가격·24h 정렬에 참여시킨다(데이터 24h 미만이면 최초 시점 대비).
+  // ⚠ 가상 코인마다 따로 받아온다 — 하나로 뭉뚱그리면 목록에서 모든 가상 코인이 같은 가격으로 보인다.
   useEffect(() => {
     if (!open) return;
     let alive = true;
     const load = async () => {
       try {
-        const [st, cd] = await Promise.all([api.spotState(), api.spotCandles('1h', 24)]);
+        const entries = await Promise.all(
+          VIRTUAL_SYMBOLS.map(async (sym) => {
+            const [st, cd] = await Promise.all([api.spotState(sym), api.spotCandles(sym, '1h', 24)]);
+            const candles = cd.candles;
+            const price = st.trades[0]?.price ?? (candles.length ? candles[candles.length - 1].close : null);
+            if (price == null) return null;
+            const ref = candles.length ? candles[0].open : price; // 가장 오래된(≈24h 전) 시가
+            return [sym, { price, changePct: ref > 0 ? ((price - ref) / ref) * 100 : 0 }] as const;
+          }),
+        );
         if (!alive) return;
-        const candles = cd.candles;
-        const price = st.trades[0]?.price ?? (candles.length ? candles[candles.length - 1].close : null);
-        if (price == null) {
-          setOxStat(null);
-          return;
-        }
-        const ref = candles.length ? candles[0].open : price; // 가장 오래된(≈24h 전) 시가
-        const changePct = ref > 0 ? ((price - ref) / ref) * 100 : 0;
-        setOxStat({ price, changePct });
+        setVirtualStats(Object.fromEntries(entries.filter((e): e is NonNullable<typeof e> => e !== null)));
       } catch {
         /* 네트워크 오류 무시(다음 주기 재시도) */
       }
@@ -97,7 +99,7 @@ export default function SymbolSelect() {
   const sortArrow = (key: SortKey) => (sortKey === key ? (sortDir === 'asc' ? '▲' : '▼') : '');
 
   // 가상 코인도 실제 코인과 같은 목록·같은 정렬에 참여시킨다(stat 은 심볼 종류에 따라 소스만 다름).
-  const statOf = (s: string): Stat | undefined => (isVirtualSymbol(s) ? oxStat ?? undefined : stats[s]);
+  const statOf = (s: string): Stat | undefined => (isVirtualSymbol(s) ? virtualStats[s] : stats[s]);
 
   const sorted = [...VIRTUAL_SYMBOLS, ...SYMBOLS].sort((a, b) => {
     let av: number | string;

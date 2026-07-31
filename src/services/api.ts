@@ -200,10 +200,10 @@ export const api = {
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'cancelConditional', conditionalId }) }),
   refill: () => req<AppState>('/refill', { method: 'POST' }),
   leaderboard: () => req<{ leaderboard: LeaderRow[]; revenue: FeeRevenue }>('/leaderboard'),
-  spotState: () => req<SpotState>('/spot'),
+  spotState: (pair: string) => req<SpotState>(`/spot?pair=${encodeURIComponent(pair)}`),
   /** OX 캔들. endTimeMs 를 주면 그 시각 "이전" 봉만 — 차트 왼쪽 스크롤 시 과거 구간 이어받기용. */
-  spotCandles: (interval: string, limit = 500, endTimeMs?: number) =>
+  spotCandles: (pair: string, interval: string, limit = 500, endTimeMs?: number) =>
     req<{ candles: Candle[] }>(
-      `/spot?candles=1&interval=${encodeURIComponent(interval)}&limit=${limit}${endTimeMs ? `&endTime=${endTimeMs}` : ''}`,
+      `/spot?pair=${encodeURIComponent(pair)}&candles=1&interval=${encodeURIComponent(interval)}&limit=${limit}${endTimeMs ? `&endTime=${endTimeMs}` : ''}`,
     ),
 };

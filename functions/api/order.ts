@@ -37,7 +37,7 @@ import {
 async function reflectVirtualFill(env: Env, symbol: string, uid: string, price: number, takerSide: 'buy' | 'sell', size: number) {
   if (!isVirtualSymbol(symbol)) return;
   try {
-    await recordVirtualFill(env, uid, price, takerSide, size);
+    await recordVirtualFill(env, symbol, uid, price, takerSide, size);
   } catch {
     /* 표시용 부가효과 — 실패해도 무시 */
   }
@@ -168,7 +168,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
       // 크로스: 여유잔고 + 전 포지션 미실현손익까지 증거금으로 walking 체결에 쓸 수 있게 uPnL 을 넘긴다.
       const uPnL = await unrealizedTotal(env, uid, marks);
-      const { filled, avgPrice } = await matchMarketOxOrder(env, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
+      const { filled, avgPrice } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
       if (!(filled > 0)) return bad('체결 가능한 호가 물량이 없습니다');
       marks[symbol] = avgPrice || ref;
       return json(await loadState(env, uid, marks));

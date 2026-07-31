@@ -32,7 +32,7 @@ const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차(조건부 주문
 async function reflectVirtualFill(env: Env, symbol: string, uid: string, price: number, takerSide: 'buy' | 'sell', size: number) {
   if (!isVirtualSymbol(symbol)) return;
   try {
-    await recordVirtualFill(env, uid, price, takerSide, size);
+    await recordVirtualFill(env, symbol, uid, price, takerSide, size);
   } catch {
     /* 표시용 부가효과 — 실패해도 무시 */
   }
@@ -277,7 +277,7 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
   // 재고·체결테이프·캔들까지 전부 정산). 부분 체결이면 filled 만큼만 나가고 잔량은 아래에서 조건 유지.
   if (isVirtualSymbol(c.symbol)) {
     const uPnL = await unrealizedTotal(env, uid, marks);
-    const { filled } = await matchMarketOxOrder(env, uid, c.side, c.size, c.leverage, null, null, uPnL);
+    const { filled } = await matchMarketOxOrder(env, c.symbol, uid, c.side, c.size, c.leverage, null, null, uPnL);
     // filled==0(감당 못 함/유동성 없음): 아무것도 안 건드림 → 조건(및 무장 상태) 그대로 유지, 다음 폴링 재시도.
     if (filled > EPS) await conditionalAfterFillStmt(env, uid, c, filled).run();
     return;

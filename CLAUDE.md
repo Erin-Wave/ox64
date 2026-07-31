@@ -58,7 +58,7 @@ ox64/
     ├── main.tsx            location.pathname 으로 트레이딩(App)·퍼즐게임(puzzle/PuzzleApp, /b)·5분 던전(dungeon/DungeonApp, /5m)·미니 RTS(sc/ScApp, /s1) 를 분기(라우터 없음, 동적 import 로 서로의 번들이 안 섞이게). useSettingsStore 를 먼저 import(저장된 테마 즉시 적용, FOUC 방지). ⚠ /s1 만 StrictMode 를 안 씌운다 — 개발 모드의 이펙트 2회 실행이 rAF 루프와 Game 인스턴스를 두 벌 만들어 시뮬이 2배속으로 도는 것처럼 보인다
     ├── index.css           Tailwind + 테마 CSS 변수(:root/[data-theme=light|high-contrast]) + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position[stopLoss/takeProfit]/PendingOrder/Side)
-    ├── symbols.ts          거래 심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS(OXUSDT)/isVirtualSymbol(체결가 소스만 다르다는 표시, 거래 로직은 동일) + 타임프레임 그룹(분/시간/일+) + KST_OFFSET(+9h 고정)
+    ├── symbols.ts          거래 심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS(OXUSDT·EWUSDT)/isVirtualSymbol(체결가 소스만 다르다는 표시, 거래 로직은 동일) + 타임프레임 그룹(분/시간/일+) + KST_OFFSET(+9h 고정)
     ├── format.ts           fmtPrice(심볼 정밀도)/fmtVol(K·M·B)/precisionFromTick
     ├── services/
     │   ├── binanceRest.ts  초기 과거봉(스팟 REST) — 차트 표시용
@@ -192,7 +192,7 @@ ox64/
 - **체결 체크 = 접속 폴링(빠른 경로) + cron sweep(접속 무관, 느린 경로)**: Cloudflare Pages Functions 는 정기 실행을 지원하지 않는다. 그래서 `functions/_trading.ts checkTriggers(env,uid)` 를 `state.ts`(GET, 클라가 `useTriggerPoll` 로 1~2.5초마다 호출)와 `order.ts`(POST 액션 진입 직후, 수동 조작과의 레이스 방지)에서 호출해 **그 유저의 요청이 들어올 때** 강제청산/지정가/SL·TP/조건부를 평가·체결한다(체결가는 지정가/SL/TP 값 그대로, 슬리피지 모델링 없음). 그리고 **아무도 접속하지 않아도** 같은 평가가 돌도록 `cron/` 워커가 매 1분 `sweepTriggers(env)` 로 전 유저를 훑는다(아래) → **주기만 다르고 기능 차이는 없다**.
 - **⚠ 접속 여부와 무관하게 매 1분 자동 실행 = `sweepTriggers`(2026-07-29, 예전엔 강제청산만)**: `cron/`(별도 배포되는 작은 Worker, Pages 는 Cron Trigger 미지원이라 분리) 가 매 1분 `sweepTriggers(env)`(`functions/_trading.ts`) 를 호출해 **포지션·미체결·조건부가 있는 전 유저**를 훑어 강제청산·지정가·SL/TP·조건부(무한 반복 포함)를 전부 평가·체결한다. 같은 D1 을 바인딩하므로 별도 동기화 불필요. 배포·시크릿 설정은 §5 참고(⚠ cron 워커는 수동 재배포).
   - **예전엔 이 sweep 이 `sweepForcedLiquidations`(강제청산만)** 이라, 무한 조건부를 걸어둬도 **앱(차트 화면)을 닫으면 반복 매수가 멈췄다**("차트 켜놨을 때만 조건부가 작동함" 제보). 근본 원인은 조건부/지정가/SL·TP 평가가 `checkTriggers` 안에만 있어서 = **유저 요청이 유일한 클럭**이었던 것. 수정: 평가 본체를 `runTriggers(env,uid,pendings,positions,conditionals,prices)` 로 추출해 `checkTriggers`(1인분)와 `sweepTriggers`(전 유저)가 **공유**한다 → 새 트리거 기능을 추가해도 자동으로 양쪽에서 돈다(한쪽에만 추가되는 실수 방지).
-  - **⚠ 마켓메이커 틱 예산은 코인 수와 무관하게 고정**(`cron/index.ts` `MM_TICK_BUDGET`=12, `MM_TICKS_PER_ROUND = MM_TICK_BUDGET / (VIRTUAL_PAIRS.length × SWEEP_ROUNDS)`): 코인마다 12틱씩 돌리면 쓰기도 invocation당 쿼리 수도 코인 수에 그대로 비례한다 — 가상 코인을 못 늘리던 진짜 이유가 그것이다. 총량을 정해두고 코인들이 나눠 쓴다(1코인이면 라운드당 3틱 = 종전과 동일). ⚠ **실제로 페어를 추가하려면 이 배열만으론 부족하다** — `spot.ts` 의 `PAIR` 상수를 인자로 내리고(48곳) 봇 재고(`users.ox_balance` 단일 컬럼)를 페어별로 분리해야 한다. 그 전까지 `VIRTUAL_PAIRS` 는 길이 1 이어야 한다.
+  - **⚠ 마켓메이커 틱 예산은 총량 고정, 코인들이 나눠 쓴다**(`cron/index.ts` `MM_TICK_BUDGET`=24, `MM_BUDGET_PER_PAIR = MM_TICK_BUDGET / VIRTUAL_PAIRS.length`, 그걸 다시 `SWEEP_ROUNDS` 로 나눠 라운드당 틱): 코인마다 예산을 곱하면 쓰기도 **invocation당 쿼리 수(한도 1,000)** 도 코인 수에 그대로 비례한다. 총량을 정하는 기준이 바로 그 쿼리 한도다 — 한 틱이 약 14쿼리이므로 24틱 ≈ 340쿼리 + 트리거 sweep ≈ 400 으로 한도의 절반 아래다(사다리를 44행으로 쓰던 시절엔 한 틱이 ~73쿼리라 12틱만으로 950 을 먹었다). 현재 2코인 × 12틱. **코인을 더 늘릴 땐 이 값을 그대로 두고 코인당 틱이 줄게 두거나(움직임이 성겨짐) 한도를 다시 계산해 올릴 것** — 무심코 "코인 수 × 12" 로 두면 4~5종에서 쿼리 한도에 부딪힌다.
   - **⚠ 유저가 보고 있으면 cron 은 물러난다**(`marketMakerTickBudget`, `POLL_ACTIVE_MS`=20s, `BURST_MIN_TICKS`=4): `/api/spot` 폴링(1초)이 이미 초당 한 번씩 재호가를 돌리는데 cron 이 12틱을 더 얹는 건 순수 중복이라, 쓰기만 배로 나가고 차트가 더 살아나지도 않는다. `last_run` 이 방금 전이면 폴링이 클럭 역할 중이라는 뜻이므로 최소치만 돌린다(cron 이 직접 찍은 `last_run` 은 다음 실행 때 60초 전이라 두 경우가 안 섞인다).
     **⚠⚠ 이 판정은 라운드 루프 밖에서 실행당 한 번만 한다** — `runMarketMakerBurst` 는 끝날 때 `last_run` 을 찍으므로, 안에서 라운드마다 판정하면 **다음 라운드가 직전 라운드의 자기 발자국을 보고 "누가 폴링 중"이라 오판**해 아무도 없는데도 cron 이 스스로 물러난다(실측: 분당 12틱이어야 할 것이 4틱). 라운드 간격이 밀리초라 시각만으로는 cron 자신과 유저 폴링을 구분할 수 없다.
   - **⚠ cron 한 번에 "봇 틱 → 트리거 평가"를 4라운드 번갈아 돈다**(`cron/index.ts` `SWEEP_ROUNDS`=4): OX 가격은 벽시계가 아니라 **봇 틱이 돌 때만** 움직이므로, 한 cron 에서 12틱을 몰아 돌린 뒤 트리거를 한 번만 보면 그 사이 지나간 딥/스파이크를 조건부가 통째로 놓친다(예: "1.0 이하로 내려가면 매수"인데 8번째 틱에서만 1.0 을 찍고 되돌아온 경우). 틱 그룹 사이에서 평가해 **가격 경로를 4번 샘플링**한다. 라운드 사이에 sleep 은 두지 않는다(OX 는 벽시계와 무관하고, 실제 코인은 1분 안에 여러 번 fetch 해도 의미가 없다).
@@ -229,7 +229,15 @@ ox64/
   - **⚠ 큰 금액 표시는 `fmtKor`(만/억/조) 이고 반올림이 아니라 내림** — 등급 기준이 억/조 단위라 K/M/B 보다 직관적이고, 999,999 를 "100만" 으로 올려 보여주면 기준선을 넘은 것처럼 읽혀("100만인데 왜 아직 VIP0?") 혼란스럽다.
 - **아직 없음**: 펀딩비.
 
-### OX/USDT (서버 = `functions/api/order.ts` + `functions/api/spot.ts`) — 실제 코인과 동일한 레버리지, 체결가만 봇이 생성
+### 가상 코인 — OX/USDT · EW/USDT (서버 = `functions/api/order.ts` + `functions/api/spot.ts`) — 실제 코인과 동일한 레버리지, 체결가만 봇이 생성
+
+> **⚠ 가상 코인은 2종이고 전부 페어 파라미터로 흐른다(2026-07-31).** 아래 설명이 "OX" 라고 적혀 있어도
+> 전부 페어별로 독립 동작한다(봇 심리상태·호가 사다리·캔들·체결 테이프·재고가 모두 pair 키). **새 가상
+> 코인을 추가할 때 손댈 곳은 딱 셋** — `functions/api/spot.ts VIRTUAL_PAIRS`, `src/symbols.ts
+> VIRTUAL_SYMBOLS`, D1 `spot_bot_state` 시작가 행(§5). 그 외에 심볼을 하드코딩하면 그 경로만 OX 전용이
+> 되어 조용히 갈라지므로 절대 금지. EW/USDT 는 2026-07-31 에 시작가 1 USDT 로 개설했다.
+> ⚠ 코인을 늘릴 때 **cron 틱 예산(`MM_TICK_BUDGET`)을 코인 수만큼 곱하지 말 것** — invocation당 D1
+> 쿼리 한도(1,000)에 부딪힌다(§ cron). 현재 24틱을 2코인이 12틱씩 나눠 쓴다.
 
 **OX 는 다른 38종과 완전히 동일하게 레버리지 롱/숏으로 거래된다** — `OrderPanel`/`PositionsPanel`/
 `order.ts` 어디에도 OX 전용 분기가 없다(가상 전용 매칭·에스크로·보유 OX 개념은 전부 제거됨, 예전엔

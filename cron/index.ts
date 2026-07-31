@@ -36,7 +36,12 @@ const SWEEP_ROUNDS = 4;
 // 이유가 그것이었다. 그래서 총량을 정해두고 코인들이 나눠 쓴다(1코인이면 지금까지와 정확히 동일한
 // 라운드당 3틱). 코인이 늘면 코인당 틱이 줄어 시장 움직임이 그만큼 성기어지는데, 실제로 누가 보고
 // 있는 코인은 /api/spot 폴링이 초당 한 번씩 따로 틱을 돌려주므로(runMarketMaker) 체감 차이는 작다.
-const MM_TICK_BUDGET = 12;
+// ⚠ 총량을 정하는 기준은 **invocation당 D1 쿼리 한도(1,000)** 다. 한 틱이 약 14쿼리(벽 조회 + 봇 조회 +
+// 배치 ~11문장 + sweep)를 쓰므로 총 틱 24 ≈ 340쿼리 + 트리거 sweep ≈ 400 으로 한도의 절반 아래다.
+// 예전(사다리를 44행으로 쓰던 시절)엔 한 틱이 ~73쿼리라 12틱만으로 950 을 먹어 코인을 못 늘렸다.
+// 코인을 더 늘릴 땐 이 값을 그대로 두고 코인당 틱이 줄게 두거나(움직임이 성겨짐), 한도를 다시 계산해
+// 올릴 것 — 무심코 "코인 수 × 12" 로 두면 4~5종에서 쿼리 한도에 부딪힌다.
+const MM_TICK_BUDGET = 24;
 const MM_BUDGET_PER_PAIR = Math.max(SWEEP_ROUNDS, Math.floor(MM_TICK_BUDGET / VIRTUAL_PAIRS.length));
 
 async function runTick(env: Env): Promise<{ sweep: { rounds: number; checked: number; liquidated: number } }> {
@@ -49,17 +54,24 @@ async function runTick(env: Env): Promise<{ sweep: { rounds: number; checked: nu
   let checked = 0;
   let liquidated = 0;
   // ⚠ 백오프 판정은 라운드 루프 **밖에서 한 번만** — 라운드마다 하면 직전 라운드가 찍은 last_run 을 보고
-  // "누가 폴링 중"이라고 오판해 cron 이 스스로 물러난다(§ marketMakerTickBudget).
-  const ticksPerRound = Math.max(1, Math.floor((await marketMakerTickBudget(tradingEnv, MM_BUDGET_PER_PAIR)) / SWEEP_ROUNDS));
+  // "누가 폴링 중"이라고 오판해 cron 이 스스로 물러난다(§ marketMakerTickBudget). 페어마다 따로 판정한다
+  // (한쪽 코인만 보고 있을 수 있으므로 — 그 코인은 cron 이 물러나고 나머지는 예산을 그대로 쓴다).
+  const ticksByPair = new Map<string, number>();
+  for (const p of VIRTUAL_PAIRS) {
+    ticksByPair.set(p, Math.max(1, Math.floor((await marketMakerTickBudget(tradingEnv, p, MM_BUDGET_PER_PAIR)) / SWEEP_ROUNDS)));
+  }
   for (let i = 0; i < SWEEP_ROUNDS; i++) {
     // ⚠ 봇 실패가 트리거 평가를 막으면 안 된다 — 마켓메이커는 "재미"지만 sweepTriggers 는 **돈**이다
     // (강제청산·지정가·SL/TP·조건부). 예전엔 그냥 await 라 봇이 한 번 던지면 runTick 전체가 중단돼
     // 그 분의 청산/체결이 통째로 스킵됐다(2026-07-31 에 D1 storage timeout 으로 실제 발생). 봇은
     // 다음 라운드/다음 cron 에서 재시도하면 그만이므로 여기서 삼키고 로그만 남긴다.
-    try {
-      await runMarketMakerBurst(tradingEnv, ticksPerRound);
-    } catch (e) {
-      console.error(`[ox64-cron] marketMaker round=${i} failed:`, e instanceof Error ? e.message : e);
+    // 한 페어가 터져도 다른 페어는 계속 돈다(페어별 try/catch).
+    for (const p of VIRTUAL_PAIRS) {
+      try {
+        await runMarketMakerBurst(tradingEnv, p, ticksByPair.get(p)!);
+      } catch (e) {
+        console.error(`[ox64-cron] marketMaker(${p}) round=${i} failed:`, e instanceof Error ? e.message : e);
+      }
     }
     const r = await sweepTriggers(tradingEnv, prices);
     prices = r.prices;

@@ -8,9 +8,11 @@ export const SYMBOLS = [
   'PUMPUSDT', 'XPLUSDT', 'GRAMUSDT', 'KITEUSDT', 'SENTUSDT', 'ALLOUSDT',
 ];
 
-// 외부 시세 없는 가상 코인(유저간 주문매칭, functions/api/spot.ts). 실제 심볼과 같은
+// 외부 시세 없는 가상 코인(봇이 체결가를 만든다, functions/api/spot.ts). 실제 심볼과 같은
 // 콤보박스(SymbolSelect)에서 선택하지만 차트/호가/주문 데이터소스가 완전히 다르다.
-export const VIRTUAL_SYMBOLS = ['OXUSDT'] as const;
+// ⚠ 여기에 심볼을 추가하면 `functions/api/spot.ts VIRTUAL_PAIRS` 와 D1 `spot_bot_state` 시작가 행도
+// 같이 추가해야 한다(셋 중 하나라도 빠지면 목록엔 뜨는데 시세가 안 도는 유령 코인이 된다).
+export const VIRTUAL_SYMBOLS = ['OXUSDT', 'EWUSDT'] as const;
 export const isVirtualSymbol = (s: string): boolean => (VIRTUAL_SYMBOLS as readonly string[]).includes(s);
 
 export interface IntervalDef {

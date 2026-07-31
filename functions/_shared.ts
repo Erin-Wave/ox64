@@ -54,7 +54,7 @@ export const BOT_USER_IDS = ['bot-mm-1', 'bot-mm-2'] as const;
 // 외부 시세 없는 가상 심볼(서버측 사본 — functions/ 는 src/symbols.ts 를 import 할 수 없어
 // intervalSecFromCode 와 같은 이유로 값만 독립 보관). OXUSDT 는 레버리지 롱/숏도 다른 38종과
 // 완전히 동일하게 order.ts 를 타지만, 체결가만 OKX/Coinbase 대신 봇이 만든 내부가격을 쓴다.
-const VIRTUAL_SYMBOLS = ['OXUSDT'] as const;
+const VIRTUAL_SYMBOLS = ['OXUSDT', 'EWUSDT'] as const;
 export function isVirtualSymbol(s: string): boolean {
   return (VIRTUAL_SYMBOLS as readonly string[]).includes(s);
 }

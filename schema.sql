@@ -165,6 +165,26 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   book_version INTEGER NOT NULL DEFAULT 0     -- 낙관적 동시성 — 재호가와 소비가 서로를 덮어쓰지 않게
 );
 
+-- 가상 코인 시작가 — 이 행이 있어야 그 페어의 봇이 돈다(functions/api/spot.ts VIRTUAL_PAIRS 와 짝).
+-- ⚠ 새 가상 코인을 추가할 때 손댈 곳은 (1) VIRTUAL_PAIRS (2) src/symbols.ts VIRTUAL_SYMBOLS (3) 이 INSERT
+-- 셋뿐이다. last_run=0 이면 다음 cron/폴링이 곧바로 첫 사다리를 깐다.
+INSERT OR IGNORE INTO spot_bot_state (id, last_run, ref_price, anchor) VALUES
+  ('OXUSDT', 0, 1, 1),
+  ('EWUSDT', 0, 1, 1);
+
+-- ── 봇 재고(가상 코인별) ──────────────────────────────────────────────
+-- 봇이 유저 상대로 체결하면 현금(users.balance)과 함께 이 재고가 움직인다(functions/api/spot.ts
+-- botFillStmts). 값의 의미는 "유저 전체 순포지션의 거울" — 유저가 순매수면 봇 재고는 마이너스로 간다.
+-- ⚠ 예전엔 `users.ox_balance` 단일 컬럼이었는데, 가상 코인이 둘 이상이면 한 컬럼에 섞여 어느 코인
+-- 재고인지 구분이 사라진다(그러면 이 값의 유일한 의미가 없어진다) → 페어별 행으로 분리(2026-07-31).
+-- ⚠ 잔고 가드는 절대 붙이지 않는다 — 봇은 설계상 무한 유동성 공급자라 음수가 정상이다.
+CREATE TABLE IF NOT EXISTS bot_inventory (
+  pair     TEXT NOT NULL,
+  user_id  TEXT NOT NULL,
+  qty      REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (pair, user_id)
+);
+
 -- ── OX 영속 캔들(차트 히스토리 영구 보존) ─────────────────────────────
 -- 예전엔 캔들을 매 요청마다 "최신 spot_trades 5000건"을 버킷팅해 만들어서, 총 거래가 5000건을 넘으면
 -- 오래된 캔들이 창 밖으로 밀려 차트 데이터가 시간이 지나면 사라졌다(특히 큰 인터벌은 몇 봉만 남음).
@@ -312,6 +332,15 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- 먼저 적용돼 있어야 한다**. 이미 실행했다면 "duplicate column name" 에러(무시 가능). prod 적용 완료.
 -- ALTER TABLE spot_bot_state ADD COLUMN book_json TEXT;
 -- ALTER TABLE spot_bot_state ADD COLUMN book_version INTEGER NOT NULL DEFAULT 0;
+
+-- ⚠ 마이그레이션 (2026-07-31 추가, 가상 코인 2종 = OX/USDT + EW/USDT): `bot_inventory` 는 신규 테이블이라
+-- `--file=./schema.sql` 재적용만으로 생성되지만, **기존 봇 재고(users.ox_balance)를 OXUSDT 행으로 옮기는
+-- 백필**과 **EWUSDT 시작가 행**은 아래를 한 번 실행해야 한다. 셋 다 멱등(IGNORE)이라 재실행해도 안전하다.
+-- ⚠ 코드가 bot_inventory 에 INSERT 하므로 **코드 배포 전에 테이블이 있어야 한다**. prod 적용 완료.
+-- CREATE TABLE IF NOT EXISTS bot_inventory (pair TEXT NOT NULL, user_id TEXT NOT NULL, qty REAL NOT NULL DEFAULT 0, PRIMARY KEY (pair, user_id));
+-- INSERT OR IGNORE INTO bot_inventory (pair, user_id, qty) SELECT 'OXUSDT', id, ox_balance FROM users WHERE id IN ('bot-mm-1','bot-mm-2');
+-- INSERT OR IGNORE INTO spot_bot_state (id, last_run, ref_price, anchor) VALUES ('EWUSDT', 0, 1, 1);
+--   (users.ox_balance 는 이제 아무도 안 쓴다 — 레거시 컬럼으로 남겨둔다.)
 
 -- ── 퍼즐게임(ox64.app/b, "스핑크스 보석찾기" 확장) — 코인 트레이딩과 완전히 분리된 별도 재화 ──────
 -- 격자 보드에 여러 칸을 차지하는 보석(모양별로 다름)이 숨겨져 있고, 칸을 하나씩 열 때마다(코스트 1
