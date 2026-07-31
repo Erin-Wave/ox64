@@ -364,7 +364,20 @@ const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에
 // /api/spot 폴링은 1초 주기라 보고 있는 동안엔 last_run 이 항상 몇 초 이내다. 반대로 cron 이 직접 찍은
 // last_run 은 다음 cron 때 60초 전이므로 두 경우가 섞이지 않는다.
 const POLL_ACTIVE_MS = 20_000;
-const BURST_MIN_TICKS = 2; // 폴링이 돌고 있을 때 cron 이 얹는 최소 틱(심리 상태가 멈추지 않을 만큼만)
+const BURST_MIN_TICKS = 4; // 폴링이 돌고 있을 때 cron 이 얹는 최소 틱(cron 라운드당 1틱)
+
+/**
+ * cron 이 이번 실행에서 마켓메이커에 쓸 총 틱 수 — 유저 폴링이 이미 클럭 역할을 하고 있으면 최소치로.
+ * ⚠⚠ 이 판정은 **cron 실행당 정확히 한 번만** 해야 한다. 예전엔 `runMarketMakerBurst` 안에서 라운드마다
+ * 했는데, 그 함수는 끝날 때 `last_run` 을 찍으므로 **다음 라운드가 "방금 누가 폴링했네"로 오판**해서
+ * cron 이 아무도 없을 때도 스스로 물러났다(실측: 분당 12틱이어야 할 것이 4~9틱). 라운드 사이 간격이
+ * 밀리초라 시각만으로는 "cron 자신"과 "유저 폴링"을 구분할 수 없다 — 그래서 루프 밖에서 한 번 정한다.
+ */
+export async function marketMakerTickBudget(env: Env, budget: number): Promise<number> {
+  const row = await env.DB.prepare('SELECT last_run FROM spot_bot_state WHERE id = ?').bind(PAIR).first<{ last_run: number }>();
+  const idleMs = Date.now() - (row?.last_run ?? 0);
+  return idleMs < POLL_ACTIVE_MS ? Math.min(budget, BURST_MIN_TICKS) : budget;
+}
 
 // ⚠ 봇이 시장을 만드는 가상 페어 목록 — **틱 예산을 나누는 기준**이다(cron/index.ts MM_TICK_BUDGET).
 // 가상 코인을 늘릴 때 cron 틱을 코인 수만큼 곱하면 D1 쿼리/쓰기가 그대로 배가 되므로, 고정 예산을 여기
@@ -936,15 +949,6 @@ export async function runMarketMaker(env: Env): Promise<void> {
 export async function runMarketMakerBurst(env: Env, ticks: number = BOT_BURST_TICKS): Promise<void> {
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(PAIR).first<BotStateRow>();
   const ref0 = await resolveRef(env, row);
-
-  // ⚠ 유저가 OX 를 보고 있으면 /api/spot 폴링(1초)이 이미 초당 한 번꼴로 재호가를 돌리고 있다
-  // (runMarketMaker). 거기에 cron 이 12틱을 더 얹는 건 순수 중복이라, 쓰기만 두 배로 나가고 차트가
-  // 더 살아나지도 않는다. `last_run` 이 방금 전이면 "폴링이 클럭 역할을 하는 중"이라는 뜻이므로 cron 은
-  // 최소치만 돌린다 — cron 이 직접 찍은 last_run 은 다음 실행 때 60초 전이라 이 판정과 헷갈리지 않는다.
-  // 아무도 안 보고 있을 때만 전체 예산을 써서 봉이 비지 않게 채운다(cron 이 유일한 클럭인 경우).
-  const idleMs = Date.now() - (row?.last_run ?? 0);
-  const effective = idleMs < POLL_ACTIVE_MS ? Math.min(ticks, BURST_MIN_TICKS) : ticks;
-  if (effective < ticks) ticks = effective;
   // 상태 행이 아직 없으면 먼저 만든다 — marketMakerTick 의 심리상태 UPDATE 가 0행이 되어 국면이
   // 매 틱 초기화되는 걸 막는다(cron 이 유일한 클럭인 초기 상태에서 실제로 문제가 된다).
   if (!row) {
