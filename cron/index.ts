@@ -42,7 +42,15 @@ async function runTick(env: Env): Promise<{ sweep: { rounds: number; checked: nu
   let checked = 0;
   let liquidated = 0;
   for (let i = 0; i < SWEEP_ROUNDS; i++) {
-    await runMarketMakerBurst(tradingEnv, MM_TICKS_PER_ROUND);
+    // ⚠ 봇 실패가 트리거 평가를 막으면 안 된다 — 마켓메이커는 "재미"지만 sweepTriggers 는 **돈**이다
+    // (강제청산·지정가·SL/TP·조건부). 예전엔 그냥 await 라 봇이 한 번 던지면 runTick 전체가 중단돼
+    // 그 분의 청산/체결이 통째로 스킵됐다(2026-07-31 에 D1 storage timeout 으로 실제 발생). 봇은
+    // 다음 라운드/다음 cron 에서 재시도하면 그만이므로 여기서 삼키고 로그만 남긴다.
+    try {
+      await runMarketMakerBurst(tradingEnv, MM_TICKS_PER_ROUND);
+    } catch (e) {
+      console.error(`[ox64-cron] marketMaker round=${i} failed:`, e instanceof Error ? e.message : e);
+    }
     const r = await sweepTriggers(tradingEnv, prices);
     prices = r.prices;
     checked = r.checked; // 매 라운드 같은 유저 집합 — 마지막 값이 곧 "이번 실행에서 훑은 유저 수"
