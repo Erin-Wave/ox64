@@ -262,6 +262,15 @@ const BOT_TRADE_SIZE_MIN = 1000;
 const BOT_TRADE_SIZE_MAX = 8000;
 const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에 몰아 돌리는 틱 수(시장이 계속 살아있게)
 
+// ⚠ 체결 테이프(spot_trades) 보존 기간 — 예전엔 영구 보존이라 하루 ~10만 행씩 무한히 쌓였다(prod 실측
+// 2026-07-31: 157만 행). 그런데 실제로 읽는 건 (a)호가창 체결내역 최근 30건 (b)1s 등 단기 캔들 버킷팅의
+// 최신 5,000건 (c)기준가 폴백 1건뿐이고, 차트 히스토리는 영속 캔들(spot_candles)이 따로 들고 있어서
+// 오래된 체결을 지워도 잃는 게 없다. 봇이 분당 ~70건을 찍으므로 5,000건 ≈ 70분 — 6시간이면 그 8배라
+// 버킷팅이 창 밖으로 밀릴 위험이 없다.
+const TRADE_RETENTION_MS = 6 * 3600 * 1000;
+// 프루닝을 매 틱 넣으면 배치 문장만 늘어난다(지워지는 총량은 어차피 같다) — 가끔만 넣어 잘라낸다.
+const TRADE_PRUNE_CHANCE = 0.05; // ≈20틱마다 1회
+
 // ── 봇 매매 심리 모델 ─────────────────────────────────────────────────────
 // ⚠ 예전 기준가는 `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 추세도, 변동성 뭉침도,
 // 과열도 공포도 없는 무특징 노이즈. 매 틱이 직전과 완전히 독립이라 차트에 읽을 구조가 아예 없었고
@@ -612,7 +621,13 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   const stmts: D1PreparedStatement[] = [
     // ⚠ 매 틱 이 페어의 봇 호가를 "전부"(두 봇 모두) 비우고 한 액터가 일관된 사다리를 새로 깐다(호가 역전 방지).
     // spot_orders 엔 봇 호가만 있으니(유저 주문은 pending_orders) pair 전체를 지워도 유저 주문엔 영향 없다.
-    env.DB.prepare("UPDATE spot_orders SET status = 'cancelled' WHERE pair = ? AND status = 'open'").bind(PAIR),
+    // ⚠⚠ 취소 "마킹"(status='cancelled')이 아니라 **DELETE** 다 — 예전엔 마킹만 하고 아무도 지우지 않아
+    // 죽은 호가가 영구히 쌓였다(prod 실측 2026-07-31: 1,358만 행, 하루 +86만 행 = +200MB/일 로 DB 3.38GB 의
+    // 대부분을 차지하고 10GB 한도까지 한 달 남은 상태였다). 이 테이블에 살아있는 호가는 항상 ~45개뿐이고
+    // 아무도 옛 호가를 읽지 않으므로(모든 SELECT 가 status='open' 필터, 체결 이력은 spot_trades 가 보관)
+    // 히스토리를 남길 이유가 전혀 없다. status 조건 없이 지우는 건 부분/전량 체결로 'filled' 이 된 행까지
+    // 같이 청소하기 위함이다(그 행들도 예전엔 영구 잔류했다).
+    env.DB.prepare('DELETE FROM spot_orders WHERE pair = ?').bind(PAIR),
   ];
   // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 타이트하게(최우선호가가 mid 에 바싹) 잡되 깊은
   // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
@@ -692,6 +707,12 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   );
   // 영속 캔들: 이 틱이 찍은 체결들의 OHLCV 로 1회 갱신(위 spot_trades 들과 정확히 일치해야 한다).
   stmts.push(...candleUpsertStmts(env, { open, high, low, close: ref, volume }, now));
+  // 보존 기간을 넘긴 옛 체결 정리(같은 batch — 왕복 추가 없음). 위 TRADE_RETENTION_MS 주석 참고.
+  if (Math.random() < TRADE_PRUNE_CHANCE) {
+    stmts.push(
+      env.DB.prepare('DELETE FROM spot_trades WHERE pair = ? AND created_at < ?').bind(PAIR, now - TRADE_RETENTION_MS),
+    );
+  }
   // 봇도 수수료를 낸다 — 이 틱의 합성 체결 명목금액에 대해(같은 batch, 왕복 추가 없음).
   // ⚠ 재고/현금 정산은 없다(botSide=null) — 합성 체결은 buyer_id=seller_id=actor 인 봇↔봇 거래라
   // 사고팔린 게 같은 계정 안에서 상계된다(수수료만 실제로 나간다).

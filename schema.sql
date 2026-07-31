@@ -102,6 +102,9 @@ CREATE INDEX IF NOT EXISTS idx_conditional_user ON conditional_orders(user_id);
 -- 레버리지·마진 없음. 매수는 USDT(users.balance)를, 매도는 OX(users.ox_balance)를
 -- 주문 시점에 즉시 잠그고(조건부 UPDATE), functions/api/spot.ts 가 주문 직후 그 자리에서
 -- 반대편 최우선호가와 매칭(체결가=먼저 있던 주문의 가격, 시간우선)한다. 남은 수량은 호가로 대기.
+-- ⚠ 이 테이블은 **항상 "지금 깔려 있는 봇 호가"(~45행)만** 들고 있는 임시 스냅샷이다. 재호가 때마다
+-- 이 페어 행을 통째로 DELETE 하고 새 사다리를 INSERT 한다(spot.ts marketMakerTick). 예전엔 지우지 않고
+-- status='cancelled' 로 마킹만 해서 1,358만 행까지 쌓였다(§ 아래 2026-07-31 일회성 정리 참고).
 CREATE TABLE IF NOT EXISTS spot_orders (
   id         TEXT PRIMARY KEY,
   user_id    TEXT NOT NULL,
@@ -110,12 +113,15 @@ CREATE TABLE IF NOT EXISTS spot_orders (
   price      REAL NOT NULL,
   size       REAL NOT NULL,          -- 남은(미체결) 수량
   orig_size  REAL NOT NULL,          -- 최초 주문 수량
-  status     TEXT NOT NULL,          -- 'open' | 'filled' | 'cancelled'
+  status     TEXT NOT NULL,          -- 'open' | 'filled' (재호가 때 행 자체가 지워지므로 'cancelled' 는 이제 안 쓴다)
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_spot_orders_book ON spot_orders(pair, status, side, price);
 CREATE INDEX IF NOT EXISTS idx_spot_orders_user ON spot_orders(user_id);
 
+-- ⚠ 체결 테이프는 **최근 6시간만 보존**한다(spot.ts TRADE_RETENTION_MS, 재호가 틱이 가끔 잘라냄).
+-- 읽는 곳이 최근 30건(호가창 체결내역)·5,000건(1s 캔들 버킷팅)·1건(기준가 폴백)뿐이고, 차트 히스토리는
+-- spot_candles 가 영구 보관하므로 오래된 체결은 지워도 잃는 게 없다(예전엔 영구 보존 → 157만 행).
 CREATE TABLE IF NOT EXISTS spot_trades (
   id         TEXT PRIMARY KEY,
   pair       TEXT NOT NULL,
@@ -267,6 +273,29 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- ALTER TABLE conditional_orders ADD COLUMN repeat_mode TEXT NOT NULL DEFAULT 'continuous';
 -- ALTER TABLE conditional_orders ADD COLUMN cooldown_ms INTEGER NOT NULL DEFAULT 0;
 -- ALTER TABLE conditional_orders ADD COLUMN last_fill_at INTEGER;
+
+-- ⚠⚠ 일회성 정리 (2026-07-31 추가, "죽은 봇 호가/옛 체결" 청소): 스키마 변경이 아니라 **데이터 청소**다.
+-- 배경 — 마켓메이커는 매 틱 봇 호가 사다리(44개)를 새로 깔면서 직전 호가를 status='cancelled' 로 "마킹만"
+-- 하고 지우지 않았고, 체결 테이프(spot_trades)도 영구 보존이었다. prod 실측(2026-07-31):
+--   spot_orders  13,584,823 행 (살아있는 호가는 항상 ~45개 — 나머지 전부 시체), 하루 +86만 행
+--   spot_trades   1,571,784 행 (실제로 읽는 건 최근 30건/5,000건뿐), 하루 +10만 행
+--   → DB 3.38GB / 하루 +200MB. D1 의 DB당 한도 10GB 까지 약 한 달 남은 상태였다(도달하면 쓰기가 거부되어
+--     가상코인뿐 아니라 트레이딩 전체가 정지한다).
+-- 코드 수정(spot.ts)으로 이제 재호가 때 DELETE 하고 체결도 6시간만 보존하므로 **더는 쌓이지 않는다**.
+-- 아래는 이미 쌓인 과거분을 한 번에 비우는 명령이다(최초 1회).
+--   ⚠ spot_orders 는 DELETE 대신 DROP+재생성을 쓴다 — 1,358만 행 DELETE 는 30초 쿼리 한도를 넘기고
+--     rows written 과금도 크게 붙는다. 이 테이블엔 봇 호가만 있고(유일한 INSERT 경로가 botQuoteStmt)
+--     모든 SELECT 가 status='open' 만 읽으므로 통째로 비워도 잃는 정보가 없다. 비운 직후 다음 봇 틱이
+--     사다리를 다시 깐다(<1초).
+--   ⚠ SQLite 는 VACUUM 없이는 파일이 줄지 않는다(D1 은 VACUUM 미지원). 지운 페이지는 freelist 로 가서
+--     이후 새 데이터가 재사용하므로, **파일 크기는 3.4GB 근처에 머물되 더 이상 커지지 않는다** — 10GB
+--     한도 문제는 이것으로 해소된다(Paid 플랜 storage 포함분 5GB 안이라 과금도 0).
+-- DROP TABLE IF EXISTS spot_orders;
+-- CREATE TABLE IF NOT EXISTS spot_orders (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, pair TEXT NOT NULL, side TEXT NOT NULL, price REAL NOT NULL, size REAL NOT NULL, orig_size REAL NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL);
+-- CREATE INDEX IF NOT EXISTS idx_spot_orders_book ON spot_orders(pair, status, side, price);
+-- CREATE INDEX IF NOT EXISTS idx_spot_orders_user ON spot_orders(user_id);
+-- (체결 테이프는 행 수가 적어 그냥 잘라낸다 — 6시간치만 남긴다. 차트 히스토리는 spot_candles 가 보관.)
+-- DELETE FROM spot_trades WHERE created_at < (strftime('%s','now') - 6*3600) * 1000;
 
 -- ── 퍼즐게임(ox64.app/b, "스핑크스 보석찾기" 확장) — 코인 트레이딩과 완전히 분리된 별도 재화 ──────
 -- 격자 보드에 여러 칸을 차지하는 보석(모양별로 다름)이 숨겨져 있고, 칸을 하나씩 열 때마다(코스트 1
