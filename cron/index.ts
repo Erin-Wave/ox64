@@ -8,7 +8,7 @@
 // @cloudflare/workers-types 를 의존성으로 두지 않는 프로젝트 관례(functions/_shared.ts 참고)를
 // 그대로 따라 ScheduledEvent/ExecutionContext 도 필요한 최소 형태만 직접 선언한다.
 import { sweepTriggers } from '../functions/_trading';
-import { runMarketMakerBurst } from '../functions/api/spot';
+import { runMarketMakerBurst, VIRTUAL_PAIRS } from '../functions/api/spot';
 import type { Env as TradingEnv, D1Database } from '../functions/_shared';
 
 interface Env {
@@ -30,7 +30,14 @@ interface MinimalExecutionContext {
 // 라운드 사이에 sleep 을 두지 않는 이유: OX 가격은 벽시계가 아니라 **봇 틱이 돌 때만** 움직이므로,
 // 틱 그룹 사이에서 평가하는 것만으로 샘플링 목적이 달성된다(실제 코인 시세는 아래 캐시로 1회만 fetch).
 const SWEEP_ROUNDS = 4;
-const MM_TICKS_PER_ROUND = 3;
+
+// ⚠ 마켓메이커 틱 예산은 **가상 코인 수와 무관하게 고정**이다. 코인마다 12틱씩 돌리면 D1 쓰기도,
+// invocation당 쿼리 수(한도 1,000)도 코인 수에 그대로 비례해 늘어난다 — 가상 코인을 못 늘리는 진짜
+// 이유가 그것이었다. 그래서 총량을 정해두고 코인들이 나눠 쓴다(1코인이면 지금까지와 정확히 동일한
+// 라운드당 3틱). 코인이 늘면 코인당 틱이 줄어 시장 움직임이 그만큼 성기어지는데, 실제로 누가 보고
+// 있는 코인은 /api/spot 폴링이 초당 한 번씩 따로 틱을 돌려주므로(runMarketMaker) 체감 차이는 작다.
+const MM_TICK_BUDGET = 12;
+const MM_TICKS_PER_ROUND = Math.max(1, Math.floor(MM_TICK_BUDGET / (VIRTUAL_PAIRS.length * SWEEP_ROUNDS)));
 
 async function runTick(env: Env): Promise<{ sweep: { rounds: number; checked: number; liquidated: number } }> {
   // 전부 env.DB 만 사용 — SESSION_SECRET 은 이 워커엔 없어도 무방.

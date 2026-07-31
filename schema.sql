@@ -102,9 +102,11 @@ CREATE INDEX IF NOT EXISTS idx_conditional_user ON conditional_orders(user_id);
 -- 레버리지·마진 없음. 매수는 USDT(users.balance)를, 매도는 OX(users.ox_balance)를
 -- 주문 시점에 즉시 잠그고(조건부 UPDATE), functions/api/spot.ts 가 주문 직후 그 자리에서
 -- 반대편 최우선호가와 매칭(체결가=먼저 있던 주문의 가격, 시간우선)한다. 남은 수량은 호가로 대기.
--- ⚠ 이 테이블은 **항상 "지금 깔려 있는 봇 호가"(~45행)만** 들고 있는 임시 스냅샷이다. 재호가 때마다
--- 이 페어 행을 통째로 DELETE 하고 새 사다리를 INSERT 한다(spot.ts marketMakerTick). 예전엔 지우지 않고
--- status='cancelled' 로 마킹만 해서 1,358만 행까지 쌓였다(§ 아래 2026-07-31 일회성 정리 참고).
+-- ⚠⚠ **레거시 — 더 이상 아무도 읽지도 쓰지도 않는다**(2026-07-31). 봇 호가 사다리는 이제
+-- spot_bot_state.book_json 한 칸에 들어간다(§ BotBook, functions/api/spot.ts). 이 테이블은 예전에
+-- 재호가 때마다 44행을 INSERT 하고 취소 마킹만 해서 **1,358만 행 / DB 3.38GB** 까지 부풀었던 주범이고,
+-- 틱당 45문장을 먹어 cron 1회가 D1 쿼리 한도(1,000)의 950 을 쓰게 만든 원인이기도 하다.
+-- 롤백 여지를 남기려고 정의만 남겨두며, 확인 후 `DROP TABLE spot_orders` 로 지우면 된다.
 CREATE TABLE IF NOT EXISTS spot_orders (
   id         TEXT PRIMARY KEY,
   user_id    TEXT NOT NULL,
@@ -156,7 +158,11 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   sentiment    REAL NOT NULL DEFAULT 0,       -- 군중 심리 -1(공포) ~ +1(탐욕)
   anchor       REAL NOT NULL DEFAULT 0,       -- 완만히 따라오는 "적정가"(과열/과매도 판정 기준, 0=미초기화)
   regime       TEXT NOT NULL DEFAULT 'calm',  -- calm|rally|euphoria|pullback|panic
-  regime_ticks INTEGER NOT NULL DEFAULT 0     -- 현재 국면이 지속된 틱 수(최소 지속시간 보장용)
+  regime_ticks INTEGER NOT NULL DEFAULT 0,    -- 현재 국면이 지속된 틱 수(최소 지속시간 보장용)
+  -- ⚠ 봇 호가 사다리 전체가 이 한 칸이다(예전엔 spot_orders 44행). {"o":액터봇,"b":[[가격,수량]..],"a":[..]}
+  -- 매 재호가마다 통째로 교체되고, 유저 체결이 물량을 깎으면 book_version 가드로 되쓴다(§ BotBook).
+  book_json    TEXT,
+  book_version INTEGER NOT NULL DEFAULT 0     -- 낙관적 동시성 — 재호가와 소비가 서로를 덮어쓰지 않게
 );
 
 -- ── OX 영속 캔들(차트 히스토리 영구 보존) ─────────────────────────────
@@ -296,6 +302,16 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- CREATE INDEX IF NOT EXISTS idx_spot_orders_user ON spot_orders(user_id);
 -- (체결 테이프는 행 수가 적어 그냥 잘라낸다 — 6시간치만 남긴다. 차트 히스토리는 spot_candles 가 보관.)
 -- DELETE FROM spot_trades WHERE created_at < (strftime('%s','now') - 6*3600) * 1000;
+--   ⚠ 실전 기록: `DROP TABLE spot_orders` 는 3GB 짜리 테이블에선 D1 의 storage operation timeout 에 걸려
+--     7429/7500 에러를 뱉는다(그 사이 DB 가 잠겨 다른 쿼리도 같이 실패한다). 그래도 DDL 자체는 커밋되므로
+--     에러 메시지만 보고 "실패했다"고 판단하지 말고 실제 행 수를 다시 확인할 것.
+
+-- ⚠ 일회성 마이그레이션 (2026-07-31 추가, 봇 사다리를 JSON 한 칸으로): 기존 prod DB 의 spot_bot_state 에
+-- 컬럼을 추가한다. CREATE TABLE IF NOT EXISTS 는 기존 테이블에 컬럼을 더해주지 않으므로 최초 1회만 아래를
+-- 직접 실행할 것 — **코드(marketMakerTick/매칭 전 경로)가 이 컬럼을 SELECT/UPDATE 하므로 코드 배포 전에
+-- 먼저 적용돼 있어야 한다**. 이미 실행했다면 "duplicate column name" 에러(무시 가능). prod 적용 완료.
+-- ALTER TABLE spot_bot_state ADD COLUMN book_json TEXT;
+-- ALTER TABLE spot_bot_state ADD COLUMN book_version INTEGER NOT NULL DEFAULT 0;
 
 -- ── 퍼즐게임(ox64.app/b, "스핑크스 보석찾기" 확장) — 코인 트레이딩과 완전히 분리된 별도 재화 ──────
 -- 격자 보드에 여러 칸을 차지하는 보석(모양별로 다름)이 숨겨져 있고, 칸을 하나씩 열 때마다(코스트 1

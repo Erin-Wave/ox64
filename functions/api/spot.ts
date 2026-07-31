@@ -8,7 +8,6 @@ import {
   getSession,
   intervalSecFromCode,
   BOT_USER_IDS,
-  type SpotOrderRow,
   type SpotTradeRow,
   type PendingRow,
   type PositionRow,
@@ -71,10 +70,14 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
 // 차트는 그 테이블에서 읽는다 → 거래가 아무리 쌓여도 히스토리가 영구 보존되고, 읽기도 인터벌+버킷
 // 인덱스로 필요한 만큼만 가져와 가볍다. 1s(및 <60s)만 예외로 영속화하지 않고(단기 조회 전용, 영속
 // 저장은 낭비) 최신 거래 버킷팅으로 처리한다.
-const CANDLE_INTERVALS: readonly [string, number][] = [
-  ['1m', 60], ['3m', 180], ['5m', 300], ['15m', 900], ['30m', 1800],
-  ['1h', 3600], ['2h', 7200], ['4h', 14400], ['6h', 21600], ['8h', 28800], ['12h', 43200],
-  ['1d', 86400], ['3d', 259200], ['1w', 604800], ['1M', 2592000],
+// ⚠ **저장은 1m/1h/1d 세 종류만** 한다(2026-07-31). 예전엔 15종을 전부 upsert 해서 체결 한 묶음마다
+// 15문장이 나갔는데, 봇이 분당 12틱 이상 영구히 도니 그것만으로 하루 29만 write 였다. 나머지 인터벌
+// (3m/5m/15m/30m, 2h/4h/6h/8h/12h, 3d/1w/1M)은 전부 이 셋의 **정수배**라 조회할 때 굴려서(rollup) 만들면
+// 값이 정확히 같다 — 저장할 이유가 없다. 셋을 고른 기준: 각 그룹의 최소 단위여야 그 그룹 전체를 덮는다.
+const PERSIST_INTERVALS: readonly [string, number][] = [
+  ['1m', 60],
+  ['1h', 3600],
+  ['1d', 86400],
 ];
 
 /** 한 묶음의 체결(OHLCV)을 모든 영속 인터벌의 캔들에 반영하는 upsert 문장들.
@@ -88,7 +91,7 @@ function candleUpsertStmts(
   bar: { open: number; high: number; low: number; close: number; volume: number },
   now: number,
 ): D1PreparedStatement[] {
-  return CANDLE_INTERVALS.map(([code, sec]) => {
+  return PERSIST_INTERVALS.map(([code, sec]) => {
     const bucket = Math.floor(now / (sec * 1000)) * (sec * 1000);
     return env.DB.prepare(
       `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)
@@ -148,6 +151,12 @@ async function loadSpotCandles(env: Env, intervalCode: string, limit: number, en
   // endTime 이 오면 빈 배열을 돌려줘서 클라가 "더 없음"으로 확정하게 한다(무한 재시도 방지).
   if (sec < 60) return endTimeMs ? [] : bucketTradesToCandles(env, bucketMs, limit);
 
+  // 저장하지 않는 인터벌은 **정수배가 되는 가장 큰 저장 인터벌**에서 굴려 만든다(§ PERSIST_INTERVALS).
+  // 예: 15m ← 1m 15개, 4h ← 1h 4개, 1w ← 1d 7개. 그만큼 원본 봉을 더 읽어야 하므로 limit 에 배수를 건다.
+  const src = [...PERSIST_INTERVALS].reverse().find(([, s]) => sec % s === 0) ?? PERSIST_INTERVALS[0];
+  const [srcCode, srcSec] = src;
+  const ratio = Math.max(1, Math.round(sec / srcSec));
+
   // endTimeMs 가 오면 그 시각 "이전" 봉만 — 차트에서 왼쪽으로 스크롤할 때 과거 구간을 이어 받는다.
   const rows = (
     await env.DB.prepare(
@@ -155,16 +164,108 @@ async function loadSpotCandles(env: Env, intervalCode: string, limit: number, en
         ? 'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
         : 'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? ORDER BY bucket DESC LIMIT ?',
     )
-      .bind(...(endTimeMs ? [PAIR, intervalCode, endTimeMs, limit] : [PAIR, intervalCode, limit]))
+      .bind(...(endTimeMs ? [PAIR, srcCode, endTimeMs, limit * ratio] : [PAIR, srcCode, limit * ratio]))
       .all<{ bucket: number; open: number; high: number; low: number; close: number; volume: number }>()
   ).results;
   // 과거 페이지 요청인데 결과가 없으면 진짜로 더 없는 것 — 거래 버킷팅 폴백으로 최신 구간을
   // 돌려주면 클라가 "받았다"고 착각해 같은 구간을 무한히 다시 붙인다.
   if (rows.length === 0) return endTimeMs ? [] : bucketTradesToCandles(env, bucketMs, limit);
 
-  return rows
-    .reverse()
-    .map((r) => ({ time: Math.floor(r.bucket / 1000), open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
+  const asc = rows.reverse();
+  if (ratio === 1) {
+    return asc.map((r) => ({ time: Math.floor(r.bucket / 1000), open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
+  }
+  // 롤업 — 원본 봉을 목표 버킷으로 묶는다(open=첫 봉, close=마지막 봉, high/low=극값, volume=합).
+  // 원본이 시간순(asc)이라 open/close 가 자연히 맞는다.
+  const merged = new Map<number, { open: number; high: number; low: number; close: number; volume: number }>();
+  for (const r of asc) {
+    const b = Math.floor(r.bucket / bucketMs) * bucketMs;
+    const cur = merged.get(b);
+    if (!cur) {
+      merged.set(b, { open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume });
+    } else {
+      cur.high = Math.max(cur.high, r.high);
+      cur.low = Math.min(cur.low, r.low);
+      cur.close = r.close;
+      cur.volume += r.volume;
+    }
+  }
+  return [...merged.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .slice(-limit)
+    .map(([t, c]) => ({ time: Math.floor(t / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+}
+
+// ── 봇 호가 사다리 = spot_bot_state 의 JSON 한 칸(예전엔 spot_orders 44행) ──────────────────
+// ⚠⚠ 왜 테이블이 아니라 한 칸인가: 사다리는 매 틱 통째로 새로 깔리는 **스냅샷**이지 이력이 아니다.
+// 그런데 44개를 44행으로 쓰면 (a)틱마다 INSERT 44문장 + DELETE 1문장이 나가 **cron 1회가 D1 쿼리
+// 한도(invocation당 1,000)의 950 을 먹어** 가상코인을 하나도 더 못 늘리고 (b)하루 172만 행을 쓰고
+// 지우느라 월 rows written 포함분(5,000만)을 넘긴다. 사다리를 이 JSON 한 칸에 담으면 **봇이 이미
+// 갱신하고 있던 상태 UPDATE 에 컬럼 하나가 붙을 뿐**이라 문장이 0 개 늘고(틱당 70→~25), 매칭 쪽도
+// "스냅샷 읽어 메모리에서 walking" 이라는 기존 패턴을 그대로 쓴다.
+// 형식: {"o":액터봇id,"b":[[가격,수량],...],"a":[...]} — b=매수(가격 내림차순), a=매도(오름차순).
+export interface BookLevel {
+  price: number;
+  size: number;
+}
+interface BotBook {
+  owner: string; // 이 사다리를 깐 봇(체결 시 재고/현금/수수료 정산 대상)
+  bids: BookLevel[];
+  asks: BookLevel[];
+}
+
+function emptyBook(): BotBook {
+  return { owner: BOT_USER_IDS[0], bids: [], asks: [] };
+}
+
+/** 저장된 JSON → 사다리. 컬럼이 비었거나(마이그레이션 직후) 깨졌으면 빈 호가창으로 떨어진다 —
+ * 빈 호가창이어도 시장가는 합성 흡수로 체결되고 지정가는 대기하므로, 다음 재호가(<1초)면 복구된다. */
+function parseBook(json: string | null | undefined): BotBook {
+  if (!json) return emptyBook();
+  try {
+    const o = JSON.parse(json) as { o?: string; b?: [number, number][]; a?: [number, number][] };
+    return {
+      owner: o.o || BOT_USER_IDS[0],
+      bids: (o.b ?? []).map(([price, size]) => ({ price, size })),
+      asks: (o.a ?? []).map(([price, size]) => ({ price, size })),
+    };
+  } catch {
+    return emptyBook();
+  }
+}
+
+/** 사다리 → JSON. 다 소비된 레벨(수량 0)은 빼서 호가창에 유령 가격대가 남지 않게 한다. */
+function serializeBook(b: BotBook): string {
+  return JSON.stringify({
+    o: b.owner,
+    b: b.bids.filter((l) => l.size > EPS).map((l) => [l.price, l.size]),
+    a: b.asks.filter((l) => l.size > EPS).map((l) => [l.price, l.size]),
+  });
+}
+
+/** 테이커가 소비할 반대편 레벨들을 가격 우선순위 순으로. limitPrice 가 있으면 그보다 불리한 레벨은 제외
+ * (매도호가를 살 땐 price<=limit, 매수호가에 팔 땐 price>=limit — 최우선호가보다 유리하게는 안 체결).
+ * ⚠ 반환 배열의 원소는 `book` 안의 객체를 **그대로 참조**한다 — walking 하며 `level.size -= take` 로
+ * 깎으면 그 결과가 serializeBook 에 그대로 반영된다(별도 인덱스 추적 불필요). */
+function makerLevels(book: BotBook, makerSide: 'buy' | 'sell', limitPrice: number | null): BookLevel[] {
+  const levels = makerSide === 'sell' ? book.asks : book.bids;
+  const sorted = [...levels].sort((x, y) => (makerSide === 'sell' ? x.price - y.price : y.price - x.price));
+  if (limitPrice == null) return sorted;
+  return sorted.filter((l) => (makerSide === 'sell' ? l.price <= limitPrice : l.price >= limitPrice));
+}
+
+const BOOK_COLS = 'book_json, book_version';
+interface BookRow {
+  book_json: string | null;
+  book_version: number;
+}
+
+/** 소비한 사다리를 되쓴다. ⚠ `book_version` 가드 — 그 사이 재호가가 새 사다리를 깔았으면 0행이 되어
+ * **옛 사다리로 덮어쓰는 사고를 막는다**. 0행이어도 체결 자체는 그대로 성립한다(봇은 무한 유동성 풀이라
+ * "물량이 모자라 못 판다"가 없다) — 예전 spot_orders 시절의 best-effort 소비와 같은 관용구다. */
+function bookWriteStmt(env: Env, book: BotBook, version: number): D1PreparedStatement {
+  return env.DB.prepare('UPDATE spot_bot_state SET book_json=?, book_version=book_version+1 WHERE id=? AND book_version=?')
+    .bind(serializeBook(book), PAIR, version);
 }
 
 /** 호가창·체결내역 "표시용" 데이터 — 특정 유저의 개인 데이터가 아니라 시장 전체를 보여준다.
@@ -176,35 +277,40 @@ async function loadSpotCandles(env: Env, intervalCode: string, limit: number, en
 async function loadSpotMarket(env: Env, uid: string) {
   // `mine` = 그 가격대에 이 유저가 걸어둔 물량. 호가창에서 내 주문을 티나게 표시하려면 합계만으론
   // 알 수 없어서(봇 물량과 섞임) 유저 소유분을 따로 합산해 내려준다.
-  const bids = (
-    await env.DB.prepare(
-      `SELECT price, SUM(size) AS size, SUM(mine) AS mine FROM (
-         SELECT price, size, 0 AS mine FROM spot_orders WHERE pair = ? AND side = 'buy' AND status = 'open'
-         UNION ALL
-         SELECT limit_price AS price, size, CASE WHEN user_id = ? THEN size ELSE 0 END AS mine
-           FROM pending_orders WHERE symbol = ? AND side = 'long'
-       ) GROUP BY price ORDER BY price DESC LIMIT ${BOOK_LIMIT}`,
+  // ⚠ 예전엔 봇 호가(spot_orders)와 유저 지정가(pending_orders)를 SQL 에서 UNION ALL 로 합쳤는데,
+  // 봇 사다리가 JSON 한 칸으로 옮겨간 뒤로는 **봇 쪽은 메모리에서** 합친다(§ BotBook). 유저 지정가는
+  // 여전히 테이블이라 SQL 로 가격대별 집계만 받아온다.
+  const [stateRow, pendingRows, tradeRows] = await Promise.all([
+    env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id = ?`).bind(PAIR).first<BookRow>(),
+    env.DB.prepare(
+      `SELECT side, limit_price AS price, SUM(size) AS size, SUM(CASE WHEN user_id = ? THEN size ELSE 0 END) AS mine
+         FROM pending_orders WHERE symbol = ? GROUP BY side, limit_price`,
     )
-      .bind(PAIR, uid, PAIR)
-      .all<{ price: number; size: number; mine: number }>()
-  ).results;
-  const asks = (
-    await env.DB.prepare(
-      `SELECT price, SUM(size) AS size, SUM(mine) AS mine FROM (
-         SELECT price, size, 0 AS mine FROM spot_orders WHERE pair = ? AND side = 'sell' AND status = 'open'
-         UNION ALL
-         SELECT limit_price AS price, size, CASE WHEN user_id = ? THEN size ELSE 0 END AS mine
-           FROM pending_orders WHERE symbol = ? AND side = 'short'
-       ) GROUP BY price ORDER BY price ASC LIMIT ${BOOK_LIMIT}`,
-    )
-      .bind(PAIR, uid, PAIR)
-      .all<{ price: number; size: number; mine: number }>()
-  ).results;
-  const trades = (
-    await env.DB.prepare('SELECT * FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 30')
-      .bind(PAIR)
-      .all<SpotTradeRow>()
-  ).results;
+      .bind(uid, PAIR)
+      .all<{ side: string; price: number; size: number; mine: number }>(),
+    env.DB.prepare('SELECT * FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 30').bind(PAIR).all<SpotTradeRow>(),
+  ]);
+
+  const book = parseBook(stateRow?.book_json);
+  // 같은 가격대는 봇/유저 물량을 합산해 한 줄로(예전 SQL 의 GROUP BY price 와 동일).
+  const merge = (levels: BookLevel[], userSide: string, desc: boolean) => {
+    const acc = new Map<number, { price: number; size: number; mine: number }>();
+    const add = (price: number, size: number, mine: number) => {
+      const cur = acc.get(price);
+      if (cur) {
+        cur.size += size;
+        cur.mine += mine;
+      } else {
+        acc.set(price, { price, size, mine });
+      }
+    };
+    for (const l of levels) if (l.size > EPS) add(l.price, l.size, 0);
+    for (const p of pendingRows.results) if (p.side === userSide) add(p.price, p.size, p.mine);
+    return [...acc.values()].sort((a, b) => (desc ? b.price - a.price : a.price - b.price)).slice(0, BOOK_LIMIT);
+  };
+  const bids = merge(book.bids, 'long', true);
+  const asks = merge(book.asks, 'short', false);
+  const trades = tradeRows.results;
 
   return {
     book: { bids, asks },
@@ -246,13 +352,6 @@ const BOT_TICK_MAX_MS = 1100;
 // 같다 — 호가창은 가격대별 합계만 보여주므로). 8단계는 스프레드 근처 몇 줄만 차서 휑했다.
 const BOT_LEVELS_PER_SIDE = 22;
 
-// 봇 패시브 호가 1개를 INSERT 하는 문장(에스크로 없음).
-function botQuoteStmt(env: Env, actor: string, side: 'buy' | 'sell', price: number, size: number, now: number): D1PreparedStatement {
-  return env.DB.prepare(
-    'INSERT INTO spot_orders (id, user_id, pair, side, price, size, orig_size, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
-  ).bind(crypto.randomUUID(), actor, PAIR, side, price, size, size, 'open', now);
-}
-
 // ⚠ 한 틱에 찍는 합성 체결의 개수·크기 — 예전엔 5~45 짜리 1건이라 캔들 거래량이 수백에 그쳤다("봇이
 // 쫄보"). 실제 시장처럼 보이도록 매 틱 여러 건을 큰 물량으로 찍는다(테이프도 붐비고 거래량도 유의미).
 // 아래 심리 모델이 국면·변동성에 따라 이 값에 배수를 걸어 "패닉엔 거래량 폭증, 잔잔할 땐 한산"을 만든다.
@@ -261,6 +360,18 @@ const BOT_TRADES_PER_TICK_MAX = 6;
 const BOT_TRADE_SIZE_MIN = 1000;
 const BOT_TRADE_SIZE_MAX = 8000;
 const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에 몰아 돌리는 틱 수(시장이 계속 살아있게)
+// ⚠ cron 백오프 — "마지막 재호가가 이만큼 이내면 유저 폴링이 클럭 역할을 하는 중"으로 본다.
+// /api/spot 폴링은 1초 주기라 보고 있는 동안엔 last_run 이 항상 몇 초 이내다. 반대로 cron 이 직접 찍은
+// last_run 은 다음 cron 때 60초 전이므로 두 경우가 섞이지 않는다.
+const POLL_ACTIVE_MS = 20_000;
+const BURST_MIN_TICKS = 2; // 폴링이 돌고 있을 때 cron 이 얹는 최소 틱(심리 상태가 멈추지 않을 만큼만)
+
+// ⚠ 봇이 시장을 만드는 가상 페어 목록 — **틱 예산을 나누는 기준**이다(cron/index.ts MM_TICK_BUDGET).
+// 가상 코인을 늘릴 때 cron 틱을 코인 수만큼 곱하면 D1 쿼리/쓰기가 그대로 배가 되므로, 고정 예산을 여기
+// 길이로 나눠 쓴다. ⚠ 실제로 페어를 추가하려면 이 배열만으론 부족하다 — 이 파일의 `PAIR` 상수를 인자로
+// 내리고(48곳), 봇 재고(`users.ox_balance` 단일 컬럼)를 페어별로 분리해야 한다. 그 작업 전까지 이 배열은
+// 항상 길이 1 이어야 한다.
+export const VIRTUAL_PAIRS: readonly string[] = [PAIR];
 
 // ⚠ 체결 테이프(spot_trades) 보존 기간 — 예전엔 영구 보존이라 하루 ~10만 행씩 무한히 쌓였다(prod 실측
 // 2026-07-31: 157만 행). 그런데 실제로 읽는 건 (a)호가창 체결내역 최근 30건 (b)1s 등 단기 캔들 버킷팅의
@@ -270,11 +381,6 @@ const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에
 const TRADE_RETENTION_MS = 6 * 3600 * 1000;
 // 프루닝을 매 틱 넣으면 배치 문장만 늘어난다(지워지는 총량은 어차피 같다) — 가끔만 넣어 잘라낸다.
 const TRADE_PRUNE_CHANCE = 0.05; // ≈20틱마다 1회
-// ⚠ 죽은 봇 호가(체결로 'filled' 이 된 행 + 과거 'cancelled' 마킹 잔재)를 **조금씩** 걷어내는 청크 크기.
-// 한 문장에서 전부 지우려 하면 안 된다 — prod 엔 잔재가 1,358만 행이라 30초 쿼리 한도를 넘겨 batch 가
-// 통째로 실패한다(실제로 밟았다). 틱마다 이만큼만 지우면 백로그가 하루 남짓에 자연히 빠지고,
-// 다 빠진 뒤엔 인덱스 범위에 아무것도 없어 사실상 공짜다.
-const STALE_SWEEP_CHUNK = 200;
 
 // ── 봇 매매 심리 모델 ─────────────────────────────────────────────────────
 // ⚠ 예전 기준가는 `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 추세도, 변동성 뭉침도,
@@ -366,12 +472,29 @@ async function botFillStmts(
     const { notional, size } = fills.get(id)!;
     const rate = vipOf(volById.get(id) ?? 0).rate;
     const fee = notional * rate;
-    out.push(...feeAccrualStmts(env, id, PAIR, 'bot', notional, rate, fee, now));
+    // ⚠ 봇은 `fee_ledger` 에 행을 남기지 않는다(유저 체결은 그대로 남긴다) — 봇은 분당 12틱 이상 영구히
+    // 돌아서 하루 2.9만 행씩 원장을 채우는데, 정작 그 행을 읽는 곳이 없다: 랭킹의 "거래소 수수료 수익"은
+    // `users.total_fees` 를 집계하고(leaderboard.ts — 원장은 행이 너무 많아 5초 폴링으로 못 스캔한다)
+    // 원장은 "유저별·심볼별 분해"용이라 봇 몫은 어차피 분해할 대상이 아니다. 총액은 아래 카운터에
+    // 그대로 누적되므로 화면 숫자는 1원도 안 바뀐다.
+    // 카운터(거래대금·수수료)와 재고/현금을 **한 문장으로 합친다** — 예전엔 (카운터 UPDATE + 원장 INSERT
+    // + 현금/재고 UPDATE) 3문장이었다. 봇 행 하나를 두 번 UPDATE 할 이유가 없다.
     if (botSide) {
       const cash = (botSide === 'buy' ? -notional : notional) - fee; // 수수료는 사든 팔든 낸다
       const inv = botSide === 'buy' ? size : -size;
       out.push(
-        env.DB.prepare('UPDATE users SET balance = balance + ?, ox_balance = ox_balance + ? WHERE id = ?').bind(cash, inv, id),
+        env.DB.prepare(
+          'UPDATE users SET total_volume = total_volume + ?, total_fees = total_fees + ?, balance = balance + ?, ox_balance = ox_balance + ? WHERE id = ?',
+        ).bind(notional, fee, cash, inv, id),
+      );
+    } else {
+      // 봇↔봇 합성 체결 — 재고·현금은 같은 계정 안에서 상계되므로 카운터만 움직인다.
+      out.push(
+        env.DB.prepare('UPDATE users SET total_volume = total_volume + ?, total_fees = total_fees + ? WHERE id = ?').bind(
+          notional,
+          fee,
+          id,
+        ),
       );
     }
   }
@@ -623,20 +746,11 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
     return p;
   }
 
-  const stmts: D1PreparedStatement[] = [
-    // ⚠ 매 틱 이 페어의 봇 호가를 "전부"(두 봇 모두) 비우고 한 액터가 일관된 사다리를 새로 깐다(호가 역전 방지).
-    // spot_orders 엔 봇 호가만 있으니(유저 주문은 pending_orders) pair 전체를 지워도 유저 주문엔 영향 없다.
-    // ⚠⚠ 취소 "마킹"(status='cancelled')이 아니라 **DELETE** 다 — 예전엔 마킹만 하고 아무도 지우지 않아
-    // 죽은 호가가 영구히 쌓였다(prod 실측 2026-07-31: 1,358만 행, 하루 +86만 행 = +200MB/일 로 DB 3.38GB 의
-    // 대부분을 차지하고 10GB 한도까지 한 달 남은 상태였다). 이 테이블에 살아있는 호가는 항상 ~45개뿐이고
-    // 아무도 옛 호가를 읽지 않으므로(모든 SELECT 가 status='open' 필터, 체결 이력은 spot_trades 가 보관)
-    // 히스토리를 남길 이유가 전혀 없다.
-    // ⚠⚠ **반드시 status='open' 으로 범위를 좁힐 것**(= 인덱스로 ~45행만 지운다). `WHERE pair=?` 로
-    // 넓게 지우면 이미 쌓인 수천만 행을 한 문장에서 전부 지우려 들어 **30초 쿼리 한도를 넘기고 batch 가
-    // 통째로 실패**한다 — 배포 직후 실제로 이걸 밟아서 마켓메이커와 cron sweep 이 동시에 멈췄다.
-    // 과거 잔재는 아래 STALE_SWEEP_CHUNK 로 조금씩 걷어낸다.
-    env.DB.prepare("DELETE FROM spot_orders WHERE pair = ? AND status = 'open'").bind(PAIR),
-  ];
+  // ⚠ 매 틱 사다리를 통째로 새로 만든다(호가 역전 방지 — 봇이 2명이라 옛 호가가 남으면 최우선매수 >
+  // 최우선매도가 생긴다). 예전엔 이게 "spot_orders 전 행 DELETE + 44행 INSERT" 였지만, 지금 사다리는
+  // 아래 상태 UPDATE 의 book_json 한 칸이라 **비우는 문장도 까는 문장도 필요 없다**(§ BotBook).
+  const stmts: D1PreparedStatement[] = [];
+  const book: BotBook = { owner: actor, bids: [], asks: [] };
   // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 타이트하게(최우선호가가 mid 에 바싹) 잡되 깊은
   // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
   // ⚠ 변동성이 높은 국면(패닉/과열)에선 spreadMult 로 호가가 벌어진다 — 실제 마켓메이커가 리스크를 피해
@@ -650,7 +764,7 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
     const price = usedPrices[side].has(q.price) ? roundOx(target) : q.price;
     const sizeMult = usedPrices[side].has(q.price) ? 1 : q.sizeMult;
     usedPrices[side].add(price);
-    stmts.push(botQuoteStmt(env, actor, side, price, humanSize((2000 + Math.random() * 8000) * sizeMult), now));
+    (side === 'buy' ? book.bids : book.asks).push({ price, size: humanSize((2000 + Math.random() * 8000) * sizeMult) });
   };
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
     const depth = level / (BOT_LEVELS_PER_SIDE - 1);
@@ -661,10 +775,13 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 얹는다 — 아래 sweep 이 유저 벽을 그 가격에 소비.
   // 물량은 **벽 크기에 비례**한다(wallAbsorbSize) — 고정 크기면 큰 벽을 영원히 못 뚫는다.
   if (press === 'up') {
-    stmts.push(botQuoteStmt(env, actor, 'buy', ref, wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment), now));
+    book.bids.push({ price: ref, size: wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment) });
   } else if (press === 'down') {
-    stmts.push(botQuoteStmt(env, actor, 'sell', ref, wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment), now));
+    book.asks.push({ price: ref, size: wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment) });
   }
+  // 가격 우선순위대로 정렬해 둔다 — 매칭(makerLevels)도 호가창 표시도 이 순서를 그대로 쓴다.
+  book.bids.sort((a, b) => b.price - a.price);
+  book.asks.sort((a, b) => a.price - b.price);
 
   // 합성 체결을 여러 건 찍는다. ⚠ 예전엔 전부 같은 가격(ref)이라 봉 안에 구조가 없었다(몸통만 있고
   // 꼬리가 없는 캔들) — 지금은 직전 기준가에서 새 기준가로 "걸어가면서" 노이즈를 얹어 찍으므로 봉마다
@@ -708,10 +825,22 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
     );
   }
   const next: BotState = { ...step.next, ref };
+  // 심리 상태 + **새 사다리**를 한 문장으로. book_version 을 올려 이 순간 진행 중이던 소비(bookWriteStmt)가
+  // 옛 사다리로 덮어쓰지 못하게 한다.
   stmts.push(
     env.DB.prepare(
-      'UPDATE spot_bot_state SET ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=? WHERE id=?',
-    ).bind(next.ref, next.drift, next.vol, next.sentiment, next.anchor, next.regime, next.regimeTicks, PAIR),
+      'UPDATE spot_bot_state SET ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, book_json=?, book_version=book_version+1 WHERE id=?',
+    ).bind(
+      next.ref,
+      next.drift,
+      next.vol,
+      next.sentiment,
+      next.anchor,
+      next.regime,
+      next.regimeTicks,
+      serializeBook(book),
+      PAIR,
+    ),
   );
   // 영속 캔들: 이 틱이 찍은 체결들의 OHLCV 로 1회 갱신(위 spot_trades 들과 정확히 일치해야 한다).
   stmts.push(...candleUpsertStmts(env, { open, high, low, close: ref, volume }, now));
@@ -719,12 +848,6 @@ async function marketMakerTick(env: Env, prev: BotState, now: number): Promise<B
   if (Math.random() < TRADE_PRUNE_CHANCE) {
     stmts.push(
       env.DB.prepare('DELETE FROM spot_trades WHERE pair = ? AND created_at < ?').bind(PAIR, now - TRADE_RETENTION_MS),
-    );
-    // 죽은 봇 호가 잔재도 같은 주기로 조금씩(STALE_SWEEP_CHUNK) 걷어낸다 — 위 주석 참고.
-    stmts.push(
-      env.DB.prepare(
-        `DELETE FROM spot_orders WHERE id IN (SELECT id FROM spot_orders WHERE pair = ? AND status <> 'open' LIMIT ${STALE_SWEEP_CHUNK})`,
-      ).bind(PAIR),
     );
   }
   // 봇도 수수료를 낸다 — 이 틱의 합성 체결 명목금액에 대해(같은 batch, 왕복 추가 없음).
@@ -813,6 +936,15 @@ export async function runMarketMaker(env: Env): Promise<void> {
 export async function runMarketMakerBurst(env: Env, ticks: number = BOT_BURST_TICKS): Promise<void> {
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(PAIR).first<BotStateRow>();
   const ref0 = await resolveRef(env, row);
+
+  // ⚠ 유저가 OX 를 보고 있으면 /api/spot 폴링(1초)이 이미 초당 한 번꼴로 재호가를 돌리고 있다
+  // (runMarketMaker). 거기에 cron 이 12틱을 더 얹는 건 순수 중복이라, 쓰기만 두 배로 나가고 차트가
+  // 더 살아나지도 않는다. `last_run` 이 방금 전이면 "폴링이 클럭 역할을 하는 중"이라는 뜻이므로 cron 은
+  // 최소치만 돌린다 — cron 이 직접 찍은 last_run 은 다음 실행 때 60초 전이라 이 판정과 헷갈리지 않는다.
+  // 아무도 안 보고 있을 때만 전체 예산을 써서 봉이 비지 않게 채운다(cron 이 유일한 클럭인 경우).
+  const idleMs = Date.now() - (row?.last_run ?? 0);
+  const effective = idleMs < POLL_ACTIVE_MS ? Math.min(ticks, BURST_MIN_TICKS) : ticks;
+  if (effective < ticks) ticks = effective;
   // 상태 행이 아직 없으면 먼저 만든다 — marketMakerTick 의 심리상태 UPDATE 가 0행이 되어 국면이
   // 매 틱 초기화되는 걸 막는다(cron 이 유일한 클럭인 초기 상태에서 실제로 문제가 된다).
   if (!row) {
@@ -848,27 +980,22 @@ export async function recordVirtualFill(
   price = roundOx(price); // 체결내역/기준가도 4자리 틱 유지
   const now = Date.now();
 
-  // ⚠ 체결 테이프에만 기록하고 호가창(spot_orders)은 그대로 두면 "체결은 찍히는데 호가는 그대로"인
-  // 이상한 상태가 됨 — 실제 매칭처럼 반대편 최우선호가부터 이 체결수량만큼 소비(줄이거나 다 채움)한다.
-  const oppositeSide = takerSide === 'buy' ? 'sell' : 'buy';
-  const order = oppositeSide === 'sell' ? 'price ASC' : 'price DESC';
+  // ⚠ 체결 테이프에만 기록하고 호가창은 그대로 두면 "체결은 찍히는데 호가는 그대로"인 이상한 상태가
+  // 됨 — 실제 매칭처럼 반대편 최우선호가부터 이 체결수량만큼 소비(줄이거나 다 채움)한다.
+  // ⚠ 예전엔 이걸 "최우선호가 SELECT → UPDATE" 를 최대 50번 **왕복**하며 했다(체결 1건에 D1 쿼리 100개).
+  // 지금은 사다리가 JSON 한 칸이라 한 번 읽어 메모리에서 깎고 아래 batch 에 되쓰기 1문장만 얹는다.
+  const oppositeSide: 'buy' | 'sell' = takerSide === 'buy' ? 'sell' : 'buy';
+  const bookRow = await env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id=?`).bind(PAIR).first<BookRow>();
+  const book = parseBook(bookRow?.book_json);
   const fills = new Map<string, BotFill>(); // 상대편이 된 봇들(재고/현금/수수료 정산용)
   let remaining = size;
-  for (let i = 0; i < 50 && remaining > EPS; i++) {
-    const maker = await env.DB.prepare(
-      `SELECT * FROM spot_orders WHERE pair = ? AND side = ? AND status = 'open' ORDER BY ${order}, created_at ASC LIMIT 1`,
-    )
-      .bind(PAIR, oppositeSide)
-      .first<SpotOrderRow>();
-    if (!maker) break;
-    const consumed = Math.min(maker.size, remaining);
-    const makerRemaining = maker.size - consumed;
-    await env.DB.prepare('UPDATE spot_orders SET size = ?, status = ? WHERE id = ?')
-      .bind(makerRemaining, makerRemaining <= EPS ? 'filled' : 'open', maker.id)
-      .run();
+  for (const level of makerLevels(book, oppositeSide, null)) {
+    if (remaining <= EPS) break;
+    const consumed = Math.min(level.size, remaining);
+    level.size -= consumed;
     // 재고 정산은 유저가 실제로 정산받은 가격(price)으로 — 호가창 소비는 "그만큼 물량이 나갔다"는 표시일 뿐,
-    // 유저의 손익은 이미 이 price 로 확정돼 있어서 maker.price 로 부기하면 양쪽 장부가 어긋난다.
-    addBotFill(fills, maker.user_id, price * consumed, consumed);
+    // 유저의 손익은 이미 이 price 로 확정돼 있어서 레벨 가격으로 부기하면 양쪽 장부가 어긋난다.
+    addBotFill(fills, book.owner, price * consumed, consumed);
     remaining -= consumed;
   }
   // 호가창이 얇아 다 못 채운 잔량도 체결 자체는 성립한 물량이다(봇이 무한 풀로 받아준 셈) — 한 봇 앞으로 단다.
@@ -877,6 +1004,7 @@ export async function recordVirtualFill(
   }
 
   await env.DB.batch([
+    bookWriteStmt(env, book, bookRow?.book_version ?? 0),
     env.DB.prepare(
       'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
     ).bind(crypto.randomUUID(), PAIR, uid, uid, price, size, takerSide, now),
@@ -929,27 +1057,6 @@ function oxPositionStmts(
   ];
 }
 
-// 체결 테이프 기록 + 기준가(ref)를 체결가로 갱신.
-function spotTradeStmts(
-  env: Env,
-  buyerId: string,
-  sellerId: string,
-  price: number,
-  size: number,
-  takerSide: 'buy' | 'sell',
-  now: number,
-): D1PreparedStatement[] {
-  return [
-    env.DB.prepare(
-      'INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), PAIR, buyerId, sellerId, price, size, takerSide, now),
-    env.DB.prepare(
-      'INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price',
-    ).bind(PAIR, now, price),
-    ...candleUpsertOne(env, price, size, now), // 유저 매칭체결도 영속 캔들에 반영
-  ];
-}
-
 // ── 시장가 잔량 흡수용 합성 유동성(스냅샷 매칭) ─────────────────────────────
 // ⚠ 봇 호가창은 한 틱 스냅샷이라 22단계 × 2천~1만 = 최대 십수만 개뿐이다. 봇은 설계상 "무한 유동성
 // 공급자"이므로, 시장가는 실제 사다리를 다 먹은 뒤에도 봇이 잔량을 받아줘야 한다(예전엔 사다리 소진 시
@@ -973,21 +1080,6 @@ const MAKER_SNAPSHOT_LIMIT = 60; // 스냅샷으로 읽어오는 봇 호가 레�
 // 영향 없음(BOT_BASE_PULL 이 anchor 를 기준선으로 약하게 tether). 봇↔봇 합성체결엔 적용 안 함.
 const ANCHOR_TRADE_PULL = 0.5;
 
-// 반대편 봇 호가 중 최우선(가격-시간 우선) 하나. limitPrice 가 있으면 그 가격까지만 크로스.
-async function bestBotMaker(env: Env, takerSide: string, limitPrice: number | null): Promise<SpotOrderRow | null> {
-  const makerSide = takerSide === 'long' ? 'sell' : 'buy';
-  const ordDir = takerSide === 'long' ? 'ASC' : 'DESC';
-  if (limitPrice == null) {
-    return env.DB.prepare(
-      `SELECT * FROM spot_orders WHERE pair=? AND side=? AND status='open' ORDER BY price ${ordDir}, created_at ASC LIMIT 1`,
-    ).bind(PAIR, makerSide).first<SpotOrderRow>();
-  }
-  const cmp = takerSide === 'long' ? 'price<=?' : 'price>=?';
-  return env.DB.prepare(
-    `SELECT * FROM spot_orders WHERE pair=? AND side=? AND status='open' AND ${cmp} ORDER BY price ${ordDir}, created_at ASC LIMIT 1`,
-  ).bind(PAIR, makerSide, limitPrice).first<SpotOrderRow>();
-}
-
 /**
  * 유저 지정가(pending_orders) 하나를 봇 호가창에 walking 매칭한다(신규 제출·대기 중 공용).
  * 증거금은 생성 시 limit_price 로 잠갔으므로 실제 체결가(더 유리)와의 차액을 환불(매수)하거나
@@ -995,104 +1087,135 @@ async function bestBotMaker(env: Env, takerSide: string, limitPrice: number | nu
  * pending 에 그대로 남아 대기 → 다음 유동성/틱에서 이어서 체결(runMarketMaker·checkTriggers 가 호출).
  */
 export async function matchLimitPendingAgainstBook(env: Env, pendingId: string): Promise<void> {
-  const first = await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
-  if (!first || first.symbol !== PAIR) return;
-  const isLong = first.side === 'long';
-  const existing0 = await env.DB.prepare('SELECT leverage FROM positions WHERE user_id=? AND symbol=? AND side=?')
-    .bind(first.user_id, PAIR, first.side)
-    .first<{ leverage: number }>();
-  const effLev = existing0 ? existing0.leverage : first.leverage;
-  const limitFeeRate = await feeRateOf(env, first.user_id); // 이 주문 전체에 한 번만 확정
+  const p = await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
+  if (!p || p.symbol !== PAIR) return;
+  if (p.size <= EPS) {
+    await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run();
+    return;
+  }
+  const isLong = p.side === 'long';
+  const makerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'; // 봇이 잡는 쪽(롱이면 봇이 매도)
+
+  // ── 1) 필요한 값을 한 번에 확보. ⚠ 예전엔 **청크마다** pending 재조회 + 최우선호가 SELECT + 봇호가
+  //        claim + 포지션 SELECT + batch 를 최대 500회 왕복해서, 체결 하나가 D1 쿼리 수백 개를 먹었다
+  //        (invocation당 1,000 한도를 혼자 태울 수 있었다). 지금은 시장가 경로와 같은 "스냅샷 → 메모리
+  //        walking → 단일 batch" 패턴이다. ──
+  const [existing, limitFeeRate, bookRow] = await Promise.all([
+    env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
+      .bind(p.user_id, PAIR, p.side)
+      .first<PositionRow>(),
+    feeRateOf(env, p.user_id), // 이 주문 전체에 한 번만 확정(청크마다 읽으면 도중에 등급이 바뀐다)
+    env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id=?`).bind(PAIR).first<BookRow>(),
+  ]);
+  const effLev = existing ? existing.leverage : p.leverage; // 물타기 시 기존 레버리지 고정
+  const book = parseBook(bookRow?.book_json);
+
+  // ── 2) 지정가를 크로스하는 레벨만, 있는 물량만 메모리에서 walking(최우선호가보다 유리하게는 안 삼). ──
   let filled = 0;
   let cost = 0;
-  let limitFeeTotal = 0;
-  const limitMakerFills = new Map<string, BotFill>(); // 상대편 봇 수수료 + 재고/현금 정산
+  let openPx = 0;
+  let high = 0;
+  let low = Infinity;
+  let lastPx = 0;
+  let remaining = p.size;
+  for (const level of makerLevels(book, makerSide, p.limit_price)) {
+    if (remaining <= EPS) break;
+    const take = Math.min(remaining, level.size);
+    if (take <= EPS) continue;
+    level.size -= take;
+    remaining -= take;
+    filled += take;
+    cost += level.price * take;
+    if (openPx === 0) openPx = level.price;
+    high = Math.max(high, level.price);
+    low = Math.min(low, level.price);
+    lastPx = level.price;
+  }
+  if (filled <= EPS) return; // 크로스되는 봇 호가 없음 → 잔량은 그대로 대기
 
-  for (let i = 0; i < 500; i++) {
-    // iter 0 은 위에서 이미 읽은 first 를 재사용(중복 read 제거), 이후엔 동시 체결 반영 위해 재조회.
-    const p = i === 0 ? first : await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
-    if (!p) break;
-    if (p.size <= EPS) {
-      await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run();
-      break;
-    }
-    const maker = await bestBotMaker(env, p.side, p.limit_price);
-    if (!maker) break; // 크로스되는 봇 호가 없음 → 잔량 대기
+  // ── 3) 이 pending 을 **원자적으로 선점**(claim-first). 예전엔 청크마다 봇 호가를 claim 해서 이중체결이
+  //        간접적으로 막혔는데, 한 방에 체결하는 지금은 pending 쪽을 직접 잠가야 한다 — 안 그러면 유저
+  //        폴링과 cron sweep 이 같은 주문을 동시에 집어 두 번 체결한다. 실패하면 다른 경로가 이미
+  //        처리한 것이므로 조용히 빠진다(사다리는 아직 안 썼으므로 부작용 없음). ──
+  const locked = (p.limit_price * filled) / p.leverage; // 이 체결분에 대해 주문 시점에 잠가둔 증거금
+  const newPendingSize = p.size - filled;
+  const claim =
+    newPendingSize <= sizeEps(p.size) // 잔량 판정도 수량 비례(대량 주문의 먼지 잔량이 영원히 남지 않게)
+      ? await env.DB.prepare('DELETE FROM pending_orders WHERE id=? AND size=?').bind(pendingId, p.size).run()
+      : await env.DB.prepare('UPDATE pending_orders SET size=?, margin=? WHERE id=? AND size=?')
+          .bind(newPendingSize, Math.max(0, p.margin - locked), pendingId, p.size)
+          .run();
+  if (claim.meta.changes !== 1) return; // 그 사이 다른 경로가 체결/취소함
 
-    const chunk = Math.min(p.size, maker.size);
-    // 봇 maker 원자적 선점(동시 매칭 이중소비 방지)
-    const makerRem = maker.size - chunk;
-    const claim = await env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open' AND size>=?")
-      .bind(makerRem, makerRem <= EPS ? 'filled' : 'open', maker.id, chunk - EPS)
+  // ── 4) 증거금 정산 — 잠근 금액(지정가 기준)과 실제 체결가 기준 증거금의 차액. 청크마다 하던 계산을
+  //        합계로 옮겼을 뿐 선형이라 결과는 같다. ──
+  let fillAvg = cost / filled;
+  let posMargin = cost / effLev;
+  let feeTotal = cost * limitFeeRate;
+  let refund = locked - posMargin; // 매수는 ≥0(체결가≤지정가) 환불 / 드물게 <0 이면 추가 증거금 필요
+  if (refund < -EPS) {
+    const extra = -refund;
+    const charged = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance>=?')
+      .bind(extra, p.user_id, extra)
       .run();
-    if (claim.meta.changes !== 1) continue; // 다른 경로가 먼저 가져감 → 재시도
-
-    const existing = await env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
-      .bind(p.user_id, PAIR, p.side)
-      .first<PositionRow>();
-
-    const lockedForChunk = (p.limit_price * chunk) / p.leverage;
-    let fillPrice = maker.price;
-    let posMargin = (fillPrice * chunk) / effLev;
-    let refund = lockedForChunk - posMargin; // 매수는 ≥0(체결가≤지정가) 환불 / 드물게 <0 이면 추가 필요
-    if (refund < -EPS) {
-      const extra = -refund;
-      const charged = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance>=?')
-        .bind(extra, p.user_id, extra)
-        .run();
-      if (charged.meta.changes !== 1) {
-        // 추가 증거금 감당 불가 → 지정가로 체결(정확히 잠근 만큼, 항상 감당 가능)
-        fillPrice = p.limit_price;
-        posMargin = lockedForChunk;
-      }
-      refund = 0;
+    if (charged.meta.changes !== 1) {
+      // 추가 증거금 감당 불가 → 지정가로 체결(정확히 잠근 만큼이라 항상 감당 가능)
+      fillAvg = p.limit_price;
+      cost = p.limit_price * filled;
+      posMargin = locked;
+      feeTotal = cost * limitFeeRate;
     }
-
-    const newPendingSize = p.size - chunk;
-    const newPendingMargin = Math.max(0, p.margin - lockedForChunk);
-    const now = Date.now();
-    const stmts: D1PreparedStatement[] = [
-      newPendingSize <= sizeEps(p.size) // 잔량 판정도 수량 비례(대량 주문의 먼지 잔량이 영원히 남지 않게)
-        ? env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId)
-        : env.DB.prepare('UPDATE pending_orders SET size=?, margin=? WHERE id=?').bind(newPendingSize, newPendingMargin, pendingId),
-      ...oxPositionStmts(env, existing, p.user_id, p.side, fillPrice, chunk, effLev, posMargin, p.stop_loss, p.take_profit, now),
-      ...spotTradeStmts(
-        env,
-        isLong ? p.user_id : maker.user_id,
-        isLong ? maker.user_id : p.user_id,
-        fillPrice,
-        chunk,
-        isLong ? 'buy' : 'sell',
-        now,
-      ),
-    ];
-    // 지정가도 체결 시점에 수수료를 뗀다. 증거금 환불(refund)과 상계해 한 번의 잔고 조정으로 처리 —
-    // 두 문장으로 나누면 배치 안에서 순서에 따라 음수 잔고가 잠깐 보이거나 문장이 늘어날 뿐이다.
-    const chunkFee = fillPrice * chunk * limitFeeRate;
-    const net = refund - chunkFee;
-    if (Math.abs(net) > EPS) {
-      stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(net, p.user_id));
-    }
-    await env.DB.batch(stmts);
-    filled += chunk;
-    cost += fillPrice * chunk;
-    limitFeeTotal += chunkFee;
-    addBotFill(limitMakerFills, maker.user_id, fillPrice * chunk, chunk);
+    refund = 0;
   }
 
-  if (filled > EPS) {
-    // 체결 이력(주문내역)엔 이번 호출의 총 체결을 가중평균가로 1건 기록(칸별로 쪼개면 내역이 넘침).
-    const done = Date.now();
-    await env.DB.batch([
-      env.DB.prepare(
-        'INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), first.user_id, PAIR, first.side, cost / filled, filled, effLev, 'open', null, done),
-      // 잔고는 청크마다 상계 정산 — 여기선 누적 카운터+원장만(합계 1행)
-      ...feeAccrualStmts(env, first.user_id, PAIR, 'open', cost, limitFeeRate, limitFeeTotal, done),
-      // 유저가 롱(매수)이면 봇이 판 쪽(sell) — 봇 현금 +, 재고 −.
-      ...(await botFillStmts(env, limitMakerFills, isLong ? 'sell' : 'buy', done)),
-    ]);
+  // ── 5) 나머지를 단일 batch 로. ──
+  const now = Date.now();
+  const closePx = roundOx(lastPx);
+  const stmts: D1PreparedStatement[] = [
+    bookWriteStmt(env, book, bookRow?.book_version ?? 0),
+    ...oxPositionStmts(env, existing, p.user_id, p.side, fillAvg, filled, effLev, posMargin, p.stop_loss, p.take_profit, now),
+    // 체결 테이프는 1건(이번 매칭 = 한 번의 체결 이벤트)으로 집계하고, 캔들은 walking 구간의 OHLC 로
+    // 남긴다 — 청크별로 쪼개 찍으면 체결내역이 사다리 단계 수만큼 넘친다.
+    env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
+      crypto.randomUUID(),
+      PAIR,
+      isLong ? p.user_id : book.owner,
+      isLong ? book.owner : p.user_id,
+      closePx,
+      filled,
+      isLong ? 'buy' : 'sell',
+      now,
+    ),
+    env.DB.prepare(
+      'INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price',
+    ).bind(PAIR, now, closePx),
+    ...candleUpsertStmts(env, { open: openPx, high, low, close: closePx, volume: filled }, now),
+    // 체결 이력(주문내역)엔 이번 호출의 총 체결을 가중평균가로 1건 기록.
+    env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
+      crypto.randomUUID(),
+      p.user_id,
+      PAIR,
+      p.side,
+      fillAvg,
+      filled,
+      effLev,
+      'open',
+      null,
+      now,
+    ),
+    ...feeAccrualStmts(env, p.user_id, PAIR, 'open', cost, limitFeeRate, feeTotal, now),
+  ];
+  // 지정가도 체결 시점에 수수료를 뗀다. 증거금 환불(refund)과 상계해 한 번의 잔고 조정으로 처리 —
+  // 두 문장으로 나누면 배치 안에서 순서에 따라 음수 잔고가 잠깐 보이거나 문장이 늘어날 뿐이다.
+  const net = refund - feeTotal;
+  if (Math.abs(net) > EPS) {
+    stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(net, p.user_id));
   }
+  // 유저가 롱(매수)이면 봇이 판 쪽(sell) — 봇 현금 +, 재고 −.
+  const limitMakerFills = new Map<string, BotFill>();
+  addBotFill(limitMakerFills, book.owner, cost, filled);
+  stmts.push(...(await botFillStmts(env, limitMakerFills, makerSide, now)));
+  await env.DB.batch(stmts);
 }
 
 /**
@@ -1121,7 +1244,10 @@ export async function matchMarketOxOrder(
   const effLev = existing0 ? existing0.leverage : leverage; // 물타기 시 기존 레버리지 고정
   const feeRate = await feeRateOf(env, uid);
   const bal0 = (await env.DB.prepare('SELECT balance FROM users WHERE id=?').bind(uid).first<{ balance: number }>())?.balance ?? 0;
-  const st = await env.DB.prepare('SELECT ref_price, anchor FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number; anchor: number }>();
+  // 기준가·적정가와 **봇 사다리를 같은 한 행에서** 함께 읽는다(예전엔 호가창을 따로 SELECT 했다).
+  const st = await env.DB.prepare(`SELECT ref_price, anchor, ${BOOK_COLS} FROM spot_bot_state WHERE id=?`)
+    .bind(PAIR)
+    .first<{ ref_price: number; anchor: number } & BookRow>();
   const est = st?.ref_price ?? 1;
 
   // 감당 가능 수량으로 목표를 먼저 클램프(부풀린 평단→즉시 강제청산 방지, 기존 로직 유지).
@@ -1130,22 +1256,16 @@ export async function matchMarketOxOrder(
   const target = Math.min(size, Math.max(0, affordableUnits));
   if (target <= EPS) return { filled: 0, avgPrice: 0 };
 
-  // ── 2) 봇 호가 사다리를 "스냅샷"으로 한 번에 읽어와 메모리에서 walking(청크마다 왕복하지 않는다). ──
-  const makers = (
-    await env.DB.prepare(
-      `SELECT * FROM spot_orders WHERE pair=? AND side=? AND status='open' ORDER BY price ${isLong ? 'ASC' : 'DESC'}, created_at ASC LIMIT ${MAKER_SNAPSHOT_LIMIT}`,
-    )
-      .bind(PAIR, openMakerSide)
-      .all<SpotOrderRow>()
-  ).results;
-
-  type MemFill = { makerId: string | null; makerUserId: string; makerFullSize: number; price: number; size: number };
+  // ── 2) 위에서 함께 읽어온 봇 사다리를 메모리에서 walking(청크마다 왕복하지 않는다). ──
+  const book = parseBook(st?.book_json);
+  type MemFill = { level: BookLevel | null; makerUserId: string; price: number; size: number };
   const planned: MemFill[] = [];
   let remaining = target;
-  for (const m of makers) {
+  for (const level of makerLevels(book, openMakerSide, null).slice(0, MAKER_SNAPSHOT_LIMIT)) {
     if (remaining <= EPS) break;
-    const take = Math.min(remaining, m.size);
-    planned.push({ makerId: m.id, makerUserId: m.user_id, makerFullSize: m.size, price: m.price, size: take });
+    const take = Math.min(remaining, level.size);
+    if (take <= EPS) continue;
+    planned.push({ level, makerUserId: book.owner, price: level.price, size: take });
     remaining -= take;
   }
   // 실제 사다리를 다 먹으면 봇 무한 유동성(합성)으로 잔량 흡수 — 고정 스텝·상한 시장충격(슬리피지 완만).
@@ -1155,7 +1275,7 @@ export async function matchMarketOxOrder(
       const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
       const price = roundOx(Math.max(0.0001, est * (1 + openAdverse * impact)));
       const take = Math.min(remaining, synthChunk);
-      planned.push({ makerId: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], makerFullSize: 0, price, size: take });
+      planned.push({ level: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], price, size: take });
       remaining -= take;
     }
   }
@@ -1175,7 +1295,6 @@ export async function matchMarketOxOrder(
   let low = Infinity;
   let lastPx = est;
   const makerFills = new Map<string, BotFill>();
-  const consume: { id: string; newSize: number }[] = [];
   for (const f of planned) {
     const perUnit = f.price / effLev + f.price * feeRate;
     let sz = f.size;
@@ -1194,7 +1313,7 @@ export async function matchMarketOxOrder(
     low = Math.min(low, f.price);
     lastPx = f.price;
     addBotFill(makerFills, f.makerUserId, f.price * sz, sz);
-    if (f.makerId) consume.push({ id: f.makerId, newSize: f.makerFullSize - sz }); // 남는 실제 호가 물량
+    if (f.level) f.level.size -= sz; // 실제 사다리 물량 소비(참조라 그대로 book 에 반영된다)
     if (sz < f.size - EPS) break; // 가용 소진 — 여기서 멈춤
   }
   if (filled <= EPS) return { filled: 0, avgPrice: 0 };
@@ -1215,17 +1334,9 @@ export async function matchMarketOxOrder(
 
   // ── 5) 나머지를 단일 batch 로 적용(포지션 병합 + 소비한 실제 호가 + 체결테이프 + 기준가/적정가 + 캔들 + 부기). ──
   const stmts: D1PreparedStatement[] = [];
-  // 소비한 실제 봇 호가를 best-effort 로 반영(리쿼트가 이미 취소했으면 0행이어도 무방 — 봇은 무한 유동성,
-  // 환불/재시도 없이 체결은 그대로 성립. 이 best-effort 가 예전 claim-실패-스핀 정체를 없앤다).
-  for (const c of consume) {
-    stmts.push(
-      env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open'").bind(
-        c.newSize,
-        c.newSize <= EPS ? 'filled' : 'open',
-        c.id,
-      ),
-    );
-  }
+  // 소비한 사다리를 best-effort 로 되쓴다(그 사이 재호가가 있었으면 0행이어도 무방 — 봇은 무한 유동성이라
+  // 환불/재시도 없이 체결은 그대로 성립. 이 best-effort 가 예전 claim-실패-스핀 정체를 없앤 그 원칙이다).
+  stmts.push(bookWriteStmt(env, book, st?.book_version ?? 0));
   stmts.push(...oxPositionStmts(env, existing0, uid, side, avgPrice, filled, effLev, totalMargin, sl, tp, now));
   // 체결 테이프는 1건(시장가=한 번의 체결 이벤트)으로 집계 기록. 봇 상대라 counterparty 는 표시용.
   stmts.push(
@@ -1296,24 +1407,23 @@ async function closePositionAgainstBook(
 
   // ── 1) 봇 호가 사다리를 스냅샷으로 한 번에 읽어 메모리에서 walking(청크마다 왕복하지 않는다 —
   //        예전엔 대량 청산이 청크마다 batch/claim 왕복이라 느리고 리쿼트와 경합해 정체됐다). ──
-  const st = await env.DB.prepare('SELECT ref_price, anchor FROM spot_bot_state WHERE id=?').bind(PAIR).first<{ ref_price: number; anchor: number }>();
+  // 기준가·적정가와 봇 사다리를 같은 한 행에서 함께 읽는다(예전엔 호가창을 따로 SELECT 했다).
+  const st = await env.DB.prepare(`SELECT ref_price, anchor, ${BOOK_COLS} FROM spot_bot_state WHERE id=?`)
+    .bind(PAIR)
+    .first<{ ref_price: number; anchor: number } & BookRow>();
   const est = st?.ref_price ?? pos.entry_price;
-  const cross = limitPrice == null ? '' : `AND price ${closeTaker === 'long' ? '<=' : '>='} ${Number(limitPrice)}`;
-  const makers = (
-    await env.DB.prepare(
-      `SELECT * FROM spot_orders WHERE pair=? AND side=? AND status='open' ${cross} ORDER BY price ${closeTaker === 'long' ? 'ASC' : 'DESC'}, created_at ASC LIMIT ${MAKER_SNAPSHOT_LIMIT}`,
-    )
-      .bind(PAIR, makerSide)
-      .all<SpotOrderRow>()
-  ).results;
+  const book = parseBook(st?.book_json);
 
-  type MemFill = { makerId: string | null; makerUserId: string; makerFullSize: number; price: number; size: number };
+  type MemFill = { level: BookLevel | null; makerUserId: string; price: number; size: number };
   const planned: MemFill[] = [];
   let remaining = Math.min(closeSize, pos.size);
-  for (const m of makers) {
+  // 지정가 청산이면 그 가격보다 불리한 레벨은 makerLevels 가 걸러낸다(롱 청산은 ≥limit 매수호가만 소비).
+  for (const level of makerLevels(book, makerSide, limitPrice).slice(0, MAKER_SNAPSHOT_LIMIT)) {
     if (remaining <= EPS) break;
-    const take = Math.min(remaining, m.size);
-    planned.push({ makerId: m.id, makerUserId: m.user_id, makerFullSize: m.size, price: m.price, size: take });
+    const take = Math.min(remaining, level.size);
+    if (take <= EPS) continue;
+    level.size -= take; // 소비 반영(참조)
+    planned.push({ level, makerUserId: book.owner, price: level.price, size: take });
     remaining -= take;
   }
   // 시장가 청산은 봇 무한 유동성으로 잔량 흡수. ⚠ 지정가 청산(limitPrice != null)은 크로스되는 호가가
@@ -1324,7 +1434,7 @@ async function closePositionAgainstBook(
       const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
       const price = roundOx(Math.max(0.0001, est * (1 + adverse * impact)));
       const take = Math.min(remaining, synthChunk);
-      planned.push({ makerId: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], makerFullSize: 0, price, size: take });
+      planned.push({ level: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], price, size: take });
       remaining -= take;
     }
   }
@@ -1339,7 +1449,6 @@ async function closePositionAgainstBook(
   let low = Infinity;
   let lastPx = est;
   const closeMakerFills = new Map<string, BotFill>();
-  const consume: { id: string; newSize: number }[] = [];
   for (const f of planned) {
     filled += f.size;
     cost += f.price * f.size;
@@ -1350,7 +1459,6 @@ async function closePositionAgainstBook(
     low = Math.min(low, f.price);
     lastPx = f.price;
     addBotFill(closeMakerFills, f.makerUserId, f.price * f.size, f.size);
-    if (f.makerId) consume.push({ id: f.makerId, newSize: f.makerFullSize - f.size });
   }
   if (filled <= EPS) return { filled: 0, avgPrice: 0 };
 
@@ -1375,21 +1483,14 @@ async function closePositionAgainstBook(
       ? env.DB.prepare('DELETE FROM positions WHERE id=? AND user_id=?').bind(pos.id, uid)
       : env.DB.prepare('UPDATE positions SET size=?, margin=? WHERE id=? AND user_id=?').bind(pos.size - filled, pos.margin - marginReleased, pos.id, uid),
   );
-  for (const c of consume) {
-    stmts.push(
-      env.DB.prepare("UPDATE spot_orders SET size=?, status=? WHERE id=? AND status='open'").bind(
-        c.newSize,
-        c.newSize <= EPS ? 'filled' : 'open',
-        c.id,
-      ),
-    );
-  }
+  // 소비한 사다리를 best-effort 로 되쓴다(재호가가 끼었으면 0행 — 봇은 무한 유동성이라 체결은 성립).
+  stmts.push(bookWriteStmt(env, book, st?.book_version ?? 0));
   stmts.push(
     env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
       crypto.randomUUID(),
       PAIR,
-      tapeSide === 'buy' ? uid : BOT_USER_IDS[0],
-      tapeSide === 'buy' ? BOT_USER_IDS[0] : uid,
+      tapeSide === 'buy' ? uid : book.owner,
+      tapeSide === 'buy' ? book.owner : uid,
       newRef,
       filled,
       tapeSide,
