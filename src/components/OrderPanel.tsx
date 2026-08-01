@@ -10,6 +10,12 @@ type Unit = 'coin' | 'usdt';
 type TriggerDir = 'above' | 'below';
 type RepeatMode = 'continuous' | 'rearm';
 
+/** ⚠ `continuous` 무한 조건부의 재실행 간격 하한(서버 functions/_shared.ts MIN_CONTINUOUS_COOLDOWN_MS 와
+ * 같은 값). 예전엔 0(=평가마다 ≈1초)이 가능했는데 그러면 주문 하나가 D1 월 쓰기 포함분을 혼자 다 먹어
+ * 실제로 초과 요금이 청구됐다(CLAUDE.md §6). 서버가 어차피 하한으로 올려 저장하므로 화면도 같은 값을
+ * 보여줘야 "설정한 대로 안 돈다"는 혼란이 없다. */
+const MIN_COOLDOWN_SEC = 5;
+
 /** 주문 패널 (OKX 스타일). 체결가는 서버가 결정.
  * Easy 모드: 시장가만. Standard 모드: 시장가 + 지정가 + SL/TP. */
 export default function OrderPanel() {
@@ -44,11 +50,11 @@ export default function OrderPanel() {
   const [triggerPrice, setTriggerPrice] = useState(''); // 조건부 주문 트리거 가격
   const [triggerDir, setTriggerDir] = useState<TriggerDir>('above'); // 이 가격 이상/이하가 되면 시장가 진입
   // 무한(반복) 조건부 — 체결돼도 주문이 사라지지 않는다. 기본 'continuous' 는 조건이 참인 **동안 계속**
-  // 실행(폴링마다 1회 ≈ 1초)이고, 'rearm' 은 가격이 되돌아왔다 다시 트리거될 때만 1회씩 실행한다.
+  // 실행(최소 5초 간격)이고, 'rearm' 은 가격이 되돌아왔다 다시 트리거될 때만 1회씩 실행한다.
   const [repeating, setRepeating] = useState(false);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>('continuous');
   const [rearmPrice, setRearmPrice] = useState(''); // (rearm) 비우면 트리거 가격에서 재무장
-  const [cooldownSec, setCooldownSec] = useState(''); // (continuous) 비우면 0 = 폴링마다
+  const [cooldownSec, setCooldownSec] = useState(''); // (continuous) 비우면 하한(MIN_COOLDOWN_SEC)
   const [maxFills, setMaxFills] = useState(''); // 비우면 무제한
   const [useSlTp, setUseSlTp] = useState(false);
   const [stopLoss, setStopLoss] = useState('');
@@ -115,10 +121,10 @@ export default function OrderPanel() {
         triggerPrice: tpx,
         triggerDir,
         repeating,
-        // 무한일 때만 의미가 있는 값들. 비워두면 간격 0(폴링마다)·재무장가=트리거가·횟수 무제한.
+        // 무한일 때만 의미가 있는 값들. 비워두면 간격=하한(5초)·재무장가=트리거가·횟수 무제한.
         repeatMode,
         rearmPrice: repeating && repeatMode === 'rearm' && rearmPrice ? Number(rearmPrice) : null,
-        cooldownSec: repeating && repeatMode === 'continuous' && cooldownSec ? Number(cooldownSec) : 0,
+        cooldownSec: repeating && repeatMode === 'continuous' && cooldownSec ? Number(cooldownSec) : MIN_COOLDOWN_SEC,
         maxFills: repeating && maxFills ? Number(maxFills) : null,
       });
       return;
@@ -311,8 +317,8 @@ export default function OrderPanel() {
                         value={fmtNumInput(cooldownSec)}
                         onChange={(e) => setCooldownSec(unfmtNum(e.target.value))}
                         inputMode="decimal"
-                        placeholder="0 (최대 속도)"
-                        title="다음 실행까지 최소 몇 초를 쉴지. 0/비움이면 평가할 때마다(앱을 켜뒀으면 약 1초에 1회) 계속 진입합니다"
+                        placeholder={`${MIN_COOLDOWN_SEC} (최소)`}
+                        title={`다음 실행까지 최소 몇 초를 쉴지. 최소 ${MIN_COOLDOWN_SEC}초이며, 비우면 ${MIN_COOLDOWN_SEC}초로 설정됩니다(더 짧게 두면 DB 쓰기 비용이 감당할 수 없이 커집니다)`}
                         className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
                       />
                     </div>
@@ -356,7 +362,8 @@ export default function OrderPanel() {
             <p className="mt-1 rounded bg-downDim p-1.5 text-[10px] leading-tight text-muted">
               현재가가 트리거 가격 {triggerDir === 'above' ? '이상' : '이하'}
               <span className="text-text">인 동안 계속</span>{' '}
-              {Number(cooldownSec) > 0 ? `${fmtNumInput(cooldownSec)}초마다` : '약 1초마다'} 같은 수량으로 진입합니다.
+              {`${fmtNumInput(String(Math.max(MIN_COOLDOWN_SEC, Number(cooldownSec) || 0)))}초마다`} 같은 수량으로 진입합니다
+              (최소 {MIN_COOLDOWN_SEC}초).
               <span className="text-down">
                 {' '}
                 ⚠ 스스로 멈추지 않습니다 — 조건이 계속 만족되면 잔고가 바닥날 때까지 사들이고, 매번 증거금·수수료가

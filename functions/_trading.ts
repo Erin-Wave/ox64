@@ -21,8 +21,10 @@ import {
   feeAccrualStmts,
   unrealizedTotal,
   repeatModeOf,
+  effectiveCooldownMs,
   sizeEps,
 } from './_shared';
+import { autoWritesBlocked, meterStmt, ROWS_PER_REPEAT_FILL } from './_budget';
 import { matchLimitPendingAgainstBook, matchMarketOxOrder, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
 
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차(조건부 주문 부분체결 잔량 등)
@@ -267,11 +269,18 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
   const triggered = c.trigger_dir === 'above' ? mark >= c.trigger_price : mark <= c.trigger_price;
   if (!triggered) return;
 
-  // 연속 모드의 재실행 간격 — 0 이면 폴링마다(가장 빠름). 마지막 실행 후 이 시간이 안 지났으면 건너뛴다.
+  // ⚠ 연속 모드의 재실행 간격 — **하한 5초가 항상 적용된다**(effectiveCooldownMs, § MIN_CONTINUOUS_COOLDOWN_MS).
+  // 저장값이 아니라 이 함수로 판정하는 이유: 하한 도입 전에 만들어진 주문들은 DB 에 cooldown_ms=0 으로
+  // 남아 있어서, 생성 검증만 고치면 그 주문들은 계속 1초 간격으로 돌아 예산을 태운다.
   if (c.repeating && mode === 'continuous') {
-    const cooldown = c.cooldown_ms ?? 0;
-    if (cooldown > 0 && c.last_fill_at != null && Date.now() - c.last_fill_at < cooldown) return;
+    const cooldown = effectiveCooldownMs(c.cooldown_ms);
+    if (c.last_fill_at != null && Date.now() - c.last_fill_at < cooldown) return;
   }
+
+  // ⚠ 반복 조건부는 이 사이트에서 유일하게 "스스로 무한히 쓰기를 만드는" 유저 경로다 — 이번 달 자동 쓰기가
+  // 차단선(포함분의 90%)을 넘었으면 조용히 물러난다(§ functions/_budget.ts). 1회성 주문은 총량이 유한하므로
+  // 막지 않는다(막으면 걸어둔 스탑이 안 걸리는 게 더 큰 사고다).
+  if (c.repeating && (await autoWritesBlocked(env))) return;
 
   // OX/USDT — 봇 호가창을 walking 하며 있는 물량만 실제 호가 가격에 체결(내부에서 잔고/증거금/수수료/봇
   // 재고·체결테이프·캔들까지 전부 정산). 부분 체결이면 filled 만큼만 나가고 잔량은 아래에서 조건 유지.
@@ -279,7 +288,12 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
     const uPnL = await unrealizedTotal(env, uid, marks);
     const { filled } = await matchMarketOxOrder(env, c.symbol, uid, c.side, c.size, c.leverage, null, null, uPnL);
     // filled==0(감당 못 함/유동성 없음): 아무것도 안 건드림 → 조건(및 무장 상태) 그대로 유지, 다음 폴링 재시도.
-    if (filled > EPS) await conditionalAfterFillStmt(env, uid, c, filled).run();
+    if (filled > EPS) {
+      // 반복 주문이면 이번 체결의 쓰기량을 예산 계량기에 기록한다(같은 batch — 왕복 추가 없음).
+      const after = conditionalAfterFillStmt(env, uid, c, filled);
+      if (c.repeating) await env.DB.batch([after, meterStmt(env, ROWS_PER_REPEAT_FILL)]);
+      else await after.run();
+    }
     return;
   }
 
@@ -339,6 +353,7 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
     ).bind(ordId, uid, c.symbol, c.side, price, fillSize, effLev, 'open', null, now),
   );
   stmts.push(conditionalAfterFillStmt(env, uid, c, fillSize));
+  if (c.repeating) stmts.push(meterStmt(env, ROWS_PER_REPEAT_FILL)); // 예산 계량기(§ _budget.ts)
   await env.DB.batch(stmts);
 }
 

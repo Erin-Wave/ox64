@@ -191,6 +191,17 @@ CREATE TABLE IF NOT EXISTS bot_inventory (
   PRIMARY KEY (pair, user_id)
 );
 
+-- ── D1 쓰기 예산 계량기(functions/_budget.ts) ─────────────────────────
+-- ⚠ 2026-08-01: 7월분 $47 이 D1 "rows written" 초과분으로 청구됐다(9,700만 행 vs 포함분 5,000만).
+-- Cloudflare 에는 D1 지출 상한 기능이 없어서 "넘기면 멈춘다"를 코드로 만들어야 한다. 이 테이블이 그
+-- 계량기다 — 하루 1행, **스스로 반복해서 도는 자동 쓰기**(마켓메이커 봇 틱 + repeating 조건부 체결)만
+-- 센다. 사람이 버튼을 눌러 만드는 쓰기는 폭주할 수 없으므로 세지 않는다(정확한 총계는 `npm run d1:budget`).
+-- 이번 달 누적이 BLOCK_AT_ROWS(포함분의 90%)를 넘으면 그 자동 경로들이 조용히 멈추고, 달이 바뀌면 풀린다.
+CREATE TABLE IF NOT EXISTS usage_meter (
+  day      TEXT PRIMARY KEY,              -- 'YYYY-MM-DD' (KST)
+  rows_est INTEGER NOT NULL DEFAULT 0     -- 그날 자동 경로가 쓴 행 수 추정치
+);
+
 -- ── OX 영속 캔들(차트 히스토리 영구 보존) ─────────────────────────────
 -- 예전엔 캔들을 매 요청마다 "최신 spot_trades 5000건"을 버킷팅해 만들어서, 총 거래가 5000건을 넘으면
 -- 오래된 캔들이 창 밖으로 밀려 차트 데이터가 시간이 지나면 사라졌다(특히 큰 인터벌은 몇 봉만 남음).

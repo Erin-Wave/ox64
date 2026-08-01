@@ -11,6 +11,12 @@ const KIND_LABEL: Record<ApiOrder['kind'], string> = { open: '진입', close: '�
 // sv-SE 로케일은 'YYYY-MM-DD HH:mm:ss' 형식으로 떨어져서 KST 타임존 지정과 함께 편하게 재사용.
 const fmtTime = (ms: number) => new Date(ms).toLocaleString('sv-SE', { timeZone: 'Asia/Seoul' });
 
+/** `continuous` 무한 조건부의 재실행 간격 하한(서버 MIN_CONTINUOUS_COOLDOWN_MS 와 같은 값, CLAUDE.md §6).
+ * 하한 도입 전에 만들어진 주문은 DB 에 0 으로 남아 있으므로, 표시할 때도 실효값으로 환산해야 화면과
+ * 실제 실행 간격이 어긋나지 않는다. */
+const MIN_COOLDOWN_SEC = 5;
+const effCooldownSec = (cooldownMs: number) => Math.max(MIN_COOLDOWN_SEC, (cooldownMs || 0) / 1000);
+
 /** 보유 포지션 목록 + 실시간 미실현 손익/ROE·청산가 (OKX 스타일).
  * 탭: 포지션 / (Standard) 미체결 지정가 / 주문내역. */
 export default function PositionsPanel() {
@@ -140,7 +146,9 @@ export default function PositionsPanel() {
       repeatMode: editCondMode,
       // 해당 모드에서 의미 없는 값은 null 로 보내 해제한다(서버가 undefined=유지, null=해제로 구분).
       rearmPrice: editCondRepeat && editCondMode === 'rearm' && editCondRearm ? Number(editCondRearm) : null,
-      cooldownSec: editCondRepeat && editCondMode === 'continuous' && editCondCooldown ? Number(editCondCooldown) : 0,
+      // ⚠ continuous 는 재실행 간격 하한이 있다(MIN_COOLDOWN_SEC) — 비워서 보내면 서버가 하한으로 올린다.
+      cooldownSec:
+        editCondRepeat && editCondMode === 'continuous' && editCondCooldown ? Number(editCondCooldown) : MIN_COOLDOWN_SEC,
       maxFills: editCondRepeat && editCondMax ? Number(editCondMax) : null,
     });
     setEditCondId(null);
@@ -615,8 +623,8 @@ export default function PositionsPanel() {
                                       value={fmtNumInput(editCondCooldown)}
                                       onChange={(e) => setEditCondCooldown(unfmtNum(e.target.value))}
                                       inputMode="decimal"
-                                      placeholder="간격s"
-                                      title="재실행 간격(초). 0/비움=최대 속도"
+                                      placeholder={`${MIN_COOLDOWN_SEC}s`}
+                                      title={`재실행 간격(초). 최소 ${MIN_COOLDOWN_SEC}초 — 비우면 ${MIN_COOLDOWN_SEC}초`}
                                       className="w-14 rounded bg-panel2 px-1 py-0.5 text-right text-[10px] text-text outline-none ring-1 ring-border placeholder:text-muted"
                                     />
                                   ) : (
@@ -653,7 +661,7 @@ export default function PositionsPanel() {
                               }`}
                               title={
                                 c.repeatMode === 'continuous'
-                                  ? `조건을 만족하는 동안 계속 실행${c.cooldownMs > 0 ? ` (${c.cooldownMs / 1000}초 간격)` : ' (최대 속도)'}`
+                                  ? `조건을 만족하는 동안 계속 실행 (${effCooldownSec(c.cooldownMs)}초 간격)`
                                   : c.armed
                                     ? '무장 상태 — 트리거되면 실행됩니다'
                                     : '재무장 대기 — 가격이 되돌아와야 다시 실행됩니다'
@@ -664,9 +672,7 @@ export default function PositionsPanel() {
                             <span className="text-[10px] text-muted">
                               {c.maxFills != null ? `${c.fillCount}/${c.maxFills}회` : `${c.fillCount}회 실행`}
                               {c.repeatMode === 'continuous'
-                                ? c.cooldownMs > 0
-                                  ? ` · ${c.cooldownMs / 1000}초 간격`
-                                  : ' · 최대 속도'
+                                ? ` · ${effCooldownSec(c.cooldownMs)}초 간격`
                                 : c.armed
                                   ? ' · 대기 중'
                                   : ' · 재무장 대기'}

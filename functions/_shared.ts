@@ -504,6 +504,18 @@ export function repeatModeOf(c: ConditionalRow): 'continuous' | 'rearm' {
   return c.repeat_mode === 'rearm' ? 'rearm' : 'continuous';
 }
 
+/** ⚠ `continuous` 무한 조건부의 **재실행 간격 하한**(2026-08-01). 예전엔 0(=폴링마다 ≈1초)이 허용됐는데,
+ * 그러면 주문 하나가 하루 8.6만 번 체결되고 체결 1건이 D1 에 ~18행을 쓰므로 **하루 155만 행 = 월 4,650만 행**
+ * — 그 주문 하나로 월 rows written 포함분(5,000만)을 거의 다 먹는다($47 청구 사건 이후 계산, §6 D1 예산).
+ * 5초로 두면 같은 주문이 월 930만 행이 되어 봇(600만)과 합쳐도 여유가 3배 남는다. DCA/물타기 용도에서
+ * 1초와 5초의 체감 차이는 거의 없다(가격이 조건 아래에 머무는 시간은 보통 분 단위다).
+ * ⚠ **저장값이 아니라 이 함수를 통해서만 판정할 것** — 하한 도입 전에 만들어진 기존 주문들이 DB 에
+ * cooldown_ms=0 으로 남아 있어서, 생성 시점 검증만 고치면 그 주문들은 계속 1초 간격으로 돈다. */
+export const MIN_CONTINUOUS_COOLDOWN_MS = 5_000;
+export function effectiveCooldownMs(cooldownMs: number | null | undefined): number {
+  return Math.max(MIN_CONTINUOUS_COOLDOWN_MS, cooldownMs ?? 0);
+}
+
 /** 로그인 사용자의 전체 상태(잔고+포지션+주문) 조회.
  * marks: 이미 받아둔 마크가격 맵(대개 checkTriggers 가 방금 fetch 한 것) — 넘기면 그대로 재사용해
  * 추가 시세 fetch 를 피한다. 안 넘기고 보유 심볼이 있으면 여기서 한 번 조회한다. 응답의 markPrices 는

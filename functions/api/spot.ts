@@ -20,6 +20,7 @@ import {
   roundVirtual,
   virtualTick,
 } from '../_shared';
+import { autoWritesBlocked, meterStmt, ROWS_PER_BOT_TICK } from '../_budget';
 
 /**
  * 가상 코인(OX/USDT · EW/USDT) — 외부 시세가 없어 이 파일의 봇이 체결가를 만든다. 그 외에는 실제 38종과
@@ -1008,6 +1009,9 @@ async function marketMakerTick(
       env.DB.prepare('DELETE FROM spot_trades WHERE pair = ? AND created_at < ?').bind(pair, now - TRADE_RETENTION_MS),
     );
   }
+  // 이 틱이 쓴 행 수를 예산 계량기에 기록한다(같은 batch — 이 문장 자체도 1행이라 단가에 포함돼 있다).
+  // 봇은 영구히 도는 유일한 컴포넌트라, 예산을 넘기면 이 기록을 보고 스스로 물러난다(§ _budget.ts).
+  stmts.push(meterStmt(env, ROWS_PER_BOT_TICK));
   // 봇도 수수료를 낸다 — 이 틱의 합성 체결 명목금액에 대해(같은 batch, 왕복 추가 없음).
   // ⚠ 재고/현금 정산은 없다(botSide=null) — 합성 체결은 buyer_id=seller_id=actor 인 봇↔봇 거래라
   // 사고팔린 게 같은 계정 안에서 상계된다(수수료만 실제로 나간다).
@@ -1067,6 +1071,9 @@ export async function runMarketMaker(env: Env, pair: string): Promise<void> {
 
   const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
   if (now - last < gate) return; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
+  // ⚠ 이번 달 D1 쓰기 예산을 넘겼으면 봇을 돌리지 않는다(§ _budget.ts) — 시장이 멈추는 건 아프지만
+  // 예상 못 한 청구서보다는 낫다. 게이트를 통과한 틱에서만 물어보므로 조회가 폴링마다 늘지 않는다.
+  if (await autoWritesBlocked(env)) return;
 
   // 재호가 틱을 원자적으로 선점(동시 폴링이 겹쳐도 이 틱은 한 번만 requote) — 조건부 upsert.
   const claim = await env.DB.prepare(
@@ -1093,6 +1100,10 @@ export async function runMarketMaker(env: Env, pair: string): Promise<void> {
  * 어차피 매 봉 채워지므로 빈 봉도 안 생긴다.
  */
 export async function runMarketMakerBurst(env: Env, pair: string, ticks: number = BOT_BURST_TICKS): Promise<void> {
+  // 예산 초과면 이번 버스트는 통째로 건너뛴다(§ _budget.ts) — 버스트당 1회만 판정하면 되므로
+  // 틱마다 조회가 붙지 않는다. 트리거 sweep(강제청산·지정가·SL/TP)은 **막지 않는다**: 그건 돈이 걸린
+  // 기능이라 멈추면 유저 손실로 이어지고, 애초에 폭주하지도 않는다.
+  if (await autoWritesBlocked(env)) return;
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BotStateRow>();
   const ref0 = await resolveRef(env, pair, row);
   // 상태 행이 아직 없으면 먼저 만든다 — marketMakerTick 의 심리상태 UPDATE 가 0행이 되어 국면이

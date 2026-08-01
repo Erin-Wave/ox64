@@ -13,6 +13,8 @@ import {
   feeRateOf,
   feeAccrualStmts,
   repeatModeOf,
+  effectiveCooldownMs,
+  MIN_CONTINUOUS_COOLDOWN_MS,
   MAX_ORDER_SIZE,
   sizeEps,
   roundVirtual,
@@ -114,13 +116,19 @@ function parseRepeatOpts(
     if (isOx) rearmPrice = roundVirtual(rearmPrice);
   }
 
-  // 클라는 사람이 읽기 쉬운 "초"로 보내고 서버는 ms 로 저장한다(0=폴링마다 = 가장 빠름).
+  // 클라는 사람이 읽기 쉬운 "초"로 보내고 서버는 ms 로 저장한다.
+  // ⚠ `continuous` 는 **하한 5초**(MIN_CONTINUOUS_COOLDOWN_MS)를 강제한다 — 0(폴링마다 ≈1초)을 허용하면
+  // 주문 하나가 월 4,650만 행을 써서 D1 포함분을 혼자 다 먹는다(§6 D1 예산, $47 청구 사건).
+  // 여기서 저장값 자체를 하한으로 올려 UI 가 실제 동작과 어긋나지 않게 하고, 평가 시점에도 별도로
+  // effectiveCooldownMs 로 한 번 더 막는다(하한 도입 전에 만들어진 기존 주문 방어).
+  const minSec = MIN_CONTINUOUS_COOLDOWN_MS / 1000;
   let cooldownMs = base.cooldownMs;
   if (body.cooldownSec !== undefined) {
-    const sec = body.cooldownSec === null || body.cooldownSec === '' ? 0 : Number(body.cooldownSec);
+    const sec = body.cooldownSec === null || body.cooldownSec === '' ? minSec : Number(body.cooldownSec);
     if (!isFinite(sec) || sec < 0 || sec > 86400) return '재실행 간격은 0~86,400초';
     cooldownMs = Math.round(sec * 1000);
   }
+  if (repeatMode === 'continuous') cooldownMs = effectiveCooldownMs(cooldownMs);
 
   let maxFills = base.maxFills;
   if (body.maxFills !== undefined) {
