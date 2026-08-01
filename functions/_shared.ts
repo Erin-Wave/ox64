@@ -2,6 +2,9 @@
 // 잔고/체결/손익은 전부 서버(D1)에서 계산하고, 체결가는 서버가 바이낸스에서
 // 직접 받아 쓴다 → 클라이언트가 가격이나 잔고를 조작해도 반영되지 않는다.
 
+// ⚠ `_budget.ts` 는 이 파일에서 **타입만** import 한다(런타임 순환 없음, 그쪽 todayKst 사본 주석 참고).
+import { meterStmt, ROWS_PER_FILL } from './_budget';
+
 // 최소 D1 타입 (workers-types 의존 없이 배포 가능하게 직접 선언)
 export interface D1Result<T = unknown> {
   results: T[];
@@ -417,6 +420,11 @@ export function feeAccrualStmts(
     env.DB.prepare(
       'INSERT INTO fee_ledger (id, user_id, symbol, kind, notional, rate, fee, created_at) VALUES (?,?,?,?,?,?,?,?)',
     ).bind(crypto.randomUUID(), uid, symbol, kind, notional, rate, fee, now),
+    // ⚠ D1 쓰기 예산 계량(§ _budget.ts). **이 함수가 모든 체결 경로가 반드시 지나는 유일한 병목**이라
+    // 여기 한 줄이면 시장가/지정가/지정가청산/SL·TP/조건부(1회성·반복)/강제청산/OX walking 이 전부 잡힌다
+    // — 경로마다 흩뿌리면 새 체결 경로를 추가할 때 빠뜨리고, 그 누락이 곧 다음 청구서다.
+    // 그래서 조건부 경로 등에 계량을 **따로 넣으면 이중 계산**이 된다(넣지 말 것).
+    meterStmt(env, ROWS_PER_FILL),
   ];
 }
 export interface SpotOrderRow {

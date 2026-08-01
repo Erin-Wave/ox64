@@ -310,7 +310,7 @@ function bookWriteStmt(env: Env, pair: string, book: BotBook, version: number): 
 // (`npx wrangler d1 insights ox64 --sort-by writes --timePeriod 1d`, 2026-08-01): 하루 96만 행 중
 // `spot_trades` INSERT 51만 + 보존기간 DELETE 25만 = **76만 행**. 원인은 튜닝이 아니라 구조다 — 봇은
 // 분당 24틱 이상을 영구히 돌고 한 틱이 3~6건을 찍으므로 **초당 ~4.5행이 영원히 INSERT** 되고, 6시간 뒤
-// 같은 수만큼 DELETE 된다. D1 은 INSERT 를 "2 + 인덱스 수" 행으로 세므로(실측: spot_trades 3, 인덱스
+// 같은 수만큼 DELETE 된다. D1 은 한 문장을 "바뀐 행 1 + 갱신된 인덱스 항목 수"로 세므로(암묵 PK 인덱스 포함 — 실측: spot_trades 3, 인덱스
 // 2개인 fee_ledger 4) 체결 한 건의 생애비용이 ~4.5 rows written 이다.
 //
 // 그런데 이 테이프를 실제로 읽는 곳은 (a)호가창 "체결" 탭 최근 30건 (b)1s 등 <60s 캔들 버킷팅뿐이고,
@@ -1073,7 +1073,7 @@ export async function runMarketMaker(env: Env, pair: string): Promise<void> {
   if (now - last < gate) return; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
   // ⚠ 이번 달 D1 쓰기 예산을 넘겼으면 봇을 돌리지 않는다(§ _budget.ts) — 시장이 멈추는 건 아프지만
   // 예상 못 한 청구서보다는 낫다. 게이트를 통과한 틱에서만 물어보므로 조회가 폴링마다 늘지 않는다.
-  if (await autoWritesBlocked(env)) return;
+  if (await autoWritesBlocked(env, 'bot')) return;
 
   // 재호가 틱을 원자적으로 선점(동시 폴링이 겹쳐도 이 틱은 한 번만 requote) — 조건부 upsert.
   const claim = await env.DB.prepare(
@@ -1103,7 +1103,7 @@ export async function runMarketMakerBurst(env: Env, pair: string, ticks: number 
   // 예산 초과면 이번 버스트는 통째로 건너뛴다(§ _budget.ts) — 버스트당 1회만 판정하면 되므로
   // 틱마다 조회가 붙지 않는다. 트리거 sweep(강제청산·지정가·SL/TP)은 **막지 않는다**: 그건 돈이 걸린
   // 기능이라 멈추면 유저 손실로 이어지고, 애초에 폭주하지도 않는다.
-  if (await autoWritesBlocked(env)) return;
+  if (await autoWritesBlocked(env, 'bot')) return;
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BotStateRow>();
   const ref0 = await resolveRef(env, pair, row);
   // 상태 행이 아직 없으면 먼저 만든다 — marketMakerTick 의 심리상태 UPDATE 가 0행이 되어 국면이

@@ -24,7 +24,7 @@ import {
   effectiveCooldownMs,
   sizeEps,
 } from './_shared';
-import { autoWritesBlocked, meterStmt, ROWS_PER_REPEAT_FILL } from './_budget';
+import { autoWritesBlocked } from './_budget';
 import { matchLimitPendingAgainstBook, matchMarketOxOrder, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
 
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차(조건부 주문 부분체결 잔량 등)
@@ -277,10 +277,11 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
     if (c.last_fill_at != null && Date.now() - c.last_fill_at < cooldown) return;
   }
 
-  // ⚠ 반복 조건부는 이 사이트에서 유일하게 "스스로 무한히 쓰기를 만드는" 유저 경로다 — 이번 달 자동 쓰기가
-  // 차단선(포함분의 90%)을 넘었으면 조용히 물러난다(§ functions/_budget.ts). 1회성 주문은 총량이 유한하므로
-  // 막지 않는다(막으면 걸어둔 스탑이 안 걸리는 게 더 큰 사고다).
-  if (c.repeating && (await autoWritesBlocked(env))) return;
+  // ⚠ 반복 조건부는 이 사이트에서 유일하게 "스스로 무한히, 개수 제한도 없이" 쓰기를 만드는 경로다
+  // (5초 간격 × 체결당 ~20행 = 주문 하나당 하루 35만 행 → 3개면 100만 행). 그래서 일일/월 차단선을
+  // 넘었으면 조용히 물러난다(§ _budget.ts — 봇보다 **먼저** 끊는 쪽이 이것이다).
+  // 1회성 주문은 총량이 유한하므로 막지 않는다(막으면 걸어둔 스탑이 안 걸리는 게 더 큰 사고다).
+  if (c.repeating && (await autoWritesBlocked(env, 'repeat'))) return;
 
   // OX/USDT — 봇 호가창을 walking 하며 있는 물량만 실제 호가 가격에 체결(내부에서 잔고/증거금/수수료/봇
   // 재고·체결테이프·캔들까지 전부 정산). 부분 체결이면 filled 만큼만 나가고 잔량은 아래에서 조건 유지.
@@ -288,12 +289,9 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
     const uPnL = await unrealizedTotal(env, uid, marks);
     const { filled } = await matchMarketOxOrder(env, c.symbol, uid, c.side, c.size, c.leverage, null, null, uPnL);
     // filled==0(감당 못 함/유동성 없음): 아무것도 안 건드림 → 조건(및 무장 상태) 그대로 유지, 다음 폴링 재시도.
-    if (filled > EPS) {
-      // 반복 주문이면 이번 체결의 쓰기량을 예산 계량기에 기록한다(같은 batch — 왕복 추가 없음).
-      const after = conditionalAfterFillStmt(env, uid, c, filled);
-      if (c.repeating) await env.DB.batch([after, meterStmt(env, ROWS_PER_REPEAT_FILL)]);
-      else await after.run();
-    }
+    // ⚠ 여기서 예산 계량을 따로 하지 않는다 — matchMarketOxOrder 안의 feeAccrualStmts 가 이미 계량했다
+    // (§ _budget.ts "계량 지점"). 여기 또 넣으면 이중 계산이 된다.
+    if (filled > EPS) await conditionalAfterFillStmt(env, uid, c, filled).run();
     return;
   }
 
@@ -353,7 +351,7 @@ async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, 
     ).bind(ordId, uid, c.symbol, c.side, price, fillSize, effLev, 'open', null, now),
   );
   stmts.push(conditionalAfterFillStmt(env, uid, c, fillSize));
-  if (c.repeating) stmts.push(meterStmt(env, ROWS_PER_REPEAT_FILL)); // 예산 계량기(§ _budget.ts)
+  // (예산 계량은 위 stmts 첫 항목인 feeAccrualStmts 가 이미 했다 — 여기 또 넣으면 이중 계산)
   await env.DB.batch(stmts);
 }
 
