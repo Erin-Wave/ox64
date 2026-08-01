@@ -39,13 +39,15 @@ export const REPEAT_BLOCK_DAY_ROWS = 600_000;
 
 // ⚠ 계량 단가 — 각 작업이 D1 에 남기는 행 수의 **보수적(넉넉한) 추정치**다. 정확할 필요는 없고
 // "과소평가하지 않는 것"이 중요하다(과소평가하면 차단이 늦게 걸려 돈이 나간다). 근거:
-//   봇 틱 6행 = 상태 UPDATE 1 + 캔들 upsert 3(1m/1h/1d) + 봇 수수료 카운터 1 + 이 계량기 1
+//   봇 틱 7행 = 상태 UPDATE 1 + 캔들 upsert 3(1m/1h/1d) + 봇 수수료 카운터 1 + 이 계량기 1 = 6
+//               ⚠ 실측 평균은 6.3 이다 — 캔들 upsert 가 **새 버킷이면 2행**(행 1 + PK 인덱스 1)이라
+//               분/시/일이 넘어갈 때 조금 더 든다. 과소평가는 차단을 늦게 걸리게 하므로 7 로 올려 잡는다.
 //   체결 20행 = users 1 + positions 1~3 + orders 3 + fee_ledger 4 + 계량기 1
 //               (+ OX 는 체결테이프 3 + 캔들 3 + 봇 정산 1 + 재고 2 + 사다리 1 → 20 근처)
 // ⚠ D1 은 한 문장의 비용을 **"바뀐 행 1 + 갱신된 인덱스 항목 수"** 로 센다(암묵 PK 인덱스도 포함).
 // 실측: spot_trades INSERT 3(=1+PK+1), fee_ledger INSERT 4(=1+PK+2), 비인덱스 컬럼 UPDATE 1.
 // 그래서 **인덱스를 하나 더 다는 것은 그 테이블 모든 INSERT 비용을 올리는 결정**이다.
-export const ROWS_PER_BOT_TICK = 6;
+export const ROWS_PER_BOT_TICK = 7;
 export const ROWS_PER_FILL = 20;
 
 /** KST(UTC+9) 기준 오늘 날짜. ⚠ `_shared.todayKst` 와 같은 로직이지만 **일부러 복사**했다 —
@@ -56,7 +58,7 @@ function todayKst(): string {
 }
 
 /** 오늘(KST) 계량값에 rows 를 더하는 문장. ⚠ 반드시 **이미 실행되는 batch 에 얹을 것**(단독 실행 금지) —
- * 계량기가 왕복을 늘리면 계량기 자체가 비용이 된다. 봇 틱 단가 6 = 실제 5행 + 이 문장 1행. */
+ * 계량기가 왕복을 늘리면 계량기 자체가 비용이 된다. 봇 틱 단가 7 = 실제 ~6행 + 이 문장 1행. */
 export function meterStmt(env: Env, rows: number): D1PreparedStatement {
   return env.DB.prepare(
     'INSERT INTO usage_meter (day, rows_est) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET rows_est = usage_meter.rows_est + excluded.rows_est',
