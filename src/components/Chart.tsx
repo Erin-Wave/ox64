@@ -23,7 +23,7 @@ import { useChartStore, type IndicatorConfig, type IndicatorType, type ChartColo
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol } from '@/symbols';
-import { fmtPrice, fmtQty } from '@/format';
+import { fmtPrice, fmtQty, virtualPrecision } from '@/format';
 import Clock from '@/components/Clock';
 import type { Candle } from '@/types';
 
@@ -449,10 +449,18 @@ export default function Chart() {
 
     // ── 가상 코인(OX/USDT): 바이낸스 REST/WS 대신 spot_trades 기반 캔들을 짧은 폴링으로 ──
     if (isVirtualSymbol(symbol)) {
-      const VIRTUAL_PREC = 4;
-      setPrec(VIRTUAL_PREC);
-      setPrecision(symbol, VIRTUAL_PREC);
-      candle.applyOptions({ priceFormat: { type: 'price', precision: VIRTUAL_PREC, minMove: Math.pow(10, -VIRTUAL_PREC) } });
+      // ⚠ 가상 코인은 소수 자릿수가 고정이 아니다 — 호가 단위가 **유효숫자 4자리**라 가격대에 따라
+      // 10배씩 바뀐다(1.057→3자리, 0.002434→6자리, 123.4→1자리). 캔들이 올 때마다 최신가 기준으로
+      // 다시 적용한다(예전엔 4자리 하드코딩이라 가격대가 바뀌면 축·크로스헤어가 실제 틱과 어긋났다).
+      let curPrec = -1;
+      const applyPrec = (price: number) => {
+        const p = virtualPrecision(price);
+        if (p === curPrec) return;
+        curPrec = p;
+        setPrec(p);
+        setPrecision(symbol, p);
+        candle.applyOptions({ priceFormat: { type: 'price', precision: p, minMove: Math.pow(10, -p) } });
+      };
 
       let isFirstLoad = true;
       let loadingMore = false;
@@ -488,6 +496,7 @@ export default function Chart() {
           const l = merged.at(-1);
           setConnected(true);
           if (l) {
+            applyPrec(l.close);
             setPrice(symbol, l.close);
             if (!hovering.current) setLegend(l);
           }

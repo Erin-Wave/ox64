@@ -15,6 +15,7 @@ import {
   repeatModeOf,
   MAX_ORDER_SIZE,
   sizeEps,
+  roundVirtual,
   type Env,
   type PositionRow,
   type PendingRow,
@@ -110,7 +111,7 @@ function parseRepeatOpts(
     // below(이하로 떨어지면 진입) → 다시 오를 때 재무장이므로 재무장가 >= 트리거가.
     if (triggerDir === 'below' && rearmPrice < triggerPrice) return '재무장 가격은 트리거 가격 이상이어야 합니다';
     if (triggerDir === 'above' && rearmPrice > triggerPrice) return '재무장 가격은 트리거 가격 이하여야 합니다';
-    if (isOx) rearmPrice = Math.round(rearmPrice * 1e4) / 1e4;
+    if (isOx) rearmPrice = roundVirtual(rearmPrice);
   }
 
   // 클라는 사람이 읽기 쉬운 "초"로 보내고 서버는 ms 로 저장한다(0=폴링마다 = 가장 빠름).
@@ -340,7 +341,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     let limitPrice = Number(body.limitPrice);
     if (!(size > 0) || !isFinite(size)) return bad('청산 수량 오류');
     if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
-    if (isVirtualSymbol(pos.symbol)) limitPrice = Math.round(limitPrice * 1e4) / 1e4; // OX 4자리 틱
+    if (isVirtualSymbol(pos.symbol)) limitPrice = roundVirtual(limitPrice); // 가상 코인 유효숫자 4자리 틱
 
     const closeSide = pos.side === 'long' ? 'short' : 'long'; // 롱 청산=매도(short), 숏 청산=매수(long)
     // ⚠ 청산 가능 수량 = 보유수량 − 이미 걸어둔 지정가 청산(reduce-only) 합. 예전엔 `size > pos.size` 로만
@@ -382,7 +383,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
     if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
     // OX 는 4자리 틱(0.0001) 정합성 유지 — 유저가 더 세밀한 지정가를 넣어도 호가창/체결이 4자리를 넘지 않게.
-    if (isVirtualSymbol(symbol)) limitPrice = Math.round(limitPrice * 1e4) / 1e4;
+    if (isVirtualSymbol(symbol)) limitPrice = roundVirtual(limitPrice);
 
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
@@ -454,7 +455,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const newSize = body.size != null ? Number(body.size) : pending.size;
     if (!(newLimit > 0) || !isFinite(newLimit)) return bad('지정가 오류');
     if (badSize(newSize)) return bad('수량 오류');
-    if (isVirtualSymbol(pending.symbol)) newLimit = Math.round(newLimit * 1e4) / 1e4; // OX 4자리 틱
+    if (isVirtualSymbol(pending.symbol)) newLimit = roundVirtual(newLimit); // 가상 코인 유효숫자 4자리 틱
 
     if (pending.reduce_only) {
       // 지정가 청산 — 증거금 없음(margin=0), 값만 갱신. ⚠ 단, 대상 포지션의 청산 가능 수량을 초과하지
@@ -514,7 +515,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
     if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
-    if (isVirtualSymbol(symbol)) triggerPrice = Math.round(triggerPrice * 1e4) / 1e4; // OX 4자리 틱
+    if (isVirtualSymbol(symbol)) triggerPrice = roundVirtual(triggerPrice); // 가상 코인 유효숫자 4자리 틱
 
     // ── 무한(반복) 조건부 ── 체결돼도 주문이 남는다. size 는 "1회 실행 수량"이 된다(차감하지 않음).
     const repeating = body.repeating === true || body.repeating === 1;
@@ -564,7 +565,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 안 보낸 필드는 기존 값 유지.
     let triggerPrice = body.triggerPrice != null && body.triggerPrice !== '' ? Number(body.triggerPrice) : cond.trigger_price;
     if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
-    if (isOx) triggerPrice = Math.round(triggerPrice * 1e4) / 1e4;
+    if (isOx) triggerPrice = roundVirtual(triggerPrice);
     const size = body.size != null && body.size !== '' ? Number(body.size) : cond.size;
     if (badSize(size)) return bad('수량 오류');
     const triggerDir = body.triggerDir != null && body.triggerDir !== '' ? String(body.triggerDir) : cond.trigger_dir;

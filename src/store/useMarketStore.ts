@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import type { TickerTrade } from '@/types';
+import { isVirtualSymbol } from '@/symbols';
+import { virtualPrecision } from '@/format';
 
 const MAX_TRADES = 40;
 
@@ -72,8 +74,18 @@ export const useMarketStore = create<MarketState>((set, get) => ({
     set({ interval });
     persist(get());
   },
+  // ⚠ 가상 코인은 소수 자릿수가 **가격대에 따라 바뀐다**(유효숫자 4자리 고정 — 1.057 은 3자리,
+  // 0.002434 는 6자리). 실제 코인처럼 거래소에서 tickSize 를 받아올 곳이 없으므로 가격이 갱신될 때
+  // 여기서 파생해 둔다(진실원본 1곳) — 차트를 안 보고 있는 심볼도 헤더/포지션 패널에서 올바른
+  // 자릿수로 표시된다(예전엔 4자리 하드코딩이라 123.4567 처럼 없는 자릿수가 보였다).
   setPrice: (symbol, price) =>
-    set((s) => (s.prices[symbol] === price ? s : { prices: { ...s.prices, [symbol]: price } })),
+    set((s) => {
+      if (s.prices[symbol] === price) return s;
+      const prices = { ...s.prices, [symbol]: price };
+      if (!isVirtualSymbol(symbol)) return { prices };
+      const prec = virtualPrecision(price);
+      return s.precisions[symbol] === prec ? { prices } : { prices, precisions: { ...s.precisions, [symbol]: prec } };
+    }),
   setPrecision: (symbol, precision) =>
     set((s) => (s.precisions[symbol] === precision ? s : { precisions: { ...s.precisions, [symbol]: precision } })),
   setConnected: (connected) => set({ connected }),

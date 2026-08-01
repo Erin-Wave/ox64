@@ -3,9 +3,12 @@ import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { isVirtualSymbol } from '@/symbols';
 import { fetchPricePrecision } from '@/services/binanceRest';
+import { virtualPrecision } from '@/format';
 import { fetchOkxPrices } from '@/services/okxRest';
 
-const VIRTUAL_PREC = 4; // OX/USDT 가상 심볼 소수 자릿수 (Chart.tsx 와 동일)
+// 가상 심볼은 거래소 tickSize 조회 대상이 아니다. 호가 단위가 **유효숫자 4자리**라 소수 자릿수가
+// 가격대에 따라 바뀌므로(1.057→3, 0.002434→6), 가격을 알면 거기서 파생하고 아직 모르면 4로 둔다
+// (가격이 들어오는 순간 useMarketStore.setPrice 가 정확한 값으로 덮어쓴다).
 
 /**
  * 현재 보는 심볼 + 보유 포지션들의 심볼 가격을 주기적으로 폴링해 prices 맵을 갱신한다.
@@ -74,7 +77,8 @@ export function useMarkPrices() {
     for (const s of syms) {
       if (have[s] != null) continue;
       if (isVirtualSymbol(s)) {
-        setPrecision(s, VIRTUAL_PREC);
+        const px = useMarketStore.getState().prices[s];
+        setPrecision(s, px ? virtualPrecision(px) : 4);
         continue;
       }
       fetchPricePrecision(s)

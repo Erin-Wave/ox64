@@ -17,6 +17,8 @@ import {
   isVirtualSymbol,
   vipOf,
   sizeEps,
+  roundVirtual,
+  virtualTick,
 } from '../_shared';
 
 /**
@@ -33,12 +35,15 @@ import {
  * 절대 심볼을 하드코딩하지 말 것 — 그 순간 그 경로만 OX 전용이 되어 조용히 갈라진다.
  */
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차
-// 가상 코인 최소 호가 단위 = 0.0001(4자리). 봇 기준가/호가/체결가를 전부 이 틱에 스냅해서, 실제
-// 코인처럼 정해진 소수 자릿수 이상으로는 호가·체결이 생기지 않게 한다(가상코인 소수점 무결성).
 // 호가창에 내려보내는 가격대 수. ⚠ 클라(OrderBook BOOK_DEPTH)가 이보다 많이 그리려 하면 그만큼은
 // 빈 채로 남는다 — 표시 개수를 바꿀 땐 두 값을 같이 맞출 것.
 const BOOK_LIMIT = 40;
-const roundOx = (p: number) => Number((Math.round(p * 1e4) / 1e4).toFixed(4));
+// 가상 코인 최소 호가 단위 = **유효숫자 4자리**(가격대에 따라 틱이 10배씩 바뀐다: 0.9234→0.0001,
+// 0.002434→0.000001, 123.4→0.1 — `_shared.roundVirtual`). 봇 기준가/호가/체결가를 전부 이 틱에
+// 스냅해서, 실제 코인처럼 정해진 자릿수 이상으로는 호가·체결이 생기지 않게 한다.
+// ⚠ 틱이 절대값이 아니라 가격 비례이므로, **가격 격자·자석 간격 같은 상수도 절대값으로 쓰면 안 된다**
+// (0.05 같은 값은 가격이 1 근처일 때만 맞는다) — 전부 아래처럼 "틱 몇 개"로 표현할 것.
+const roundOx = roundVirtual;
 
 export function onRequestGet({ request, env }: Ctx): Promise<Response> {
   return safe(async () => {
@@ -456,7 +461,7 @@ const REGIME_PARAMS: Record<Regime, { bias: number; volMult: number; sizeMult: n
   panic:    { bias: -0.0036,  volMult: 2.60, sizeMult: 2.90, takerBias: -0.40, minTicks: 4 },
 };
 
-const ROUND_STEP = 0.05; // 라운드넘버 자석이 잡아당기는 심리적 가격대 간격
+const ROUND_STEP_TICKS = 50; // 라운드넘버 자석이 잡아당기는 심리적 가격대 간격(틱 개수 — 절대값이면 가격대가 바뀔 때 무의미해진다)
 
 /** 한 주문에서 특정 봇이 상대편(maker)으로 잡은 체결의 합계 — 수수료(명목금액)와 재고(수량) 양쪽에 쓴다. */
 interface BotFill {
@@ -552,11 +557,13 @@ async function botFillStmts(
 // 같은 **딱 떨어지는 가격**에 주문을 몰아 걸고, 그런 라운드 가격일수록 물량이 훨씬 크다(심리적 지지·
 // 저항 "벽"). 수량도 4,712.3856 이 아니라 1,000 / 5,000 처럼 떨어지는 숫자를 넣는다.
 // 격자가 굵을수록(=더 라운드한 가격) 그 자리에 붙는 물량 배수(sizeMult)가 크다.
-const PRICE_GRIDS: readonly { step: number; sizeMult: number; pull: number }[] = [
-  { step: 0.05, sizeMult: 7.0, pull: 0.95 }, // 1.40 / 1.45 — 대형 심리 가격, 두꺼운 벽
-  { step: 0.01, sizeMult: 3.4, pull: 0.85 }, // 1.41 / 1.42
-  { step: 0.005, sizeMult: 1.9, pull: 0.65 }, // 1.4050
-  { step: 0.001, sizeMult: 1.3, pull: 0.8 }, // 1.4070 — 그나마 깔끔한 값
+//
+// ⚠ 격자 간격은 **틱 개수**로 적는다(절대값 금지) — 틱이 유효숫자 4자리라 가격대마다 10배씩 달라지고,
+// 0.05 같은 절대값은 가격이 1 근처일 때만 "라운드 가격"이다(0.002 대에선 격자가 가격의 25배).
+const PRICE_GRIDS: readonly { ticks: number; sizeMult: number; pull: number }[] = [
+  { ticks: 50, sizeMult: 7.0, pull: 0.95 }, // 1.400 / 1.450 — 대형 심리 가격, 두꺼운 벽
+  { ticks: 10, sizeMult: 3.4, pull: 0.85 }, // 1.410 / 1.420
+  { ticks: 5, sizeMult: 1.9, pull: 0.65 }, // 1.405
 ];
 
 /**
@@ -568,12 +575,14 @@ const PRICE_GRIDS: readonly { step: number; sizeMult: number; pull: number }[] =
  */
 function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): { price: number; sizeMult: number } {
   const tol = 0.0009 + depth * 0.0022; // 이만큼 넘게 끌려가야 하면 그 격자는 포기(사다리가 뭉개지지 않게)
+  const tick = virtualTick(target);
   for (const g of PRICE_GRIDS) {
+    const step = g.ticks * tick;
     // ⚠ price/step 을 그냥 floor/ceil 하면 정확히 격자 위에 있는 값이 한 칸 밀린다
     // (1.45/0.0001 = 14499.999999999998). 정수에서 1e-9 이내면 그 정수로 간주해 흡수한다.
-    const ticks = target / g.step;
+    const ticks = target / step;
     const idx = side === 'buy' ? Math.floor(ticks + 1e-9) : Math.ceil(ticks - 1e-9);
-    const snapped = idx * g.step;
+    const snapped = idx * step;
     if (Math.abs(snapped - target) / target > tol) continue;
     if (Math.random() > g.pull * (0.6 + 0.7 * depth)) continue;
     return { price: roundOx(snapped), sizeMult: g.sizeMult };
@@ -697,7 +706,8 @@ function nextMarketState(s: BotState): {
   const revert = -0.045 * stretch - 0.7 * stretch * Math.abs(stretch);
 
   // 5) 라운드넘버 자석 — 심리적 지지/저항 근처에서 잠시 머뭇거린다.
-  const round = Math.round(s.ref / ROUND_STEP) * ROUND_STEP;
+  const roundStep = ROUND_STEP_TICKS * virtualTick(s.ref);
+  const round = Math.round(s.ref / roundStep) * roundStep;
   const toRound = (round - s.ref) / s.ref;
   const magnet = Math.abs(toRound) < 0.004 ? toRound * 0.35 : 0;
 
@@ -804,10 +814,21 @@ async function marketMakerTick(env: Env, pair: string, prev: BotState, now: numb
   // (심리적 벽). 같은 가격으로 두 레벨이 겹치면 원래 목표가로 되돌려 사다리 깊이를 유지한다 —
   // 겹친 채 두면 호가창에 보이는 단계 수가 줄어든다(loadSpotMarket 이 가격별로 SUM 하므로).
   const usedPrices: Record<'buy' | 'sell', Set<number>> = { buy: new Set(), sell: new Set() };
+  // ⚠ 겹칠 땐 **mid 에서 한 틱씩 더 멀리** 민다(예전엔 원래 목표가로 되돌렸다). 유효숫자 4자리 틱은
+  // 가격대에 따라 굵어서(1.05 근처면 0.001) 레벨 간 목표 간격이 한 틱보다 좁아질 수 있고, 그러면
+  // 되돌린 목표가도 이미 쓴 가격이라 사다리가 몇 단계로 뭉개진다.
   const placeQuote = (side: 'buy' | 'sell', target: number, depth: number) => {
     const q = humanQuotePrice(target, side, depth);
-    const price = usedPrices[side].has(q.price) ? roundOx(target) : q.price;
-    const sizeMult = usedPrices[side].has(q.price) ? 1 : q.sizeMult;
+    let price = q.price;
+    let sizeMult = q.sizeMult;
+    if (usedPrices[side].has(price)) {
+      const dir = side === 'buy' ? -1 : 1;
+      let p = price;
+      while (usedPrices[side].has(p) && p > 0) p = roundOx(p + dir * virtualTick(p));
+      if (!(p > 0)) return; // 매수 사다리가 0 아래로 갈 정도면 그 레벨은 그냥 생략
+      price = p;
+      sizeMult = 1;
+    }
     usedPrices[side].add(price);
     (side === 'buy' ? book.bids : book.asks).push({ price, size: humanSize((2000 + Math.random() * 8000) * sizeMult) });
   };
@@ -850,7 +871,10 @@ async function marketMakerTick(env: Env, pair: string, prev: BotState, now: numb
     // 가격에 일어나는데, 그 호가들이 위 humanQuotePrice 로 라운드 가격에 뭉쳐 있기 때문. 테이프만
     // 어중간한 값이면 호가창과 따로 노는 시장으로 보인다. 마지막 체결은 기준가(=종가)와 정확히 일치시킨다.
     const raw = walk * jitter;
-    const snapped = Math.random() < 0.65 ? Math.round(raw / 0.001) * 0.001 : raw;
+    // 스냅 격자는 위 PRICE_GRIDS 의 가장 촘촘한 격자(5틱)와 맞춘다 — 체결은 "거기 걸려 있던 호가"
+    // 가격에 일어나므로 호가 격자와 다르면 테이프만 따로 노는 시장처럼 보인다.
+    const tapeStep = 5 * virtualTick(raw);
+    const snapped = Math.random() < 0.65 ? Math.round(raw / tapeStep) * tapeStep : raw;
     const price = i === nTrades - 1 ? ref : clampToWalls(roundOx(snapped));
     if (i === 0) open = price;
     high = Math.max(high, price);

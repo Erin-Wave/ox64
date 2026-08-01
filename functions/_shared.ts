@@ -59,6 +59,43 @@ export function isVirtualSymbol(s: string): boolean {
   return (VIRTUAL_SYMBOLS as readonly string[]).includes(s);
 }
 
+// ── 가상 코인 호가 단위 = **유효숫자 4자리 고정** ─────────────────────────────
+// ⚠ 예전엔 "소수 4자리 고정"(틱 0.0001)이었다. 그건 가격이 1 USDT 근처일 때만 말이 되는 규칙이라,
+// 봇 가격이 0.002 대로 내려가면 유효숫자가 2자리뿐이라 호가가 뭉텅이로 움직이고(0.0024↔0.0025 =
+// 4% 점프), 반대로 100 USDT 를 넘으면 의미 없는 자릿수(123.4567)가 붙었다. 지금은 실제 거래소처럼
+// **가격 크기에 따라 틱이 10배씩 바뀐다**:
+//   0.9234 → 0.0001 / 0.002434 → 0.000001 / 123.4 → 0.1
+// 서버(봇 기준가·호가 사다리·체결가·유저 지정가/트리거가)와 클라 표시(src/format.ts 의 동일 구현)가
+// 이 규칙을 공유한다 — ⚠ 한쪽만 고치면 "입력한 가격과 다르게 걸린다"가 된다.
+export const VIRTUAL_SIG_DIGITS = 4;
+
+/** 가격의 10 의 지수(유효숫자 반올림 후 기준). `toExponential` 로 뽑아 log10 의 경계 오차를 피한다
+ *  — Math.log10(0.001) 은 -3.0000000000000004 라 floor 가 한 자리 어긋난다. */
+function virtualExp(price: number): number {
+  return Number(Math.abs(price).toExponential(VIRTUAL_SIG_DIGITS - 1).split('e')[1]);
+}
+
+/** 그 가격대의 최소 호가 단위(틱). 예: 0.9234→0.0001, 0.002434→0.000001, 123.4→0.1 */
+export function virtualTick(price: number): number {
+  const p = Math.abs(price);
+  if (!(p > 0) || !isFinite(p)) return 1e-8;
+  return Math.pow(10, virtualExp(p) - (VIRTUAL_SIG_DIGITS - 1));
+}
+
+/** 가격을 유효숫자 4자리로 스냅. 9.9996e-1 처럼 올림으로 자릿수가 넘어가는 경우도 `toExponential`
+ *  이 알아서 1.000e+0 으로 처리하므로 틱이 어긋나지 않는다. */
+export function roundVirtual(price: number): number {
+  if (!isFinite(price) || price === 0) return 0;
+  return Number(price.toExponential(VIRTUAL_SIG_DIGITS - 1));
+}
+
+/** 그 가격대의 소수 자릿수(표시용). 예: 0.9234→4, 0.002434→6, 123.4→1, 12340→0 */
+export function virtualPrecision(price: number): number {
+  const p = Math.abs(price);
+  if (!(p > 0) || !isFinite(p)) return VIRTUAL_SIG_DIGITS;
+  return Math.max(0, VIRTUAL_SIG_DIGITS - 1 - virtualExp(p));
+}
+
 // 캔들 인터벌 코드 → 초 (src/symbols.ts INTERVAL_GROUPS 와 동일한 값을 함수 쪽에 독립 보관).
 const INTERVAL_SEC: Record<string, number> = {
   '1s': 1,

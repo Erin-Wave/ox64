@@ -8,6 +8,35 @@ export function precisionFromTick(tick: number): number {
   return dot < 0 ? 0 : s.length - dot - 1;
 }
 
+// ── 가상 코인(OX/EW) 호가 단위 = **유효숫자 4자리 고정** ──────────────────────
+// ⚠ 서버(functions/_shared.ts 의 virtualTick/roundVirtual/virtualPrecision)와 **같은 규칙의 사본**이다
+// (src/ 는 functions/ 를 import 할 수 없어 intervalSec 과 같은 이유로 값만 독립 보관). 한쪽만 고치면
+// 화면에 보이는 자릿수와 실제 체결 틱이 어긋난다 — 반드시 양쪽을 같이 고칠 것.
+// 예: 0.9234 → 틱 0.0001(4자리) / 0.002434 → 0.000001(6자리) / 123.4 → 0.1(1자리)
+export const VIRTUAL_SIG_DIGITS = 4;
+const virtualExp = (price: number): number =>
+  Number(Math.abs(price).toExponential(VIRTUAL_SIG_DIGITS - 1).split('e')[1]);
+
+/** 그 가격대의 최소 호가 단위(틱). */
+export function virtualTick(price: number): number {
+  const p = Math.abs(price);
+  if (!(p > 0) || !isFinite(p)) return 1e-8;
+  return Math.pow(10, virtualExp(p) - (VIRTUAL_SIG_DIGITS - 1));
+}
+
+/** 가격을 유효숫자 4자리로 스냅(서버가 실제로 받아들이는 값). */
+export function roundVirtual(price: number): number {
+  if (!isFinite(price) || price === 0) return 0;
+  return Number(price.toExponential(VIRTUAL_SIG_DIGITS - 1));
+}
+
+/** 그 가격대의 소수 자릿수(표시용). 0.9234→4, 0.002434→6, 123.4→1, 12340→0 */
+export function virtualPrecision(price: number): number {
+  const p = Math.abs(price);
+  if (!(p > 0) || !isFinite(p)) return VIRTUAL_SIG_DIGITS;
+  return Math.max(0, VIRTUAL_SIG_DIGITS - 1 - virtualExp(p));
+}
+
 /** 심볼 정밀도(prec)에 맞춘 가격 문자열. */
 export function fmtPrice(v: number | null | undefined, prec: number): string {
   if (v == null || !isFinite(v)) return '—';
