@@ -27,7 +27,7 @@
 ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
-├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks=봇 심리상태]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
+├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks=봇 심리상태, +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조(rgb(var(--color-x) / <alpha-value>)) — 실제 값은 src/index.css 테마 블록
 ├── cron/                   ── 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker (메인 Pages 프로젝트와 별도 배포) ──
@@ -346,6 +346,27 @@ ox64/
   (b)체결 테이프는 `TRADE_RETENTION_MS`(6시간)만 보존한다(가끔 도는 틱이 잘라냄). 차트 히스토리는
   `spot_candles` 가 따로 영구 보관하므로 잃는 게 없다. **⚠ 봇 경로에 새 INSERT 를 추가할 땐 "이 행을
   누가 언제 지우는가"를 반드시 같이 정할 것** — 안 정하면 그게 다음 3GB 다.
+- **⚠⚠⚠ 봇 합성 체결 테이프 = `spot_bot_state.tape_json` 링 버퍼(2026-08-01, 실제 $47 청구서를 만든 항목)**:
+  위 (b)로 "쌓이지는" 않게 됐지만 **쓰고 지우는 행 자체가 과금 대상**이라는 걸 놓쳤다. 봇은 한 틱에 3~6건을
+  찍으므로 **초당 ~4.5행이 영구히 INSERT** 되고 6시간 뒤 같은 수만큼 DELETE 됐다 → 실측(`wrangler d1
+  insights`, 2026-08-01) **하루 96만 행 중 76만 행(79%)이 이 테이프**였다(INSERT 51만 + DELETE 25만).
+  근본 원인은 §6 의 원칙 위반 — 이 테이프를 읽는 곳은 (a)호가창 "체결" 탭 최근 30건 (b)`<60s` 캔들
+  버킷팅뿐이고 차트 히스토리는 `spot_candles` 가 따로 보관하므로, **이력 테이블이 아니라 최근 N건짜리 링
+  버퍼**다. 사다리(`book_json`)와 똑같이 상태 행의 JSON 한 칸(`tape_json`, 최근 `TAPE_MAX`=400건,
+  `[[가격,수량,1=매수테이커/0=매도,시각ms],…]`)에 담으니 **봇이 어차피 매 틱 UPDATE 하던 문장에 컬럼
+  하나가 붙을 뿐**이라 테이프 쓰기 비용이 **0**이 되고, 보존기간 DELETE 도 통째로 사라졌다(링 버퍼는 넘치는
+  쪽이 자동으로 잘려나가므로 "누가 언제 지우나" 문제 자체가 없다). **틱당 4행**(상태 1 + 캔들 3)만 남는다.
+  - **⚠ 유저 체결은 계속 `spot_trades` 에 행으로 남긴다** — 사람이 내는 주문은 하루 수백 건 규모라 비용이
+    없고 체결 원장으로서의 가치는 그대로다. 그래서 읽는 쪽(`loadSpotMarket`·`bucketTradesToCandles`)이
+    **테이프와 테이블을 시간순으로 병합**한다(`mergeRecentTrades`). 테이프 항목엔 행 id 가 없어 `t<시각>-<i>`
+    합성 키를 준다(리스트 렌더 key 용도). **새 체결 경로를 추가할 때: 봇이 만드는 것이면 테이프에, 유저
+    것이면 테이블에.**
+  - `<60s`(1s) 캔들이 볼 수 있는 과거 범위가 링 버퍼 길이(≈90초)로 제한된다 — `<60s` 는 애초에 과거
+    페이지가 없고(`loadSpotCandles` 가 `endTime` 에 빈 배열 반환) 기본 표시가 ~38봉이라 실사용 영향은 없다.
+    더 길게 보여주고 싶으면 `TAPE_MAX` 만 올리면 된다(**행 수가 아니라 바이트만 늘어 과금과 무관**).
+  - cron 버스트는 테이프를 시작에 한 번 읽어 틱 사이에 메모리로 이어받는다. cron 과 유저 폴링 틱이 겹치면
+    뒤에 쓴 쪽이 상대의 append 를 덮어쓸 수 있는데, 잃는 건 **표시용 테이프 몇 건**뿐이다(캔들·기준가·
+    잔고·재고는 각자 자기 문장으로 쓴다).
 - **⚠ 봇 거래량(한 틱=버스트) + 접속 무관 활성화(cron 버스트)**: 예전엔 한 틱에 5~45 짜리 합성체결 1건이라
   캔들 거래량이 ~300 에 그쳐 "봇이 쫄보"였고, 게다가 마켓메이커는 `/api/spot` 폴링(=유저가 OX 를 볼 때)
   으로만 돌아서 **아무도 안 켜놓으면 cron(예전 5분) 때만 1틱** → 차트가 사실상 멈췄다. 수정:
@@ -525,21 +546,44 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - **⚠ 격자 스냅 부동소수 함정(가격이 한 틱 밀리는 버그)**: `Math.floor(price / step) * step` 은 **정확히 격자 위에 있는 가격을 한 칸 아래로 떨어뜨린다** — `1.45/0.0001 = 14499.999999999998`, `2.3/0.01 = 229.99999999999997` 이라 floor 가 한 칸 작은 정수를 준다. 그래서 유저가 1.45 에 건 주문이 호가창에 1.4499 로 표시됐다("분명 1.1 에 올렸는데 미세하게 다르게 올라간다"던 버그). 격자 연산은 **나눈 값이 정수에서 1e-9 이내면 그 정수로 간주**하고(`OrderBook.snapToGrid` / `spot.ts humanQuotePrice`) 곱한 뒤 `toFixed` 로 자릿수를 정리할 것.
 - **⚠ 캔들 조회는 마켓메이커를 굴리지 않는다**: `/api/spot?candles=1` 은 차트가 읽어가는 조회일 뿐이라 봇 틱을 돌리지 않는다(시장 클럭은 호가창 폴링 `useSpotPoll` 만 담당). 가상 코인이 둘이 된 뒤 **심볼 드롭다운이 코인마다 24h 변동률용 캔들을 5초 주기로 긁으므로**(`SymbolSelect`), 예전처럼 두면 드롭다운을 열어둔 것만으로 코인 수 × 요청 수만큼 봇이 돌아간다 — 코인 수에 비례해 늘어나는 바로 그 낭비다.
 - **⚠ 봇 실패를 조용히 삼키지 말 것**: `/api/spot` 의 `runMarketMaker` 호출은 실패해도 유저 요청을 막지 않게 try/catch 로 감싸는데, 예전엔 **완전히 무시**해서 봇이 죽어도 화면상 멀쩡해 보였다(로컬에서 `spot_bot_state` 컬럼 마이그레이션 누락으로 배치가 통째로 롤백되는데 옛 호가가 남아 정상처럼 보임 → 원인 찾는 데 한참 걸림). 지금은 `console.error` 로 남긴다(`wrangler tail` 로 확인).
-- **⚠⚠ D1 예산 — 새 기능을 얹기 전에 여기부터 볼 것**(2026-07-31 실측). 이 사이트는 **Workers Paid**
-  플랜이다(무료였다면 DB당 500MB 한도에서 이미 죽었다). 걸리는 한도는 CPU 가 아니라 이 셋이다:
-  | 한도 | 값(Paid) | 현재 |
+- **⚠⚠⚠ D1 예산 — 새 기능을 얹기 전에 여기부터 볼 것. 실제로 돈이 청구된 적이 있다.**
+  **2026-08-01 사건: 7월분 청구서 $47** — 전액 **D1 Rows Written 초과분**($1/100만 행, 5,000만 행 포함).
+  즉 7월에 **9,700만 행**을 썼다. 7/24 에 포함분을 다 쓰고 그때부터 하루 $5~9(=500~900만 행/일)씩 붙었다.
+  이 사이트는 **Workers Paid($5/월)** 플랜이고 **그 이상은 용납 안 된다**(유저 방침) — 아래 셋 중 하나라도
+  넘기면 곧바로 초과 과금이므로, 쓰기 경로를 추가할 땐 반드시 "이게 하루 몇 행인가"를 먼저 계산할 것.
+  | 한도 | 값(Paid) | 현재(2026-08-01) |
   | --- | --- | --- |
-  | DB당 최대 크기 | **10 GB** | 3.38 GB (한도 도달 시 **쓰기 거부 = 서비스 정지**) |
-  | Worker invocation 1회당 D1 쿼리 | **1,000** | cron 1회 ≈ **950** (틱당 ~73 × 12틱 + sweep) |
-  | 월 rows written | 5,000만 포함(+$1/100만) | 약 6,500만/월 |
-  - **비용의 주인은 봇이다** — 유저 13명이 아니라 분당 12틱 도는 마켓메이커가 쓰기·용량의 95%를 만든다.
-    실제 코인 38종은 봇이 없어 사실상 공짜고, **비용은 "가상 코인 개수 = 돌리는 봇 개수"에 비례**한다.
-  - 그래서 **가상 코인을 늘리려면 코인 수만큼 틱을 곱하면 안 된다** — 위 "쿼리 1,000" 이 먼저 터진다
-    (코인 2개면 ~1,900). 총 틱 예산을 코인들이 나눠 갖고, 활성(누가 보고 있거나 포지션·미체결이 걸린)
-    코인에 몰아주는 방식이어야 한다.
-  - 점검 명령(전체 스캔 없이 싸게): `npx wrangler d1 execute ox64 --remote --json --command "SELECT
-    (SELECT MAX(rowid) FROM spot_orders) so, (SELECT MAX(rowid) FROM spot_trades) st"` → 응답 `meta.size_after`
-    가 현재 DB 바이트 크기다. ⚠ `COUNT(*)`/`GROUP BY` 는 수천만 행 풀스캔이라 30초 쿼리 한도에 걸린다.
+  | 월 rows written | 5,000만 포함(+$1/100만) | **약 600만/월** (개선 전 2,900만 → 사건 당시 9,700만) |
+  | DB당 최대 크기 | **10 GB** | **15 MB** (7/31 정리로 3.38GB → 회수됨) |
+  | Worker invocation 1회당 D1 쿼리 | **1,000** | cron 1회 ≈ 400 |
+  - **⚠ 과금 단위는 "문장 수"가 아니라 "행 수"다** — 그리고 **INSERT 1건 = `2 + 인덱스 수` 행**이다
+    (실측: 인덱스 1개인 `spot_trades` 3행, 2개인 `fee_ledger`·구 `spot_orders` 4행. UPDATE 는 인덱스
+    컬럼을 안 건드리면 1행, DELETE 는 지운 행 수만큼). 그래서 **인덱스를 하나 더 다는 것은 그 테이블의
+    모든 INSERT 비용을 +33% 하는 결정**이고, "행 하나 INSERT 하고 나중에 DELETE" 는 왕복 ~4.5행이다.
+  - **비용의 주인은 봇이다** — 유저 13명이 아니라 **분당 24틱 이상 영구히 도는 마켓메이커**가 쓰기의
+    95%를 만든다. 실제 코인 38종은 봇이 없어 사실상 공짜다. 그래서 판단 기준은 딱 하나:
+    **"봇이 틱마다 남기는 행이 몇 개인가"**. 지금은 **틱당 4행**(상태 1 + 캔들 3)까지 내려왔다.
+  - **⚠ 봇 경로에서 "행을 남기는" 설계 자체를 피할 것**: 매 틱 통째로 교체되는 스냅샷(호가 사다리,
+    체결 테이프)은 **이력이 아니라 링 버퍼**이므로 행으로 쪼개면 안 된다 — 이미 UPDATE 하고 있는 상태
+    행의 JSON 칸에 담으면 **쓰기 비용이 0**이다(rows written 은 행 수만 세고 바이트는 세지 않는다).
+    이 원칙을 두 번 위반해서 두 번 터졌다: `spot_orders` 사다리 44행/틱(7/31 수정, DB 3.38GB + 쿼리
+    한도 950), `spot_trades` 합성 체결 4.5행/틱(8/01 수정, 하루 76만 행 = 전체의 79%).
+  - 그래서 **가상 코인을 늘리려면 코인 수만큼 틱을 곱하면 안 된다** — 총 틱 예산(`MM_TICK_BUDGET`)을
+    코인들이 나눠 갖고, 유저가 보고 있는 코인은 폴링이 클럭이 되므로 cron 이 물러난다(`POLL_ACTIVE_MS`).
+  - **⚠ 남은 유일한 무한 쓰기 경로 = `continuous` 무한 조건부 주문**(§4). 폴링마다 1회 체결이고 한 체결이
+    ~18행(users 1 + positions 3 + orders 3 + fee_ledger 4 + conditional 1 + 체결/캔들 등)이라, **하나만
+    걸어둬도 하루 150만 행 = 월 4,500만 행**으로 그것만으로 포함분을 거의 다 먹는다. `cooldown_ms`/
+    `max_fills` 를 안 걸고 오래 돌리지 말 것(UI 경고 문구 유지).
+  - **⚠ 정기 점검(매달 1회 + 봇 경로를 건드린 직후) — 추측하지 말고 이걸로 실측한다**:
+    ```bash
+    npx wrangler d1 insights ox64 --sort-by writes --count 15 --timePeriod 1d --json
+    ```
+    쿼리별 `totalRowsWritten`/`numberOfTimesRun` 이 그대로 나온다. **합계가 하루 160만 행을 넘으면 그
+    페이스로 월 포함분(5,000만)을 넘긴다** — 상위 항목이 곧 원인이다. `--timePeriod 7d` 로 추세를 본다.
+    (DB 크기는 아무 쿼리의 응답 `meta.size_after` 가 바이트로 알려준다. ⚠ `COUNT(*)`/`GROUP BY` 는
+    큰 테이블 풀스캔이라 30초 쿼리 한도에 걸리니 크기 확인엔 쓰지 말 것.)
+    Cloudflare 쪽엔 D1 지출 상한(hard cap) 기능이 없다 — **예산 알림(Budget alert)은 사후 통보일 뿐이고,
+    실제 방어는 코드에서만 가능하다.**
 
 ## 7. 퍼즐게임 (ox64.app/b, `functions/api/puzzle.ts` + `src/puzzle/`)
 
@@ -619,8 +663,10 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   (D1·Pages·기존 cron 워커는 전부 무료 플랜으로 충분했던 것과 다름). 대신 기존 OX 마켓메이커
   (`useSpotPoll`)와 완전히 같은 "D1 + 짧은 폴링" 패턴을 재사용해 무료 플랜을 유지하고 새 인프라
   없이(같은 Pages 배포 안에서) 구현했다.
-  **⚠ 정정(2026-07-31): 이 계정은 실제로는 Workers Paid 다** — prod D1 이 3.38GB 인데 무료 플랜은
-  DB당 500MB 한도라 애초에 불가능하고, 쓰기도 무료 한도(10만/일)의 20배가 나가고 있다(§6 "D1 예산").
+  **⚠ 정정(2026-07-31): 이 계정은 실제로는 Workers Paid 다** — 당시 prod D1 이 3.38GB 였는데 무료 플랜은
+  DB당 500MB 한도라 애초에 불가능하고, 쓰기도 무료 한도(10만/일)의 20배가 나가고 있었다(§6 "D1 예산").
+  실제로 7월분 **$47 이 D1 rows written 초과로 청구됐다** — 그 이후 봇 쓰기를 틱당 4행까지 줄여 월 600만
+  행(포함분 5,000만)으로 내려왔고, DB 도 15MB 로 회수됐다. 폴링 간격을 줄이려면 §6 을 먼저 읽을 것.
   즉 **Durable Objects 를 쓸 수 있다**. 위 "무료 플랜 유지" 는 당시의 (틀린) 전제였을 뿐이고, 지금도
   D1+폴링을 유지하는 이유는 비용이 아니라 "이미 잘 돌고 새 인프라·배포가 안 늘어난다" 쪽이다. 모든 액션(POST)은 자기 응답으로 즉시 상태를 갱신하므로
   (폴링을 기다리지 않음 — 트레이딩 스토어와 동일) 폴링 지연은 "남이 한 일이 내 화면에 보이기까지"
@@ -825,7 +871,9 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - [x] **DB 무한 증식 차단(2026-07-31, ①③)** — 재호가가 옛 봇 호가를 `status='cancelled'` 로 마킹만 하고 안 지워 prod `spot_orders` 가 **1,358만 행**(하루 +86만), `spot_trades` 는 영구 보존이라 157만 행 → **DB 3.38GB / +200MB일, 10GB 한도까지 한 달** 남은 상태였다. 재호가를 `DELETE FROM spot_orders WHERE pair=?` 로 바꾸고(체결로 `filled` 이 된 행까지 청소) 체결 테이프는 6시간만 보존(`TRADE_RETENTION_MS`, 차트 히스토리는 `spot_candles` 가 영구 보관). 로컬 검증: 18회 폴링 동안 `spot_orders` 가 44행에 **고정**(이전엔 틱마다 +44), 취소 잔재 0, 호가창/체결/캔들 정상. 기존 누적분은 일회성 정리(schema.sql 2026-07-31 블록)
 - [x] **봇 비용 구조 재설계 — 가상 코인 확장의 전제(2026-07-31, ②④⑤⑥)** — ①③ 으로 용량은 잡았지만 **틱당 문장 수**가 그대로여서 (a)월 rows written 포함분 초과 (b)**cron 1회가 D1 쿼리 한도(1,000)의 950** 이라 코인을 하나도 더 못 늘리는 상태였다. ②봇 사다리 44행을 `spot_bot_state.book_json` 한 칸으로(재호가 문장 45→**0**, 매칭은 `parseBook`/`makerLevels` 로 메모리 walking + `book_version` 낙관적 가드, `matchLimitPendingAgainstBook` 의 최대 500회 왕복 루프와 `recordVirtualFill` 의 50회 루프도 스냅샷 방식으로 통일 + pending claim-first 로 이중체결 방지, `spot_orders` 폐기) ④캔들 저장을 15종→**1m/1h/1d 3종**만 하고 나머지는 조회 시 롤업 ⑤봇 `fee_ledger` 행 제거 + 봇 부기 3문장→1문장 ⑥틱 예산을 코인 수로 나누고(`MM_TICK_BUDGET`) 유저가 보고 있으면 cron 이 물러남(`POLL_ACTIVE_MS`). **틱당 문장 ~70 → ~11**. 로컬 D1 검증: 시장가 진입/부분청산/전량청산/지정가 대기·즉시체결/지정가청산(reduce-only)/SL 히트/100만개 합성흡수 전부 정상, 호가창에 내 주문 표시·봇 재고 정확 상쇄(진입 −4000 → 청산 +4000)·`spot_orders` 0행·에러 0
 - [x] **가상 코인 호가 단위를 유효숫자 4자리로 고정** — 소수 4자리 절대 고정(틱 0.0001)이라 저가에선 호가가 뭉텅이로 튀고 고가에선 의미 없는 자릿수가 붙던 것을, 가격대에 따라 틱이 10배씩 바뀌는 방식으로 교체(`_shared.roundVirtual`/`virtualTick`/`virtualPrecision`). 가격 격자·자석·테이프 스냅 상수를 전부 "틱 개수"로 바꾸고, 사다리 겹침을 한 틱씩 밀어 해소. 클라 표시 자릿수도 가격에서 파생
-- [ ] 가상 코인 2종 이상 실제 추가 — `spot.ts` `PAIR` 상수 파라미터화(48곳) + 봇 재고를 페어별로 분리(`users.ox_balance` 단일 컬럼 → 페어별 테이블) + `VIRTUAL_SYMBOLS`/`SymbolSelect` 확장. 비용 구조는 위에서 이미 정리됨
+- [x] **봇 체결 테이프를 링 버퍼 한 칸으로 — 실제 $47 청구서의 원인 제거(2026-08-01)** — 7월분 청구서 **$47 이 전액 D1 Rows Written 초과**(9,700만 행/월, 포함분 5,000만)로 나왔다. `wrangler d1 insights` 로 실측하니 **하루 96만 행 중 76만(79%)이 봇 합성 체결**이었다 — 한 틱에 3~6건을 `spot_trades` 에 INSERT(초당 ~4.5행, D1 은 INSERT 를 "2+인덱스 수" 행으로 센다) 하고 6시간 뒤 같은 수를 DELETE 하는 구조. 7/31 에 사다리를 JSON 한 칸으로 옮긴 것과 **정확히 같은 실수를 테이프에서 반복**한 것(매 틱 통째로 교체되는 스냅샷을 행으로 쪼갬). `spot_bot_state.tape_json`(최근 400건 링 버퍼)로 옮겨 봇이 어차피 쓰던 상태 UPDATE 에 컬럼 하나만 붙이니 **테이프 쓰기 0행 + 보존기간 DELETE 소멸 → 틱당 4행**(상태 1 + 캔들 3), **월 2,900만 → 약 600만 행**(포함분의 12%). 유저 체결은 계속 테이블에 남기고 읽는 쪽이 병합(`mergeRecentTrades`). 로컬 D1 검증: cron 4회(16라운드) 동안 `spot_trades` **0행 증가**(이전 같은 조건 ~430행), 테이프 122건/3.5KB, 호가창 체결 30건 DESC·고유 key, 1s 캔들 버킷팅·1m 영속 캔들·유저 진입(테이블 1행 추가 후 병합 표시)·전량 청산 전부 정상. §6 에 과금 모델(INSERT=2+인덱스)·월 점검 명령·"봇 경로에 행을 남기지 말 것" 원칙을 못박음
+- [ ] `continuous` 무한 조건부의 쓰기 상한 — 하나만 걸어둬도 체결당 ~18행 × 하루 8.6만 회 = **월 4,500만 행**으로 포함분을 거의 다 먹는다(§6). `cooldown_ms` 하한 또는 일일 실행 상한이 필요한지 결정할 것(기능 동작이 바뀌는 사안이라 사용자 확인 필요)
+- [ ] 가상 코인 3종 이상 추가 — 페어 파라미터화·봇 재고 분리는 끝났고(`VIRTUAL_PAIRS`/`bot_inventory`) `VIRTUAL_SYMBOLS`+`spot_bot_state` 시작가 행만 추가하면 된다. 틱 예산은 코인 수로 나눠 쓰므로 비용은 안 늘지만 코인당 움직임이 성겨진다
 - [ ] 미니 RTS 확장(종족 추가, 유닛 다양화, 난이도 선택, 리플레이)
 - [ ] 펀딩비 반영
 - [ ] 랭킹 새로고침 최적화(현재 5초 폴링 → 서버 캐시/집계)

@@ -162,7 +162,13 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   -- ⚠ 봇 호가 사다리 전체가 이 한 칸이다(예전엔 spot_orders 44행). {"o":액터봇,"b":[[가격,수량]..],"a":[..]}
   -- 매 재호가마다 통째로 교체되고, 유저 체결이 물량을 깎으면 book_version 가드로 되쓴다(§ BotBook).
   book_json    TEXT,
-  book_version INTEGER NOT NULL DEFAULT 0     -- 낙관적 동시성 — 재호가와 소비가 서로를 덮어쓰지 않게
+  book_version INTEGER NOT NULL DEFAULT 0,    -- 낙관적 동시성 — 재호가와 소비가 서로를 덮어쓰지 않게
+  -- ⚠ 봇 합성 체결 테이프(최근 400건 링 버퍼). 예전엔 이걸 spot_trades 에 행으로 넣어 **하루 76만
+  -- rows written(전체의 79%)** 을 먹었다(초당 ~4.5건 INSERT + 6시간 뒤 같은 수만큼 DELETE) — 실제로
+  -- 읽는 건 최근 30건과 <60s 캔들 버킷팅뿐이고 차트 히스토리는 spot_candles 가 보관하므로, 이력이
+  -- 아니라 링 버퍼다. 사다리와 같이 이 행에 담으면 쓰기 비용이 0 이 된다(§ 봇 합성 체결 테이프).
+  -- 형식: [[가격, 수량, 1=매수테이커/0=매도, 시각ms], ...]. 유저 체결은 계속 spot_trades 에 남는다.
+  tape_json    TEXT
 );
 
 -- 가상 코인 시작가 — 이 행이 있어야 그 페어의 봇이 돈다(functions/api/spot.ts VIRTUAL_PAIRS 와 짝).
@@ -332,6 +338,13 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- 먼저 적용돼 있어야 한다**. 이미 실행했다면 "duplicate column name" 에러(무시 가능). prod 적용 완료.
 -- ALTER TABLE spot_bot_state ADD COLUMN book_json TEXT;
 -- ALTER TABLE spot_bot_state ADD COLUMN book_version INTEGER NOT NULL DEFAULT 0;
+
+-- ⚠ 일회성 마이그레이션 (2026-08-01 추가, 봇 체결 테이프를 링 버퍼 한 칸으로 = D1 과금 79% 제거):
+-- 기존 prod DB 의 spot_bot_state 에 컬럼을 추가한다. **코드(marketMakerTick 이 이 컬럼을 UPDATE, 호가창/
+-- 캔들 경로가 SELECT)가 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다** — 없으면 봇 batch 가 통째로
+-- 실패해 시장이 멈춘다. 값이 NULL 이어도 읽기는 빈 테이프로 방어된다(parseTape). 이미 실행했다면
+-- "duplicate column name" 에러(무시 가능).
+-- ALTER TABLE spot_bot_state ADD COLUMN tape_json TEXT;
 
 -- ⚠ 마이그레이션 (2026-07-31 추가, 가상 코인 2종 = OX/USDT + EW/USDT): `bot_inventory` 는 신규 테이블이라
 -- `--file=./schema.sql` 재적용만으로 생성되지만, **기존 봇 재고(users.ox_balance)를 OXUSDT 행으로 옮기는

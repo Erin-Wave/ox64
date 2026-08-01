@@ -135,17 +135,26 @@ function candleUpsertOne(env: Env, pair: string, price: number, size: number, no
   return candleUpsertStmts(env, pair, { open: price, high: price, low: price, close: price, volume: size }, now);
 }
 
-/** 최신 spot_trades 를 interval 버킷으로 묶어 OHLCV 를 만든다(1s 등 단기 인터벌 + 영속 캔들 폴백 전용).
- * ⚠ 반드시 "가장 최신" 5000건(DESC 로 뽑아 ASC 재정렬) — ASC LIMIT 이면 총 거래가 5000건을 넘는 순간
- * 새 거래가 창 밖으로 밀려 차트 마지막 봉이 멈춘다. */
+/** 최근 체결을 interval 버킷으로 묶어 OHLCV 를 만든다(1s 등 단기 인터벌 + 영속 캔들 폴백 전용).
+ * ⚠ 봇 합성 체결은 이제 테이블이 아니라 상태 행의 링 버퍼(tape_json)에 있다(§ 봇 합성 체결 테이프) —
+ * 유저 체결(spot_trades)과 병합해서 버킷팅한다. 그래서 이 함수가 볼 수 있는 과거 범위는 링 버퍼 길이
+ * (TAPE_MAX ≈ 90초)로 제한되는데, <60s 인터벌은 애초에 과거 페이지가 없고(loadSpotCandles) 기본
+ * 표시가 ~38봉이라 실사용엔 영향이 없다.
+ * ⚠ 유저 체결 쪽은 반드시 "가장 최신"부터(DESC 로 뽑아 ASC 재정렬) — ASC LIMIT 이면 행이 한도를 넘는
+ * 순간 새 거래가 창 밖으로 밀려 차트 마지막 봉이 멈춘다. */
 async function bucketTradesToCandles(env: Env, pair: string, bucketMs: number, limit: number) {
-  const trades = (
-    await env.DB.prepare(
-      'SELECT price, size, created_at FROM (SELECT price, size, created_at FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 5000) ORDER BY created_at ASC',
+  const [stateRow, userRows] = await Promise.all([
+    env.DB.prepare('SELECT tape_json FROM spot_bot_state WHERE id = ?').bind(pair).first<{ tape_json: string | null }>(),
+    env.DB.prepare(
+      'SELECT price, size, created_at FROM (SELECT price, size, created_at FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 2000) ORDER BY created_at ASC',
     )
       .bind(pair)
-      .all<{ price: number; size: number; created_at: number }>()
-  ).results;
+      .all<{ price: number; size: number; created_at: number }>(),
+  ]);
+  const trades = [
+    ...parseTape(stateRow?.tape_json).map((t) => ({ price: t.price, size: t.size, created_at: t.createdAt })),
+    ...userRows.results,
+  ].sort((a, b) => a.created_at - b.created_at);
   if (trades.length === 0) return [];
 
   const buckets = new Map<number, { open: number; high: number; low: number; close: number; volume: number }>();
@@ -280,10 +289,11 @@ function makerLevels(book: BotBook, makerSide: 'buy' | 'sell', limitPrice: numbe
   return sorted.filter((l) => (makerSide === 'sell' ? l.price <= limitPrice : l.price >= limitPrice));
 }
 
-const BOOK_COLS = 'book_json, book_version';
+const BOOK_COLS = 'book_json, book_version, tape_json';
 interface BookRow {
   book_json: string | null;
   book_version: number;
+  tape_json: string | null;
 }
 
 /** 소비한 사다리를 되쓴다. ⚠ `book_version` 가드 — 그 사이 재호가가 새 사다리를 깔았으면 0행이 되어
@@ -292,6 +302,81 @@ interface BookRow {
 function bookWriteStmt(env: Env, pair: string, book: BotBook, version: number): D1PreparedStatement {
   return env.DB.prepare('UPDATE spot_bot_state SET book_json=?, book_version=book_version+1 WHERE id=? AND book_version=?')
     .bind(serializeBook(book), pair, version);
+}
+
+// ── 봇 합성 체결 테이프 = spot_bot_state.tape_json 한 칸(2026-08-01, § D1 예산) ──────────
+// ⚠⚠ **D1 청구서의 유일한 항목은 "rows written" 이고, 그 79% 가 이 테이프였다.** 실측
+// (`npx wrangler d1 insights ox64 --sort-by writes --timePeriod 1d`, 2026-08-01): 하루 96만 행 중
+// `spot_trades` INSERT 51만 + 보존기간 DELETE 25만 = **76만 행**. 원인은 튜닝이 아니라 구조다 — 봇은
+// 분당 24틱 이상을 영구히 돌고 한 틱이 3~6건을 찍으므로 **초당 ~4.5행이 영원히 INSERT** 되고, 6시간 뒤
+// 같은 수만큼 DELETE 된다. D1 은 INSERT 를 "2 + 인덱스 수" 행으로 세므로(실측: spot_trades 3, 인덱스
+// 2개인 fee_ledger 4) 체결 한 건의 생애비용이 ~4.5 rows written 이다.
+//
+// 그런데 이 테이프를 실제로 읽는 곳은 (a)호가창 "체결" 탭 최근 30건 (b)1s 등 <60s 캔들 버킷팅뿐이고,
+// 차트 히스토리는 `spot_candles` 가 따로 영구 보관한다 → 이건 **이력 테이블이 아니라 최근 N건짜리 링
+// 버퍼**다. 행으로 쪼갤 이유가 없으므로 `book_json` 과 똑같이 상태 행의 JSON 한 칸에 담는다: 봇이 어차피
+// 매 틱 UPDATE 하던 행이라 **테이프의 쓰기 비용이 통째로 0** 이 된다(rows written 은 행 수만 세고 바이트는
+// 세지 않으므로, 10KB JSON 을 매 틱 덮어써도 1행이다). 보존기간 DELETE 도 함께 사라진다(링 버퍼는 넘치는
+// 쪽이 자동으로 잘려나가므로 "누가 이 행을 지우는가" 문제 자체가 없다 — § 봇이 만드는 행은 쌓이면 안 된다).
+//
+// ⚠ **유저 체결은 계속 `spot_trades` 에 남긴다** — 사람이 내는 주문은 하루 수백 건 규모라 비용이 없고,
+// 체결 원장으로서의 가치(누가 언제 무엇을)는 그대로다. 그래서 읽는 쪽은 **둘을 시간순으로 병합**한다
+// (`mergeRecentTrades`). 새 체결 경로를 추가할 때: 봇이 만드는 것이면 테이프에, 유저 것이면 테이블에.
+export interface TapeTrade {
+  price: number;
+  size: number;
+  takerSide: 'buy' | 'sell' | null;
+  createdAt: number;
+}
+
+// 링 버퍼 길이 — 1s 캔들이 이 테이프를 버킷팅해 만들어지므로 "몇 초치까지 그릴 수 있나"를 정한다.
+// 봇이 초당 ~4.5건을 찍으므로 400건 ≈ 90초 ≈ 1s 봉 90개(차트 기본 표시가 ~38봉이라 넉넉하다. <60s 는
+// 애초에 과거 페이지가 없어 스크롤로 더 받아올 수도 없다 — loadSpotCandles 참고).
+// ⚠ 늘려도 rows written 은 그대로 1행이지만(비용 무관) 매 틱 직렬화/파싱하는 바이트가 커진다.
+const TAPE_MAX = 400;
+
+/** JSON → 테이프. 컬럼이 비었거나(마이그레이션 직후) 깨졌으면 빈 배열 — 봇이 다음 틱부터 다시 채운다. */
+function parseTape(json: string | null | undefined): TapeTrade[] {
+  if (!json) return [];
+  try {
+    const arr = JSON.parse(json) as [number, number, number, number][];
+    if (!Array.isArray(arr)) return [];
+    return arr.map(([price, size, taker, createdAt]) => ({
+      price,
+      size,
+      takerSide: taker === 1 ? 'buy' : taker === 0 ? 'sell' : null,
+      createdAt,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** 테이프 → JSON(최근 TAPE_MAX 건만). 배열의 배열로 담아 키 이름이 매 건 반복되지 않게 한다. */
+function serializeTape(trades: TapeTrade[]): string {
+  return JSON.stringify(
+    trades.slice(-TAPE_MAX).map((t) => [t.price, t.size, t.takerSide === 'buy' ? 1 : t.takerSide === 'sell' ? 0 : -1, t.createdAt]),
+  );
+}
+
+/** 표시·버킷팅용 최근 체결 = 봇 테이프(JSON) + 유저 체결(spot_trades) 을 시간순으로 병합.
+ * ⚠ 테이프 항목엔 행 id 가 없으므로 (시각, 가격) 으로 합성 키를 만든다 — 리스트 렌더 key 용도라 유일하면 된다. */
+function mergeRecentTrades(
+  tape: TapeTrade[],
+  userRows: SpotTradeRow[],
+  limit: number,
+): { id: string; price: number; size: number; takerSide: 'buy' | 'sell' | null; createdAt: number }[] {
+  const merged = [
+    ...tape.map((t, i) => ({ id: `t${t.createdAt}-${i}`, price: t.price, size: t.size, takerSide: t.takerSide, createdAt: t.createdAt })),
+    ...userRows.map((r) => ({
+      id: r.id,
+      price: r.price,
+      size: r.size,
+      takerSide: (r.taker_side as 'buy' | 'sell' | null) ?? null,
+      createdAt: r.created_at,
+    })),
+  ];
+  return merged.sort((a, b) => b.createdAt - a.createdAt).slice(0, limit);
 }
 
 /** 호가창·체결내역 "표시용" 데이터 — 특정 유저의 개인 데이터가 아니라 시장 전체를 보여준다.
@@ -336,17 +421,11 @@ async function loadSpotMarket(env: Env, uid: string, pair: string) {
   };
   const bids = merge(book.bids, 'long', true);
   const asks = merge(book.asks, 'short', false);
-  const trades = tradeRows.results;
 
   return {
     book: { bids, asks },
-    trades: trades.map((t) => ({
-      id: t.id,
-      price: t.price,
-      size: t.size,
-      takerSide: t.taker_side,
-      createdAt: t.created_at,
-    })),
+    // 봇 합성 체결은 상태 행의 링 버퍼(tape_json), 유저 체결은 테이블 — 시간순으로 합쳐 최근 30건.
+    trades: mergeRecentTrades(parseTape(stateRow?.tape_json), tradeRows.results, 30),
   };
 }
 
@@ -744,7 +823,13 @@ function nextMarketState(s: BotState): {
  * 심리 모델을 한 스텝 굴려 다음 상태를 반환. now 는 이 틱의 기준 시각(항상 현재 이후 — 과거면 마감된
  * 봉이 변조된다). 심리 상태는 갱신하지만 last_run 은 건드리지 않는다(게이트는 호출자 담당).
  */
-async function marketMakerTick(env: Env, pair: string, prev: BotState, now: number): Promise<BotState> {
+async function marketMakerTick(
+  env: Env,
+  pair: string,
+  prev: BotState,
+  now: number,
+  prevTape: TapeTrade[],
+): Promise<{ next: BotState; tape: TapeTrade[] }> {
   const step = nextMarketState(prev);
   const candidateRef = step.next.ref;
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
@@ -863,6 +948,9 @@ async function marketMakerTick(env: Env, pair: string, prev: BotState, now: numb
   let high = ref;
   let low = ref;
   let open = ref;
+  // 이번 틱의 체결은 행이 아니라 링 버퍼에 얹힌다(§ 봇 합성 체결 테이프). 호출자가 준 배열을 복사해
+  // 쓰는 이유: 이 batch 가 실패하면 호출자의 테이프가 오염되지 않아야 다음 틱이 깨끗한 상태로 재시도한다.
+  const tape = prevTape.slice();
   for (let i = 0; i < nTrades; i++) {
     const progress = (i + 1) / nTrades;
     const walk = prev.ref + (ref - prev.ref) * progress;
@@ -886,19 +974,17 @@ async function marketMakerTick(env: Env, pair: string, prev: BotState, now: numb
     volume += sz;
     notionalSum += price * sz;
 
-    const takerSide = Math.random() < step.buyProb ? 'buy' : 'sell';
-    stmts.push(
-      env.DB.prepare(
-        'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), pair, actor, actor, price, sz, takerSide, now + i),
-    );
+    const takerSide: 'buy' | 'sell' = Math.random() < step.buyProb ? 'buy' : 'sell';
+    tape.push({ price, size: sz, takerSide, createdAt: now + i });
   }
   const next: BotState = { ...step.next, ref };
-  // 심리 상태 + **새 사다리**를 한 문장으로. book_version 을 올려 이 순간 진행 중이던 소비(bookWriteStmt)가
-  // 옛 사다리로 덮어쓰지 못하게 한다.
+  // 심리 상태 + **새 사다리 + 체결 테이프**를 한 문장으로 — 이 세 가지가 봇이 매 틱 만드는 전부이고,
+  // 전부 "매 틱 통째로 교체되는 스냅샷"이라 한 행에 담는 게 맞다(§ BotBook, § 봇 합성 체결 테이프).
+  // 그래서 **한 틱의 쓰기 비용이 이 1행 + 캔들 3행뿐**이다. book_version 을 올려 이 순간 진행 중이던
+  // 소비(bookWriteStmt)가 옛 사다리로 덮어쓰지 못하게 한다.
   stmts.push(
     env.DB.prepare(
-      'UPDATE spot_bot_state SET ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, book_json=?, book_version=book_version+1 WHERE id=?',
+      'UPDATE spot_bot_state SET ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, book_json=?, tape_json=?, book_version=book_version+1 WHERE id=?',
     ).bind(
       next.ref,
       next.drift,
@@ -908,12 +994,15 @@ async function marketMakerTick(env: Env, pair: string, prev: BotState, now: numb
       next.regime,
       next.regimeTicks,
       serializeBook(book),
+      serializeTape(tape),
       pair,
     ),
   );
-  // 영속 캔들: 이 틱이 찍은 체결들의 OHLCV 로 1회 갱신(위 spot_trades 들과 정확히 일치해야 한다).
+  // 영속 캔들: 이 틱이 찍은 체결들의 OHLCV 로 1회 갱신(위 테이프에 얹은 체결들과 정확히 일치해야 한다).
   stmts.push(...candleUpsertStmts(env, pair, { open, high, low, close: ref, volume }, now));
-  // 보존 기간을 넘긴 옛 체결 정리(같은 batch — 왕복 추가 없음). 위 TRADE_RETENTION_MS 주석 참고.
+  // 보존 기간을 넘긴 옛 체결 정리(같은 batch — 왕복 추가 없음). 봇 체결이 테이프로 옮겨간 뒤로는
+  // **유저 체결만** 남으므로 지울 게 거의 없다 — 그래도 남겨두는 이유는 이 테이블이 다시 무한히 자라지
+  // 않게 하는 보험이다(§ 봇이 만드는 행은 쌓이면 안 된다). 배포 직후엔 옛 봇 체결을 이게 걷어낸다.
   if (Math.random() < TRADE_PRUNE_CHANCE) {
     stmts.push(
       env.DB.prepare('DELETE FROM spot_trades WHERE pair = ? AND created_at < ?').bind(pair, now - TRADE_RETENTION_MS),
@@ -927,12 +1016,12 @@ async function marketMakerTick(env: Env, pair: string, prev: BotState, now: numb
 
   // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
   await sweepRestingOxPendings(env, pair);
-  return next;
+  return { next, tape };
 }
 
 // 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
 // 읽히고, 값이 비었거나(anchor=0=미초기화) 알 수 없는 regime 이면 안전한 기본값으로 떨어진다.
-const BOT_STATE_COLS = 'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks';
+const BOT_STATE_COLS = 'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, tape_json';
 const REGIMES: readonly Regime[] = ['calm', 'rally', 'euphoria', 'pullback', 'panic'];
 
 interface BotStateRow {
@@ -944,6 +1033,7 @@ interface BotStateRow {
   anchor: number;
   regime: string;
   regime_ticks: number;
+  tape_json: string | null; // 봇 합성 체결 링 버퍼(§ 봇 합성 체결 테이프) — 틱이 이어받아 append 한다
 }
 
 function toBotState(row: BotStateRow | null, ref: number): BotState {
@@ -986,7 +1076,7 @@ export async function runMarketMaker(env: Env, pair: string): Promise<void> {
     .run();
   if (claim.meta.changes !== 1) return; // 다른 요청이 이 틱을 이미 선점 — 중복 requote 방지
 
-  await marketMakerTick(env, pair, toBotState(row, await resolveRef(env, pair, row)), now);
+  await marketMakerTick(env, pair, toBotState(row, await resolveRef(env, pair, row)), now, parseTape(row?.tape_json));
 }
 
 /**
@@ -1015,12 +1105,18 @@ export async function runMarketMakerBurst(env: Env, pair: string, ticks: number 
 
   // 각 틱의 시각 = "그 틱을 실제로 실행하는 시점"(단조 증가). 버스트가 분 경계를 넘어가더라도
   // 소급 기록이 생기지 않는다. +10ms 는 틱 내부 체결(now+0..5)끼리 겹치지 않게 하는 최소 간격.
+  // 체결 테이프도 심리 상태처럼 틱 사이에 이어받는다 — 버스트 안에서 한 번만 읽고 메모리에서 append 한다
+  // (§ 봇 합성 체결 테이프). ⚠ cron 버스트와 유저 폴링 틱이 겹치면 뒤에 쓴 쪽이 상대의 append 를 덮어쓸 수
+  // 있는데, 잃는 건 표시용 테이프 몇 건뿐이다(캔들·기준가·잔고는 각자 자기 문장으로 쓴다).
   let state = toBotState(row, ref0);
+  let tape = parseTape(row?.tape_json);
   let prevTs = 0;
   for (let i = 0; i < ticks; i++) {
     const ts = Math.max(Date.now(), prevTs + 10);
     prevTs = ts;
-    state = await marketMakerTick(env, pair, state, ts);
+    const r = await marketMakerTick(env, pair, state, ts, tape);
+    state = r.next;
+    tape = r.tape;
   }
   // 심리 상태는 각 틱이 이미 기록했으므로 여기선 last_run 만 갱신한다(직후 폴링이 곧바로 겹쳐 requote 하지 않게).
   await env.DB.prepare('UPDATE spot_bot_state SET last_run = ? WHERE id = ?').bind(Date.now(), pair).run();
