@@ -1,5 +1,5 @@
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtKor, fmtUsd, fmtFeeRate } from '@/format';
+import { fmtKor, fmtUsd, fmtUsdShort, fmtFeeRate } from '@/format';
 import VipBadge from './VipBadge';
 
 /**
@@ -85,7 +85,9 @@ export default function VipModal({ onClose }: { onClose: () => void }) {
           </div>
           <div className="rounded-lg bg-panel2 p-2.5">
             <div className="text-[10px] text-muted">낸 수수료 합계</div>
-            <div className="mt-0.5 text-sm font-bold text-text">{fmtUsd(totalFees)}</div>
+            <div className="mt-0.5 truncate text-sm font-bold text-text" title={`${fmtUsd(totalFees)} USDT`}>
+              {fmtUsdShort(totalFees, 9)}
+            </div>
           </div>
         </div>
 

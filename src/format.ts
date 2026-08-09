@@ -83,6 +83,49 @@ export function fmtKor(v: number | null | undefined): string {
   return Math.trunc(v).toLocaleString();
 }
 
+// ── 길면 축약 ────────────────────────────────────────────────────────────────
+// 이 사이트는 200배 레버리지 + 무한 조건부라 평가자산/수량이 1e30 까지 간다. 콤마 표기 그대로 두면
+// 랭킹 행·헤더처럼 폭이 정해진 칸을 통째로 밀어내 레이아웃이 부서진다(실제 제보).
+// 그래서 **정수부가 maxIntDigits 자리를 넘으면** 한국식 단위(만/억/조/경/해/자/양)로 줄인다.
+// ⚠ 축약한 자리에는 반드시 `title` 로 전체값(fmtUsd/fmtQty)을 붙여 정확한 값을 볼 수 있게 할 것.
+const KOR_UNITS: ReadonlyArray<readonly [number, string]> = [
+  [1e28, '양'],
+  [1e24, '자'],
+  [1e20, '해'],
+  [1e16, '경'],
+  [1e12, '조'],
+  [1e8, '억'],
+  [1e4, '만'],
+];
+
+/** 축약 공용 본체. 작으면 콤마 표기 그대로, 크면 한국식 단위(반올림), 단위를 넘어서면 지수 표기.
+ * ⚠ fmtKor 과 달리 **반올림**이다 — 그쪽은 VIP 기준선을 넘은 것처럼 보이면 안 돼서 내림이지만,
+ * 여기는 "대략 얼마인지" 를 좁은 칸에 보여주는 용도라 내림/반올림 차이가 의미가 없다. */
+function shortNum(v: number, maxIntDigits: number, full: (n: number) => string): string {
+  const a = Math.abs(v);
+  if (!(a >= Math.pow(10, maxIntDigits))) return full(v);
+  if (a >= 1e32) return v.toExponential(2); // 양(1e28)으로도 4자리를 넘으면 지수로
+  for (const [unit, label] of KOR_UNITS) {
+    if (a < unit) continue;
+    const n = v / unit;
+    const d = Math.abs(n) >= 100 ? 0 : Math.abs(n) >= 10 ? 1 : 2;
+    return n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) + label;
+  }
+  return full(v);
+}
+
+/** USDT 금액 — 길면 한국식 단위로 축약(예 1.02e31 → "1,016만양" 대신 "1.02e+31"). 짧으면 fmtUsd 와 동일. */
+export function fmtUsdShort(v: number | null | undefined, maxIntDigits = 12): string {
+  if (v == null || !isFinite(v)) return '—';
+  return shortNum(v, maxIntDigits, fmtUsd);
+}
+
+/** 수량 — 길면 한국식 단위로 축약. 짧으면 fmtQty 와 동일. */
+export function fmtQtyShort(v: number | null | undefined, maxIntDigits = 12): string {
+  if (v == null || !isFinite(v)) return '—';
+  return shortNum(v, maxIntDigits, fmtQty);
+}
+
 /** 수량(코인 개수 등)을 세자리 콤마로. 소수는 최대 8자리까지 표기하되 뒤 0 은 자동으로 떨어진다
  * (예 1234567 → "1,234,567", 0.0123 → "0.0123", 3000 → "3,000"). */
 export function fmtQty(v: number | null | undefined): string {

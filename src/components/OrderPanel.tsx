@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtUsd, fmtNumInput, unfmtNum, fmtFeeRate } from '@/format';
+import { fmtUsd, fmtUsdShort, fmtNumInput, unfmtNum, fmtFeeRate } from '@/format';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit' | 'conditional';
@@ -495,25 +495,36 @@ export default function OrderPanel() {
 
       {/* 정보 */}
       <div className="space-y-0.5 rounded-md bg-panel2 p-2 text-xs">
-        <div className="flex justify-between">
-          <span className="text-muted">가용 (크로스)</span>
-          <span className="text-text">{fmtUsd(available)} USDT</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-muted">명목가</span>
-          <span className="text-text">{notional ? fmtUsd(notional) : '—'} USDT</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-muted">증거금</span>
-          <span className={margin + fee > available ? 'text-down' : 'text-text'}>
-            {margin ? fmtUsd(margin) : '—'} USDT
+        {/* ⚠ 금액은 전부 fmtUsdShort — 고배율 대량 주문이면 명목가가 1e20 을 넘어 이 좁은 칸을 부순다.
+            정확한 값은 title 툴팁으로 남긴다(§format.fmtUsdShort). */}
+        <div className="flex justify-between gap-2">
+          <span className="shrink-0 text-muted">가용 (크로스)</span>
+          <span className="truncate text-text" title={`${fmtUsd(available)} USDT`}>
+            {fmtUsdShort(available, 9)} USDT
           </span>
         </div>
-        <div className="flex justify-between">
-          <span className="text-muted">
+        <div className="flex justify-between gap-2">
+          <span className="shrink-0 text-muted">명목가</span>
+          <span className="truncate text-text" title={notional ? `${fmtUsd(notional)} USDT` : undefined}>
+            {notional ? fmtUsdShort(notional, 9) : '—'} USDT
+          </span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="shrink-0 text-muted">증거금</span>
+          <span
+            className={`truncate ${margin + fee > available ? 'text-down' : 'text-text'}`}
+            title={margin ? `${fmtUsd(margin)} USDT` : undefined}
+          >
+            {margin ? fmtUsdShort(margin, 9) : '—'} USDT
+          </span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="shrink-0 text-muted">
             수수료 <span className="text-[10px] text-muted">VIP{vipTier} · {fmtFeeRate(feeRate)}%</span>
           </span>
-          <span className="text-text">{fee ? fmtUsd(fee) : '—'} USDT</span>
+          <span className="truncate text-text" title={fee ? `${fmtUsd(fee)} USDT` : undefined}>
+            {fee ? fmtUsdShort(fee, 9) : '—'} USDT
+          </span>
         </div>
       </div>
 

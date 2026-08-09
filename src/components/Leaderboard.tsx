@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type LeaderRow, type FeeRevenue } from '@/services/api';
-import { fmtUsd, fmtKor } from '@/format';
+import { fmtUsd, fmtKor, fmtUsdShort } from '@/format';
 import VipBadge from './VipBadge';
 
 const MEDAL = ['🥇', '🥈', '🥉'];
@@ -52,12 +52,19 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
         {/* 거래소가 수수료로 벌어들인 총액 — 봇이 물량 대부분을 만들어서 섞으면 의미가 흐려지므로 분리 표기 */}
         {revenue && (
           <div className="border-b border-border bg-panel2 px-5 py-2.5">
-            <div className="flex items-baseline justify-between">
-              <span className="text-[11px] text-muted">🏦 거래소 수수료 수익</span>
-              <span className="text-sm font-extrabold text-accent">{fmtUsd(revenue.total)} USDT</span>
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="shrink-0 text-[11px] text-muted">🏦 거래소 수수료 수익</span>
+              <span
+                className="truncate text-sm font-extrabold text-accent"
+                title={`${fmtUsd(revenue.total)} USDT`}
+              >
+                {fmtUsdShort(revenue.total, 9)} USDT
+              </span>
             </div>
-            <div className="mt-0.5 text-[10px] text-muted">
-              유저 {fmtUsd(revenue.fromUsers)} · 봇 {fmtUsd(revenue.fromBots)} · 누적 거래대금 {fmtKor(revenue.volume)}
+            <div className="mt-0.5 truncate text-[10px] text-muted">
+              유저 <span title={fmtUsd(revenue.fromUsers)}>{fmtUsdShort(revenue.fromUsers, 9)}</span> · 봇{' '}
+              <span title={fmtUsd(revenue.fromBots)}>{fmtUsdShort(revenue.fromBots, 9)}</span> · 누적 거래대금{' '}
+              {fmtKor(revenue.volume)}
             </div>
           </div>
         )}
@@ -84,20 +91,25 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
                   {r.name.slice(0, 1).toUpperCase()}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5 truncate text-sm font-semibold text-text">
-                    {r.name}
+                  <div className="flex items-center gap-1.5 text-sm font-semibold text-text">
+                    <span className="truncate">{r.name}</span>
                     <VipBadge tier={r.vipTier ?? 0} />
-                    {r.isMe && <span className="text-[10px] font-normal text-accent">(나)</span>}
+                    {r.isMe && <span className="shrink-0 text-[10px] font-normal text-accent">(나)</span>}
                   </div>
                   <div className="text-[11px] text-muted">
                     포지션 {r.openCount}개
                   </div>
                 </div>
-                <div className="text-right">
-                  <div className="text-sm font-bold text-text">{fmtUsd(r.equity)}</div>
-                  <div className={`text-[11px] ${r.unrealized >= 0 ? 'text-up' : 'text-down'}`}>
+                <div className="shrink-0 text-right">
+                  <div className="text-sm font-bold text-text" title={`${fmtUsd(r.equity)} USDT`}>
+                    {fmtUsdShort(r.equity)}
+                  </div>
+                  <div
+                    className={`text-[11px] ${r.unrealized >= 0 ? 'text-up' : 'text-down'}`}
+                    title={`미실현 ${fmtUsd(r.unrealized)} USDT`}
+                  >
                     {r.unrealized >= 0 ? '+' : ''}
-                    {fmtUsd(r.unrealized)}
+                    {fmtUsdShort(r.unrealized)}
                   </div>
                 </div>
               </li>

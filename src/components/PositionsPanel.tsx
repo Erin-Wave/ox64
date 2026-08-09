@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtPrice, fmtQty, fmtUsd, fmtPct, fmtNumInput, unfmtNum } from '@/format';
+import { fmtPrice, fmtQty, fmtQtyShort, fmtUsd, fmtUsdShort, fmtPct, fmtNumInput, unfmtNum } from '@/format';
 import type { ApiOrder } from '@/services/api';
 
 type Tab = 'positions' | 'pending' | 'conditional' | 'history';
@@ -262,8 +262,11 @@ export default function PositionsPanel() {
                         {liq != null && liq > 0 ? fmtPrice(liq, prec) : '—'}
                       </td>
                       <td className="px-3 py-2.5 text-right text-text">
-                        <div>{fmtQty(p.size)}</div>
-                        <div className="text-[10px] text-muted">({fmtUsd(margin)} USDT)</div>
+                        {/* 수량·증거금은 1e30 까지 가므로 축약(전체값은 title) — §format.fmtQtyShort */}
+                        <div title={`${fmtQty(p.size)} ${p.symbol.replace('USDT', '')}`}>{fmtQtyShort(p.size)}</div>
+                        <div className="text-[10px] text-muted" title={`증거금 ${fmtUsd(margin)} USDT`}>
+                          ({fmtUsdShort(margin, 9)} USDT)
+                        </div>
                       </td>
                       {standard && (
                         <td className="px-3 py-2.5 text-right">
@@ -317,14 +320,14 @@ export default function PositionsPanel() {
                         {pnl == null ? (
                           '—'
                         ) : (
-                          <>
+                          <span title={`미실현 ${fmtUsd(pnl)} USDT`}>
                             {pos ? '+' : ''}
-                            {fmtUsd(pnl)}
+                            {fmtUsdShort(pnl)}
                             <span className="ml-1 text-[10px] opacity-80">
                               ({pos ? '+' : ''}
                               {fmtPct(roe)}%)
                             </span>
-                          </>
+                          </span>
                         )}
                       </td>
                       <td className="px-3 py-2.5 text-right">
@@ -334,11 +337,12 @@ export default function PositionsPanel() {
                               <input
                                 value={fmtNumInput(closeAmt[p.id] ?? '')}
                                 onChange={(e) => setCloseAmt((s) => ({ ...s, [p.id]: unfmtNum(e.target.value) }))}
-                                placeholder={fmtQty(closable)}
+                                placeholder={fmtQtyShort(closable)}
                                 inputMode="decimal"
                                 title={`청산 수량(비우면 전량) · 청산 가능 ${fmtQty(closable)}${reservedClose > 0 ? ` (예약 ${fmtQty(reservedClose)} 제외)` : ''}`}
                                 // 보유 수량 텍스트 길이에 맞춰 폭을 잡는다(콤마 포함 자릿수 + 패딩). 너무 짧던 w-14 대체.
-                                style={{ width: `calc(${Math.max(5, fmtQty(p.size).length)}ch + 1.25rem)` }}
+                                // ⚠ 상한 20ch — 1e30 개를 들고 있으면 자릿수가 31 이라 입력칸 하나가 패널을 통째로 밀어낸다.
+                                style={{ width: `calc(${Math.min(20, Math.max(5, fmtQty(p.size).length))}ch + 1.25rem)` }}
                                 className="rounded bg-panel2 px-1.5 py-1 text-right text-[11px] text-text outline-none ring-1 ring-border placeholder:text-muted"
                               />
                               <input
@@ -443,7 +447,7 @@ export default function PositionsPanel() {
                             className="w-20 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
                           />
                         ) : (
-                          fmtQty(o.size)
+                          <span title={fmtQty(o.size)}>{fmtQtyShort(o.size)}</span>
                         )}
                       </td>
                       <td className="px-3 py-2.5 text-right">
@@ -578,7 +582,7 @@ export default function PositionsPanel() {
                           />
                         ) : (
                           <>
-                            {fmtQty(c.size)}
+                            <span title={fmtQty(c.size)}>{fmtQtyShort(c.size)}</span>
                             {c.repeating && <div className="text-[10px] text-muted">1회당</div>}
                           </>
                         )}
@@ -776,9 +780,14 @@ export default function PositionsPanel() {
                         </span>
                       </td>
                       <td className="px-3 py-2 text-right text-text">{fmtPrice(o.price, prec)}</td>
-                      <td className="px-3 py-2 text-right text-text">{fmtQty(o.size)}</td>
-                      <td className={`px-3 py-2 text-right font-medium ${o.pnl == null ? 'text-muted' : pos ? 'text-up' : 'text-down'}`}>
-                        {o.pnl == null ? '—' : `${pos ? '+' : ''}${fmtUsd(o.pnl)}`}
+                      <td className="px-3 py-2 text-right text-text" title={fmtQty(o.size)}>
+                        {fmtQtyShort(o.size)}
+                      </td>
+                      <td
+                        className={`px-3 py-2 text-right font-medium ${o.pnl == null ? 'text-muted' : pos ? 'text-up' : 'text-down'}`}
+                        title={o.pnl == null ? undefined : `${fmtUsd(o.pnl)} USDT`}
+                      >
+                        {o.pnl == null ? '—' : `${pos ? '+' : ''}${fmtUsdShort(o.pnl)}`}
                       </td>
                     </tr>
                   );

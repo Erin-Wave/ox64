@@ -3,12 +3,14 @@ import { orderbookStream, type OrderBookLevel, type OrderBookSnapshot } from '@/
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { isVirtualSymbol } from '@/symbols';
-import { fmtPrice, precisionFromTick } from '@/format';
+import { fmtPrice, fmtQtyShort, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
 
 const EMPTY_TRADES: TickerTrade[] = [];
 // 수량은 세자리 콤마로. 큰 물량(≥1000)은 소수 1자리, 작은 물량은 최대 4자리(뒤 0 은 자동으로 떨어짐).
-const fmtQty = (q: number) => q.toLocaleString(undefined, { maximumFractionDigits: q >= 1000 ? 1 : 4 });
+// ⚠ 1e9 이상은 한국식 단위로 축약한다 — 유저가 1e30 개짜리 벽을 걸면 수량 칸이 호가창을 통째로 밀어낸다.
+const fmtQty = (q: number) =>
+  Math.abs(q) >= 1e9 ? fmtQtyShort(q, 9) : q.toLocaleString(undefined, { maximumFractionDigits: q >= 1000 ? 1 : 4 });
 const fmtTime = (ms: number) => {
   const d = new Date(ms);
   const p = (n: number) => String(n).padStart(2, '0');

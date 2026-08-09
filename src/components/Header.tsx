@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useMarketStore, selectLastPrice, selectLastTakerSide, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtPrice } from '@/format';
+import { fmtPrice, fmtUsd, fmtUsdShort } from '@/format';
 import SymbolSelect from '@/components/SymbolSelect';
 import Logo from './Logo';
 import VipBadge from './VipBadge';
@@ -73,8 +73,12 @@ export default function Header({
       <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
         <div className="flex flex-col items-end leading-none">
           <span className="hidden text-[10px] text-muted sm:block">평가자산</span>
-          <span className="mt-0 text-xs font-bold text-text sm:mt-0.5 sm:text-sm">
-            {equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          <span
+            className="mt-0 text-xs font-bold text-text sm:mt-0.5 sm:text-sm"
+            title={`평가자산 ${fmtUsd(equity)} USDT`}
+          >
+            {/* ⚠ 200배 + 무한 조건부로 1e30 까지 가는 값이라 그대로 두면 헤더가 통째로 밀린다(§format.fmtUsdShort) */}
+            {fmtUsdShort(equity, 9)}
             <span className="ml-0.5 text-[10px] font-normal text-muted">USDT</span>
           </span>
         </div>
