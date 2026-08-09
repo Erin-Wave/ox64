@@ -352,38 +352,66 @@ export interface UserRow {
 // 등급은 **누적 거래대금(notional = 체결가 × 수량, 레버리지가 곱해진 명목금액)** 으로 결정된다.
 // 증거금이 아니라 명목금액 기준이라 레버리지를 크게 쓸수록 등급이 빨리 오른다("레버리지 포함").
 // 진입·청산 양쪽 모두 각자의 명목금액만큼 누적된다(거래소 관행과 동일).
-// ⚠ 등급 기준 = 누적 거래대금, **1단계당 100배**(기존 0→1e6→1e8→1e10→1e12 패턴 유지). VIP4(1조) 가 너무
-// 쉬워 상위 프레스티지 등급 VIP5~12 를 같은 100배 간격으로 이어붙였다(VIP12=1양=1e28). 요율도 기존처럼
-// 공격적으로(대략 반토막씩 5-2-1) 0.001%(VIP4) → 0.000002%(VIP12) 로 내린다. 0.001% 미만이라 표시는
-// `fmtFeeRate`(소수 6자리)로. ⚠ 1e28 은 double 정밀도를 넘지만 등급 판정은 크기 비교라 무관.
-export const VIP_TIERS = [
-  { tier: 0, minVolume: 0, rate: 0.0003 }, //     ~100만 USDT     0.03%
-  { tier: 1, minVolume: 1e6, rate: 0.0002 }, //   100만~1억       0.02%
-  { tier: 2, minVolume: 1e8, rate: 0.0001 }, //   1억~100억       0.01%
-  { tier: 3, minVolume: 1e10, rate: 0.00005 }, // 100억~1조       0.005%
-  { tier: 4, minVolume: 1e12, rate: 0.00001 }, // 1조~100조       0.001%
-  { tier: 5, minVolume: 1e14, rate: 0.000005 }, //   100조~1경    0.0005%
-  { tier: 6, minVolume: 1e16, rate: 0.000002 }, //   1경~100경    0.0002%
-  { tier: 7, minVolume: 1e18, rate: 0.000001 }, //   100경~1해    0.0001%
-  { tier: 8, minVolume: 1e20, rate: 0.0000005 }, //  1해~100해    0.00005%
-  { tier: 9, minVolume: 1e22, rate: 0.0000002 }, //  100해~1자    0.00002%
-  { tier: 10, minVolume: 1e24, rate: 0.0000001 }, // 1자~100자    0.00001%
-  { tier: 11, minVolume: 1e26, rate: 0.00000005 }, // 100자~1양   0.000005%
-  { tier: 12, minVolume: 1e28, rate: 0.00000002 }, // 1양~        0.000002%
-] as const;
+// ⚠ 등급은 **표가 아니라 공식**이다(2026-08-09, 무한 레벨). 예전엔 VIP0~12 짜리 13행 상수표였고 1단계당
+// 100배라, (a)등급이 12 에서 끝나 그 위로는 아무리 거래해도 변화가 없고 (b)한 칸이 100배라 RPG 로 치면
+// "레벨이 12개뿐이고 다음 레벨까지 경험치 100배"인 구조였다. 지금은 등비수열 두 개로 무한히 이어진다:
+//
+//   등급 t 진입 거래대금 = VIP_BASE_VOLUME × VIP_VOLUME_GROWTH^(t-1)   (t>=1, VIP0 = 0)
+//   등급 t 수수료율      = max(VIP_MIN_RATE, VIP_BASE_RATE × VIP_RATE_DECAY^t)
+//
+// 밸런스 근거:
+//  · 거래대금 4배/등급 — 한 등급이 "조금만 더 하면 오른다"고 느껴지는 폭. 첫 등급이 1만 USDT 라 몇 번만
+//    거래해도 VIP1 이 뜨고(초반 보상), 이후 VIP10=26억 · VIP20=2.7경 · VIP30=2.9해 · VIP40=3.1자 로 이어진다.
+//    거래대금은 명목금액(레버리지 포함)이라 고배율 유저는 한 판에 몇 등급씩 뛴다 — 그래서 100배가 아니라
+//    4배로 촘촘하게 썰어야 "레벨업"이 자주 일어난다. 현재 최상위 유저(~1e24)가 VIP34 근처.
+//  · 요율 ×0.79/등급 — **옛 13행 표를 그대로 근사한 값**이다(옛 VIP1(1e6)≈새 VIP4, 옛 VIP4(1e12)≈새 VIP14
+//    에서 요율이 거의 일치). 즉 등급 숫자만 촘촘해지고 "이만큼 거래하면 수수료가 이 정도" 라는 실제 경제는
+//    바뀌지 않는다. 등급마다 -21% 라 5등급이면 대략 반토막.
+//  · 하한 0.0000001% — 0 으로 두면 상위 등급의 거래가 거래소 수익에 전혀 안 잡힌다(랭킹 수수료 수익 표시가
+//    멈춰버림). 대략 VIP54 부터 이 하한에 닿는다.
+// ⚠ 표시 자릿수: 이 하한(1e-9)은 퍼센트로 0.0000001% 라 `fmtFeeRate` 가 소수 **8자리**까지 찍어야 한다
+//   (6자리였을 땐 0.0000001% 가 "0" 으로 뭉개졌다). 상수를 더 내리면 그쪽도 같이 늘릴 것.
+export const VIP_BASE_VOLUME = 1e4; // VIP1 진입 누적 거래대금(USDT)
+export const VIP_VOLUME_GROWTH = 4; // 한 등급당 거래대금 배수
+export const VIP_BASE_RATE = 0.0003; // VIP0 요율 = 0.03%
+export const VIP_RATE_DECAY = 0.79; // 한 등급당 요율 배수
+export const VIP_MIN_RATE = 1e-9; // 요율 하한 = 0.0000001%
+
+/** 그 등급에 들어가는 데 필요한 누적 거래대금(VIP0 = 0). */
+export function vipMinVolume(tier: number): number {
+  if (!(tier > 0)) return 0;
+  return VIP_BASE_VOLUME * Math.pow(VIP_VOLUME_GROWTH, tier - 1);
+}
+
+/** 그 등급의 수수료율(분수). */
+export function vipRate(tier: number): number {
+  if (!(tier > 0)) return VIP_BASE_RATE;
+  return Math.max(VIP_MIN_RATE, VIP_BASE_RATE * Math.pow(VIP_RATE_DECAY, tier));
+}
 
 /** 누적 거래대금 → VIP 등급/수수료율/다음 등급 기준. 등급은 컬럼으로 저장하지 않고 항상 여기서
- * 파생한다(총거래량 하나만 진실원본이라 등급이 어긋날 여지가 없다). */
+ * 파생한다(총거래량 하나만 진실원본이라 등급이 어긋날 여지가 없다).
+ * ⚠ 로그로 구한 등급은 기준선에 정확히 걸친 값에서 부동소수 오차로 한 칸 어긋날 수 있어(1e4·4^k 를
+ * 그대로 넣어도 지수가 k-1e-16 으로 나온다) 계산 뒤 실제 기준선과 대조해 보정한다. */
 export function vipOf(totalVolume: number): { tier: number; rate: number; nextAt: number | null } {
-  const v = totalVolume > 0 ? totalVolume : 0;
-  let idx = 0;
-  for (let i = VIP_TIERS.length - 1; i >= 0; i--) {
-    if (v >= VIP_TIERS[i].minVolume) {
-      idx = i;
-      break;
-    }
+  const v = totalVolume > 0 && isFinite(totalVolume) ? totalVolume : 0;
+  let tier = 0;
+  if (v >= VIP_BASE_VOLUME) {
+    tier = Math.floor(Math.log(v / VIP_BASE_VOLUME) / Math.log(VIP_VOLUME_GROWTH) + 1e-9) + 1;
+    // 경계 보정(최대 몇 회). 위/아래 양방향 모두 막는다.
+    while (tier > 0 && v < vipMinVolume(tier)) tier--;
+    while (v >= vipMinVolume(tier + 1)) tier++;
   }
-  return { tier: VIP_TIERS[idx].tier, rate: VIP_TIERS[idx].rate, nextAt: VIP_TIERS[idx + 1]?.minVolume ?? null };
+  const next = vipMinVolume(tier + 1);
+  return { tier, rate: vipRate(tier), nextAt: isFinite(next) ? next : null };
+}
+
+/** 등급표를 "현재 등급 주변 창" 으로만 만든다 — 등급이 무한이라 전부 내려보낼 수 없다. */
+export function vipTierWindow(tier: number, before = 2, after = 6) {
+  const from = Math.max(0, tier - before);
+  const rows: { tier: number; minVolume: number; rate: number }[] = [];
+  for (let t = from; t <= tier + after; t++) rows.push({ tier: t, minVolume: vipMinVolume(t), rate: vipRate(t) });
+  return rows;
 }
 
 /** 이 유저의 현재 수수료율(누적 거래대금 기준). 체결 직전에 읽어 그 체결에 적용한다. */
@@ -578,10 +606,13 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
     vipTier: vip.tier,
     feeRate: vip.rate,
     vipNextAt: vip.nextAt,
-    // 등급 기준표도 함께 내려보낸다 — 클라가 진행률/등급표를 그리려면 각 구간의 하한이 필요한데,
-    // 클라에 같은 표를 또 적어두면 서버 기준이 바뀔 때 조용히 어긋난다(수수료는 서버가 떼므로
-    // 화면만 틀리게 된다). 5개짜리 작은 배열이라 폴링마다 실려도 무시할 만한 크기.
-    vipTiers: VIP_TIERS.map((t) => ({ tier: t.tier, minVolume: t.minVolume, rate: t.rate })),
+    // 현재 등급 구간의 하한(진행률 계산용) — 등급이 무한이라 클라가 표에서 찾아 쓰던 방식은 못 쓴다.
+    vipFrom: vipMinVolume(vip.tier),
+    // 등급표는 **현재 등급 주변 창**만 내려보낸다(무한 등급이라 전부 못 보냄). 클라에 같은 공식을 또
+    // 적어두면 서버 기준이 바뀔 때 조용히 어긋난다(수수료는 서버가 떼므로 화면만 틀리게 된다).
+    vipTiers: vipTierWindow(vip.tier),
+    // 등급 곡선 파라미터 — 모달이 "한 등급당 거래대금 ×4 · 수수료 ×0.79" 를 설명하는 데 쓴다(하드코딩 금지).
+    vipCurve: { baseVolume: VIP_BASE_VOLUME, growth: VIP_VOLUME_GROWTH, decay: VIP_RATE_DECAY, minRate: VIP_MIN_RATE },
     totalVolume: user.total_volume ?? 0,
     totalFees: user.total_fees ?? 0,
     positions: positions.map((p) => ({

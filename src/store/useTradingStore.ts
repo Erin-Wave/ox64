@@ -29,7 +29,9 @@ interface TradingState {
   vipTier: number;
   feeRate: number;
   vipNextAt: number | null;
+  vipFrom: number;
   vipTiers: { tier: number; minVolume: number; rate: number }[];
+  vipCurve: { baseVolume: number; growth: number; decay: number; minRate: number } | null;
   totalVolume: number;
   totalFees: number;
   positions: ApiPosition[];
@@ -116,7 +118,9 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     vipTier: st.vipTier ?? 0,
     feeRate: st.feeRate ?? 0.0003,
     vipNextAt: st.vipNextAt ?? null,
+    vipFrom: st.vipFrom ?? 0,
     vipTiers: st.vipTiers ?? [],
+    vipCurve: st.vipCurve ?? null,
     totalVolume: st.totalVolume ?? 0,
     totalFees: st.totalFees ?? 0,
     positions: st.positions,
@@ -148,7 +152,9 @@ export const useTradingStore = create<TradingState>((set) => ({
   vipTier: 0,
   feeRate: 0.0003,
   vipNextAt: null,
+  vipFrom: 0,
   vipTiers: [],
+  vipCurve: null,
   totalVolume: 0,
   totalFees: 0,
   positions: [],
@@ -209,7 +215,9 @@ export const useTradingStore = create<TradingState>((set) => ({
       vipTier: 0,
       feeRate: 0.0003,
       vipNextAt: null,
+      vipFrom: 0,
       vipTiers: [],
+      vipCurve: null,
       totalVolume: 0,
       totalFees: 0,
       positions: [],

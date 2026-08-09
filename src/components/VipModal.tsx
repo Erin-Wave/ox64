@@ -15,14 +15,17 @@ export default function VipModal({ onClose }: { onClose: () => void }) {
   const tier = useTradingStore((s) => s.vipTier);
   const feeRate = useTradingStore((s) => s.feeRate);
   const nextAt = useTradingStore((s) => s.vipNextAt);
+  const vipFrom = useTradingStore((s) => s.vipFrom);
   const totalVolume = useTradingStore((s) => s.totalVolume);
   const totalFees = useTradingStore((s) => s.totalFees);
   const tiers = useTradingStore((s) => s.vipTiers);
+  const curve = useTradingStore((s) => s.vipCurve);
 
   const pct = (r: number) => fmtFeeRate(r) + '%';
 
-  // 현재 등급 구간의 하한 → 그 구간을 얼마나 채웠는지. 최고 등급이면 진행도가 없다(항상 100%).
-  const from = tiers.find((t) => t.tier === tier)?.minVolume ?? 0;
+  // 현재 등급 구간의 하한 → 그 구간을 얼마나 채웠는지. (등급은 무한이라 `isMax` 는 사실상 안 걸린다 —
+  // double 로 다음 기준선을 표현할 수 없을 만큼(VIP500 대) 올라갔을 때만.)
+  const from = vipFrom;
   const isMax = nextAt == null;
   const span = isMax ? 0 : nextAt - from;
   const progress = isMax ? 1 : span > 0 ? Math.min(1, Math.max(0, (totalVolume - from) / span)) : 0;
@@ -49,6 +52,14 @@ export default function VipModal({ onClose }: { onClose: () => void }) {
           누적 <strong className="text-text">거래대금</strong>이 쌓일수록 등급이 올라 수수료가 내려갑니다. 거래대금은
           증거금이 아니라 <strong className="text-text">명목금액(체결가 × 수량)</strong> 기준이라 레버리지를 크게 쓸수록
           빨리 오르고, 진입·청산이 각각 집계됩니다.
+          {curve && (
+            <>
+              {' '}
+              등급에 <strong className="text-text">상한이 없습니다</strong> — 한 등급 오를 때마다 필요 거래대금이{' '}
+              <strong className="text-text">×{curve.growth}</strong>, 수수료는{' '}
+              <strong className="text-text">×{curve.decay}</strong> 가 됩니다(수수료 하한 {pct(curve.minRate)}).
+            </>
+          )}
         </p>
 
         {/* 진행 막대 */}
@@ -91,7 +102,8 @@ export default function VipModal({ onClose }: { onClose: () => void }) {
           </div>
         </div>
 
-        {/* 등급표 */}
+        {/* 등급표 — 등급이 무한이라 서버가 **현재 등급 주변 창**만 내려준다(전부 못 보냄). */}
+        <div className="mb-1 text-[10px] text-muted">현재 등급 주변</div>
         <table className="w-full text-xs">
           <thead>
             <tr className="text-[10px] text-muted">
@@ -117,6 +129,15 @@ export default function VipModal({ onClose }: { onClose: () => void }) {
                 </tr>
               );
             })}
+            {/* 창의 끝 — 마지막 행이 "최고 등급"으로 읽히지 않게 계속 이어진다는 걸 명시한다 */}
+            {tiers.length > 0 && (
+              <tr className="text-muted/70">
+                <td className="py-1 pl-1.5">VIP{(tiers[tiers.length - 1]?.tier ?? tier) + 1}+</td>
+                <td className="py-1 text-right" colSpan={2}>
+                  계속 이어집니다 (상한 없음)
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>

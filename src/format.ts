@@ -139,12 +139,13 @@ export function fmtUsd(v: number | null | undefined): string {
   return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-/** VIP 수수료율(분수, 예 0.0003)을 퍼센트 문자열로 — 뒤 0 트림, 최대 소수 6자리(VIP12 의 0.000002% 같은
- * 극저율까지 구분). ⚠ '%' 는 붙이지 않는다(호출부가 붙임). 예: 0.0003→"0.03", 0.00001→"0.001", 0.00000002→"0.000002".
- * 예전 toFixed(3) 은 0.001% 미만을 전부 "0" 으로 뭉갰다(VIP5+ 추가로 자릿수 확대 필요). */
+/** VIP 수수료율(분수, 예 0.0003)을 퍼센트 문자열로 — 뒤 0 트림, 최대 소수 8자리. ⚠ '%' 는 붙이지 않는다
+ * (호출부가 붙임). 예: 0.0003→"0.03", 0.00001→"0.001", 0.000000001→"0.0000001".
+ * ⚠ 자릿수는 **요율 하한(functions/_shared.ts VIP_MIN_RATE = 1e-9 → 0.0000001%)에 맞춰져 있다** — 예전
+ * toFixed(3) 은 0.001% 미만을, toFixed(6) 은 0.0000001% 를 각각 "0" 으로 뭉갰다. 하한을 더 내리면 여기도 같이. */
 export function fmtFeeRate(rate: number | null | undefined): string {
   if (rate == null || !isFinite(rate)) return '—';
-  return (rate * 100).toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
+  return (rate * 100).toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 /** 퍼센트 값을 세자리 콤마 + 지정 소수자리로(예 ROE 1234.5 → "1,234.5"). % 기호는 호출부에서 붙인다.

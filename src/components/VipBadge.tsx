@@ -7,8 +7,12 @@ import { fmtKor, fmtFeeRate } from '@/format';
  * 등급이 오를수록 뱃지가 진해져서 한눈에 구분된다. title 에 수수료율과 다음 등급까지 남은 거래대금을
  * 넣어 두 번 클릭하지 않고도 확인할 수 있게 했다.
  */
-// VIP0~4 는 기존 배색, VIP5~12 는 프레스티지 등급이라 골드→오렌지→퍼플 그라디언트로 점점 화려해진다.
+// 배색 13단계 — 아래로 갈수록 화려해진다(골드→오렌지→퍼플 그라디언트).
 // (arbitrary 색은 정적 문자열이라 Tailwind JIT 가 생성 — 조건부 주문선의 #f0b90b 와 동일 방식)
+// ⚠ 등급은 무한이라 색을 등급마다 줄 수 없다 — **STYLE_SPAN 등급마다 한 칸씩** 올라가고 끝에서 고정된다.
+// 3 인 이유: 새 곡선(거래대금 ×4/등급)에서 3등급 ≈ 옛 곡선의 1등급(×100)이라, 같은 거래대금이면 예전과
+// 거의 같은 색이 나온다(옛 VIP12=1e28 ≈ 새 VIP40 → 마지막 배색).
+const STYLE_SPAN = 3;
 const TIER_STYLE = [
   'bg-panel2 text-muted ring-border', // VIP0
   'bg-panel2 text-text ring-border', // VIP1
@@ -41,7 +45,7 @@ export default function VipBadge({
   /** 주면 버튼이 되어 클릭 시 VIP 진행도 모달을 연다(랭킹의 "남의 등급"엔 안 준다). */
   onClick?: () => void;
 }) {
-  const style = TIER_STYLE[Math.max(0, Math.min(TIER_STYLE.length - 1, tier))];
+  const style = TIER_STYLE[Math.max(0, Math.min(TIER_STYLE.length - 1, Math.floor(tier / STYLE_SPAN)))];
   const parts: string[] = [`VIP${tier}`];
   if (feeRate != null) parts.push(`거래 수수료 ${fmtFeeRate(feeRate)}%`);
   if (totalVolume != null) parts.push(`누적 거래대금 ${fmtKor(totalVolume)} USDT`);

@@ -62,12 +62,16 @@ export interface AppState {
   name: string;
   balance: number;
   refillsLeft: number;
-  /** VIP 등급(0~4) — 누적 거래대금에서 서버가 파생. 수수료율/진행도 표시에 사용 */
+  /** VIP 등급(상한 없음) — 누적 거래대금에서 서버가 파생. 수수료율/진행도 표시에 사용 */
   vipTier: number;
   feeRate: number;
   vipNextAt: number | null;
-  /** 등급 기준표(서버가 내려줌 — 클라에 중복 정의하지 않는다) */
+  /** 현재 등급 구간의 하한(진행률 계산용) — 등급이 무한이라 표에서 찾아 쓸 수 없다 */
+  vipFrom: number;
+  /** 등급표 — 무한 등급이라 **현재 등급 주변 창**만 온다(서버가 내려줌, 클라에 중복 정의 금지) */
   vipTiers: { tier: number; minVolume: number; rate: number }[];
+  /** 등급 곡선 파라미터(한 등급당 거래대금 배수·수수료 배수) — 모달 설명 문구용 */
+  vipCurve?: { baseVolume: number; growth: number; decay: number; minRate: number };
   totalVolume: number;
   totalFees: number;
   positions: ApiPosition[];

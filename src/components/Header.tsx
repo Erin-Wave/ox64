@@ -31,9 +31,10 @@ export default function Header({
   const feeRate = useTradingStore((s) => s.feeRate);
   const vipNextAt = useTradingStore((s) => s.vipNextAt);
   const totalVolume = useTradingStore((s) => s.totalVolume);
-  const vipTiers = useTradingStore((s) => s.vipTiers);
-  // 현재 등급 구간을 얼마나 채웠는지(0~1). 최고 등급이면 항상 가득. VipModal 과 같은 식.
-  const vipFrom = vipTiers.find((t) => t.tier === vipTier)?.minVolume ?? 0;
+  // 현재 등급 구간을 얼마나 채웠는지(0~1). VipModal 과 같은 식.
+  // ⚠ 등급이 무한이라 하한은 서버가 내려준 `vipFrom` 을 쓴다(예전엔 등급표에서 찾아 썼는데, 이제 표는
+  // 현재 등급 주변 창만 오므로 찾기 방식은 창을 벗어나는 순간 조용히 0 이 된다).
+  const vipFrom = useTradingStore((s) => s.vipFrom);
   const vipProgress =
     vipNextAt == null ? 1 : Math.min(1, Math.max(0, (totalVolume - vipFrom) / Math.max(1, vipNextAt - vipFrom)));
   const prices = useMarketStore((s) => s.prices);
