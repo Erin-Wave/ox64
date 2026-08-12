@@ -510,12 +510,24 @@ const TRADE_PRUNE_CHANCE = 0.05; // ≈20틱마다 1회
 //   1. 추세 지속(momentum)   — 수익률이 AR(1) 자기상관 → 한 번 잡힌 방향이 여러 틱 이어진다
 //   2. 변동성 클러스터링      — vol 이 AR(1) → 잔잔한 구간과 거친 구간이 뭉치고, 드물게 "뉴스" 충격
 //   3. 과열 후 평균회귀       — 적정가(anchor)에서 벌어질수록 되돌림이 제곱으로 강해진다(고점 공포/저점 매수)
-//   4. 탐욕-공포 국면 전환    — calm→rally→euphoria→panic→… 하락이 상승보다 빠르고 거칠다(비대칭)
+//   4. 탐욕-공포 국면 전환    — calm→rally→euphoria→panic→capitulation→… 하락이 상승보다 빠르고 거칠다
 // 여기에 라운드넘버 자석(심리적 지지/저항), 팻테일(급등락), 그리고 거래량·체결 방향·호가 스프레드가
 // 국면에 함께 반응하는 것까지 묶었다. 전부 결정론적 알고리즘이다(LLM 아님).
-type Regime = 'calm' | 'rally' | 'euphoria' | 'pullback' | 'panic';
+//
+// ⚠ 2026-08-12 확장 — "탐욕과 공포를 더 반영해달라". 위 1~4 는 **가격의 통계적 성질**이지 사람의
+// 행동이 아니었다: 군중 심리(sentiment)가 사실상 최근 수익률의 즉석 함수라 자기 관성이 없었고
+// (=탐욕이 쌓였다 꺼지는 "무드"가 아니었다), 시장이 **최근 고점/저점을 기억하지 않아** 저항 돌파나
+// 지지 붕괴 같은 사람이 읽는 사건이 아예 없었다. 그래서 다음 넷을 더했다:
+//   5. 무드의 관성·군집(herding) — sentiment 가 자기 자신을 되먹임하되 극단에서 포화(logistic)
+//   6. 고점/저점 기억(peak/trough) — 서서히 잊히는 최근 고점·저점. 탐욕/공포 게이지의 기준이자,
+//      **돌파 추격(FOMO)·지지 붕괴 손절 연쇄(stop cascade)** 라는 두 사건의 방아쇠
+//   7. 레버리지 효과 — 떨어질 때 변동성이 커진다(공포는 시끄럽고 탐욕은 조용하다)
+//   8. 투매(capitulation) 국면 — 공포가 극단이면 panic 이 한 번 더 폭발했다가 3~5틱 만에 소진되고
+//      반등한다(V 바닥). 여기에 호가 **깊이의 비대칭**(공포장엔 매수벽이 얇아지고 매도벽이 두꺼워진다)을
+//      더해, 심리가 가격뿐 아니라 **유동성**으로도 드러나게 했다.
+type Regime = 'calm' | 'rally' | 'euphoria' | 'pullback' | 'panic' | 'capitulation';
 
-interface BotState {
+export interface BotState {
   ref: number;
   drift: number;      // 추세 강도(틱당 기대수익률)
   vol: number;        // 변동성 배수
@@ -523,23 +535,48 @@ interface BotState {
   anchor: number;     // 완만히 따라오는 "적정가"
   regime: Regime;
   regimeTicks: number;
+  peak: number;       // 서서히 잊히는 최근 고점(저항·FOMO 기준, 0=미초기화)
+  trough: number;     // 서서히 잊히는 최근 저점(지지·손절연쇄 기준, 0=미초기화)
 }
 
 // 국면별 성격. bias=틱당 추가 드리프트, volMult=변동성 배수, sizeMult=거래량 배수,
-// takerBias=체결 방향 편향(+면 매수 우위), minTicks=최소 지속 틱(국면이 1틱만에 튕기지 않게).
+// takerBias=체결 방향 편향(+면 매수 우위), minTicks=최소 지속 틱(국면이 1틱만에 튕기지 않게),
+// bidDepth/askDepth=호가 사다리 물량 배수(공포장엔 매수벽이 사라지고 매도벽이 쌓인다),
+// spread=호가 스프레드 배수(거친 국면일수록 마켓메이커가 물러난다).
 // ⚠ 비대칭: panic 은 euphoria 보다 |bias|·volMult·sizeMult 가 모두 크다 — 실제 시장처럼 "떨어질 땐
 // 빠르고 거칠게, 오를 땐 느리게".
-// ⚠ bias 는 국면 점유율(대략 calm 50% / rally 25% / pullback 16% / panic 6% / euphoria 3%)로 가중하면
-// 합이 거의 0 이 되도록 맞춰져 있다 — 안 맞추면 틱마다 미세한 편향이 누적돼 며칠 만에 가격이 0 으로
-// 붕괴하거나 발산한다(초기 튜닝에서 실제로 5일 만에 -40% 편향이 나왔다). 값을 바꿀 땐 반드시
-// 시뮬레이션으로 장기 안정성을 다시 확인할 것.
-const REGIME_PARAMS: Record<Regime, { bias: number; volMult: number; sizeMult: number; takerBias: number; minTicks: number }> = {
-  calm:     { bias:  0,       volMult: 0.65, sizeMult: 0.55, takerBias:  0.02, minTicks: 8 },
-  rally:    { bias:  0.0011,  volMult: 1.05, sizeMult: 1.10, takerBias:  0.20, minTicks: 6 },
-  euphoria: { bias:  0.0030,  volMult: 1.80, sizeMult: 2.20, takerBias:  0.36, minTicks: 4 },
-  pullback: { bias: -0.0007,  volMult: 1.20, sizeMult: 0.95, takerBias: -0.18, minTicks: 3 },
-  panic:    { bias: -0.0036,  volMult: 2.60, sizeMult: 2.90, takerBias: -0.40, minTicks: 4 },
+// ⚠ bias 는 국면 점유율(실측 대략 calm 46 / rally 27 / pullback 18 / panic 6 / euphoria 3 /
+// capitulation 0.4%)로 가중하면 합이 거의 0 이 되도록 맞춰져 있다 — 안 맞추면 틱마다 미세한 편향이
+// 누적돼 며칠 만에 가격이 0 으로 붕괴하거나 발산한다(초기 튜닝에서 실제로 5일 만에 -40% 편향이 나왔다).
+// 값을 바꿀 땐 반드시 시뮬레이션으로 장기 안정성을 다시 확인할 것(`npm run sim:bot`).
+const REGIME_PARAMS: Record<
+  Regime,
+  { bias: number; volMult: number; sizeMult: number; takerBias: number; minTicks: number; bidDepth: number; askDepth: number; spread: number }
+> = {
+  calm:         { bias:  0,       volMult: 0.65, sizeMult: 0.55, takerBias:  0.02, minTicks: 8, bidDepth: 1.10, askDepth: 1.10, spread: 0.90 },
+  rally:        { bias:  0.00085,  volMult: 1.05, sizeMult: 1.10, takerBias:  0.20, minTicks: 6, bidDepth: 1.25, askDepth: 0.85, spread: 0.95 },
+  euphoria:     { bias:  0.0028,  volMult: 1.80, sizeMult: 2.20, takerBias:  0.36, minTicks: 4, bidDepth: 1.45, askDepth: 0.55, spread: 1.25 },
+  pullback:     { bias: -0.0008,  volMult: 1.20, sizeMult: 0.95, takerBias: -0.18, minTicks: 3, bidDepth: 0.90, askDepth: 1.15, spread: 1.05 },
+  panic:        { bias: -0.0034,  volMult: 2.60, sizeMult: 3.00, takerBias: -0.42, minTicks: 4, bidDepth: 0.50, askDepth: 1.50, spread: 1.55 },
+  capitulation: { bias: -0.0090,  volMult: 3.60, sizeMult: 5.50, takerBias: -0.62, minTicks: 2, bidDepth: 0.28, askDepth: 1.80, spread: 2.10 },
 };
+
+// ── 탐욕/공포 게이지 · 기억 파라미터 ──────────────────────────────────
+// 최근 고점/저점은 "완전히 잊히지 않되 영원히 남지도 않게" 지수적으로 현재가 쪽으로 흘러내린다.
+// 반감기 ≈ 870틱(틱은 접속 중 ~60/분, 유휴 시 12/분이라 실시간으로 15분~1시간).
+const EXTREME_DECAY = 0.003;
+// 고점 대비 이만큼 빠지면 공포 게이지가 100%(반대로 저점 대비 이만큼 오르면 탐욕 100%).
+// 봇의 1분봉 평균 고저폭이 ~2% 라 6% 는 "며칠 안에 몇 번" 나오는 수준이다.
+export const GAUGE_FULL = 0.1;
+// 무드의 군집(herding) — sentiment 가 자기 자신을 키우되 s(1-s²) 라 극단(±1)에선 0 이 되어 발산하지
+// 않는다. 실효 지속계수는 최대 0.90+0.06 = 0.96 (< 1) 이라 수학적으로도 폭주가 불가능하다.
+const HERD_GAIN = 0.06;
+// 신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄 — **연쇄 쪽이 1.6배 크고 자주 터진다**(공포가 탐욕보다
+// 빠르다). 둘 다 "그 방향으로 이미 쏠려 있을 때만" 발동해서, 평상시엔 아무 일도 일어나지 않는다.
+const FOMO_CHANCE = 0.05;
+const FOMO_KICK = 0.004;
+const CASCADE_CHANCE = 0.08;
+const CASCADE_KICK = 0.006;
 
 const ROUND_STEP_TICKS = 50; // 라운드넘버 자석이 잡아당기는 심리적 가격대 간격(틱 개수 — 절대값이면 가격대가 바뀔 때 무의미해진다)
 
@@ -723,83 +760,146 @@ function gauss(): number {
 }
 
 /** 국면 전이 — 최소 지속시간을 지킨 뒤 심리/과열도에 따라 확률적으로 넘어간다.
- * 상승은 단계를 밟아 올라가지만(calm→rally→euphoria) 꼭대기에선 곧장 panic 으로 떨어질 수 있다. */
-function nextRegime(s: BotState, stretch: number, sentiment: number): { regime: Regime; regimeTicks: number } {
+ * 상승은 단계를 밟아 올라가지만(calm→rally→euphoria) 꼭대기에선 곧장 panic 으로 떨어질 수 있다.
+ *
+ * ⚠ 전이 확률이 이제 **고정 상수가 아니라 탐욕/공포 게이지의 함수**다(2026-08-12). 예전엔 "rally 에서
+ * 20% 확률로 pullback" 처럼 무드와 무관한 주사위라, 국면 이름만 심리였지 정작 전환 시점은 심리와
+ * 아무 상관이 없었다(무섭지 않은데 공포장이 시작되고, 다들 탐욕적인데 조용히 식었다). 지금은
+ *  - 탐욕이 강할수록 rally→euphoria 가 쉬워지고(추격매수),
+ *  - **euphoria 는 오래 끌수록·많이 벌어질수록 무너지기 쉽다**(버블 피로 — 고정 34% 였을 땐 꼭대기가
+ *    얼마나 높든 붕괴 확률이 같아서 "고점일수록 위험하다"는 감각이 없었다),
+ *  - 공포가 극단이고 낙폭이 깊을 때만 panic→capitulation(투매)이 열린다. */
+function nextRegime(
+  s: BotState,
+  stretch: number,
+  sentiment: number,
+  fear: number, // 0(평온) ~ 1(극단적 공포) — 최근 고점 대비 낙폭
+  greed: number, // 0 ~ 1 — 최근 저점 대비 상승폭
+): { regime: Regime; regimeTicks: number } {
   const age = s.regimeTicks + 1;
   if (age < REGIME_PARAMS[s.regime].minTicks) return { regime: s.regime, regimeTicks: age };
   const start = (regime: Regime) => ({ regime, regimeTicks: 0 });
   const roll = Math.random();
   switch (s.regime) {
     case 'calm':
-      if (sentiment > 0.35 && roll < 0.26) return start('rally');
-      if (sentiment < -0.35 && roll < 0.20) return start('pullback');
+      if (sentiment > 0.35 && roll < 0.18 + 0.16 * greed) return start('rally');
+      if (sentiment < -0.35 && roll < 0.14 + 0.18 * fear) return start('pullback');
       if (roll < 0.04) return start(sentiment >= 0 ? 'rally' : 'pullback');
       break;
     case 'rally':
-      if (stretch > 0.022 && sentiment > 0.42 && roll < 0.34) return start('euphoria'); // 과열 진입(추격매수)
-      if (roll < 0.20) return start('pullback'); // 차익실현
-      if (roll < 0.28) return start('calm');
+      if (stretch > 0.02 && sentiment > 0.4 && roll < 0.18 + 0.25 * greed) return start('euphoria'); // 과열 진입(추격매수)
+      if (roll < 0.13 + 0.14 * fear) return start('pullback'); // 차익실현
+      if (roll < 0.26) return start('calm');
       break;
-    case 'euphoria':
-      if (roll < 0.34) return start('panic'); // 꼭대기에서 곧장 급락 — 상승보다 하락이 빠르다
-      if (roll < 0.56) return start('pullback');
+    case 'euphoria': {
+      // 버블 피로 — 오래 버틸수록, 적정가에서 멀어질수록 붕괴 확률이 커진다(최대 78%).
+      const fatigue = clamp(0.16 + 0.035 * age + 6 * Math.max(0, stretch), 0, 0.78);
+      if (roll < fatigue) return start('panic'); // 꼭대기에서 곧장 급락 — 상승보다 하락이 빠르다
+      if (roll < fatigue + 0.2) return start('pullback');
       break;
+    }
     case 'pullback':
-      if (stretch < -0.022 && sentiment < -0.42 && roll < 0.32) return start('panic'); // 투매 전환
-      if (roll < 0.30) return start('calm');
-      if (roll < 0.44) return start('rally'); // 저가 매수 유입
+      if (stretch < -0.02 && sentiment < -0.4 && roll < 0.16 + 0.2 * fear) return start('panic'); // 투매 전환
+      if (roll < 0.28) return start('calm');
+      if (roll < 0.42) return start('rally'); // 저가 매수 유입
       break;
     case 'panic':
-      if (roll < 0.30) return start('calm'); // 진정
-      if (roll < 0.40) return start('rally'); // 데드캣 바운스
+      // 공포가 바닥까지 갔을 때만 열리는 마지막 단계 — 투매(항복). 짧고 격렬하다.
+      if (fear > 0.9 && sentiment < -0.7 && roll < 0.03) return start('capitulation');
+      if (roll < 0.34) return start('calm'); // 진정
+      if (roll < 0.46) return start('rally'); // 데드캣 바운스
+      break;
+    case 'capitulation':
+      // 투매는 오래 못 간다 — 팔 사람이 다 팔고 나면 반등한다(V 바닥). 평균 3~4틱.
+      if (roll < 0.5) return start('rally'); // 안도 랠리
+      if (roll < 0.8) return start('calm');
       break;
   }
   return { regime: s.regime, regimeTicks: age };
 }
 
-/** 한 틱의 시장 심리를 굴려 다음 상태와 이번 틱의 체결 성격을 만든다(순수 함수, DB 접근 없음). */
-function nextMarketState(s: BotState): {
+/** 한 틱의 시장 심리를 굴려 다음 상태와 이번 틱의 체결 성격을 만든다(순수 함수, DB 접근 없음).
+ * ⚠ 순수 함수라 그대로 떼어내 장기 시뮬레이션을 돌릴 수 있다(`npm run sim:bot`) — 파라미터를 바꿨다면
+ * 반드시 돌려서 장기 안정성(며칠 뒤 가격이 0 으로 붕괴하거나 발산하지 않는지)을 다시 확인할 것. */
+export function nextMarketState(s: BotState): {
   next: BotState;
   ret: number;         // 이번 틱 수익률
   sizeMult: number;    // 거래량 배수
   buyProb: number;     // 체결이 매수(taker buy)일 확률
   spreadMult: number;  // 호가 스프레드 배수
+  bidDepthMult: number; // 매수 사다리 물량 배수(공포장엔 매수벽이 사라진다)
+  askDepthMult: number; // 매도 사다리 물량 배수(공포장엔 팔려는 물량이 쌓인다)
 } {
   const anchor = s.anchor > 0 ? s.anchor : s.ref;
   const stretch = (s.ref - anchor) / anchor; // 적정가 대비 과열(+)/과매도(-)
+  const peak = s.peak > 0 ? Math.max(s.peak, s.ref) : s.ref;
+  const trough = s.trough > 0 ? Math.min(s.trough, s.ref) : s.ref;
+
+  // 0) 탐욕/공포 게이지 — 사람이 실제로 보는 기준은 "적정가"가 아니라 **최근 고점과 저점**이다.
+  //    고점 대비 얼마나 빠졌나 = 공포, 저점 대비 얼마나 올랐나 = 탐욕. 각각 0~1 로 정규화한다.
+  const fear = clamp((peak - s.ref) / peak / GAUGE_FULL, 0, 1);
+  const greed = clamp((s.ref - trough) / trough / GAUGE_FULL, 0, 1);
 
   // 1) 변동성 클러스터링 — 직전 변동성을 대부분 물려받고(AR(1)) 드물게 뉴스 충격으로 튄다.
   let vol = s.vol * 0.9 + 0.1 * Math.exp(gauss() * 0.45);
   if (Math.random() < 0.02) vol *= 1.8 + Math.random() * 1.4;
   vol = clamp(vol, 0.35, 4.5);
+  // ⚠ 레버리지 효과 — 같은 크기라도 **떨어질 때가 오를 때보다 시끄럽다**. 공포 게이지로 이번 틱에만
+  //    증폭하고(상태엔 안 저장) 넘긴다 — 저장하면 AR(1) 에 곱해져 공포가 이어지는 동안 기하급수로
+  //    커지고 상한(clamp)에 붙어버린다.
+  const volEff = vol * (1 + 0.4 * fear);
 
   // 2) 추세 지속 — 방향이 한 번 잡히면 감쇠하며 몇 틱 이어진다.
-  const drift = s.drift * 0.86 + gauss() * 0.0007 * vol;
+  const drift = s.drift * 0.86 + gauss() * 0.0004 * vol;
 
-  // 3) 군중 심리 — 최근 추세와 과열도가 쌓여 탐욕/공포가 된다(국면 전이의 방아쇠).
-  const sentiment = clamp(s.sentiment * 0.88 + 45 * drift + 3 * stretch, -1, 1);
+  // 3) 군중 심리 — 최근 추세·과열도·고저점 대비 위치가 쌓여 탐욕/공포가 된다(국면 전이의 방아쇠).
+  //    ⚠ 여기에 **군집(herding)** 을 더했다: 무드는 자기 자신을 되먹여 한 번 쏠리면 한동안 유지된다
+  //    (s(1-s²) 라 극단에선 0 이 되어 포화 — 실효 지속계수 ≤ 0.96 이므로 발산 불가).
+  const herd = HERD_GAIN * s.sentiment * (1 - s.sentiment * s.sentiment);
+  const sentiment = clamp(s.sentiment * 0.9 + herd + 40 * drift + 2.6 * stretch + 0.05 * (greed - 1.4 * fear), -1, 1);
 
-  const { regime, regimeTicks } = nextRegime(s, stretch, sentiment);
+  const { regime, regimeTicks } = nextRegime(s, stretch, sentiment, fear, greed);
   const P = REGIME_PARAMS[regime];
 
   // 4) 평균회귀 — 벌어질수록 제곱으로 강해진다(무한 발산 방지 + "너무 올랐다" 심리).
   const revert = -0.045 * stretch - 0.7 * stretch * Math.abs(stretch);
 
   // 5) 라운드넘버 자석 — 심리적 지지/저항 근처에서 잠시 머뭇거린다.
+  //    단 무드가 극단이면 그런 자리는 그냥 뚫고 지나간다(확신에 찬 군중은 저항을 안 본다).
   const roundStep = ROUND_STEP_TICKS * virtualTick(s.ref);
   const round = Math.round(s.ref / roundStep) * roundStep;
   const toRound = (round - s.ref) / s.ref;
-  const magnet = Math.abs(toRound) < 0.004 ? toRound * 0.35 : 0;
+  const magnet = Math.abs(toRound) < 0.004 ? toRound * 0.35 * (1 - Math.abs(sentiment)) : 0;
 
-  // 6) 이번 틱 수익률 + 팻테일(가끔 튀는 급등락)
-  let ret = drift + revert + magnet + P.bias + gauss() * 0.0015 * vol * P.volMult;
+  // 6) 확신(conviction) — 국면 드리프트는 군중이 그 방향으로 쏠려 있을수록 세진다. 같은 rally 라도
+  //    "다들 사고 있는 rally"가 더 가파르다.
+  const conviction = 1 + 0.7 * clamp(sentiment * Math.sign(P.bias), 0, 1);
+
+  // 7) 사건 — 최근 고점 돌파(FOMO 추격매수)와 최근 저점 붕괴(손절 연쇄). 실제 차트에서 사람이 읽는
+  //    사건은 대부분 이 둘이다. ⚠ **연쇄가 추격보다 크고 자주** 터진다(계단으로 오르고 엘리베이터로
+  //    떨어진다). 그 방향으로 이미 쏠려 있을 때만 발동하므로 평상시엔 아무 일도 안 일어난다.
+  let event = 0;
+  if (s.ref >= peak - EPS && sentiment > 0.35 && Math.random() < FOMO_CHANCE) {
+    event += FOMO_KICK * (0.5 + Math.random()) * volEff;
+  } else if (s.ref <= trough + EPS && sentiment < -0.35 && Math.random() < CASCADE_CHANCE) {
+    event -= CASCADE_KICK * (0.5 + Math.random()) * volEff;
+  }
+
+  // 8) 이번 틱 수익률 + 팻테일(가끔 튀는 급등락). 팻테일도 비대칭이다 — 공포장의 급락(투매 flush)이
+  //    탐욕장의 급등(숏스퀴즈)보다 크고 잦다.
+  let ret = drift + revert + magnet + P.bias * conviction + event + gauss() * 0.00095 * volEff * P.volMult;
   if (Math.random() < 0.03) ret *= 2 + Math.random() * 2;
+  if (fear > 0.5 && Math.random() < 0.008) ret -= (0.003 + 0.007 * Math.random()) * volEff;
+  else if (greed > 0.6 && Math.random() < 0.005) ret += (0.003 + 0.005 * Math.random()) * volEff;
 
   const ref = roundOx(clamp(s.ref * (1 + ret), 0.0001, 1e6));
 
-  // 7) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증.
+  // 9) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증(공포가 거래를 만든다).
   const intensity = clamp(0.5 + Math.abs(ret) / 0.003, 0.45, 6);
   const nextAnchor = anchor * 0.99 + ref * 0.01;
+  // 호가 깊이의 비대칭 — 공포장엔 매수벽이 걷히고 매도벽이 쌓인다(그래서 같은 크기 시장가 매도라도
+  // 패닉 때 훨씬 깊게 파고든다). 탐욕장은 반대. 심리가 가격뿐 아니라 유동성으로도 드러나는 부분이다.
+  const lean = clamp(sentiment, -1, 1);
   return {
     next: {
       ref,
@@ -810,11 +910,18 @@ function nextMarketState(s: BotState): {
       anchor: nextAnchor + (BOT_BASE_PRICE - nextAnchor) * BOT_BASE_PULL,
       regime,
       regimeTicks,
+      // 고점/저점 기억은 새 극값이면 즉시 갱신되고, 아니면 현재가 쪽으로 서서히 잊힌다.
+      peak: Math.max(ref, peak - (peak - ref) * EXTREME_DECAY),
+      trough: Math.min(ref, trough + (ref - trough) * EXTREME_DECAY),
     },
     ret,
-    sizeMult: P.sizeMult * intensity,
-    buyProb: clamp(0.5 + P.takerBias + (ret >= 0 ? 0.22 : -0.22), 0.06, 0.94),
-    spreadMult: 0.75 + 0.45 * vol, // 변동성이 크면 마켓메이커가 물러나 호가가 벌어진다
+    sizeMult: P.sizeMult * intensity * (1 + 0.5 * fear),
+    buyProb: clamp(0.5 + P.takerBias + 0.18 * lean + (ret >= 0 ? 0.18 : -0.18), 0.05, 0.95),
+    // 변동성이 크면 마켓메이커가 물러나 호가가 벌어진다(국면 배수까지 곱하되 상한을 둔다 — 안 두면
+    // 투매 때 깊은 레벨이 몇 %씩 벌어져 시장가 슬리피지가 비현실적으로 커진다).
+    spreadMult: clamp((0.75 + 0.45 * volEff) * P.spread, 0.6, 3.2),
+    bidDepthMult: clamp(P.bidDepth * (1 + 0.35 * lean), 0.2, 2.2),
+    askDepthMult: clamp(P.askDepth * (1 - 0.35 * lean), 0.2, 2.2),
   };
 }
 
@@ -916,7 +1023,14 @@ async function marketMakerTick(
       sizeMult = 1;
     }
     usedPrices[side].add(price);
-    (side === 'buy' ? book.bids : book.asks).push({ price, size: humanSize((2000 + Math.random() * 8000) * sizeMult) });
+    // ⚠ 물량에 **국면별 깊이 배수**를 건다(2026-08-12) — 예전엔 양쪽이 항상 같은 두께라, 패닉이든
+    // 광기든 호가창은 똑같이 생겼고 심리는 가격에서만 보였다. 지금은 공포장이면 매수벽이 걷히고
+    // (시장가 매도가 훨씬 깊게 파고든다) 매도벽이 쌓인다 — 탐욕장은 반대.
+    const depthMult = side === 'buy' ? step.bidDepthMult : step.askDepthMult;
+    (side === 'buy' ? book.bids : book.asks).push({
+      price,
+      size: humanSize((2000 + Math.random() * 8000) * sizeMult * depthMult),
+    });
   };
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
     const depth = level / (BOT_LEVELS_PER_SIDE - 1);
@@ -985,7 +1099,7 @@ async function marketMakerTick(
   // 소비(bookWriteStmt)가 옛 사다리로 덮어쓰지 못하게 한다.
   stmts.push(
     env.DB.prepare(
-      'UPDATE spot_bot_state SET ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, book_json=?, tape_json=?, book_version=book_version+1 WHERE id=?',
+      'UPDATE spot_bot_state SET ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, book_version=book_version+1 WHERE id=?',
     ).bind(
       next.ref,
       next.drift,
@@ -994,6 +1108,8 @@ async function marketMakerTick(
       next.anchor,
       next.regime,
       next.regimeTicks,
+      next.peak,
+      next.trough,
       serializeBook(book),
       serializeTape(tape),
       pair,
@@ -1025,8 +1141,8 @@ async function marketMakerTick(
 
 // 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
 // 읽히고, 값이 비었거나(anchor=0=미초기화) 알 수 없는 regime 이면 안전한 기본값으로 떨어진다.
-const BOT_STATE_COLS = 'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, tape_json';
-const REGIMES: readonly Regime[] = ['calm', 'rally', 'euphoria', 'pullback', 'panic'];
+const BOT_STATE_COLS = 'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, tape_json';
+const REGIMES: readonly Regime[] = ['calm', 'rally', 'euphoria', 'pullback', 'panic', 'capitulation'];
 
 interface BotStateRow {
   last_run: number;
@@ -1037,6 +1153,8 @@ interface BotStateRow {
   anchor: number;
   regime: string;
   regime_ticks: number;
+  peak: number;   // 최근 고점 기억(0=미초기화 → 현재가로 시작)
+  trough: number; // 최근 저점 기억(0=미초기화)
   tape_json: string | null; // 봇 합성 체결 링 버퍼(§ 봇 합성 체결 테이프) — 틱이 이어받아 append 한다
 }
 
@@ -1049,6 +1167,8 @@ function toBotState(row: BotStateRow | null, ref: number): BotState {
     anchor: row?.anchor ?? 0,
     regime: REGIMES.includes(row?.regime as Regime) ? (row!.regime as Regime) : 'calm',
     regimeTicks: row?.regime_ticks ?? 0,
+    peak: row?.peak ?? 0,
+    trough: row?.trough ?? 0,
   };
 }
 

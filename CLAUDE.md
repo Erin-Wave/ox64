@@ -27,7 +27,8 @@
 ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
-├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks=봇 심리상태, +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
+├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks/peak/trough=봇 심리상태(고점·저점 기억 포함), +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
+├── scripts/                운영 스크립트 — d1-budget.mjs(D1 쓰기 예산 점검, §6) · sim-bot.ts(봇 심리 모델 장기 시뮬레이션, `npm run sim:bot` — 심리 파라미터를 바꿨으면 반드시 돌릴 것)
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조(rgb(var(--color-x) / <alpha-value>)) — 실제 값은 src/index.css 테마 블록
 ├── cron/                   ── 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker (메인 Pages 프로젝트와 별도 배포) ──
@@ -261,24 +262,56 @@ ox64/
   `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 매 틱이 직전과 완전히 독립이라 추세도
   변동성 뭉침도 과열도 공포도 없는 무특징 노이즈였고, 차트에 읽을 구조가 없어 분석도 재미도 성립하지
   않았다("사람 심리가 안 들어간 매매라 노잼"). 지금은 실제 시장의 정형화된 사실(stylized facts)을 작은
-  상태기계로 재현한다. 상태(`drift`/`vol`/`sentiment`/`anchor`/`regime`/`regime_ticks`)는
-  **`spot_bot_state` 행에 얹혀 틱 사이에 지속**되므로 추가 DB 왕복이 없다(어차피 읽고 쓰던 행):
+  상태기계로 재현한다. 상태(`drift`/`vol`/`sentiment`/`anchor`/`regime`/`regime_ticks`/`peak`/`trough`)는
+  **`spot_bot_state` 행에 얹혀 틱 사이에 지속**되므로 추가 DB 왕복이 없다(어차피 읽고 쓰던 행 — 컬럼이
+  몇 개든 UPDATE 는 1행이라 **쓰기 비용도 그대로 0 증가**다, §6):
   - **추세 지속** — 수익률이 AR(1) 자기상관(`drift = drift*0.86 + noise`) → 한 번 잡힌 방향이 여러 틱 이어짐
   - **변동성 클러스터링** — `vol` 이 AR(1) + 2% 확률의 "뉴스" 충격 → 잔잔한 구간과 거친 구간이 뭉침
   - **과열 후 평균회귀** — 적정가(`anchor`) 대비 괴리(`stretch`)가 커질수록 되돌림이 **제곱으로** 강해짐
-  - **탐욕-공포 국면**(`REGIME_PARAMS`) — `calm→rally→euphoria→panic→…` 전이. **비대칭**: `panic` 이
-    `euphoria` 보다 bias·변동성·거래량이 모두 크다(떨어질 땐 빠르고 거칠게). 각 국면은 `minTicks` 만큼
-    최소 지속돼 1틱만에 튕기지 않는다. 실측 점유율 ≈ calm 50 / rally 25 / pullback 16 / panic 6 / euphoria 3%
-  - **라운드넘버 자석**(0.05 간격 근처에서 머뭇거림), **팻테일**(3% 확률로 수익률 2~4배), 그리고
+  - **탐욕-공포 국면**(`REGIME_PARAMS`) — `calm→rally→euphoria→panic→capitulation→…` 전이. **비대칭**:
+    `panic` 이 `euphoria` 보다 bias·변동성·거래량이 모두 크다(떨어질 땐 빠르고 거칠게). 각 국면은
+    `minTicks` 만큼 최소 지속돼 1틱만에 튕기지 않는다. 실측 점유율 ≈ calm 50 / rally 26 / pullback 16 /
+    panic 5 / euphoria 3 / capitulation 0.04%
+  - **라운드넘버 자석**(50틱 간격 근처에서 머뭇거림), **팻테일**(3% 확률로 수익률 2~4배), 그리고
     **거래량·체결 방향(taker buy 비율)·호가 스프레드가 국면에 함께 반응**(패닉엔 거래량 폭증 + 스프레드
     확대 = 마켓메이커 후퇴) — 한 틱의 체결들도 직전 기준가에서 새 기준가로 "걸어가며" 찍어 봉마다
     시가/고가/저가/종가와 꼬리가 제대로 생긴다(예전엔 전부 같은 가격이라 꼬리 없는 몸통뿐이었다).
-  - **⚠ 장기 안정성**: `REGIME_PARAMS.bias` 는 국면 점유율로 가중하면 합이 ~0 이 되게 맞춰져 있고, 그
-    위에 `anchor` 를 기준선(`BOT_BASE_PRICE=1`)으로 아주 약하게 당기는 힘(반감기 ~14h)을 얹었다. 둘 중
-    하나라도 빠지면 며칠 만에 가격이 0 으로 붕괴하거나 발산한다(초기 튜닝에서 5일 -40% 편향 실측).
-    **파라미터를 바꾸면 반드시 장기 시뮬레이션으로 재확인할 것** — 모델은 DB 접근 없는 순수 함수라
-    그대로 떼어내 돌릴 수 있다. 검증 기준: 5일치에서 가격이 특정 배수 범위에 머물고, 수익률 lag1
-    자기상관 ~0.2(추세), |수익률| lag1 자기상관 ~0.25(변동성 뭉침), 1분봉 평균 고저폭 ~1.9%.
+  - **⚠ 탐욕/공포 심화(2026-08-12)**: 위 항목들은 **가격의 통계적 성질**이지 사람의 행동이 아니었다 —
+    군중 심리(`sentiment`)가 사실상 최근 수익률의 즉석 함수라 "쌓였다 꺼지는 무드"가 아니었고, 시장이
+    **자기 고점/저점을 기억하지 않아** 저항 돌파·지지 붕괴 같은 사람이 읽는 사건이 아예 없었다. 그래서:
+    - **무드의 관성·군집(herding)** — `sentiment` 가 자기 자신을 되먹이되 `s(1-s²)` 라 극단에서 포화한다.
+      ⚠ 실효 지속계수가 `0.90 + HERD_GAIN(0.06) = 0.96 < 1` 이라 **수학적으로 발산이 불가능**하다 —
+      되먹임을 넣을 땐 이 상한을 반드시 유지할 것(1 을 넘기면 무드가 한쪽으로 굳어 시장이 멈춘다).
+    - **고점/저점 기억(`peak`/`trough`)** — 새 극값이면 즉시 갱신, 아니면 현재가 쪽으로 서서히 잊힌다
+      (`EXTREME_DECAY`, 반감기 ≈ 230틱). 여기서 **공포 = 고점 대비 낙폭 / 탐욕 = 저점 대비 상승폭**
+      (`GAUGE_FULL`=10% 에서 100%)을 뽑아 전이 확률·변동성·거래량·호가 두께에 먹인다.
+      ⚠ 이 게이지가 **포화되면(항상 ~1) 모든 게 망가진다** — 초기 튜닝에서 `GAUGE_FULL` 이 6%,
+      감쇠가 느려서 평균 공포 0.86 이 나왔고, 그 결과 공포 기반 전이가 전부 최대치로 걸려 panic 점유율이
+      17%(정상 5%)까지 치솟고 1분봉 폭이 5.7%(정상 2.2%)로 폭발했다. 목표는 **평균 0.3 안팎**이다.
+    - **사건 2종** — 신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄(cascade). **연쇄가 1.5배 크고 더 자주**
+      터진다(계단으로 오르고 엘리베이터로 떨어진다). 그 방향으로 이미 쏠려 있을 때만 발동해 평상시엔
+      아무 일도 안 일어난다.
+    - **투매(`capitulation`) 국면** — 공포가 극단(>0.9)이고 무드가 -0.7 아래인 `panic` 에서만 열리는
+      마지막 단계. bias -1.1%/틱·거래량 5.5배로 짧고 격렬하게 쏟아진 뒤 3~4틱 만에 소진돼 반등한다
+      (V 바닥). 실측 하루 2~3회 — **가끔 나와야 사건이 된다**(초기 튜닝에선 하루 200회가 나왔다).
+    - **레버리지 효과** — 떨어질 때가 오를 때보다 시끄럽다(공포 게이지로 이번 틱 변동성만 증폭).
+      ⚠ 증폭분을 상태에 **저장하면 안 된다** — AR(1) 에 곱해져 공포가 이어지는 동안 기하급수로 커진다.
+    - **버블 피로** — `euphoria` 는 오래 끌수록·적정가에서 벌어질수록 붕괴 확률이 커진다(예전엔 고정
+      34% 라 "고점일수록 위험하다"는 감각이 없었다).
+    - **호가 깊이의 비대칭** — 공포장엔 매수벽이 걷히고 매도벽이 쌓인다(반대로 광기엔 매도호가가
+      사라진다). 실측 공포 구간 매수/매도 두께비 **0.5**, 광기 구간 **5.1** — 심리가 가격뿐 아니라
+      **유동성**으로 드러나므로 같은 크기 시장가라도 패닉 때 훨씬 깊게 파고든다(대량 주문은 여전히
+      `synthMaker` 의 3% 시장충격 상한이 막는다).
+    - 실측 비대칭: 수익률 왜도 **-1.5**, 급락(-0.5%↓) 4.1% vs 급등(+0.5%↑) 3.2%.
+  - **⚠ 장기 안정성 — 파라미터를 바꿨으면 `npm run sim:bot` 을 반드시 돌릴 것**(`scripts/sim-bot.ts`,
+    모델이 DB 접근 없는 순수 함수라 5~20일치를 몇 초에 굴린다. `SIM_DAYS`/`SIM_RUNS` 로 조절):
+    `REGIME_PARAMS.bias` 는 국면 점유율로 가중하면 합이 ~0 이 되게 맞춰져 있고, 그 위에 `anchor` 를
+    기준선(`BOT_BASE_PRICE=1`)으로 아주 약하게 당기는 힘(반감기 ~14h)을 얹었다. 둘 중 하나라도 빠지면
+    며칠 만에 가격이 0 으로 붕괴하거나 발산한다(초기 튜닝에서 5일 -40%, 이번 확장 중에도 5일 -73% 와
+    +730% 를 각각 실측했다). ⚠ **평형은 놀랄 만큼 민감하다** — 틱당 편향 `2.8e-5`(rally bias 를
+    0.0010→0.0009 만큼) 차이가 5일 뒤 가격 2.4배로 나타난다. 검증 기준: 5~20일치에서 가격이 시작가의
+    0.5~2배 안, 수익률 lag1 자기상관 ~0.27(추세), |수익률| lag1 자기상관 ~0.30(변동성 뭉침), 1분봉 평균
+    고저폭 ~2.2%, 국면 점유율이 위 표와 비슷할 것. 실측(20일×4회): 종가 0.90~1.23, MDD -60%.
   - **⚠ 가격 하한(2026-07-24)**: `nextMarketState` 의 기준가 클램프는 `clamp(s.ref*(1+ret), 0.0001, 1e6)`
     이다. 예전엔 하한이 **0.02** 라 "가격이 0.02 밑으로 안 내려가는" 버그가 있었다(유저가 아무리 팔아도
     0.02 에서 막힘) → 4자리 틱 최소값 0.0001 로 낮췄다. 유저 체결이 anchor 를 끌어당기고(위 `ANCHOR_TRADE_PULL`)
@@ -515,6 +548,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   이미 실행했다면 재실행 시 "duplicate column name" 에러 발생(무시 가능, 이미 적용됐다는 뜻).
   - **⚠ `spot_candles`(OX 영속 캔들, 2026-07-19)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` 라 `--file=./schema.sql` 재적용만으로 생성된다(ALTER 불필요). **코드가 이 테이블을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다**(없으면 봇/유저 체결 batch 가 통째로 실패) — prod 엔 이미 적용 완료(`num_tables` 8). 로컬은 `--local --file=./schema.sql`.
   - **⚠ `spot_bot_state` 봇 심리 컬럼(2026-07-20)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE spot_bot_state ADD COLUMN drift REAL NOT NULL DEFAULT 0"` 및 동일 형식으로 `vol REAL NOT NULL DEFAULT 1` / `sentiment REAL NOT NULL DEFAULT 0` / `anchor REAL NOT NULL DEFAULT 0` / `regime TEXT NOT NULL DEFAULT 'calm'` / `regime_ticks INTEGER NOT NULL DEFAULT 0`. **코드(`nextMarketState` 상태 로드/저장)가 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다** — prod 엔 이미 적용 완료. 전부 DEFAULT 가 있어 기존 행도 그대로 동작(anchor=0 은 "미초기화"라 첫 틱에 현재가로 자동 세팅).
+  - **⚠ `spot_bot_state` 고점/저점 기억 컬럼(2026-08-12, 탐욕/공포 심화)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE spot_bot_state ADD COLUMN peak REAL NOT NULL DEFAULT 0"` 및 동일 형식으로 `trough REAL NOT NULL DEFAULT 0`. **코드(`nextMarketState` 가 읽고 `marketMakerTick` 이 UPDATE)가 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다** — 없으면 봇 틱 batch 가 통째로 실패해 시장이 멈춘다. prod·로컬 적용 완료. DEFAULT 0 = 미초기화라 기존 행도 첫 틱에 현재가로 자동 세팅. 컬럼이 늘어도 UPDATE 는 여전히 1행이라 **D1 쓰기 비용은 그대로**다(§6).
   - **⚠ `pending_orders.reduce_only`(지정가 청산, 2026-07-19)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE pending_orders ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0"`. **코드(limitClose INSERT)가 이 컬럼을 참조하므로 코드 배포 전에 먼저 적용돼 있어야 한다** — prod 엔 이미 적용 완료. 재실행 시 "duplicate column name"(무시 가능).
   - **⚠ `conditional_orders`(조건부/스탑 주문, 2026-07-24)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용(멱등) 또는 `npx wrangler d1 execute ox64 --remote --command "CREATE TABLE IF NOT EXISTS conditional_orders (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, size REAL NOT NULL, leverage INTEGER NOT NULL, trigger_price REAL NOT NULL, trigger_dir TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_conditional_user ON conditional_orders(user_id);"` 로 생성. **코드(loadState/checkTriggers)가 이 테이블을 SELECT 하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 단, loadState/checkTriggers 는 이 조회를 try/catch 로 감싸 미생성 시에도 앱 전체가 500 이 되진 않게 방어함(조건부 기능만 비활성). conditionalOpen(INSERT)만 테이블 없으면 500.
   - **⚠ `conditional_orders` 무한 반복 컬럼(2026-07-28)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE conditional_orders ADD COLUMN repeating INTEGER NOT NULL DEFAULT 0"` 및 동일 형식으로 `armed INTEGER NOT NULL DEFAULT 1` / `rearm_price REAL` / `fill_count INTEGER NOT NULL DEFAULT 0` / `max_fills INTEGER` / `repeat_mode TEXT NOT NULL DEFAULT 'continuous'` / `cooldown_ms INTEGER NOT NULL DEFAULT 0` / `last_fill_at INTEGER`. **코드 배포 전에 먼저 적용돼 있어야 한다**(읽기 경로는 기본값으로 방어하지만 `conditionalOpen` INSERT 가 컬럼을 참조) — prod 엔 이미 적용 완료. 전부 DEFAULT 가 있거나 NULL 허용이라 기존 행도 그대로 1회성 주문으로 동작.
@@ -932,6 +966,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - [x] **일일 상한 + 계량 병목 통합 — "하루 100만 행" 보증(2026-08-01, 전 경로 감사)** — 월 상한만으로는 **반복 조건부 3개(하루 100만 = 월 3,100만)가 월 차단선(4,500만) 아래라 영원히 안 걸리면서** 하루 목표치를 넘긴다는 구멍을 감사에서 찾았다(반복 조건부는 **개수 제한이 없다**). ①**일일 2단 차단** — 반복 조건부 60만 / 봇 80만(봇 단독 최악 58.7만이라 못 닿는 최후 방어선, 80만×31=2,480만 이므로 일일선이 곧 월 보증). ②**계량 지점을 `feeAccrualStmts` 하나로 통합** — 모든 체결 경로가 반드시 지나는 병목이라 여기 한 줄이면 11개 체결 경로가 전부 잡히고, 경로별로 흩뿌릴 때의 누락 위험이 사라진다(조건부에 따로 넣었던 계량은 이중 계산이라 제거). ③**폴링 경로 전수 점검** — 클라의 8개 주기 요청 중 D1 쓰기를 만드는 건 `useSpotPoll`(봇 틱)과 `useTriggerPoll`(체결) 둘뿐이고 둘 다 계량·차단 아래임을 확인(던전 GET·캔들 조회·랭킹·심볼목록은 쓰기 0). ④과금 규칙을 정확히 정정: `바뀐 행 1 + 갱신된 인덱스 항목 수`(암묵 PK 인덱스 포함). 로컬 D1 검증: 실제코인/OX 체결 각 정확히 +20·주문 생성은 +0·이중 계산 0, 61만에서 **반복만 정지**(봇 5틱 +30 계속), 81만에서 **봇까지 정지**(전부 불변)하면서 수동 진입은 정상
 - [x] **VIP 무한 레벨(등급표 → 공식)** — 13행 상수표(VIP0~12, 1단계당 100배)를 등비수열 두 개로 교체: 진입 거래대금 `1만 × 4^(t-1)`, 요율 `0.03% × 0.79^t`(하한 0.0000001%). 요율 곡선은 **옛 표를 근사**해 실제 수수료 부담은 그대로 두고 등급 칸만 3배 촘촘하게 만들었다(1e12·1e20·1e24 에서 옛 값과 거의 일치). `vipMinVolume`/`vipRate`/`vipTierWindow` 추가, 응답에 `vipFrom`/`vipCurve` 추가(무한이라 표를 통째로 못 보냄 → 창 + 하한 별도), `fmtFeeRate` 8자리, `VipBadge` 배색 3등급당 1칸. 검증: 1~45 등급 기준선 경계 정확(로그 오차 보정), 곡선이 옛 표와 1e10~1e28 구간에서 ±20% 이내
 - [x] **아주 큰 금액/수량 축약 표시(`fmtUsdShort`/`fmtQtyShort`)** — 평가자산 1.02e31 같은 값이 콤마 표기로 나와 랭킹 행을 밀어내고 VIP 뱃지·순위를 화면 밖으로 보내던 문제(제보). 정수부가 임계 자릿수를 넘으면 한국식 단위로 축약(그 위는 지수 표기) + `title` 에 전체값. 적용: 랭킹(수수료 수익·평가자산·미실현) · 헤더 평가자산 · 주문패널 정보란(가용/명목가/증거금/수수료) · 포지션 패널(수량·증거금·PnL·주문내역) · 호가창 수량 · VIP 모달 누적 수수료. 함께 레이아웃 방어(`shrink-0`/`min-w-0`+`truncate`, 청산 수량 입력칸 폭 상한 20ch)
+- [x] **봇 심리에 탐욕/공포 심화(2026-08-12)** — 기존 모델은 추세·변동성 뭉침 같은 **가격의 통계적 성질**이지 사람의 행동이 아니었다(무드가 최근 수익률의 즉석 함수라 관성이 없고, 시장이 고점/저점을 기억하지 않아 저항 돌파·지지 붕괴가 아예 없었다). 무드 군집(herding, 실효 지속계수 0.96 로 발산 불가)·고점/저점 기억(`peak`/`trough` → 탐욕/공포 게이지)·신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄(1.5배 크고 잦다)·**투매(`capitulation`) 국면**(공포 극단에서만 열리는 V 바닥, 하루 2~3회)·레버리지 효과(떨어질 때 더 시끄럽다)·버블 피로(euphoria 는 오래 끌수록 붕괴 확률 ↑)·**호가 깊이 비대칭**(공포장 매수/매도 두께비 0.5, 광기 5.1)을 추가. 상태 컬럼 2개가 늘었지만 **D1 쓰기 비용은 0 증가**(같은 행 UPDATE). 검증: `npm run sim:bot`(새 스크립트) 20일×4회에서 종가 0.90~1.23·1분봉 폭 2.2%·국면 점유율 calm 50/rally 26/pullback 16/panic 5/euphoria 3%·수익률 왜도 -1.5, 로컬 D1 에서 두 페어 봇 틱·시장가 진입/청산·지정가 대기 정상
 - [ ] 가상 코인 3종 이상 추가 — 페어 파라미터화·봇 재고 분리는 끝났고(`VIRTUAL_PAIRS`/`bot_inventory`) `VIRTUAL_SYMBOLS`+`spot_bot_state` 시작가 행만 추가하면 된다. 틱 예산은 코인 수로 나눠 쓰므로 비용은 안 늘지만 코인당 움직임이 성겨진다
 - [ ] 미니 RTS 확장(종족 추가, 유닛 다양화, 난이도 선택, 리플레이)
 - [ ] 펀딩비 반영

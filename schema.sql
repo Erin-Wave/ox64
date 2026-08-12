@@ -157,8 +157,13 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   vol          REAL NOT NULL DEFAULT 1,       -- 변동성 배수(클러스터링 — 잔잔한 구간/거친 구간이 뭉침)
   sentiment    REAL NOT NULL DEFAULT 0,       -- 군중 심리 -1(공포) ~ +1(탐욕)
   anchor       REAL NOT NULL DEFAULT 0,       -- 완만히 따라오는 "적정가"(과열/과매도 판정 기준, 0=미초기화)
-  regime       TEXT NOT NULL DEFAULT 'calm',  -- calm|rally|euphoria|pullback|panic
+  regime       TEXT NOT NULL DEFAULT 'calm',  -- calm|rally|euphoria|pullback|panic|capitulation
   regime_ticks INTEGER NOT NULL DEFAULT 0,    -- 현재 국면이 지속된 틱 수(최소 지속시간 보장용)
+  -- ⚠ 서서히 잊히는 최근 고점/저점(2026-08-12). 탐욕/공포 게이지의 기준이자 "저항 돌파 추격(FOMO)"·
+  -- "지지 붕괴 손절 연쇄"의 방아쇠 — 시장이 자기 고점/저점을 기억해야 사람이 읽는 사건이 생긴다.
+  -- 0 = 미초기화(첫 틱에 현재가로 세팅).
+  peak         REAL NOT NULL DEFAULT 0,
+  trough       REAL NOT NULL DEFAULT 0,
   -- ⚠ 봇 호가 사다리 전체가 이 한 칸이다(예전엔 spot_orders 44행). {"o":액터봇,"b":[[가격,수량]..],"a":[..]}
   -- 매 재호가마다 통째로 교체되고, 유저 체결이 물량을 깎으면 book_version 가드로 되쓴다(§ BotBook).
   book_json    TEXT,
@@ -356,6 +361,13 @@ CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 -- 실패해 시장이 멈춘다. 값이 NULL 이어도 읽기는 빈 테이프로 방어된다(parseTape). 이미 실행했다면
 -- "duplicate column name" 에러(무시 가능).
 -- ALTER TABLE spot_bot_state ADD COLUMN tape_json TEXT;
+
+-- ⚠ 일회성 마이그레이션 (2026-08-12 추가, 봇 심리 모델에 탐욕/공포 기억 추가): 서서히 잊히는 최근
+-- 고점/저점. **코드(nextMarketState 가 읽고 marketMakerTick 이 UPDATE)가 참조하므로 코드 배포 전에 먼저
+-- 적용돼 있어야 한다** — 없으면 봇 틱 batch 가 통째로 실패해 시장이 멈춘다. DEFAULT 0 = 미초기화라
+-- 기존 행도 첫 틱에 현재가로 자동 세팅된다. 이미 실행했다면 "duplicate column name"(무시 가능).
+-- ALTER TABLE spot_bot_state ADD COLUMN peak REAL NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_bot_state ADD COLUMN trough REAL NOT NULL DEFAULT 0;
 
 -- ⚠ 마이그레이션 (2026-07-31 추가, 가상 코인 2종 = OX/USDT + EW/USDT): `bot_inventory` 는 신규 테이블이라
 -- `--file=./schema.sql` 재적용만으로 생성되지만, **기존 봇 재고(users.ox_balance)를 OXUSDT 행으로 옮기는
