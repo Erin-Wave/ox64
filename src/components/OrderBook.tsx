@@ -196,10 +196,15 @@ export default function OrderBook() {
             {trades.map((t, i) => {
               const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
               return (
-                <div key={`${t.time}-${i}`} className="flex items-center justify-between px-1.5 py-px leading-[14px]">
+                // ⚠ 3열은 반드시 **격자**로 — 예전엔 `flex justify-between` 이라 세 칸의 너비가 행마다
+                // 제각각 계산돼, 수량 자릿수가 바뀌면(604 vs 6,694) 가운데 가격이 좌우로 흔들렸다.
+                <div
+                  key={`${t.time}-${i}`}
+                  className="grid grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)] items-center gap-2 px-1.5 py-px leading-[14px]"
+                >
                   <span className="text-muted">{fmtTime(t.time)}</span>
-                  <span className={color}>{fmtPrice(t.price, prec)}</span>
-                  <span className="text-muted">{fmtQty(t.qty)}</span>
+                  <span className={`truncate text-right ${color}`}>{fmtPrice(t.price, prec)}</span>
+                  <span className="truncate text-right text-muted">{fmtQty(t.qty)}</span>
                 </div>
               );
             })}
