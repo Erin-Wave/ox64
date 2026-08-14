@@ -27,6 +27,9 @@ export function useTriggerPoll() {
     let inFlight = false;
     const t = setInterval(async () => {
       if (inFlight) return; // 직전 폴링이 아직 안 끝났으면 건너뜀(느린 네트워크에서 중첩 방지)
+      // ⚠ OX 를 보고 있으면 통합 폴링(§ useSpotPoll)이 계정 상태도 함께 받아온다 → 여기서 또 요청하면
+      // 그게 곧 예전의 "폴링 3개" 로 되돌아간다. 방금 갱신됐으면 이번 차례는 건너뛴다.
+      if (Date.now() - useTradingStore.getState().stateAt < BASE_MS) return;
       inFlight = true;
       try {
         await refresh();

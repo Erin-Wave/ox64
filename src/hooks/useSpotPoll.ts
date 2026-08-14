@@ -4,7 +4,11 @@ import { useTradingStore } from '@/store/useTradingStore';
 import { isVirtualSymbol } from '@/symbols';
 
 /**
- * 가상 코인을 보고 있을 때만 1초마다 그 코인의 /api/spot 을 폴링해 호가/체결을 갱신한다.
+ * 가상 코인을 보고 있을 때만 1초마다 **통합 폴링**(§ useTradingStore.spotTick)을 돌린다 —
+ * 호가·체결·캔들을, 그리고 3틱에 한 번은 계정 상태(잔고·포지션·주문)까지 **한 요청**으로 받는다.
+ * ⚠ 예전엔 이 셋이 각자 폴링해서(호가 1s + 캔들 1s + 계정 2.5s) OX 화면 1인이 시간당 8,640요청이었고,
+ * 그게 무료 플랜(하루 10만 요청)에서 "하루 총 시청 시간 11.4시간"이라는 천장을 만들었다 — 신선도는
+ * 그대로 두고 요청만 1/2.4 로 줄인 것이다(§6 D1 예산).
  * 항상 폴링하지 않고 실제로 그 심볼을 보고 있을 때만 요청을 보낸다.
  * ⚠ 이 폴링이 곧 봇 마켓메이커(runMarketMaker)를 구동하는 클럭이기도 하다 — 주기를 짧게(3s→1.5s→1s)
  * 잡아 호가/체결/기준가가 자주 갱신되고 크로스되는 유저 물량이 그만큼 빨리 체결된다(체결 딜레이 감소).
@@ -21,8 +25,9 @@ import { isVirtualSymbol } from '@/symbols';
  */
 export function useSpotPoll() {
   const symbol = useMarketStore((s) => s.symbol);
+  const interval = useMarketStore((s) => s.interval);
   const authed = useTradingStore((s) => s.authed);
-  const spotRefresh = useTradingStore((s) => s.spotRefresh);
+  const spotTick = useTradingStore((s) => s.spotTick);
   const spotClear = useTradingStore((s) => s.spotClear);
   const active = authed && isVirtualSymbol(symbol);
 
@@ -32,7 +37,7 @@ export function useSpotPoll() {
     // 가상 코인의 호가창이 그려진다(가상 코인이 둘 이상이면 바로 티가 난다).
     spotClear(); // 이전 코인의 호가/체결이 잠깐 남아 보이지 않게
     let t: number | undefined;
-    const tick = () => spotRefresh(symbol);
+    const tick = () => spotTick(symbol, interval);
     const start = () => {
       if (t !== undefined) return;
       tick(); // 돌아온 직후 한 번은 즉시(호가창이 낡은 채로 1초 기다리지 않게)
@@ -50,5 +55,5 @@ export function useSpotPoll() {
       document.removeEventListener('visibilitychange', onVisibility);
       stop();
     };
-  }, [active, symbol, spotRefresh, spotClear]);
+  }, [active, symbol, interval, spotTick, spotClear]);
 }

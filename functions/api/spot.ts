@@ -225,10 +225,13 @@ function candleUpsertOne(env: Env, pair: string, price: number, size: number, no
 async function bucketTradesToCandles(env: Env, pair: string, bucketMs: number, limit: number) {
   const [stateRow, userRows] = await Promise.all([
     env.DB.prepare('SELECT tape_json FROM spot_bot_state WHERE id = ?').bind(pair).first<{ tape_json: string | null }>(),
+    // ⚠ 여기도 시간 범위를 건다 — 이 경로(<60s 인터벌)는 1초 폴링이라 `LIMIT 2000` 을 그대로 두면
+    // 요청 하나가 2,000행이다(시간당 720만 행!). 볼 수 있는 과거가 어차피 테이프 길이(≈3분)로 제한돼
+    // 있으므로(§ 봇 합성 체결 테이프) 그보다 넉넉한 창이면 표시 결과가 같다.
     env.DB.prepare(
-      'SELECT price, size, created_at FROM (SELECT price, size, created_at FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 2000) ORDER BY created_at ASC',
+      'SELECT price, size, created_at FROM (SELECT price, size, created_at FROM spot_trades WHERE pair = ? AND created_at > ? ORDER BY created_at DESC LIMIT 2000) ORDER BY created_at ASC',
     )
-      .bind(pair)
+      .bind(pair, Date.now() - TRADE_VIEW_WINDOW_MS)
       .all<{ price: number; size: number; created_at: number }>(),
   ]);
   const trades = [
@@ -259,7 +262,7 @@ async function bucketTradesToCandles(env: Env, pair: string, bucketMs: number, l
 /** OX 캔들 로드. 1m 이상은 영속 테이블(spot_candles)에서 읽어 히스토리가 시간이 지나도 사라지지 않게
  * 한다. 1s(및 <60s)는 단기 조회라 최신 거래 버킷팅. 영속 테이블이 아직 빈 인터벌(신규 배포 직후,
  * 거래가 아직 안 쌓인 상태)은 거래 버킷팅으로 폴백해 차트가 비지 않게 한다. */
-async function loadSpotCandles(env: Env, pair: string, intervalCode: string, limit: number, endTimeMs?: number) {
+export async function loadSpotCandles(env: Env, pair: string, intervalCode: string, limit: number, endTimeMs?: number) {
   const sec = intervalSecFromCode(intervalCode);
   const bucketMs = sec * 1000;
   // ⚠ 1s 등 <60s 는 영속 테이블이 없어(최신 거래 버킷팅) 과거 페이지가 존재하지 않는다 —
@@ -469,7 +472,7 @@ function mergeRecentTrades(
  * 근본 원인) — 그래서 두 테이블을 UNION 해서 같은 가격대끼리 합산한다. long 지정가=매수 호가,
  * short 지정가=매도 호가. pending_orders 는 취소/체결되면 즉시 그 행이 사라지므로(order.ts/
  * _trading.ts) 별도 동기화 없이 항상 최신 상태가 자동으로 반영된다. */
-async function loadSpotMarket(env: Env, uid: string, pair: string) {
+export async function loadSpotMarket(env: Env, uid: string, pair: string) {
   // `mine` = 그 가격대에 이 유저가 걸어둔 물량. 호가창에서 내 주문을 티나게 표시하려면 합계만으론
   // 알 수 없어서(봇 물량과 섞임) 유저 소유분을 따로 합산해 내려준다.
   // ⚠ 예전엔 봇 호가(spot_orders)와 유저 지정가(pending_orders)를 SQL 에서 UNION ALL 로 합쳤는데,
@@ -483,7 +486,15 @@ async function loadSpotMarket(env: Env, uid: string, pair: string) {
     )
       .bind(uid, pair)
       .all<{ side: string; price: number; size: number; mine: number }>(),
-    env.DB.prepare('SELECT * FROM spot_trades WHERE pair = ? ORDER BY created_at DESC LIMIT 30').bind(pair).all<SpotTradeRow>(),
+    // ⚠ **시간 범위를 함께 건다**(2026-08-14). 이 조회는 1초마다 도는데 `LIMIT 30` 만 있으면 인덱스를
+    // 30행 걸어가므로 **항상 30행**을 읽는다(시간당 10.8만 행 — state 다음으로 큰 읽기였다). 그런데 이
+    // 테이블에 남는 건 **유저 체결뿐**이고(봇 합성 체결은 tape_json 링 버퍼로 갔다, § 봇 합성 체결 테이프)
+    // 아래 mergeRecentTrades 가 테이프와 합쳐 상위 30건만 쓰므로, 실제로 화면에 낄 수 있는 유저 체결은
+    // 최근 것뿐이다. 범위를 주면 `(pair, created_at)` 인덱스가 그 구간만 읽어 평상시 0~3행이 된다.
+    // LIMIT 은 그대로 둬서 **어떤 경우에도 예전보다 많이 읽지 않는다**(구간에 30건 넘게 있어도 30에서 멈춤).
+    env.DB.prepare('SELECT * FROM spot_trades WHERE pair = ? AND created_at > ? ORDER BY created_at DESC LIMIT 30')
+      .bind(pair, Date.now() - TRADE_VIEW_WINDOW_MS)
+      .all<SpotTradeRow>(),
   ]);
 
   const book = parseBook(stateRow?.book_json);
@@ -584,6 +595,12 @@ export const VIRTUAL_PAIRS: readonly string[] = ['OXUSDT', 'EWUSDT'];
 const TRADE_RETENTION_MS = 6 * 3600 * 1000;
 // 프루닝을 매 틱 넣으면 배치 문장만 늘어난다(지워지는 총량은 어차피 같다) — 가끔만 넣어 잘라낸다.
 const TRADE_PRUNE_CHANCE = 0.05; // ≈20틱마다 1회
+
+/** 체결내역을 **표시**하려고 `spot_trades` 를 읽을 때 거는 시간 범위(2026-08-14, 읽기 절감).
+ * 이 테이블엔 유저 체결만 남고 봇 합성 체결은 tape_json 링 버퍼(≈3분치)에 있으므로, 화면(최근 30건 ·
+ * <60s 캔들 버킷팅)에 낄 수 있는 유저 체결은 그 창 근처뿐이다. 테이프보다 넉넉하게 잡아 봇이 멈춰
+ * 테이프가 낡은 상황에서도 최근 체결이 사라지지 않게 한다. 보존 기간(TRADE_RETENTION_MS, 6h)보다는 짧다. */
+const TRADE_VIEW_WINDOW_MS = 60 * 60 * 1000;
 
 // ── 봇 매매 심리 모델 ─────────────────────────────────────────────────────
 // ⚠ 예전 기준가는 `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 추세도, 변동성 뭉침도,

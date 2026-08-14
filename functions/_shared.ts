@@ -557,7 +557,7 @@ export function effectiveCooldownMs(cooldownMs: number | null | undefined): numb
  * marks: 이미 받아둔 마크가격 맵(대개 checkTriggers 가 방금 fetch 한 것) — 넘기면 그대로 재사용해
  * 추가 시세 fetch 를 피한다. 안 넘기고 보유 심볼이 있으면 여기서 한 번 조회한다. 응답의 markPrices 는
  * 클라가 서버와 "동일한 시세"로 청산가/평가자산을 즉시(폴링 지연 없이) 계산하게 해준다(§청산가 표시). */
-export async function loadState(env: Env, uid: string, marks?: Record<string, number>) {
+export async function loadState(env: Env, uid: string, marks?: Record<string, number>, ordersSince?: number) {
   const user = await env.DB.prepare(
     'SELECT id, name, balance, refill_count, refill_date, total_volume, total_fees FROM users WHERE id = ?',
   )
@@ -571,12 +571,23 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
       .bind(uid)
       .all<PositionRow>()
   ).results;
+  // ⚠ 주문내역은 **증분으로** 준다(2026-08-14, 읽기 절감). 이 목록은 화면에 그대로 쌓아두는 이력이라
+  // 폴링마다 같은 50행을 다시 읽을 이유가 없는데, 그게 `/api/state` 읽기 65행 중 50행이었다(폴링 2.5초 →
+  // 시간당 7.2만 행). 클라가 가진 마지막 주문 시각을 보내면 그 이후 것만 읽으므로 평상시 0~1행이다.
+  // ⚠ 경계는 `>=` 다 — 같은 밀리초에 두 건이 체결되면 `>` 는 뒤엣것을 영영 건너뛴다. 대신 경계 1건이
+  // 중복으로 오므로 **클라가 id 로 중복을 제거**한다(useTradingStore.apply).
   const orders = (
-    await env.DB.prepare(
-      'SELECT id, symbol, side, price, size, leverage, kind, pnl, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 50',
-    )
-      .bind(uid)
-      .all<OrderRow>()
+    ordersSince
+      ? await env.DB.prepare(
+          'SELECT id, symbol, side, price, size, leverage, kind, pnl, created_at FROM orders WHERE user_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 50',
+        )
+          .bind(uid, ordersSince)
+          .all<OrderRow>()
+      : await env.DB.prepare(
+          'SELECT id, symbol, side, price, size, leverage, kind, pnl, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 50',
+        )
+          .bind(uid)
+          .all<OrderRow>()
   ).results;
   const pending = (
     await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ? ORDER BY created_at DESC')
@@ -627,6 +638,8 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
       stopLoss: p.stop_loss,
       takeProfit: p.take_profit,
     })),
+    // true 면 위 `orders` 는 전체 목록이 아니라 **증분**이다 → 클라는 교체가 아니라 기존 목록에 합친다.
+    ordersPartial: ordersSince != null,
     orders: orders.map((o) => ({
       id: o.id,
       symbol: o.symbol,

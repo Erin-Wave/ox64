@@ -76,6 +76,9 @@ export interface AppState {
   totalFees: number;
   positions: ApiPosition[];
   orders: ApiOrder[];
+  /** true 면 `orders` 는 전체 목록이 아니라 **증분**이다(§ loadState ordersSince) — 교체하지 말고 합칠 것.
+   * 폴링마다 같은 50건을 다시 읽지 않으려는 것이고, 경계 1건이 중복으로 올 수 있어 id 로 걸러야 한다. */
+  ordersPartial?: boolean;
   pendingOrders: ApiPendingOrder[];
   conditionalOrders: ApiConditionalOrder[];
   // 보유/미체결 심볼의 서버 마크가격 맵 — 클라가 서버와 동일 시세로 청산가/평가자산을 즉시 계산하게 한다
@@ -145,7 +148,10 @@ export const api = {
   login: (name: string, passcode: string) =>
     req<AppState>('/login', { method: 'POST', body: JSON.stringify({ name, passcode }) }),
   logout: () => req<{ ok: boolean }>('/logout', { method: 'POST' }),
-  state: () => req<AppState>('/state'),
+  /** ordersSince = 클라가 가진 가장 최근 주문의 createdAt. 주면 그 이후 주문만 증분으로 받는다
+   * (응답 `ordersPartial=true`). 안 주면 전체(최초 로드·새로고침·액션 응답). */
+  state: (ordersSince?: number) =>
+    req<AppState>(ordersSince ? `/state?ordersSince=${ordersSince}` : '/state'),
   open: (p: { symbol: string; side: Side; size: number; leverage: number; stopLoss?: number | null; takeProfit?: number | null }) =>
     req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'open', ...p }) }),
   close: (positionId: string, size?: number) =>
@@ -205,6 +211,16 @@ export const api = {
   refill: () => req<AppState>('/refill', { method: 'POST' }),
   leaderboard: () => req<{ leaderboard: LeaderRow[]; revenue: FeeRevenue }>('/leaderboard'),
   spotState: (pair: string) => req<SpotState>(`/spot?pair=${encodeURIComponent(pair)}`),
+  /** ⚠ **통합 폴링**(§ functions/api/state.ts `?tick=`) — 호가·체결·캔들(+선택적으로 계정 상태)을
+   * **한 요청**으로 받는다. 예전엔 이 셋이 각자 폴링해서 OX 화면 1인이 시간당 8,640요청이었고, 그게
+   * 무료 플랜(하루 10만 요청)에서 "하루 총 시청 시간 11.4시간"이라는 천장을 만들었다.
+   * `state` 는 매번 받지 않는다 — 매번 받으면 요청은 줄어도 계정 읽기가 2.5배가 되어 읽기 쪽이 손해다. */
+  spotTick: (pair: string, o: { interval: string; bars: number; state?: boolean; ordersSince?: number }) =>
+    req<{ market: SpotState; candles: Candle[]; state: AppState | null }>(
+      `/state?tick=${encodeURIComponent(pair)}&interval=${encodeURIComponent(o.interval)}&bars=${o.bars}` +
+        (o.state ? '&state=1' : '') +
+        (o.state && o.ordersSince ? `&ordersSince=${o.ordersSince}` : ''),
+    ),
   /** OX 캔들. endTimeMs 를 주면 그 시각 "이전" 봉만 — 차트 왼쪽 스크롤 시 과거 구간 이어받기용. */
   spotCandles: (pair: string, interval: string, limit = 500, endTimeMs?: number) =>
     req<{ candles: Candle[] }>(

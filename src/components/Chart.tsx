@@ -465,24 +465,15 @@ export default function Chart() {
       let isFirstLoad = true;
       let loadingMore = false;
       let noMore = false;
-      // ⚠ 폴링은 **최근 몇 봉만** 받는다(2026-08-14, 무료 플랜 전환 ②). 예전엔 1초마다 500봉을 통째로
-      // 다시 받았는데, 서버가 롤업(15m ← 1m 15개)까지 하므로 요청 하나가 D1 에서 최대 500×배수 행을
-      // 읽었다 — 실측 하루 1,050만 행(전체 읽기의 9%)이 **화면에 이미 있는 과거봉을 계속 다시 읽는 데**
-      // 쓰였다. 아래 병합(cut 이전은 보존)이 원래부터 부분 갱신을 전제로 짜여 있어서, 받는 개수만
-      // 줄이면 그대로 동작한다. 필요한 봉 수는 "마지막 성공 이후 흐른 시간 ÷ 인터벌 + 여유 2"로 잡아
-      // 탭이 잠깐 멈췄다 돌아와도 구멍이 안 생긴다(그보다 오래 쉬었으면 아래에서 전체 재적재).
-      // ⚠ 2 면 충분하다 — "진행 중인 봉 + 방금 닫힌 봉"이 갱신 대상의 전부다. 이 숫자가 그대로
-      // 서버 읽기 행 수를 정한다: 저장 안 하는 인터벌은 조회 시 롤업하므로 **limit × 배수**만큼
-      // 원본(1m/1h/1d) 봉을 읽는다(30m 이면 ×30). 3→2 로 줄이면 그 배수가 큰 인터벌에서 읽기가
-      // 3분의 1 준다(실측 30m: 90행 → 60행).
-      const POLL_MIN_BARS = 2;
+      // ⚠ **캔들은 이 컴포넌트가 직접 폴링하지 않는다**(2026-08-14, 무료 플랜 전환). 예전엔 1초마다
+      // 500봉을 통째로 다시 받았고(하루 1,050만 행 읽기), 그걸 증분으로 줄인 뒤에도 호가 폴링과 **따로**
+      // 요청을 보내 OX 화면 1인이 시간당 8,640요청이었다 — 무료 플랜(하루 10만 요청)의 실질 천장이
+      // 그것이었다. 지금은 통합 폴링(useSpotPoll → useTradingStore.spotTick)이 호가·체결·캔들을 한
+      // 요청으로 받아 스토어에 넣고, 여기선 **그 변화를 구독만** 한다. 몇 봉을 받을지도 스토어가 정한다.
+      // 과거봉 추가 로드(loadOlder)만은 사용자가 스크롤할 때만 도는 별개 요청이라 그대로 둔다.
       const FULL_BARS = 500;
-      let lastLoadAt = 0;
-      const barsToFetch = () => {
-        if (isFirstLoad || lastLoadAt === 0) return FULL_BARS;
-        const gapBars = Math.ceil((Date.now() - lastLoadAt) / 1000 / intervalSec(interval));
-        return Math.min(FULL_BARS, Math.max(POLL_MIN_BARS, gapBars + 2));
-      };
+      // 이보다 오래 새 봉이 안 들어오면 "끊김"으로 본다(통합 폴링 1초 주기 기준 넉넉하게).
+      const STALE_MS = 8000;
 
       const draw = (arr: Candle[]) => {
         candle.setData(
@@ -491,43 +482,36 @@ export default function Chart() {
         syncIndicatorsRef.current();
       };
 
-      const load = async () => {
-        try {
-          const want = barsToFetch();
-          const { candles: fresh } = await api.spotCandles(symbol, interval, want);
-          if (cancelled || fresh.length === 0) return;
-          lastLoadAt = Date.now();
-          // ⚠ 폴링 결과로 배열을 통째로 갈아끼우면 왼쪽 스크롤로 붙여둔 과거봉이 매번 날아간다
-          // (1.5초마다 리셋되니 사실상 과거 조회 불가) → 최신 구간만 교체하고 그보다 앞선 구간은 보존.
-          // ⚠ 단 요청 폭이 상한(FULL_BARS)에 닿았다는 건 그만큼 오래 쉬었다는 뜻이라, 받아온 구간과
-          // 기존 구간 사이에 구멍이 있을 수 있다 → 그땐 이어붙이지 말고 통째로 갈아끼운다.
-          const prev = want >= FULL_BARS ? [] : candlesRef.current;
-          const cut = fresh[0].time;
-          const merged = prev.length ? [...prev.filter((c) => c.time < cut), ...fresh] : fresh;
-          candlesRef.current = merged;
-          for (const c of fresh) volMap.current.set(c.time, c.volume ?? 0);
-          draw(merged);
-          // 최초 1회만 표시 범위를 잡는다 — 매번(1.5초 폴링마다) 다시 잡으면 사용자가 확대/축소한
-          // 뷰가 계속 리셋되는 버그가 있었음(실제 심볼은 초기 로드 1번 + WS 업데이트뿐이라 이 문제가 없음).
-          if (isFirstLoad) {
-            isFirstLoad = false;
-            const len = merged.length;
-            const initBars = optsRef.current.visibleBars;
-            chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - initBars), to: len + 2 });
-          }
-          const l = merged.at(-1);
-          setConnected(true);
-          if (l) {
-            applyPrec(l.close);
-            setPrice(symbol, l.close);
-            if (!hovering.current) setLegend(l);
-          }
-          if (!hovering.current) setIndLegend(lastIndLegend());
-          repositionCountdownRef.current();
-        } catch (e) {
-          console.error('[chart] spot candle load failed', e);
-          setConnected(false);
+      /** 통합 폴링이 새로 받아온 봉들을 화면에 반영한다(예전 load() 의 응답 처리 부분 그대로). */
+      const onCandles = (fresh: Candle[]) => {
+        if (cancelled || fresh.length === 0) return;
+        // ⚠ 받아온 걸로 배열을 통째로 갈아끼우면 왼쪽 스크롤로 붙여둔 과거봉이 매번 날아간다
+        // (매 폴링마다 리셋되니 사실상 과거 조회 불가) → 최신 구간만 교체하고 그보다 앞선 구간은 보존.
+        // ⚠ 단 받아온 폭이 상한(FULL_BARS)에 닿았다는 건 그만큼 오래 쉬었거나 처음이라는 뜻이라,
+        // 기존 구간과 사이에 구멍이 있을 수 있다 → 그땐 이어붙이지 말고 통째로 갈아끼운다.
+        const prev = fresh.length >= FULL_BARS ? [] : candlesRef.current;
+        const cut = fresh[0].time;
+        const merged = prev.length ? [...prev.filter((c) => c.time < cut), ...fresh] : fresh;
+        candlesRef.current = merged;
+        for (const c of fresh) volMap.current.set(c.time, c.volume ?? 0);
+        draw(merged);
+        // 최초 1회만 표시 범위를 잡는다 — 매 폴링마다 다시 잡으면 사용자가 확대/축소한 뷰가 계속
+        // 리셋되는 버그가 있었음(실제 심볼은 초기 로드 1번 + WS 업데이트뿐이라 이 문제가 없음).
+        if (isFirstLoad) {
+          isFirstLoad = false;
+          const len = merged.length;
+          const initBars = optsRef.current.visibleBars;
+          chartRef.current?.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - initBars), to: len + 2 });
         }
+        const l = merged.at(-1);
+        setConnected(true);
+        if (l) {
+          applyPrec(l.close);
+          setPrice(symbol, l.close);
+          if (!hovering.current) setLegend(l);
+        }
+        if (!hovering.current) setIndLegend(lastIndLegend());
+        repositionCountdownRef.current();
       };
 
       // ── 과거봉 추가 로드 (왼쪽 스크롤) ── 실제 심볼과 동일한 동작. 예전엔 이 분기가 여기서
@@ -578,28 +562,30 @@ export default function Chart() {
       const tsApiV = chartRef.current?.timeScale();
       tsApiV?.subscribeVisibleLogicalRangeChange(onRangeV);
 
-      // ⚠ **탭이 백그라운드면 폴링을 멈춘다** — useSpotPoll 과 같은 이유·같은 패턴이다(§6 D1 예산).
-      // 그쪽만 멈추고 이 폴링은 계속 돌아서, 배경 탭 하나가 초당 1회씩 캔들을 조회하는 누수가 남아
-      // 있었다(화면을 아무도 안 보는데 읽기만 나간다). 돌아오면 즉시 1회 로드하고, 그때 barsToFetch 가
-      // 쉰 시간만큼 봉을 더 받아 구멍을 메운다.
-      let t: number | undefined;
-      const start = () => {
-        if (t !== undefined) return;
-        load();
-        t = window.setInterval(load, 1000); // 3s→1.5s→1s: OX 캔들/현재가 갱신을 더 촘촘히(체결 딜레이 감소 맥락)
+      // 통합 폴링(useSpotPoll)이 스토어에 새 봉을 넣을 때마다 반영한다. 폴링 주기·탭 숨김 정지·요청
+      // 폭은 전부 그쪽이 관리하므로 여기엔 타이머가 없다. 마운트 시점에 이미 값이 있으면 즉시 한 번 그린다.
+      let lastAt = 0;
+      const myKey = `${symbol}|${interval}`;
+      const pump = (candles: Candle[], at: number, key: string) => {
+        // ⚠ 키 대조 필수 — 이게 없으면 인터벌을 바꾼 직후 **이전 인터벌의 봉**이 한 번 그려진다.
+        if (at === 0 || at === lastAt || key !== myKey) return;
+        lastAt = at;
+        onCandles(candles);
       };
-      const stop = () => {
-        if (t === undefined) return;
-        window.clearInterval(t);
-        t = undefined;
-      };
-      const onVisibility = () => (document.visibilityState === 'visible' ? start() : stop());
-      onVisibility();
-      document.addEventListener('visibilitychange', onVisibility);
+      const s0 = useTradingStore.getState();
+      pump(s0.spotCandles, s0.spotCandlesAt, s0.spotCandlesKey);
+      const unsub = useTradingStore.subscribe((st) => pump(st.spotCandles, st.spotCandlesAt, st.spotCandlesKey));
+      // ⚠ 연결 표시는 **신선도로** 판정한다 — 예전엔 이 컴포넌트가 직접 fetch 해서 그 catch 로 껐는데,
+      // 지금은 통합 폴링이 스토어에서 조용히 재시도하므로 실패가 여기까지 안 온다. 그대로 두면 서버가
+      // 죽어도 초록불이 켜져 있다. 요청을 새로 만들지 않고 "마지막 갱신이 얼마나 됐나"만 본다.
+      const staleTimer = window.setInterval(() => {
+        const at = useTradingStore.getState().spotCandlesAt;
+        if (at > 0 && Date.now() - at > STALE_MS) setConnected(false);
+      }, 2000);
       return () => {
         cancelled = true;
-        document.removeEventListener('visibilitychange', onVisibility);
-        stop();
+        window.clearInterval(staleTimer);
+        unsub();
         tsApiV?.unsubscribeVisibleLogicalRangeChange(onRangeV);
         setConnected(false);
       };
