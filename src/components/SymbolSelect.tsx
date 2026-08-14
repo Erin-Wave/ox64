@@ -66,9 +66,13 @@ export default function SymbolSelect() {
       try {
         const entries = await Promise.all(
           VIRTUAL_SYMBOLS.map(async (sym) => {
-            const [st, cd] = await Promise.all([api.spotState(sym), api.spotCandles(sym, '1h', 24)]);
-            const candles = cd.candles;
-            const price = st.trades[0]?.price ?? (candles.length ? candles[candles.length - 1].close : null);
+            // ⚠ 현재가는 `spotState`(=/api/spot 호가창)가 아니라 **마지막 1시간봉의 종가**로 구한다
+            // (2026-08-14, 무료 플랜 전환 ②). 그 엔드포인트는 캔들 조회와 달리 **봇 틱을 굴린다** —
+            // 드롭다운을 열어둔 것만으로 코인 수 × 5초마다 봇이 돌아 쓰기가 나갔다(= cron 과 맞먹는 양).
+            // 마지막 1시간봉은 "진행 중인 봉"이라 그 종가가 곧 최근 체결가이므로 값은 동일하고,
+            // 요청 수도 코인당 2회 → 1회로 준다. (원래 이 값이 없을 때의 폴백이 바로 이 식이었다.)
+            const { candles } = await api.spotCandles(sym, '1h', 24);
+            const price = candles.length ? candles[candles.length - 1].close : null;
             if (price == null) return null;
             const ref = candles.length ? candles[0].open : price; // 가장 오래된(≈24h 전) 시가
             return [sym, { price, changePct: ref > 0 ? ((price - ref) / ref) * 100 : 0 }] as const;

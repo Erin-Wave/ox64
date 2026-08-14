@@ -42,7 +42,14 @@ CREATE TABLE IF NOT EXISTS orders (
   pnl        REAL,                    -- close 시 실현손익
   created_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+-- ⚠ **복합 인덱스여야 한다**(user_id 단독 금지, 2026-08-14). 이 테이블을 읽는 쿼리는 loadState 의
+-- `WHERE user_id=? ORDER BY created_at DESC LIMIT 50` 하나뿐인데, 인덱스가 user_id 단독이면 SQLite 가
+-- 그 유저의 주문을 **전부 읽어 TEMP B-TREE 로 정렬한 뒤** 50개만 쓴다. 실측(prod): 유저 1명당 35,249행
+-- × 하루 2,999회 = **하루 1억 570만 행 읽기(전체 읽기의 96%)** + 쿼리당 11.7ms. created_at 을 뒤에 붙이면
+-- 인덱스를 역순으로 걸어가다 50개에서 멈춘다(실측 11.203ms → 0.095ms).
+-- 단독 인덱스는 이 복합 인덱스의 접두사로 완전히 대체되므로 **지운다** → INSERT 당 인덱스 항목 수가
+-- 그대로라 쓰기 비용 증가가 0 이다(§6 과금 모델: 바뀐 행 1 + 갱신된 인덱스 항목 수).
+CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at);
 
 -- 지정가(미체결) 주문. 생성 시 증거금(limit_price 기준)을 즉시 잠그고,
 -- 체결 시 positions 로 이관된다(checkTriggers, functions/_trading.ts).
@@ -58,7 +65,13 @@ CREATE TABLE IF NOT EXISTS pending_orders (
   stop_loss   REAL,
   take_profit REAL,
   created_at  INTEGER NOT NULL,
-  reduce_only INTEGER NOT NULL DEFAULT 0  -- 1이면 지정가 "청산"(체결 시 포지션을 열지 않고 반대 포지션을 줄인다), 증거금 안 잠금
+  reduce_only INTEGER NOT NULL DEFAULT 0, -- 1이면 지정가 "청산"(체결 시 포지션을 열지 않고 반대 포지션을 줄인다), 증거금 안 잠금
+  -- ⚠ 마지막 **부분** 체결 시각(2026-08-14). 시장이 한 번에 소화 못 하는 큰 지정가는 봇이 재호가할
+  -- 때마다 조금씩 계속 체결되는데(합성 유동성이 매 틱 되살아나므로), 그 한 번 한 번이 D1 에 ~20행을
+  -- 쓴다 — prod 실측으로 **주문 하나가 하루 3,000건을 체결해 쓰기의 상당 부분**을 만들고 있었다.
+  -- 이 값으로 재체결 간격에 하한을 둔다(§ spot.ts PARTIAL_FILL_COOLDOWN_MS). 한 번에 다 체결되는
+  -- 보통 주문은 그 자리에서 행이 삭제되므로 이 컬럼을 쓸 일이 없다(=영향 없음).
+  last_fill_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_pending_user ON pending_orders(user_id);
 -- OX 호가창(loadSpotMarket UNION)·마켓메이커 sweep 이 매 폴링마다 symbol 로 조회하므로 인덱스를 둔다.
@@ -173,7 +186,21 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   -- 읽는 건 최근 30건과 <60s 캔들 버킷팅뿐이고 차트 히스토리는 spot_candles 가 보관하므로, 이력이
   -- 아니라 링 버퍼다. 사다리와 같이 이 행에 담으면 쓰기 비용이 0 이 된다(§ 봇 합성 체결 테이프).
   -- 형식: [[가격, 수량, 1=매수테이커/0=매도, 시각ms], ...]. 유저 체결은 계속 spot_trades 에 남는다.
-  tape_json    TEXT
+  tape_json    TEXT,
+  -- ⚠ **진행 중(아직 안 닫힌) 캔들 버킷**(2026-08-14, 무료 플랜 전환 ③). 사다리·테이프와 정확히 같은
+  -- 이유로 여기 있다 — "매 틱 갈아엎히는 집계"는 이력이 아니므로 행으로 쪼개면 안 된다. 예전엔 틱마다
+  -- spot_candles 에 1m/1h/1d 3행을 upsert 해서 **하루 11.4만 rows written(전체 쓰기의 38%)** 이 나갔는데,
+  -- 그 3행은 같은 버킷을 초당 몇 번씩 다시 쓰는 것이었다. 지금은 여기에 누적하고 **버킷이 닫힐 때만**
+  -- spot_candles 로 넘긴다(1m=분당 1행). 진행 중 버킷은 loadSpotCandles 가 읽을 때 병합해 붙이므로
+  -- 차트의 마지막 봉은 예전과 똑같이 실시간으로 움직인다.
+  -- 형식: {"1m":{"b":버킷ms,"o":시가,"h":고가,"l":저가,"c":종가,"v":거래량},"1h":{...},"1d":{...}}
+  live_json    TEXT,
+  -- ⚠ 봇 수수료·예산계량 누적분(틱마다 쓰지 않고 모았다가 BOT_ACCRUAL_TICKS 마다 한 번에 정산).
+  -- 예전엔 틱마다 users 카운터 1행 + usage_meter 1행이 나가 봇 틱 하나가 3행이었다. 값 자체는 이 상태
+  -- 행에 누적되므로(같은 1행 UPDATE) 정확도 손실 없이 쓰기만 사라진다 — 정산이 최대 몇 분 늦을 뿐이다.
+  pend_notional REAL NOT NULL DEFAULT 0,      -- 아직 users.total_volume/total_fees 에 안 넘긴 합성체결 명목금액
+  pend_rows     INTEGER NOT NULL DEFAULT 0,   -- 아직 usage_meter 에 안 넘긴 예상 쓰기 행 수
+  pend_ticks    INTEGER NOT NULL DEFAULT 0    -- 마지막 정산 이후 돈 틱 수(정산 주기 판정용)
 );
 
 -- 가상 코인 시작가 — 이 행이 있어야 그 페어의 봇이 돈다(functions/api/spot.ts VIRTUAL_PAIRS 와 짝).
@@ -238,8 +265,11 @@ CREATE TABLE IF NOT EXISTS fee_ledger (
   fee        REAL NOT NULL,       -- notional × rate
   created_at INTEGER NOT NULL
 );
+-- ⚠ 인덱스는 **하나만** 둔다(2026-08-14). 인덱스 하나가 그 테이블 모든 INSERT 의 비용을 1행씩 올리는데
+-- (§6 과금 모델), 이 테이블은 체결마다 INSERT 되므로 그 1행이 곧 "체결 1건당 1행"이다. created_at 단독
+-- 인덱스는 **읽는 코드가 한 곳도 없어**(랭킹의 수수료 수익은 users.total_fees 집계를 쓴다) 순수 비용이었다.
+-- user_id 로 뽑을 때는 아래 복합 인덱스가 그대로 쓰인다.
 CREATE INDEX IF NOT EXISTS idx_fee_ledger_user ON fee_ledger(user_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_fee_ledger_time ON fee_ledger(created_at);
 
 -- ⚠ 일회성 마이그레이션 (2026-07-15 추가, SL/TP 지원): 이미 스키마가 적용된 기존
 -- prod DB 의 positions 테이블에 컬럼을 추가한다. CREATE TABLE IF NOT EXISTS 는
@@ -477,3 +507,26 @@ CREATE INDEX IF NOT EXISTS idx_dungeon_players_room ON dungeon_players(room_code
 -- ALTER TABLE dungeon_rooms ADD COLUMN total_events INTEGER;
 -- ALTER TABLE dungeon_rooms ADD COLUMN ward INTEGER NOT NULL DEFAULT 0;
 -- ALTER TABLE dungeon_players ADD COLUMN contributed REAL NOT NULL DEFAULT 0;
+
+-- ⚠ 일회성 마이그레이션 (2026-08-14 추가, 무료 플랜 전환 ①): orders 읽기 인덱스 교체.
+-- 위 CREATE 는 신규 DB 에만 적용되므로 기존 DB(=prod)는 아래를 **한 번만** 직접 실행할 것.
+-- 근거: prod 실측으로 이 한 쿼리가 하루 1억 570만 행(전체 읽기의 96%)을 읽고 있었다(TEMP B-TREE 정렬).
+-- 단독 인덱스는 복합 인덱스의 접두사라 남겨둘 이유가 없다 — 지워야 INSERT 비용이 안 늘어난다.
+-- CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at);
+-- DROP INDEX IF EXISTS idx_orders_user;
+
+-- ⚠ 일회성 마이그레이션 (2026-08-14 추가, 무료 플랜 전환 ③): 봇 틱을 1행 쓰기로 줄이는 컬럼들.
+-- 위 CREATE TABLE 에는 이미 포함돼 있지만 기존 DB(=prod)엔 CREATE TABLE IF NOT EXISTS 가 컬럼을
+-- 더해주지 않으므로 최초 1회만 아래를 직접 실행할 것.
+-- ⚠⚠ **코드 배포 전에 먼저 적용돼야 한다** — marketMakerTick 의 상태 UPDATE 가 이 컬럼들을 쓰므로
+-- 없으면 봇 틱 batch 가 통째로 롤백돼 시장이 멈춘다(2026-07-20 심리 컬럼 때 실제로 겪은 함정).
+-- 전부 DEFAULT 가 있거나 NULL 허용이라 기존 행도 그대로 동작한다(live_json=NULL → 첫 틱에 새로 시작).
+-- ALTER TABLE spot_bot_state ADD COLUMN live_json TEXT;
+-- ALTER TABLE spot_bot_state ADD COLUMN pend_notional REAL NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_bot_state ADD COLUMN pend_rows INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_bot_state ADD COLUMN pend_ticks INTEGER NOT NULL DEFAULT 0;
+
+-- ⚠ 일회성 마이그레이션 (2026-08-14 추가, 무료 플랜 전환 ④): 큰 지정가의 부분 체결 간격 하한 + 낭비 인덱스 제거.
+-- 코드 배포 전에 먼저 적용할 것(sweepRestingOxPendings 가 last_fill_at 을 SELECT/UPDATE 한다).
+-- ALTER TABLE pending_orders ADD COLUMN last_fill_at INTEGER;
+-- DROP INDEX IF EXISTS idx_fee_ledger_time;

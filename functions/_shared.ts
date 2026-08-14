@@ -502,6 +502,7 @@ export interface PendingRow {
   take_profit: number | null;
   created_at: number;
   reduce_only: number; // 1이면 지정가 청산(reduce-only) — 체결 시 포지션을 열지 않고 반대 포지션을 줄인다
+  last_fill_at: number | null; // 마지막 **부분** 체결 시각 — 재체결 간격 하한 판정용(§ spot.ts PARTIAL_FILL_COOLDOWN_MS)
 }
 export interface OrderRow {
   id: string;

@@ -15,27 +15,42 @@
 // 계량하지 않는 것: 주문 생성/취소/수정, 로그인, 퍼즐, 던전. 전부 사람 손 속도에 묶여 있고 체결 batch 보다
 // 훨씬 작다(1~5행). 즉 이 숫자는 **총계가 아니라 "폭주 가능한 몫"** 이고, 정확한 총계는 `npm run d1:budget`.
 //
-// ── 차단(2단) ──────────────────────────────────────────────────────────────────────────
-// 폭주할 수 있는 경로는 딱 둘이고, **위험한 쪽을 먼저 끊는다**:
-//   `repeating` 조건부 체결 → REPEAT_BLOCK_DAY_ROWS 에서 정지 (개수 제한이 없어 N배로 늘어나는 유일한 경로)
-//   마켓메이커 봇 틱       → BOT_BLOCK_DAY_ROWS 에서 정지 (봇 단독으로는 여기 못 닿는다 = 최후 방어선)
-// 둘 다 월 MONTH_BLOCK_ROWS 도 함께 본다. **수동 거래·강제청산·지정가·SL/TP·1회성 조건부는 절대 막지
-// 않는다** — 돈이 걸린 기능을 DB 비용 때문에 막는 건 더 큰 사고다. 날짜/달이 바뀌면 자동으로 풀린다.
+// ── 차단(3단) ──────────────────────────────────────────────────────────────────────────
+// 스스로 반복해서 도는(=폭주할 수 있는) 경로는 셋이고, **잃는 게 적은 쪽부터** 끊는다:
+//   ① 큰 지정가의 재체결   → NIBBLE_BLOCK_DAY_ROWS (주문은 살아있고 나중에 이어서 채워진다)
+//   ② `repeating` 조건부  → REPEAT_BLOCK_DAY_ROWS (주문 하나가 쉬는 건 국지적)
+//   ③ 마켓메이커 봇       → BOT_BLOCK_DAY_ROWS    (멈추면 가상 코인 시장이 통째로 선다 = 최후 방어선)
+// **수동 거래·강제청산·지정가 첫 체결·SL/TP·1회성 조건부는 절대 막지 않는다** — 돈이 걸린 기능을 DB
+// 비용 때문에 막는 건 더 큰 사고다. 날짜(KST)가 바뀌면 자동으로 풀린다.
 import type { Env, D1PreparedStatement } from './_shared';
 
-/** D1 Paid 플랜에 월 단위로 포함된 rows written(넘으면 100만 행당 $1). */
-export const MONTHLY_ROW_BUDGET = 50_000_000;
-/** 월 차단선 — 포함분의 90%. 남긴 10% 는 "자동 경로가 멈춘 뒤에도 유저가 청산/주문은 할 수 있는" 여유분. */
-export const MONTH_BLOCK_ROWS = 45_000_000;
-/** ⚠ **일일 차단선** — 월 상한만으로는 부족하다. 반복 조건부는 개수 제한이 없어서 3개만 걸면 하루 100만 행
- * (월 3,100만)이 되는데, 그건 월 차단선(4,500만) 아래라 **월 계량기로는 절대 안 걸리면서** 하루 목표치는
- * 넘긴다. 그래서 일일선을 따로 둔다. 이 값 × 31 = 2,790만 < 4,500만 이므로 **일일선이 곧 월 보증**이다. */
-// 계량되지 않는 잔여분(주문 생성/취소/수정, 퍼즐, 던전 — 전부 사람 손 속도, 실측상 하루 수만 행)을 감안해
-// **하루 100만 행 목표치 아래로** 잡는다. 정상 운영은 20~60만/일 이라 여기 닿지 않는다.
-export const BOT_BLOCK_DAY_ROWS = 800_000;
-/** 반복 조건부는 봇보다 먼저 끊는다 — 봇이 멈추면 시장이 통째로 죽지만, 반복 주문 하나가 쉬는 건 국지적이다.
- * 정상 사용(봇 20~60만/일 + 사람 거래)은 이 선에 닿지 않는다. */
-export const REPEAT_BLOCK_DAY_ROWS = 600_000;
+/** ⚠⚠ **무료 플랜 기준이다**(2026-08-14 전환). Paid 와 성격이 완전히 다르다:
+ *   Paid — 포함분을 넘기면 **돈이 더 나간다**(100만 행당 $1). 아파도 서비스는 돈다.
+ *   Free — 한도를 넘기면 **그 종류의 작업이 실패한다**("further operations of that type will fail with
+ *          an error"). 즉 쓰기 한도를 넘기는 순간 봇이 아니라 **거래 자체가 멈춘다**.
+ * 그래서 임계값은 "아끼려고"가 아니라 **서비스가 죽지 않게** 잡는다 — 정상 운영치의 몇 배 위, 그러나
+ * 한도보다는 확실히 아래. */
+export const FREE_DAY_ROW_LIMIT = 100_000; // D1 Free: rows written / day
+export const FREE_DAY_READ_LIMIT = 5_000_000; // D1 Free: rows read / day (참고용 — 계량 대상 아님)
+
+/** 계량되지 않는 잔여분(주문 생성/취소/수정, 로그인, 퍼즐, 던전 — 전부 사람 손 속도, 하루 수천 행)과
+ * "차단이 걸린 뒤에도 유저가 청산/주문은 할 수 있어야 한다"는 여유분으로 남겨두는 몫. */
+const DAY_RESERVE_ROWS = 20_000;
+
+/** ⚠ 차단은 **덜 아픈 것부터** 3단이다. 위험한 순서가 아니라 **잃는 게 적은 순서**로 끊는다.
+ *  1) nibble — 시장 깊이보다 큰 지정가의 **재**체결. 멈춰도 주문은 살아있고 잠시 뒤 이어서 채워진다.
+ *     (개수 제한이 없고 조건이 유지되는 한 영원히 반복되는, 실측상 가장 큰 폭주 경로다 — prod 에서
+ *      주문 하나가 하루 3,000건을 체결했다.)
+ *  2) repeat — `continuous` 무한 조건부 체결. 주문 하나가 쉬는 건 국지적이다.
+ *  3) bot    — 마켓메이커. 멈추면 가상 코인 시장이 통째로 선다 → **최후 방어선**.
+ * 셋 다 날짜(KST)가 바뀌면 자동으로 풀린다. 수동 거래·강제청산·지정가 첫 체결·SL/TP·1회성 조건부는
+ * **절대 막지 않는다** — 돈이 걸린 기능을 DB 비용 때문에 막는 건 더 큰 사고다. */
+export const NIBBLE_BLOCK_DAY_ROWS = 45_000;
+export const REPEAT_BLOCK_DAY_ROWS = 55_000;
+export const BOT_BLOCK_DAY_ROWS = FREE_DAY_ROW_LIMIT - DAY_RESERVE_ROWS; // 80,000
+
+/** 월 누적은 무료 플랜에선 한도가 아니다(매일 리셋) — `npm run d1:budget` 표시용으로만 남긴다. */
+export const MONTHLY_ROW_BUDGET = FREE_DAY_ROW_LIMIT * 31;
 
 // ⚠ 계량 단가 — 각 작업이 D1 에 남기는 행 수의 **보수적(넉넉한) 추정치**다. 정확할 필요는 없고
 // "과소평가하지 않는 것"이 중요하다(과소평가하면 차단이 늦게 걸려 돈이 나간다). 근거:
@@ -47,7 +62,8 @@ export const REPEAT_BLOCK_DAY_ROWS = 600_000;
 // ⚠ D1 은 한 문장의 비용을 **"바뀐 행 1 + 갱신된 인덱스 항목 수"** 로 센다(암묵 PK 인덱스도 포함).
 // 실측: spot_trades INSERT 3(=1+PK+1), fee_ledger INSERT 4(=1+PK+2), 비인덱스 컬럼 UPDATE 1.
 // 그래서 **인덱스를 하나 더 다는 것은 그 테이블 모든 INSERT 비용을 올리는 결정**이다.
-export const ROWS_PER_BOT_TICK = 7;
+// ⚠ 봇 단가는 이제 "틱당"이 아니라 **"커밋당"** 이라 여기 없다 — 버스트는 틱을 몇 개 돌든 상태 행을
+// 한 번만 쓴다(§ spot.ts ROWS_PER_BOT_COMMIT). 틱 수와 쓰기가 분리된 게 이번 전환의 핵심이다.
 export const ROWS_PER_FILL = 20;
 
 /** KST(UTC+9) 기준 오늘 날짜. ⚠ `_shared.todayKst` 와 같은 로직이지만 **일부러 복사**했다 —
@@ -78,7 +94,7 @@ const CACHE_MS_BLOCKED = 10 * 60_000;
  * 봇이 통째로 서는 게 더 큰 사고다. 그 경우는 `npm run d1:budget` 월 점검이 잡는다). */
 export async function meterRows(env: Env): Promise<{ day: number; month: number }> {
   const now = Date.now();
-  const blocked = cache && (cache.day >= REPEAT_BLOCK_DAY_ROWS || cache.month >= MONTH_BLOCK_ROWS);
+  const blocked = cache && cache.day >= NIBBLE_BLOCK_DAY_ROWS;
   if (cache && now - cache.at < (blocked ? CACHE_MS_BLOCKED : CACHE_MS)) return { day: cache.day, month: cache.month };
   const today = todayKst();
   try {
@@ -90,10 +106,10 @@ export async function meterRows(env: Env): Promise<{ day: number; month: number 
     cache = { at: now, day: row?.d ?? 0, month: row?.m ?? 0 };
     // 차단이 걸렸으면 로그를 남긴다 — 조용한 후퇴라 로그가 없으면 "봇이 왜 멈췄지?" 를 알 방법이 없다
     // (`cd cron && npx wrangler tail` 또는 Pages 로그로 확인). 캐시 갱신 시에만 찍어 매 호출 도배를 막는다.
-    if (cache.day >= REPEAT_BLOCK_DAY_ROWS || cache.month >= MONTH_BLOCK_ROWS) {
+    if (cache.day >= NIBBLE_BLOCK_DAY_ROWS) {
       console.log(
-        `[budget] 자동 쓰기 차단 — 오늘 ${cache.day} / 이번 달 ${cache.month} 행` +
-          ` (반복조건부 ${REPEAT_BLOCK_DAY_ROWS} · 봇 ${BOT_BLOCK_DAY_ROWS} · 월 ${MONTH_BLOCK_ROWS})`,
+        `[budget] 자동 쓰기 차단 — 오늘 ${cache.day} 행 / 무료 한도 ${FREE_DAY_ROW_LIMIT}` +
+          ` (재체결 ${NIBBLE_BLOCK_DAY_ROWS} · 반복조건부 ${REPEAT_BLOCK_DAY_ROWS} · 봇 ${BOT_BLOCK_DAY_ROWS})`,
       );
     }
   } catch {
@@ -102,14 +118,20 @@ export async function meterRows(env: Env): Promise<{ day: number; month: number 
   return { day: cache.day, month: cache.month };
 }
 
-/** 이 자동 경로를 지금 돌려도 되는가. `kind`:
- *  - `'repeat'` = `repeating` 조건부 체결(개수 제한이 없어 가장 위험 → 먼저 끊는다)
- *  - `'bot'`    = 마켓메이커 봇 틱(최후 방어선)
- * true 면 그 작업을 **그냥 하지 않는다**(에러가 아니라 조용한 후퇴 — 날짜/달이 바뀌면 자동 해제). */
-export async function autoWritesBlocked(env: Env, kind: 'bot' | 'repeat'): Promise<boolean> {
-  const { day, month } = await meterRows(env);
-  if (month >= MONTH_BLOCK_ROWS) return true;
-  return day >= (kind === 'repeat' ? REPEAT_BLOCK_DAY_ROWS : BOT_BLOCK_DAY_ROWS);
+const BLOCK_AT: Record<'nibble' | 'repeat' | 'bot', number> = {
+  nibble: NIBBLE_BLOCK_DAY_ROWS,
+  repeat: REPEAT_BLOCK_DAY_ROWS,
+  bot: BOT_BLOCK_DAY_ROWS,
+};
+
+/** 이 자동 경로를 지금 돌려도 되는가. `kind` 는 **잃는 게 적은 순서**로 끊긴다(위 BLOCK_AT):
+ *  - `'nibble'` = 시장 깊이보다 큰 지정가의 재체결(가장 먼저 — 주문은 살아있고 나중에 이어서 채워진다)
+ *  - `'repeat'` = `repeating` 조건부 체결(개수 제한이 없어 N배로 늘어난다)
+ *  - `'bot'`    = 마켓메이커 봇(최후 방어선 — 멈추면 가상 코인 시장이 통째로 선다)
+ * true 면 그 작업을 **그냥 하지 않는다**(에러가 아니라 조용한 후퇴 — 날짜가 바뀌면 자동 해제). */
+export async function autoWritesBlocked(env: Env, kind: 'bot' | 'repeat' | 'nibble'): Promise<boolean> {
+  const { day } = await meterRows(env);
+  return day >= BLOCK_AT[kind];
 }
 
 /** 계량기 현황(운영 점검용). */
@@ -118,6 +140,8 @@ export async function budgetStatus(env: Env): Promise<{
   dayRows: number;
   monthRows: number;
   monthBudget: number;
+  dayBudget: number;
+  nibbleBlocked: boolean;
   repeatBlocked: boolean;
   botBlocked: boolean;
 }> {
@@ -127,7 +151,9 @@ export async function budgetStatus(env: Env): Promise<{
     dayRows: day,
     monthRows: month,
     monthBudget: MONTHLY_ROW_BUDGET,
-    repeatBlocked: day >= REPEAT_BLOCK_DAY_ROWS || month >= MONTH_BLOCK_ROWS,
-    botBlocked: day >= BOT_BLOCK_DAY_ROWS || month >= MONTH_BLOCK_ROWS,
+    dayBudget: FREE_DAY_ROW_LIMIT,
+    nibbleBlocked: day >= NIBBLE_BLOCK_DAY_ROWS,
+    repeatBlocked: day >= REPEAT_BLOCK_DAY_ROWS,
+    botBlocked: day >= BOT_BLOCK_DAY_ROWS,
   };
 }

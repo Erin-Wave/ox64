@@ -19,8 +19,12 @@ import { spawnSync } from 'node:child_process';
 
 const ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || '7bed0008b7981f7f7ce113249440038a';
 const DB_NAME = 'ox64';
-const MONTHLY_BUDGET = 50_000_000; // Paid 플랜 월 포함분(rows written)
-const PRICE_PER_MILLION = 1.0; // 초과분 $1 / 100만 행
+// ⚠ **무료 플랜 기준**(2026-08-14 전환). Free 는 한도를 넘으면 과금이 아니라 **쓰기가 실패**하므로
+// (= 거래가 멈춘다) 여기서 보는 건 "요금"이 아니라 "며칠 안에 서비스가 죽는가"다.
+const DAILY_BUDGET = 100_000; // D1 Free: rows written / day
+const DAILY_READ_BUDGET = 5_000_000; // D1 Free: rows read / day
+const MONTHLY_BUDGET = DAILY_BUDGET * 31; // 월 표시는 참고용(무료 플랜의 한도는 일 단위다)
+const PRICE_PER_MILLION = 0; // 무료 플랜엔 초과 과금이 없다 — 대신 그 종류의 작업이 실패한다
 
 const fmt = (n) => Math.round(n).toLocaleString('en-US');
 const bar = (frac, width = 28) => {

@@ -20,7 +20,7 @@ import {
   roundVirtual,
   virtualTick,
 } from '../_shared';
-import { autoWritesBlocked, meterStmt, ROWS_PER_BOT_TICK } from '../_budget';
+import { autoWritesBlocked, meterStmt } from '../_budget';
 
 /**
  * 가상 코인(OX/USDT · EW/USDT) — 외부 시세가 없어 이 파일의 봇이 체결가를 만든다. 그 외에는 실제 38종과
@@ -120,15 +120,94 @@ function candleUpsertStmts(
 ): D1PreparedStatement[] {
   return PERSIST_INTERVALS.map(([code, sec]) => {
     const bucket = Math.floor(now / (sec * 1000)) * (sec * 1000);
-    return env.DB.prepare(
-      `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)
+    return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, bucket, bar.open, bar.high, bar.low, bar.close, bar.volume);
+  });
+}
+
+// ⚠ 누적 upsert 라 같은 버킷에 여러 번 써도 값이 맞는다(high/low 는 극값, volume 은 합). 이 성질 덕에
+// "봇은 버킷이 닫힐 때 자기 몫을 한 번에" / "유저 체결은 그때그때" 따로 써도 결과가 정확히 합쳐진다.
+const CANDLE_UPSERT_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)
        ON CONFLICT(pair, interval, bucket) DO UPDATE SET
          high = MAX(spot_candles.high, excluded.high),
          low = MIN(spot_candles.low, excluded.low),
          close = excluded.close,
-         volume = spot_candles.volume + excluded.volume`,
-    ).bind(pair, code, bucket, bar.open, bar.high, bar.low, bar.close, bar.volume);
-  });
+         volume = spot_candles.volume + excluded.volume`;
+
+// ── 진행 중(안 닫힌) 캔들 버킷 = spot_bot_state.live_json (2026-08-14, § D1 예산) ─────────────
+// 봇은 초당 몇 번씩 도는데 그때마다 같은 1m/1h/1d 버킷을 다시 쓰는 건 "매 틱 갈아엎히는 집계"를 행으로
+// 들고 있는 것이다(사다리·테이프와 정확히 같은 실수). 여기 누적했다가 **버킷이 닫힐 때만** 테이블로
+// 넘긴다 → 1m 은 분당 1행, 1h 은 시간당 1행. 진행 중 버킷은 loadSpotCandles 가 읽을 때 붙여주므로
+// 차트의 마지막 봉은 예전과 똑같이 실시간으로 움직인다.
+interface LiveBar {
+  b: number; // 버킷 시작 시각(ms)
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+}
+type LiveBars = Record<string, LiveBar>;
+
+function parseLive(json: string | null | undefined): LiveBars {
+  if (!json) return {};
+  try {
+    const v = JSON.parse(json) as LiveBars;
+    if (!v || typeof v !== 'object') return {};
+    // 손상된 항목은 조용히 버린다 — 진행 중 봉 하나를 잃을 뿐이고, 다음 틱이 새로 시작한다.
+    const out: LiveBars = {};
+    for (const [code, b] of Object.entries(v)) {
+      if (b && typeof b.b === 'number' && typeof b.c === 'number') out[code] = b;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** 이 틱의 OHLCV 를 진행 중 버킷들에 누적한다. 버킷이 넘어갔으면 닫힌 버킷을 돌려준다(= 테이블로 넘길 것). */
+function accrueLive(live: LiveBars, bar: { open: number; high: number; low: number; close: number; volume: number }, now: number): { code: string; bar: LiveBar }[] {
+  const closed: { code: string; bar: LiveBar }[] = [];
+  for (const [code, sec] of PERSIST_INTERVALS) {
+    const bucket = Math.floor(now / (sec * 1000)) * (sec * 1000);
+    const cur = live[code];
+    if (!cur || cur.b !== bucket) {
+      // ⚠ 과거 버킷일 때만 넘긴다 — 시계가 뒤로 가는 이상 상황에서 미래 버킷을 "닫힌 것"으로 쓰면
+      // 이미 마감된 봉을 다시 건드리게 된다(§ 마감된 봉은 불변).
+      if (cur && cur.b < bucket) closed.push({ code, bar: cur });
+      live[code] = { b: bucket, o: bar.open, h: bar.high, l: bar.low, c: bar.close, v: bar.volume };
+    } else {
+      cur.h = Math.max(cur.h, bar.high);
+      cur.l = Math.min(cur.l, bar.low);
+      cur.c = bar.close;
+      cur.v += bar.volume;
+    }
+  }
+  return closed;
+}
+
+/** 닫힌 버킷을 영속 캔들 테이블로 넘기는 문장(버킷 시각을 그 버킷 것으로 그대로 쓴다). */
+function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar): D1PreparedStatement {
+  return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v);
+}
+
+/** 읽기 경로용 — 진행 중 버킷을 (이미 읽어온) 영속 봉 배열 뒤에 병합한다.
+ * ⚠ 같은 버킷의 행이 이미 있을 수 있다(그 사이 **유저 체결**이 직접 upsert 했을 때) → 겹치면 합친다.
+ * 두 쪽은 서로 다른 체결 묶음이라 volume 은 더하는 게 맞다(중복 아님).
+ * ⚠ open 은 먼저 쓴 쪽 것이 남는다 — 봇이 초당 몇 번씩 도니 거의 항상 봇의 첫 체결가지만, 그 버킷에
+ * 유저 체결이 먼저 들어온 드문 경우엔 유저 체결가가 시가가 된다(같은 봉 안의 값이라 시각적으로 무해). */
+function mergeLiveBar(asc: { bucket: number; open: number; high: number; low: number; close: number; volume: number }[], live: LiveBar | undefined) {
+  if (!live) return asc;
+  const last = asc[asc.length - 1];
+  if (last && last.bucket === live.b) {
+    last.high = Math.max(last.high, live.h);
+    last.low = Math.min(last.low, live.l);
+    last.close = live.c;
+    last.volume += live.v;
+    return asc;
+  }
+  if (last && live.b < last.bucket) return asc; // 이미 넘어간 버킷(경합) — 무시
+  asc.push({ bucket: live.b, open: live.o, high: live.h, low: live.l, close: live.c, volume: live.v });
+  return asc;
 }
 
 /** 단일 가격 체결용 단축(진입/청산 등 개별 체결 — OHLC 가 전부 같은 가격). */
@@ -194,20 +273,24 @@ async function loadSpotCandles(env: Env, pair: string, intervalCode: string, lim
   const ratio = Math.max(1, Math.round(sec / srcSec));
 
   // endTimeMs 가 오면 그 시각 "이전" 봉만 — 차트에서 왼쪽으로 스크롤할 때 과거 구간을 이어 받는다.
-  const rows = (
-    await env.DB.prepare(
+  // ⚠ 진행 중(아직 안 닫힌) 봉은 테이블이 아니라 봇 상태 행에 있다(§ live_json) → 최신 페이지일 때만
+  // 같이 읽어 뒤에 붙인다. 과거 페이지(endTimeMs)엔 해당 없음.
+  const [rowsRes, liveRow] = await Promise.all([
+    env.DB.prepare(
       endTimeMs
         ? 'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
         : 'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? ORDER BY bucket DESC LIMIT ?',
     )
       .bind(...(endTimeMs ? [pair, srcCode, endTimeMs, limit * ratio] : [pair, srcCode, limit * ratio]))
-      .all<{ bucket: number; open: number; high: number; low: number; close: number; volume: number }>()
-  ).results;
+      .all<{ bucket: number; open: number; high: number; low: number; close: number; volume: number }>(),
+    endTimeMs
+      ? Promise.resolve(null)
+      : env.DB.prepare('SELECT live_json FROM spot_bot_state WHERE id = ?').bind(pair).first<{ live_json: string | null }>(),
+  ]);
+  const asc = mergeLiveBar(rowsRes.results.reverse(), parseLive(liveRow?.live_json)[srcCode]);
   // 과거 페이지 요청인데 결과가 없으면 진짜로 더 없는 것 — 거래 버킷팅 폴백으로 최신 구간을
   // 돌려주면 클라가 "받았다"고 착각해 같은 구간을 무한히 다시 붙인다.
-  if (rows.length === 0) return endTimeMs ? [] : bucketTradesToCandles(env, pair, bucketMs, limit);
-
-  const asc = rows.reverse();
+  if (asc.length === 0) return endTimeMs ? [] : bucketTradesToCandles(env, pair, bucketMs, limit);
   if (ratio === 1) {
     return asc.map((r) => ({ time: Math.floor(r.bucket / 1000), open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
   }
@@ -931,13 +1014,38 @@ export function nextMarketState(s: BotState): {
  * 심리 모델을 한 스텝 굴려 다음 상태를 반환. now 는 이 틱의 기준 시각(항상 현재 이후 — 과거면 마감된
  * 봉이 변조된다). 심리 상태는 갱신하지만 last_run 은 건드리지 않는다(게이트는 호출자 담당).
  */
-async function marketMakerTick(
-  env: Env,
-  pair: string,
-  prev: BotState,
-  now: number,
-  prevTape: TapeTrade[],
-): Promise<{ next: BotState; tape: TapeTrade[] }> {
+/** 유저 지정가 "벽" 조회 결과(가격대별 합계) — 한 실행 동안 바뀌지 않으므로 호출자가 1회만 읽어 넘긴다. */
+interface WallRow {
+  side: string;
+  price: number;
+  size: number;
+}
+
+/** 한 틱의 결과. ⚠ D1 을 전혀 건드리지 않는다(§ 봇 틱은 메모리에서, 커밋은 한 번에). */
+interface TickResult {
+  next: BotState;
+  tape: TapeTrade[];
+  book: BotBook;
+  /** 이 틱이 찍은 합성 체결들의 OHLCV(캔들 누적용). */
+  bar: { open: number; high: number; low: number; close: number; volume: number };
+  /** 합성 체결 명목금액 합(봇 수수료 산정용). */
+  notional: number;
+  actor: string;
+}
+
+/**
+ * 봇 한 틱 — **순수 함수**다(2026-08-14, 무료 플랜 전환 ③④).
+ *
+ * 예전엔 이 함수가 직접 D1 을 읽고(벽 조회) 쓰고(batch) 대기 지정가 sweep 까지 돌려서 **틱 하나가
+ * D1 쿼리 ~14개**를 먹었다. cron 은 한 번에 24틱을 도니 invocation 당 ~400쿼리 — Workers **무료 플랜의
+ * invocation당 D1 쿼리 한도 50** 을 8배 넘긴다(유료는 1,000이라 안 보였다). 게다가 틱마다 상태 행과
+ * 캔들 3행을 다시 써서 쓰기의 63%가 여기서 나왔다.
+ *
+ * 지금은 계산만 하고 아무것도 안 쓴다 → 호출자(runBotTicks)가 N틱을 메모리에서 이어 돌린 뒤
+ * **결과를 단일 batch 로 한 번만** 커밋한다. 틱 수를 늘려도 D1 왕복·쓰기가 안 늘어나므로
+ * 가격 경로의 촘촘함(=품질)과 비용이 분리된다.
+ */
+function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: WallRow[], now: number): TickResult {
   const step = nextMarketState(prev);
   const candidateRef = step.next.ref;
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
@@ -949,13 +1057,9 @@ async function marketMakerTick(
   // ⚠ 가격뿐 아니라 **그 가격의 총 물량**까지 받아온다 — 벽을 얼마나 물어뜯을지가 벽 크기에 비례해야
   // 하기 때문(아래 wallAbsorbSize). 예전엔 가격만 알아서 100만주 벽이든 5천주 벽이든 똑같이 5천주씩만
   // 먹었고, 그래서 큰 벽 앞에서 몇십 분씩 가격이 굳어버렸다("봇이 쫄보라 큰 벽을 못 뚫는 느낌").
-  const wallRows = (
-    await env.DB.prepare(
-      "SELECT side, limit_price AS price, SUM(size) AS size FROM pending_orders WHERE symbol=? GROUP BY side, limit_price",
-    )
-      .bind(pair)
-      .all<{ side: string; price: number; size: number }>()
-  ).results;
+  // ⚠ 벽 목록은 **틱마다가 아니라 실행마다** 읽는다(호출자가 넘겨준다) — 한 invocation 안에서는 유저
+  // 주문이 새로 들어올 수 없어 값이 안 변하는데, 틱마다 읽으면 그것만으로 쿼리가 틱 수만큼 늘어난다.
+  // 단, 어느 호가가 "벽"인지는 그 틱의 기준가(prev.ref)에 따라 달라지므로 **판정은 매 틱 다시** 한다.
   let wallAsk: number | null = null;
   let wallAskSize = 0;
   let wallBid: number | null = null;
@@ -997,7 +1101,6 @@ async function marketMakerTick(
   // ⚠ 매 틱 사다리를 통째로 새로 만든다(호가 역전 방지 — 봇이 2명이라 옛 호가가 남으면 최우선매수 >
   // 최우선매도가 생긴다). 예전엔 이게 "spot_orders 전 행 DELETE + 44행 INSERT" 였지만, 지금 사다리는
   // 아래 상태 UPDATE 의 book_json 한 칸이라 **비우는 문장도 까는 문장도 필요 없다**(§ BotBook).
-  const stmts: D1PreparedStatement[] = [];
   const book: BotBook = { owner: actor, bids: [], asks: [] };
   // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 타이트하게(최우선호가가 mid 에 바싹) 잡되 깊은
   // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
@@ -1093,55 +1196,13 @@ async function marketMakerTick(
     tape.push({ price, size: sz, takerSide, createdAt: now + i });
   }
   const next: BotState = { ...step.next, ref };
-  // 심리 상태 + **새 사다리 + 체결 테이프**를 한 문장으로 — 이 세 가지가 봇이 매 틱 만드는 전부이고,
-  // 전부 "매 틱 통째로 교체되는 스냅샷"이라 한 행에 담는 게 맞다(§ BotBook, § 봇 합성 체결 테이프).
-  // 그래서 **한 틱의 쓰기 비용이 이 1행 + 캔들 3행뿐**이다. book_version 을 올려 이 순간 진행 중이던
-  // 소비(bookWriteStmt)가 옛 사다리로 덮어쓰지 못하게 한다.
-  stmts.push(
-    env.DB.prepare(
-      'UPDATE spot_bot_state SET ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, book_version=book_version+1 WHERE id=?',
-    ).bind(
-      next.ref,
-      next.drift,
-      next.vol,
-      next.sentiment,
-      next.anchor,
-      next.regime,
-      next.regimeTicks,
-      next.peak,
-      next.trough,
-      serializeBook(book),
-      serializeTape(tape),
-      pair,
-    ),
-  );
-  // 영속 캔들: 이 틱이 찍은 체결들의 OHLCV 로 1회 갱신(위 테이프에 얹은 체결들과 정확히 일치해야 한다).
-  stmts.push(...candleUpsertStmts(env, pair, { open, high, low, close: ref, volume }, now));
-  // 보존 기간을 넘긴 옛 체결 정리(같은 batch — 왕복 추가 없음). 봇 체결이 테이프로 옮겨간 뒤로는
-  // **유저 체결만** 남으므로 지울 게 거의 없다 — 그래도 남겨두는 이유는 이 테이블이 다시 무한히 자라지
-  // 않게 하는 보험이다(§ 봇이 만드는 행은 쌓이면 안 된다). 배포 직후엔 옛 봇 체결을 이게 걷어낸다.
-  if (Math.random() < TRADE_PRUNE_CHANCE) {
-    stmts.push(
-      env.DB.prepare('DELETE FROM spot_trades WHERE pair = ? AND created_at < ?').bind(pair, now - TRADE_RETENTION_MS),
-    );
-  }
-  // 이 틱이 쓴 행 수를 예산 계량기에 기록한다(같은 batch — 이 문장 자체도 1행이라 단가에 포함돼 있다).
-  // 봇은 영구히 도는 유일한 컴포넌트라, 예산을 넘기면 이 기록을 보고 스스로 물러난다(§ _budget.ts).
-  stmts.push(meterStmt(env, ROWS_PER_BOT_TICK));
-  // 봇도 수수료를 낸다 — 이 틱의 합성 체결 명목금액에 대해(같은 batch, 왕복 추가 없음).
-  // ⚠ 재고/현금 정산은 없다(botSide=null) — 합성 체결은 buyer_id=seller_id=actor 인 봇↔봇 거래라
-  // 사고팔린 게 같은 계정 안에서 상계된다(수수료만 실제로 나간다).
-  stmts.push(...(await botFillStmts(env, pair, new Map([[actor, { notional: notionalSum, size: volume }]]), null, now)));
-  await env.DB.batch(stmts);
-
-  // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
-  await sweepRestingOxPendings(env, pair);
-  return { next, tape };
+  return { next, tape, book, bar: { open, high, low, close: ref, volume }, notional: notionalSum, actor };
 }
 
 // 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
 // 읽히고, 값이 비었거나(anchor=0=미초기화) 알 수 없는 regime 이면 안전한 기본값으로 떨어진다.
-const BOT_STATE_COLS = 'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, tape_json';
+const BOT_STATE_COLS =
+  'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, tape_json, live_json, pend_notional, pend_rows, pend_ticks';
 const REGIMES: readonly Regime[] = ['calm', 'rally', 'euphoria', 'pullback', 'panic', 'capitulation'];
 
 interface BotStateRow {
@@ -1156,6 +1217,10 @@ interface BotStateRow {
   peak: number;   // 최근 고점 기억(0=미초기화 → 현재가로 시작)
   trough: number; // 최근 저점 기억(0=미초기화)
   tape_json: string | null; // 봇 합성 체결 링 버퍼(§ 봇 합성 체결 테이프) — 틱이 이어받아 append 한다
+  live_json: string | null; // 진행 중(안 닫힌) 캔들 버킷들(§ live_json) — 닫힐 때만 spot_candles 로 넘어간다
+  pend_notional: number;    // 아직 봇 수수료 카운터에 안 넘긴 합성체결 명목금액
+  pend_rows: number;        // 아직 usage_meter 에 안 넘긴 예상 쓰기 행 수
+  pend_ticks: number;       // 마지막 정산 이후 돈 틱 수
 }
 
 function toBotState(row: BotStateRow | null, ref: number): BotState {
@@ -1181,6 +1246,135 @@ async function resolveRef(env: Env, pair: string, row: BotStateRow | null): Prom
   return lastTrade?.price ?? 1;
 }
 
+/** 봇 정산 주기 — 이 틱 수마다 봇 수수료 카운터·예산 계량기를 **한 번에** 넘긴다(§ pend_* 컬럼).
+ * 틱마다 쓰면 그 둘만으로 봇 틱이 3행이 된다(상태 1 + 카운터 1 + 계량기 1). 값 자체는 상태 행에
+ * 누적되므로(어차피 매번 쓰는 그 1행) **총액은 정확하고 반영이 최대 이 틱 수만큼 늦을 뿐**이다.
+ * 120틱 ≈ cron 만 돌 때 5분, 유저가 보고 있을 때 2분. */
+const BOT_ACCRUAL_TICKS = 120;
+
+/** 봇 한 커밋이 D1 에 남기는 행 수(예산 계량용 보수적 추정, § _budget.ts 과금 모델).
+ * ⚠ 단위가 "틱"이 아니라 "커밋"이다 — 버스트는 틱을 몇 개 돌든 상태 행을 한 번만 쓴다. */
+const ROWS_PER_BOT_COMMIT = 1; // 상태 행 UPDATE(사다리·테이프·진행중 캔들·누적분이 전부 여기 들어있다)
+const ROWS_PER_CANDLE_FLUSH = 2; // 닫힌 버킷을 넘길 때 — 새 버킷이면 행 1 + PK 인덱스 1
+const ROWS_PER_BOT_ACCRUAL = 4; // 정산 시 usage_meter 1 + 봇 2명 카운터 2 (+여유 1)
+
+/**
+ * 봇 틱 N 회를 **메모리에서 이어 돌리고 결과를 단일 batch 로 한 번만 커밋**한다(2026-08-14).
+ *
+ * 예전엔 틱마다 (벽 조회 + 상태/캔들 batch + 봇 카운터 SELECT + 대기 지정가 sweep) = D1 쿼리 ~14개가
+ * 나갔다. 그래서 cron 1회(24틱)가 ~400쿼리 — Workers **무료 플랜의 invocation당 D1 쿼리 한도 50** 을
+ * 8배 초과였고, 쓰기도 틱당 6행이라 전체 쓰기의 63%를 봇이 만들었다.
+ *
+ * 지금은 틱 수와 무관하게 **읽기 2회(상태·벽) + 쓰기 batch 1회 + sweep 1회**다. 그 결과:
+ *   · invocation 쿼리 수가 틱 수에 비례하지 않는다 → 무료 한도 안에 들어온다
+ *   · 가격 경로의 촘촘함(품질)과 D1 비용이 분리된다 → 틱을 더 돌려도 공짜다
+ *   · 반환한 가격 경로(path)로 트리거를 여러 지점에서 평가할 수 있다(cron 이 이걸 쓴다)
+ *
+ * ⚠ 벽(유저 지정가)은 이 실행 동안 바뀔 수 없으므로 한 번만 읽어 전 틱이 공유한다. 어느 호가가
+ * 그 틱의 "벽"인지는 기준가에 따라 달라지므로 판정 자체는 simulateTick 이 매 틱 다시 한다.
+ * ⚠ 체결 시각은 절대 과거로 소급하지 않는다(마감된 봉이 변하던 버그) — 각 틱의 시각은 그 틱을 실제로
+ * 실행하는 시점(단조 증가)이다. +10ms 는 틱 내부 체결끼리 겹치지 않게 하는 최소 간격.
+ */
+async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0: number, ticks: number): Promise<number[]> {
+  if (ticks <= 0) return [];
+  const wallRows = (
+    await env.DB.prepare(
+      'SELECT side, limit_price AS price, SUM(size) AS size FROM pending_orders WHERE symbol=? GROUP BY side, limit_price',
+    )
+      .bind(pair)
+      .all<WallRow>()
+  ).results;
+
+  let state = toBotState(row, ref0);
+  let tape = parseTape(row?.tape_json);
+  const live = parseLive(row?.live_json);
+  let book: BotBook | null = null;
+  let notional = 0;
+  const closed: { code: string; bar: LiveBar }[] = [];
+  const path: number[] = []; // 이 실행이 지나온 기준가들 — 트리거를 여러 지점에서 평가하는 데 쓴다
+  let prevTs = 0;
+  let lastTs = Date.now();
+  for (let i = 0; i < ticks; i++) {
+    const ts = Math.max(Date.now(), prevTs + 10);
+    prevTs = ts;
+    lastTs = ts;
+    const r = simulateTick(state, tape, wallRows, ts);
+    state = r.next;
+    tape = r.tape;
+    book = r.book;
+    notional += r.notional;
+    closed.push(...accrueLive(live, r.bar, ts));
+    path.push(r.next.ref);
+  }
+  if (!book) return path;
+
+  const stmts: D1PreparedStatement[] = [];
+  // 닫힌 버킷만 테이블로 넘긴다(진행 중 버킷은 아래 상태 행에 그대로 남아 조회 때 병합된다).
+  for (const c of closed) stmts.push(candleFlushStmt(env, pair, c.code, c.bar));
+
+  let pendNotional = (row?.pend_notional ?? 0) + notional;
+  let pendRows = (row?.pend_rows ?? 0) + ROWS_PER_BOT_COMMIT + closed.length * ROWS_PER_CANDLE_FLUSH;
+  let pendTicks = (row?.pend_ticks ?? 0) + ticks;
+  if (pendTicks >= BOT_ACCRUAL_TICKS) {
+    pendRows += ROWS_PER_BOT_ACCRUAL;
+    stmts.push(meterStmt(env, pendRows));
+    // 봇도 수수료를 낸다(§ 봇도 거래 수수료를 낸다). ⚠ 명목금액은 두 봇에 **균등 분배** 한다 — 틱마다
+    // 랜덤 액터에게 몰아주면 누적 거래대금이 한쪽으로 쏠려 두 봇의 VIP 요율이 갈린다(예전에 synthMaker
+    // 가 1번 봇 하드코딩이라 700배까지 벌어진 적이 있다). 재고/현금 정산은 없다(botSide=null) —
+    // 합성 체결은 봇↔봇이라 같은 계정 안에서 상계되고 수수료만 실제로 나간다.
+    const share = pendNotional / BOT_USER_IDS.length;
+    stmts.push(
+      ...(await botFillStmts(env, pair, new Map(BOT_USER_IDS.map((id) => [id, { notional: share, size: 0 }])), null, lastTs)),
+    );
+    pendNotional = 0;
+    pendRows = 0;
+    pendTicks = 0;
+  }
+  // 보존 기간을 넘긴 옛 체결 정리(같은 batch — 왕복 추가 없음). 봇 체결이 테이프로 옮겨간 뒤로는
+  // **유저 체결만** 남으므로 지울 게 거의 없다 — 그래도 남겨두는 이유는 이 테이블이 다시 무한히 자라지
+  // 않게 하는 보험이다(§ 봇이 만드는 행은 쌓이면 안 된다).
+  if (Math.random() < TRADE_PRUNE_CHANCE) {
+    stmts.push(
+      env.DB.prepare('DELETE FROM spot_trades WHERE pair = ? AND created_at < ?').bind(pair, lastTs - TRADE_RETENTION_MS),
+    );
+  }
+  // 심리 상태 + 사다리 + 체결 테이프 + **진행 중 캔들 + 미정산 누적분**을 한 문장으로. 전부 "매 틱
+  // 통째로 교체되는 스냅샷"이라 한 행에 담는 게 맞다(§ BotBook, § 봇 합성 체결 테이프, § live_json).
+  // 그래서 **봇 커밋 하나의 쓰기 비용이 이 1행**이다. book_version 을 올려 이 순간 진행 중이던
+  // 소비(bookWriteStmt)가 옛 사다리로 덮어쓰지 못하게 한다. last_run 도 여기서 함께 찍는다(직후 폴링이
+  // 곧바로 겹쳐 requote 하지 않게 — 예전엔 버스트가 이걸 위해 UPDATE 를 한 번 더 날렸다).
+  stmts.push(
+    env.DB.prepare(
+      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, book_version=book_version+1 WHERE id=?',
+    ).bind(
+      lastTs,
+      state.ref,
+      state.drift,
+      state.vol,
+      state.sentiment,
+      state.anchor,
+      state.regime,
+      state.regimeTicks,
+      state.peak,
+      state.trough,
+      serializeBook(book),
+      serializeTape(tape),
+      JSON.stringify(live),
+      pendNotional,
+      pendRows,
+      pendTicks,
+      pair,
+    ),
+  );
+  await env.DB.batch(stmts);
+
+  // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
+  // ⚠ 틱마다가 아니라 **커밋 뒤 한 번** — 호가창은 이 커밋으로 한 번 바뀌므로 그 이상은 낭비였다
+  // (예전엔 버스트 12틱이면 sweep 도 12번 돌아 쿼리를 그만큼 먹었다).
+  await sweepRestingOxPendings(env, pair);
+  return path;
+}
+
 /** 폴링(유저 접속) 시 호출 — 재호가 게이트를 통과할 때만 한 틱을 돈다. */
 export async function runMarketMaker(env: Env, pair: string): Promise<void> {
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`)
@@ -1203,54 +1397,32 @@ export async function runMarketMaker(env: Env, pair: string): Promise<void> {
     .run();
   if (claim.meta.changes !== 1) return; // 다른 요청이 이 틱을 이미 선점 — 중복 requote 방지
 
-  await marketMakerTick(env, pair, toBotState(row, await resolveRef(env, pair, row)), now, parseTape(row?.tape_json));
+  await runBotTicks(env, pair, row, await resolveRef(env, pair, row), 1);
 }
 
 /**
  * cron 전용 — 접속자가 없어도 시장이 계속 살아있도록 한 번에 여러 틱을 몰아 돈다(게이트 무시).
  * cron 이 1분마다 부르므로 그 사이의 거래량·가격 움직임을 여기서 만든다(예전엔 5분마다 1틱뿐이라
- * 아무도 안 볼 때 차트가 사실상 멈춰 있었다). 마지막에 last_run 을 갱신해 직후 폴링이 곧바로 겹쳐
- * requote 하지 않게 함.
+ * 아무도 안 볼 때 차트가 사실상 멈춰 있었다).
  *
- * ⚠ 체결 시각은 절대 과거로 소급하지 않는다(마감된 봉이 변하던 버그). 예전엔 각 틱의 시각을
- * [now-55s, now] 에 퍼뜨려 "빈 봉"을 메웠는데(cron 이 5분 주기이던 시절의 잔재), cron 이 매 1분인
- * 지금은 그 소급분이 **이미 마감된 직전 분봉 버킷**에 upsert 돼 high/low/close/volume 이 계속 갱신됐다
- * → 차트(OX 는 1.5초마다 전체 setData)에서 "봉 마감됐는데 이전 봉이 막 바뀌는" 현상. 마감된 봉은
- * 불변이어야 하므로 모든 틱을 현재 시각 이후(now+i)에만 찍는다. cron 이 매 분 도는 이상 1분봉은
- * 어차피 매 봉 채워지므로 빈 봉도 안 생긴다.
+ * 반환값 = 이 버스트가 지나온 **기준가 경로**. cron 이 이걸 트리거 평가에 넘겨 그 1분 안의 딥/스파이크를
+ * 조건부가 놓치지 않게 한다(§ cron: 가격 경로 샘플링).
  */
-export async function runMarketMakerBurst(env: Env, pair: string, ticks: number = BOT_BURST_TICKS): Promise<void> {
+export async function runMarketMakerBurst(env: Env, pair: string, ticks: number = BOT_BURST_TICKS): Promise<number[]> {
   // 예산 초과면 이번 버스트는 통째로 건너뛴다(§ _budget.ts) — 버스트당 1회만 판정하면 되므로
   // 틱마다 조회가 붙지 않는다. 트리거 sweep(강제청산·지정가·SL/TP)은 **막지 않는다**: 그건 돈이 걸린
   // 기능이라 멈추면 유저 손실로 이어지고, 애초에 폭주하지도 않는다.
-  if (await autoWritesBlocked(env, 'bot')) return;
+  if (await autoWritesBlocked(env, 'bot')) return [];
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BotStateRow>();
   const ref0 = await resolveRef(env, pair, row);
-  // 상태 행이 아직 없으면 먼저 만든다 — marketMakerTick 의 심리상태 UPDATE 가 0행이 되어 국면이
-  // 매 틱 초기화되는 걸 막는다(cron 이 유일한 클럭인 초기 상태에서 실제로 문제가 된다).
+  // 상태 행이 아직 없으면 먼저 만든다 — 아래 상태 UPDATE 가 0행이 되어 국면이 매 틱 초기화되는 걸
+  // 막는다(cron 이 유일한 클럭인 초기 상태에서 실제로 문제가 된다).
   if (!row) {
     await env.DB.prepare('INSERT OR IGNORE INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?)')
       .bind(pair, 0, ref0)
       .run();
   }
-
-  // 각 틱의 시각 = "그 틱을 실제로 실행하는 시점"(단조 증가). 버스트가 분 경계를 넘어가더라도
-  // 소급 기록이 생기지 않는다. +10ms 는 틱 내부 체결(now+0..5)끼리 겹치지 않게 하는 최소 간격.
-  // 체결 테이프도 심리 상태처럼 틱 사이에 이어받는다 — 버스트 안에서 한 번만 읽고 메모리에서 append 한다
-  // (§ 봇 합성 체결 테이프). ⚠ cron 버스트와 유저 폴링 틱이 겹치면 뒤에 쓴 쪽이 상대의 append 를 덮어쓸 수
-  // 있는데, 잃는 건 표시용 테이프 몇 건뿐이다(캔들·기준가·잔고는 각자 자기 문장으로 쓴다).
-  let state = toBotState(row, ref0);
-  let tape = parseTape(row?.tape_json);
-  let prevTs = 0;
-  for (let i = 0; i < ticks; i++) {
-    const ts = Math.max(Date.now(), prevTs + 10);
-    prevTs = ts;
-    const r = await marketMakerTick(env, pair, state, ts, tape);
-    state = r.next;
-    tape = r.tape;
-  }
-  // 심리 상태는 각 틱이 이미 기록했으므로 여기선 last_run 만 갱신한다(직후 폴링이 곧바로 겹쳐 requote 하지 않게).
-  await env.DB.prepare('UPDATE spot_bot_state SET last_run = ? WHERE id = ?').bind(Date.now(), pair).run();
+  return runBotTicks(env, pair, row, ref0, ticks);
 }
 
 /** 유저가 OX 를 실제로 레버리지 거래(order.ts open/close)할 때 그 체결을 합성 시장에도 반영한다.
@@ -1433,8 +1605,10 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
   const claim =
     newPendingSize <= sizeEps(p.size) // 잔량 판정도 수량 비례(대량 주문의 먼지 잔량이 영원히 남지 않게)
       ? await env.DB.prepare('DELETE FROM pending_orders WHERE id=? AND size=?').bind(pendingId, p.size).run()
-      : await env.DB.prepare('UPDATE pending_orders SET size=?, margin=? WHERE id=? AND size=?')
-          .bind(newPendingSize, Math.max(0, p.margin - locked), pendingId, p.size)
+      : // ⚠ 부분 체결이면 시각도 같이 찍는다 — 재체결 간격 하한 판정용(§ PARTIAL_FILL_COOLDOWN_MS).
+        // 어차피 쓰는 UPDATE 에 컬럼 하나가 붙을 뿐이라 쓰기 비용은 그대로 1행이다.
+        await env.DB.prepare('UPDATE pending_orders SET size=?, margin=?, last_fill_at=? WHERE id=? AND size=?')
+          .bind(newPendingSize, Math.max(0, p.margin - locked), Date.now(), pendingId, p.size)
           .run();
   if (claim.meta.changes !== 1) return; // 그 사이 다른 경로가 체결/취소함
 
@@ -1800,7 +1974,8 @@ async function closePositionAgainstBook(
     stmts.push(
       filled >= pendingSize - sizeEps(pendingSize)
         ? env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId)
-        : env.DB.prepare('UPDATE pending_orders SET size=? WHERE id=?').bind(pendingSize - filled, pendingId),
+        : // 부분 체결 시각도 함께(재체결 간격 하한 판정용, § PARTIAL_FILL_COOLDOWN_MS) — 같은 1행 UPDATE.
+          env.DB.prepare('UPDATE pending_orders SET size=?, last_fill_at=? WHERE id=?').bind(pendingSize - filled, now, pendingId),
     );
   }
   stmts.push(
@@ -1848,13 +2023,35 @@ export async function matchReduceOnlyOxPending(env: Env, pendingId: string): Pro
 
 /** 대기 중인 전 유저의 OX 지정가(진입·청산)를 봇 호가창에 매칭 — runMarketMaker 가 재호가 직후 호출하므로,
  * 주문 낸 유저가 접속/폴링 중이 아니어도 유동성이 크로스되면 실제 호가 가격에 이어서 체결된다. */
+/** ⚠ **이미 부분 체결된** 지정가를 다시 체결하기까지의 최소 간격(2026-08-14, 무료 플랜 전환 ④).
+ *
+ * 시장이 한 번에 소화 못 하는 큰 지정가는 봇이 재호가할 때마다 조금씩 계속 체결된다 — 합성 유동성은
+ * 매 틱 되살아나므로 **영원히** 그렇다. 그런데 그 한 번 한 번이 (포지션+주문+원장+체결테이프+캔들+
+ * 봇정산) ~20행짜리 체결 batch 다. prod 실측: 주문 **하나**가 하루 3,000건을 체결해 하루 6만 행을 썼다.
+ * 이건 봇 사다리·체결 테이프와 같은 부류의 구조적 낭비다(무한히 반복되는데 아무도 한도를 안 정했다).
+ *
+ * 한 번에 다 체결되는 보통 주문은 그 자리에서 행이 삭제되므로 이 하한을 **한 번도 만나지 않는다** —
+ * 영향을 받는 건 "시장 깊이보다 큰 주문"뿐이고, 그런 주문이 천천히 채워지는 건 실제 시장의 정상 동작이다.
+ */
+export const PARTIAL_FILL_COOLDOWN_MS = 5_000;
+
 async function sweepRestingOxPendings(env: Env, pair: string): Promise<void> {
   const pendings = (
-    await env.DB.prepare('SELECT id, reduce_only FROM pending_orders WHERE symbol=?')
+    await env.DB.prepare('SELECT id, reduce_only, last_fill_at FROM pending_orders WHERE symbol=?')
       .bind(pair)
-      .all<{ id: string; reduce_only: number }>()
+      .all<{ id: string; reduce_only: number; last_fill_at: number | null }>()
   ).results;
+  const now = Date.now();
+  // 이미 부분 체결된 주문이 하나라도 있으면 예산을 확인한다(없으면 조회조차 안 한다 — 흔한 경로가 공짜).
+  const nibbling = pendings.some((p) => p.last_fill_at != null);
+  const throttled = nibbling && (await autoWritesBlocked(env, 'nibble'));
   for (const p of pendings) {
+    // ⚠ 첫 체결은 절대 늦추지 않는다(last_fill_at == null) — 유저가 방금 낸 주문이 즉시 체결되는 체감은
+    // 이 사이트가 여러 번 튜닝해온 핵심이다. 하한은 **재체결**에만 건다.
+    if (p.last_fill_at != null) {
+      if (throttled) continue; // 오늘 예산이 위험 — 재체결만 쉰다(신규 주문·청산·강제청산은 그대로)
+      if (now - p.last_fill_at < PARTIAL_FILL_COOLDOWN_MS) continue;
+    }
     try {
       if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id);
       else await matchLimitPendingAgainstBook(env, p.id);

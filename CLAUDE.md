@@ -27,13 +27,13 @@
 ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
-├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks/peak/trough=봇 심리상태(고점·저점 기억 포함), +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
+├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산, +last_fill_at=부분 재체결 간격 하한]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks/peak/trough=봇 심리상태(고점·저점 기억 포함), +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼, +live_json=진행 중 캔들 버킷, +pend_notional/pend_rows/pend_ticks=봇 수수료·계량기 누적]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── scripts/                운영 스크립트 — d1-budget.mjs(D1 쓰기 예산 점검, §6) · sim-bot.ts(봇 심리 모델 장기 시뮬레이션, `npm run sim:bot` — 심리 파라미터를 바꿨으면 반드시 돌릴 것)
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조(rgb(var(--color-x) / <alpha-value>)) — 실제 값은 src/index.css 테마 블록
 ├── cron/                   ── 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker (메인 Pages 프로젝트와 별도 배포) ──
 │   ├── wrangler.toml       name="ox64-liquidation-cron", 같은 D1(ox64) 바인딩, [triggers] crons=["* * * * *"](매 1분)
-│   └── index.ts            scheduled() 가 매 1분 "봇 틱(runMarketMakerBurst) → 트리거 평가(sweepTriggers)"를 SWEEP_ROUNDS(4)회 번갈아 호출 — 봇 틱 총량은 예전 단일 버스트와 같게 두고(MM_TICKS_PER_ROUND 3×4=12) 그 사이사이 트리거를 평가해 봇이 만든 가격 경로를 여러 번 샘플링한다(한 번만 훑으면 그 1분 안의 딥/스파이크를 조건부가 놓친다). 실제 코인 시세 맵은 라운드 간 재사용(외부 fetch 1회), OX 는 매 라운드 새로 읽음. fetch() 는 CRON_SECRET 헤더로 보호된 수동 트리거(테스트/즉시 재실행용)
+│   └── index.ts            scheduled() 가 매 1분 "페어별 봇 버스트(runMarketMakerBurst) → 트리거 평가(sweepTriggers) **1회**"를 호출. ⚠ 예전엔 이걸 4라운드 번갈아 돌려 가격 경로를 4번 샘플링했는데, sweep 한 번이 D1 쿼리 ~18개라 **무료 플랜의 invocation당 한도(50)** 를 넘겼다 → 지금은 버스트가 **지나온 기준가 경로**를 돌려주고(rangeOfPath) 그 최저/최고로 한 번에 판정한다(4점 샘플링보다 정확 — 그 구간의 딥/스파이크를 하나도 안 놓친다, § _trading.ts runTriggers ranges). fetch() 는 CRON_SECRET 헤더로 보호된 수동 트리거(테스트/즉시 재실행용)
 ├── functions/              ── 백엔드 (Cloudflare Pages Functions, /api/*) ──
 │   ├── _middleware.ts      전역 미들웨어 — Host 가 ox64.app/localhost 가 아니면(*.pages.dev 포함) ox64.app 으로 301 리다이렉트(Pages 는 pages.dev 서브도메인을 끄는 대시보드 옵션이 없어서 미들웨어로 처리)
 │   ├── _shared.ts          인증(HMAC 토큰/PBKDF2)·바이낸스 서버측 시세·D1 타입·loadState(positions/orders/pendingOrders)
@@ -47,7 +47,7 @@ ox64/
 │       ├── state.ts        GET  /api/state  (checkTriggers 호출 후 잔고+refillsLeft+포지션+주문+미체결주문, 인증필요)
 │       ├── order.ts        POST /api/order  (open/close/limitClose/limitOpen/cancelLimit/editLimit/setSlTp/conditionalOpen/cancelConditional — 서버가 체결가 fetch·손익 계산·D1 원자 갱신. close 는 OX 면 봇 호가창 walking 청산, limitClose 는 지정가 청산=reduce-only, editLimit 는 미체결 주문의 지정가·수량 수정, conditionalOpen 은 조건부/스탑 주문 예약)
 │       ├── refill.ts       POST /api/refill (강제청산 안전망 — 1일 최대 3회, 1회 +10,000 USDT)
-│       ├── spot.ts         GET /api/spot (OX/USDT 호가창·체결내역 "표시용" 시장 데이터, ?candles=1 로 캔들도) + runMarketMaker() (봇이 심리 모델(nextMarketState: 추세/변동성 클러스터링/과열회귀/탐욕-공포 국면)로 기준가를 옮기고 그 주변에 호가 사다리를 깔아 만드는 합성 시세·호가·체결 — **한 틱=단일 batch 로 왕복 1회, 사다리는 `spot_bot_state.book_json` 한 칸(§BotBook)이라 재호가 문장 0개**, 봇 호가는 잔고 에스크로 안 함(무한 유동성 풀 — 단 체결된 뒤의 재고/현금은 `botFillStmts` 가 정산). OX 는 레버리지 롱/숏도 order.ts 로 실제 코인과 동일하게 거래됨, 체결가만 여기서 옴)
+│       ├── spot.ts         GET /api/spot (OX/USDT 호가창·체결내역 "표시용" 시장 데이터, ?candles=1 로 캔들도) + runMarketMaker() (봇이 심리 모델(nextMarketState: 추세/변동성 클러스터링/과열회귀/탐욕-공포 국면)로 기준가를 옮기고 그 주변에 호가 사다리를 깔아 만드는 합성 시세·호가·체결 — **틱은 순수 계산(simulateTick)이고 N틱을 메모리에서 돌린 뒤 커밋 1회 = 상태 행 1행만 쓴다(runBotTicks)** — 사다리(`book_json`)·체결 테이프(`tape_json`)·진행 중 캔들(`live_json`)이 전부 그 한 행이라, 틱을 몇 개 돌리든 D1 왕복·쓰기가 안 늘어난다, 봇 호가는 잔고 에스크로 안 함(무한 유동성 풀 — 단 체결된 뒤의 재고/현금은 `botFillStmts` 가 정산). OX 는 레버리지 롱/숏도 order.ts 로 실제 코인과 동일하게 거래됨, 체결가만 여기서 옴)
 │       ├── leaderboard.ts  GET  /api/leaderboard (친구 자산 순위=잔고+미실현PnL, 서버 시세)
 │       ├── puzzle.ts       GET/POST /api/puzzle — "스핑크스 보석찾기" 퍼즐게임(§7, ox64.app/b). 트레이딩과 별도 재화(puzzle_stats), 보드 정답(puzzle_games.board)은 서버만 알고 클라 응답엔 "이미 연 칸"만 내려줌
 │       └── dungeon.ts      GET/POST /api/dungeon — "5분 던전"(§8, ox64.app/5m) 방 생성/참가/던전선택/영웅선택/시작/카드플레이(여러 장 동시)/휴식/특수카드/나가기. GET 폴링(진행 중 0.5초)이 곧 동기화 수단(Durable Objects/WebSocket 없이 D1만으로) — ⚠ **GET 은 D1 왕복 2회·쓰기 0회**로 유지할 것(§8)
@@ -70,7 +70,7 @@ ox64/
     ├── hooks/
     │   ├── useMarkPrices.ts   현재+포지션 심볼 가격 1.2초 폴링(다른 심볼 PnL 갱신 + 현재 심볼 mark). **가격 소스=OKX(services/okxRest, 서버 체결가와 동일 소스)**, 실패 시 바이낸스 폴백. isVirtualSymbol 은 제외(OX 는 서버 ref/spotCandles 로 옴). 실제 코인 mark 를 OKX 로 통일한 이유는 §시세 참고(바이낸스 mark 였을 때 고배율 진입 즉시 손익 튐)
     │   ├── useTriggerPoll.ts  로그인 시 **항상 2.5초마다** /api/state 재조회 → 서버 checkTriggers 를 실질적으로 구동시키는 폴링(=OX 안 볼 때 지정가/SL·TP 체결 지연 + 내 잔고/PnL 갱신 주기). in-flight 가드로 중첩 방지. ⚠ 예전엔 연속 무한 조건부가 있으면 1초로 당기는 적응형이었는데, 그 모드에 재실행 간격 하한 5초가 생겨(§4) 2.5초로 충분해져 분기를 없앴다
-    │   └── useSpotPoll.ts     현재 심볼이 가상(OXUSDT)일 때만 1초마다 /api/spot 재조회 → useTradingStore 의 spotBook/spotTrades(호가창·체결내역 표시용, 유저 개인 데이터 아님) 갱신. 이 폴링이 곧 봇 마켓메이커 클럭이라 짧게 잡아 체결 딜레이를 줄임
+    │   └── useSpotPoll.ts     현재 심볼이 가상(OXUSDT)일 때만 1초마다 /api/spot 재조회 → useTradingStore 의 spotBook/spotTrades(호가창·체결내역 표시용, 유저 개인 데이터 아님) 갱신. 이 폴링이 곧 봇 마켓메이커 클럭이라 짧게 잡아 체결 딜레이를 줄임. **탭이 백그라운드면 정지**(§6 — 안 보이는 화면에 봇 틱과 요청을 쓰는 건 순수 낭비)
     ├── store/
     │   ├── useMarketStore.ts   symbol/interval(둘 다 localStorage 영속)/prices(심볼별 가격맵)/precisions(심볼별 소수자릿수)/connected/chartClickPrice+chartClickNonce(차트·호가창 클릭→지정가 입력 신호)+priceTarget(그 신호를 받을 칸: ''=주문패널 지정가, 'close:<positionId>'=그 포지션의 청산 지정가) + selectLastPrice/precisionOf
     │   ├── useChartStore.ts    차트 옵션(indicators: 기간/개수 자유 설정 가능한 EMA/BB/RSI 배열, visibleBars: 마지막 확대/축소 봉수, 카운트다운·거래량·매매마커·평단선·SL/TP선·지정가주문선) localStorage 영속
@@ -86,7 +86,7 @@ ox64/
         ├── OrderBook.tsx       호가(매수 좌열·매도 우열, 각 최우선호가가 맨 위) / 체결(내부 탭으로 전환). **내 미체결 주문이 있는 가격대는 accent 링+점+굵은 수량으로 강조**(서버가 가격대별 `mine` 을 따로 합산해 내려줌) — 실제 심볼=바이낸스 depth WS/aggTrade WS, 가상 심볼=useTradingStore.spotBook·spotTrades(useSpotPoll 1.5초 폴링). Standard 모드 + 옵션(useChartStore.orderBook) 둘 다 켜져 있을 때만 표시
         ├── Settings.tsx        테마 3선택 + 거래모드(Easy/Standard) 2선택 + 폰트 크기 3선택 모달
         ├── Clock.tsx           우측 구석 실시간 시계(KST, 시:분:초). 1초마다 자체 상태만 갱신하는 독립 컴포넌트(부모 리렌더 안 유발). Chart 툴바 우측에 마운트
-        ├── Chart.tsx           Lightweight Charts: 타임프레임 그룹셀렉트(초봉 포함)·KST+9·OHLCV+인디케이터값 레전드(hover/터치, 종가 옆에 그 봉의 변동률 (종가-시가)/시가 % 표시)·툴바 우측 실시간 시계(Clock)·다음봉 카운트다운(트레이딩뷰처럼 우측 가격축의 현재가 티커=마지막 봉 종가 라벨 바로 아래에 붙임 — `priceToCoordinate`+`priceScale('right').width()` 로 위치 계산, WS 틱·폴링·팬/줌·1초 틱마다 갱신)·인디케이터(추가/삭제/기간편집)·매매 B/S/L 마커·포지션 평단선+청산가선(추정, 평단선 옵션에 묶임)·SL/TP 수평선·미체결 지정가 주문선(가격+수량, 매수녹색/매도적색)·조건부(스탑) 주문 수평선(트리거가에 앰버 점선 "조건부 롱/숏 ≥/≤ 수량", 취소 X 버튼은 `cancelConditional` 로 라우팅 — 지정가/조건부 모두 `pendingLine` 옵션에 묶임)·차트 클릭→지정가 입력·테마 반응형 캔버스 재도색. 가상 심볼은 바이낸스 REST/WS 대신 api.spotCandles(3초 폴링, spot_trades 기반 서버 집계 캔들)로 분기하되 표시범위는 최초 로드 때만 설정(매 폴링마다 재설정하면 줌이 리셋되는 버그가 있었음)
+        ├── Chart.tsx           Lightweight Charts: 타임프레임 그룹셀렉트(초봉 포함)·KST+9·OHLCV+인디케이터값 레전드(hover/터치, 종가 옆에 그 봉의 변동률 (종가-시가)/시가 % 표시)·툴바 우측 실시간 시계(Clock)·다음봉 카운트다운(트레이딩뷰처럼 우측 가격축의 현재가 티커=마지막 봉 종가 라벨 바로 아래에 붙임 — `priceToCoordinate`+`priceScale('right').width()` 로 위치 계산, WS 틱·폴링·팬/줌·1초 틱마다 갱신)·인디케이터(추가/삭제/기간편집)·매매 B/S/L 마커·포지션 평단선+청산가선(추정, 평단선 옵션에 묶임)·SL/TP 수평선·미체결 지정가 주문선(가격+수량, 매수녹색/매도적색)·조건부(스탑) 주문 수평선(트리거가에 앰버 점선 "조건부 롱/숏 ≥/≤ 수량", 취소 X 버튼은 `cancelConditional` 로 라우팅 — 지정가/조건부 모두 `pendingLine` 옵션에 묶임)·차트 클릭→지정가 입력·테마 반응형 캔버스 재도색. 가상 심볼은 바이낸스 REST/WS 대신 api.spotCandles(1초 폴링)로 분기하되 표시범위는 최초 로드 때만 설정(매 폴링마다 재설정하면 줌이 리셋되는 버그가 있었음). **⚠ 폴링은 최초 1회만 500봉을 받고 이후엔 "마지막 로드 이후 흐른 시간 ÷ 인터벌 + 2"봉만 받는다**(§6 — 예전엔 1초마다 500봉을 통째로 다시 받아 하루 1,050만 행을 읽었다. 서버 롤업까지 겹쳐 요청 하나가 500×배수 행이었다). **탭이 백그라운드면 폴링 정지**, 돌아오면 쉰 시간만큼 봉을 더 받아 구멍을 메운다
         ├── OrderPanel.tsx      Easy=슬라이더로 비중만 정해 롱/숏 버튼 / Standard=시장가+지정가+조건부 탭·SL·TP 입력·수량 텍스트입력+단위(코인/USDT) 전환 (레버리지는 공통, 체결가는 서버가 fetch). **⚠ 수량 입력의 진실원본은 입력칸 문자열(`amtInput`, 현재 unit 기준)이고 코인 수량은 `sizeCoin` 으로 파생** — 예전엔 코인 수량을 상태로 두고 USDT 표시를 coin×가격으로 매 렌더 재계산했는데, 그 왕복에서 정밀도가 깨져(coin toFixed(6)) USDT 로 입력하면 타이핑이 엉뚱한 값으로 튀었다(BTC 에 "1 USDT" → 0.98). 단위 전환·슬라이더는 현재 unit 값으로 입력칸을 1회 채운다. **OXUSDT 도 이 컴포넌트 하나로 처리**(가상 전용 분기 없음 — 실제 코인과 완전히 동일한 레버리지 거래)
         ├── PositionsPanel.tsx  탭: 포지션(청산가 표시·(Standard 전용) 부분청산 수량 입력 + **지정가 청산 입력(비우면 시장가, 칸을 포커스하면 차트·호가창 클릭 가격이 여기로 들어옴 — accent 링으로 표시)**·SL/TP 인라인 편집, 청산 실행 후에도 수량·지정가 입력값 유지, Easy 는 전량 시장가청산 버튼만) / (Standard) 미체결 지정가(reduce-only 는 "롱/숏 청산" 뱃지) / 주문내역(전체 체결 이력, 강제청산 하이라이트). **OXUSDT 도 이 컴포넌트 하나로 처리**(가상 전용 분기 없음)
         └── Leaderboard.tsx     친구 자산 순위 모달(5초 폴링) + 상단에 거래소 수수료 수익(유저분/봇분/누적 거래대금)
@@ -197,12 +197,13 @@ ox64/
 - **체결 체크 = 접속 폴링(빠른 경로) + cron sweep(접속 무관, 느린 경로)**: Cloudflare Pages Functions 는 정기 실행을 지원하지 않는다. 그래서 `functions/_trading.ts checkTriggers(env,uid)` 를 `state.ts`(GET, 클라가 `useTriggerPoll` 로 1~2.5초마다 호출)와 `order.ts`(POST 액션 진입 직후, 수동 조작과의 레이스 방지)에서 호출해 **그 유저의 요청이 들어올 때** 강제청산/지정가/SL·TP/조건부를 평가·체결한다(체결가는 지정가/SL/TP 값 그대로, 슬리피지 모델링 없음). 그리고 **아무도 접속하지 않아도** 같은 평가가 돌도록 `cron/` 워커가 매 1분 `sweepTriggers(env)` 로 전 유저를 훑는다(아래) → **주기만 다르고 기능 차이는 없다**.
 - **⚠ 접속 여부와 무관하게 매 1분 자동 실행 = `sweepTriggers`(2026-07-29, 예전엔 강제청산만)**: `cron/`(별도 배포되는 작은 Worker, Pages 는 Cron Trigger 미지원이라 분리) 가 매 1분 `sweepTriggers(env)`(`functions/_trading.ts`) 를 호출해 **포지션·미체결·조건부가 있는 전 유저**를 훑어 강제청산·지정가·SL/TP·조건부(무한 반복 포함)를 전부 평가·체결한다. 같은 D1 을 바인딩하므로 별도 동기화 불필요. 배포·시크릿 설정은 §5 참고(⚠ cron 워커는 수동 재배포).
   - **예전엔 이 sweep 이 `sweepForcedLiquidations`(강제청산만)** 이라, 무한 조건부를 걸어둬도 **앱(차트 화면)을 닫으면 반복 매수가 멈췄다**("차트 켜놨을 때만 조건부가 작동함" 제보). 근본 원인은 조건부/지정가/SL·TP 평가가 `checkTriggers` 안에만 있어서 = **유저 요청이 유일한 클럭**이었던 것. 수정: 평가 본체를 `runTriggers(env,uid,pendings,positions,conditionals,prices)` 로 추출해 `checkTriggers`(1인분)와 `sweepTriggers`(전 유저)가 **공유**한다 → 새 트리거 기능을 추가해도 자동으로 양쪽에서 돈다(한쪽에만 추가되는 실수 방지).
-  - **⚠ 마켓메이커 틱 예산은 총량 고정, 코인들이 나눠 쓴다**(`cron/index.ts` `MM_TICK_BUDGET`=24, `MM_BUDGET_PER_PAIR = MM_TICK_BUDGET / VIRTUAL_PAIRS.length`, 그걸 다시 `SWEEP_ROUNDS` 로 나눠 라운드당 틱): 코인마다 예산을 곱하면 쓰기도 **invocation당 쿼리 수(한도 1,000)** 도 코인 수에 그대로 비례한다. 총량을 정하는 기준이 바로 그 쿼리 한도다 — 한 틱이 약 14쿼리이므로 24틱 ≈ 340쿼리 + 트리거 sweep ≈ 400 으로 한도의 절반 아래다(사다리를 44행으로 쓰던 시절엔 한 틱이 ~73쿼리라 12틱만으로 950 을 먹었다). 현재 2코인 × 12틱. **코인을 더 늘릴 땐 이 값을 그대로 두고 코인당 틱이 줄게 두거나(움직임이 성겨짐) 한도를 다시 계산해 올릴 것** — 무심코 "코인 수 × 12" 로 두면 4~5종에서 쿼리 한도에 부딪힌다.
+  - **⚠ 마켓메이커 틱 예산은 총량 고정, 코인들이 나눠 쓴다**(`cron/index.ts` `MM_TICK_BUDGET`=24, `MM_BUDGET_PER_PAIR = MM_TICK_BUDGET / VIRTUAL_PAIRS.length`): 현재 2코인 × 12틱. **⚠ 이 값을 정하는 기준이 바뀌었다(2026-08-14)** — 예전엔 틱 하나가 D1 왕복 ~14쿼리라 쿼리 한도가 상한을 정했지만, 지금은 틱이 순수 계산이고 커밋이 페어당 1회라 **틱 수가 쿼리 수도 쓰기도 거의 안 늘린다**(§ spot.ts runBotTicks). 이제 상한을 정하는 건 **CPU(무료 10ms/invocation)** 다 — 실측 24틱 ≈ 3.5ms. 코인을 늘릴 때도 총량을 그대로 두면 코인당 틱만 줄어(움직임이 성겨짐) 비용은 불변이다.
   - **⚠ 유저가 보고 있으면 cron 은 물러난다**(`marketMakerTickBudget`, `POLL_ACTIVE_MS`=20s, `BURST_MIN_TICKS`=4): `/api/spot` 폴링(1초)이 이미 초당 한 번씩 재호가를 돌리는데 cron 이 12틱을 더 얹는 건 순수 중복이라, 쓰기만 배로 나가고 차트가 더 살아나지도 않는다. `last_run` 이 방금 전이면 폴링이 클럭 역할 중이라는 뜻이므로 최소치만 돌린다(cron 이 직접 찍은 `last_run` 은 다음 실행 때 60초 전이라 두 경우가 안 섞인다).
     **⚠⚠ 이 판정은 라운드 루프 밖에서 실행당 한 번만 한다** — `runMarketMakerBurst` 는 끝날 때 `last_run` 을 찍으므로, 안에서 라운드마다 판정하면 **다음 라운드가 직전 라운드의 자기 발자국을 보고 "누가 폴링 중"이라 오판**해 아무도 없는데도 cron 이 스스로 물러난다(실측: 분당 12틱이어야 할 것이 4틱). 라운드 간격이 밀리초라 시각만으로는 cron 자신과 유저 폴링을 구분할 수 없다.
-  - **⚠ cron 한 번에 "봇 틱 → 트리거 평가"를 4라운드 번갈아 돈다**(`cron/index.ts` `SWEEP_ROUNDS`=4): OX 가격은 벽시계가 아니라 **봇 틱이 돌 때만** 움직이므로, 한 cron 에서 12틱을 몰아 돌린 뒤 트리거를 한 번만 보면 그 사이 지나간 딥/스파이크를 조건부가 통째로 놓친다(예: "1.0 이하로 내려가면 매수"인데 8번째 틱에서만 1.0 을 찍고 되돌아온 경우). 틱 그룹 사이에서 평가해 **가격 경로를 4번 샘플링**한다. 라운드 사이에 sleep 은 두지 않는다(OX 는 벽시계와 무관하고, 실제 코인은 1분 안에 여러 번 fetch 해도 의미가 없다).
+  - **⚠ 트리거는 "현재가 한 점"이 아니라 "지나온 가격 범위"로 판정한다**(`_trading.ts` `PriceRanges`/`rangeOfPath`, 2026-08-14): OX 가격은 벽시계가 아니라 **봇 틱이 돌 때만** 움직이는데 cron 은 1분치 틱을 한 번에 몰아 돌린다 — 끝난 뒤 현재가 한 점만 보면 그 사이 지나간 딥/스파이크를 통째로 놓친다(예: "1.0 이하로 내려가면 매수"인데 8번째 틱에서만 1.0 을 찍고 되돌아온 경우). 예전엔 이걸 "sweep 을 4라운드 반복"으로 때웠으나 sweep 한 번이 D1 쿼리 ~18개라 무료 한도(50)를 넘겼다. 지금은 버스트가 돌려준 경로의 **최저/최고**로 한 번에 판정한다 — 실제 거래소가 구간 고가/저가로 스탑을 판정하는 방식과 같고, 4점 샘플링보다 오히려 정확하다. 적용 대상은 조건부(발동·재무장)·SL/TP·지정가 크로스이고, **강제청산만은 현재가로 본다**(스쳐간 저가로 계좌를 파산시키면 되돌릴 수 없다).
+  - **⚠ 한 invocation 에서 훑는 유저 수 상한 `MAX_SWEEP_USERS`(8)**: 유저가 늘어도 invocation 쿼리 수가 늘지 않게 분 단위로 회전하며 나눠 훑는다(무료 한도 50 방어). 접속 중인 유저는 자기 폴링(2.5초)이 즉시 처리하므로 늦어지는 건 앱을 닫아둔 유저뿐이고, 그마저 몇 분 안에 차례가 온다. 현재 대상 유저는 4명이라 회전이 아예 일어나지 않는다.
   - **⚠ 실제 코인 시세는 한 cron 안에서 재사용, OX 는 매 라운드 새로 읽는다**(`sweepTriggers(env, cachedPrices?)` → 반환한 `prices` 를 다음 라운드에 넘김): 실제 코인은 외부 거래소 fetch(비싸고 라운드마다 거의 같은 값), OX 는 `spot_bot_state.ref_price`(D1 read, 라운드마다 실제로 바뀜).
-  - **체감 주기**: 접속 중이면 폴링(2.5초) / 접속을 끊으면 1분마다 4라운드. 단 `continuous` 무한 조건부의 실제 실행 간격은 **재실행 간격 하한 5초**가 상한을 잡으므로 **접속 중이든 아니든 분당 최대 12회**다(앱을 닫으면 cron 4라운드에 묶여 분당 최대 4회). 더 촘촘하게 하려면 cron 주기(1분이 Cloudflare 최소)나 `SWEEP_ROUNDS` 를 올려야 하는데, **돈도 D1 쓰기도 계속 나가는 기능**이라 §6 예산을 먼저 계산할 것.
+  - **체감 주기**: 접속 중이면 폴링(2.5초) / 접속을 끊으면 1분마다 1회. 단 `continuous` 무한 조건부의 실제 실행 간격은 **재실행 간격 하한 5초**가 상한을 잡으므로 접속 중엔 분당 최대 12회, 앱을 닫으면 분당 1회다. 더 촘촘하게 하려면 cron 주기(1분이 Cloudflare 최소)를 줄여야 하는데 그게 최소값이고, **D1 쓰기가 계속 나가는 기능**이라 §6 예산을 먼저 계산할 것.
   - 한 유저의 평가가 예외로 터져도 나머지 유저는 계속 평가한다(try/catch + `console.error`, 다음 라운드/다음 cron 에서 재시도).
   - 로컬 검증(`cd cron && npx wrangler dev` → `curl .../cdn-cgi/handler/scheduled`, **유저 요청 0회**): OX 무한 `continuous` 가 4라운드에 정확히 4회 체결(fill_count=4, 무장 유지), `cooldown_ms`=60s 는 1회로 제한, 1회성 조건부(실제 코인 BTCUSDT)는 체결 후 행 삭제, 실제 코인 지정가 pending 체결, SL 히트로 포지션 청산까지 전부 확인.
 - **⚠ 거래 수수료 + VIP 등급(2026-07-20)**: 모든 체결에 `수수료 = 명목금액(체결가×수량) × VIP 요율` 이 붙는다.
@@ -554,6 +555,10 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   - **⚠ `conditional_orders` 무한 반복 컬럼(2026-07-28)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE conditional_orders ADD COLUMN repeating INTEGER NOT NULL DEFAULT 0"` 및 동일 형식으로 `armed INTEGER NOT NULL DEFAULT 1` / `rearm_price REAL` / `fill_count INTEGER NOT NULL DEFAULT 0` / `max_fills INTEGER` / `repeat_mode TEXT NOT NULL DEFAULT 'continuous'` / `cooldown_ms INTEGER NOT NULL DEFAULT 0` / `last_fill_at INTEGER`. **코드 배포 전에 먼저 적용돼 있어야 한다**(읽기 경로는 기본값으로 방어하지만 `conditionalOpen` INSERT 가 컬럼을 참조) — prod 엔 이미 적용 완료. 전부 DEFAULT 가 있거나 NULL 허용이라 기존 행도 그대로 1회성 주문으로 동작.
   - **⚠ `usage_meter`(D1 쓰기 예산 계량기, §6, 2026-08-01)**: 신규 테이블이라 `--file=./schema.sql` 재적용 또는 `npx wrangler d1 execute ox64 --remote --command "CREATE TABLE IF NOT EXISTS usage_meter (day TEXT PRIMARY KEY, rows_est INTEGER NOT NULL DEFAULT 0)"`. **코드(`_budget.ts` 가 SELECT/UPSERT)가 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 조회는 try/catch 로 0 을 반환해 방어하지만(계량기 고장이 봇을 멈추면 안 됨) `meterStmt` 는 봇 틱 batch 안에 있어서 테이블이 없으면 **봇 틱이 통째로 롤백된다**(시장 정지). prod 적용 완료.
   - **⚠ `puzzle_stats`/`puzzle_games`(퍼즐게임, §7, 2026-07-25)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/puzzle` 코드가 이 테이블들을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩(`/api/state` 등) 과는 완전히 분리된 라우트라 이 테이블이 없어도 트레이딩 쪽은 영향 없고, `/api/puzzle` 만 500 이 된다(방어적 try/catch 없음 — 격리돼 있어 불필요 판단).
+  - **⚠⚠ 무료 플랜 전환 마이그레이션(2026-08-14)** — 아래 5줄. **전부 코드 배포 전에 먼저 적용해야 한다**(봇 상태 UPDATE·sweep 이 이 컬럼들을 참조하므로, 없으면 봇 틱 batch 가 통째로 롤백돼 시장이 멈춘다). prod·로컬 적용 완료:
+    `ALTER TABLE spot_bot_state ADD COLUMN live_json TEXT` / `pend_notional REAL NOT NULL DEFAULT 0` / `pend_rows INTEGER NOT NULL DEFAULT 0` / `pend_ticks INTEGER NOT NULL DEFAULT 0` / `ALTER TABLE pending_orders ADD COLUMN last_fill_at INTEGER`
+    그리고 **인덱스 교체**(쓰기 비용 증가 0, 읽기 96% 감소): `CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at)` + `DROP INDEX IF EXISTS idx_orders_user` + `DROP INDEX IF EXISTS idx_fee_ledger_time`(읽는 코드가 없는데 체결마다 1행씩 비용만 냈다).
+    **⚠ `usage_meter` 의 오늘 행은 전환 시 한 번 리셋해야 한다** — 예전 단가(틱당 7행)로 쌓인 값이라 새 임계값(§6, 일 8만)에서 즉시 차단이 걸린다. `DELETE FROM usage_meter WHERE day = <오늘 KST>`.
   - **⚠ `dungeon_stats`/`dungeon_rooms`/`dungeon_players`(5분 던전, §8, 2026-07-27)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/dungeon` 코드가 이 테이블들을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩·퍼즐 라우트와 완전히 분리돼 있어 없어도 그쪽엔 영향 없고 `/api/dungeon` 만 500 이 된다(방어적 try/catch 없음 — 격리돼 있어 불필요 판단).
 - **Secret**: `SESSION_SECRET` = `wrangler pages secret put SESSION_SECRET --project-name ox64` 로 production 에 설정됨(랜덤 32B hex). wrangler.toml 엔 두지 않음.
 - 재적용 명령: 스키마 `npx wrangler d1 execute ox64 --remote --file=./schema.sql` / 시크릿 `echo <값> | npx wrangler pages secret put SESSION_SECRET --project-name ox64`.
@@ -595,25 +600,41 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - **⚠⚠⚠ D1 예산 — 새 기능을 얹기 전에 여기부터 볼 것. 실제로 돈이 청구된 적이 있다.**
   **2026-08-01 사건: 7월분 청구서 $47** — 전액 **D1 Rows Written 초과분**($1/100만 행, 5,000만 행 포함).
   즉 7월에 **9,700만 행**을 썼다. 7/24 에 포함분을 다 쓰고 그때부터 하루 $5~9(=500~900만 행/일)씩 붙었다.
-  이 사이트는 **Workers Paid($5/월)** 플랜이고 **그 이상은 용납 안 된다**(유저 방침) — 아래 셋 중 하나라도
-  넘기면 곧바로 초과 과금이므로, 쓰기 경로를 추가할 땐 반드시 "이게 하루 몇 행인가"를 먼저 계산할 것.
-  | 한도 | 값(Paid) | 현재(2026-08-01) |
+  **⚠⚠ 2026-08-14 부터 이 사이트는 Workers *Free* 플랜을 목표로 운영한다.** 그래서 판단 기준이 완전히
+  바뀌었다 — Paid 는 한도를 넘기면 **돈이 더 나갈 뿐** 서비스는 돌지만, **Free 는 넘기는 순간 그 종류의
+  작업이 실패한다**("further operations of that type will fail with an error"). 즉 쓰기 한도를 넘기면
+  봇이 아니라 **거래 자체가 멈춘다**. 한도도 훨씬 빡빡하고, **행 수만이 아니라 요청 수·CPU·invocation당
+  쿼리 수까지** 걸린다:
+  | 한도 | 값(Free) | 현재(2026-08-14 전환 후 예상) |
   | --- | --- | --- |
-  | 월 rows written | 5,000만 포함(+$1/100만) | **약 600만/월** (개선 전 2,900만 → 사건 당시 9,700만) |
-  | DB당 최대 크기 | **10 GB** | **15 MB** (7/31 정리로 3.38GB → 회수됨) |
-  | Worker invocation 1회당 D1 쿼리 | **1,000** | cron 1회 ≈ 400 |
+  | 일 rows written | **10만/일** | **약 3~5만/일** (전환 전 30만) |
+  | 일 rows read | **500만/일** | **약 30만/일** (전환 전 1억 1,000만) |
+  | **Worker invocation 1회당 D1 쿼리** | **50** ⚠ Paid 는 1,000 | cron 1회 ≈ 25~35 (전환 전 ~400) |
+  | 요청 수(Pages Functions 포함) | **10만/일** | 약 1.5~2만/일 |
+  | CPU / invocation | **10 ms** ⚠ Paid 는 30초 | cron 실측 ~3.5ms(봇 24틱 순수 연산) |
+  | DB당 최대 크기 | **500 MB** ⚠ Paid 는 10GB | 18 MB |
+  - **⚠ invocation당 쿼리 50 이 새로 생긴 진짜 벽이다.** `DB.batch([...])` 는 **문장 하나하나가 1쿼리로**
+    계산되고, 바인딩 호출도 subrequest 한도(50)에 함께 잡힌다. 전환 전 cron 1회가 ~400쿼리였던 이유는
+    "틱마다 D1 을 왕복"했기 때문이고, 그래서 봇을 **메모리 시뮬 + 단일 커밋**으로 바꾼 것이 이번 전환의
+    핵심이다(§ spot.ts runBotTicks). **새 경로를 추가할 땐 "이 요청이 D1 문장을 몇 개 쓰는가"를 먼저 셀 것.**
+  - **⚠ 요청 수(10만/일)는 유저가 늘면 가장 먼저 닿는 한도다.** OX 화면 1인 = 시간당 약 3,600요청
+    (호가 1s + 캔들 1s + state 2.5s, 탭 숨기면 전부 정지) → **하루 약 27 user-hour** 가 천장이다.
+    실제 코인 화면은 state 폴링뿐(시간당 1,440)이라 훨씬 여유롭다.
   - **⚠ 과금 단위는 "문장 수"가 아니라 "행 수"다** — 정확한 규칙은 **`바뀐 행 1 + 갱신된 인덱스 항목 수`**
     이고, 여기서 인덱스에는 **`id TEXT PRIMARY KEY` 같은 암묵 인덱스도 포함**된다(`sqlite_autoindex`).
     실측 대조: `spot_trades` INSERT 3행(= 1 + PK + 명시 인덱스 1), `fee_ledger` INSERT 4행(= 1 + PK +
     명시 2), 비인덱스 컬럼 UPDATE 1행, `spot_candles` upsert 1행(기존 버킷 갱신이라 인덱스 불변).
     DELETE 는 지운 행마다 같은 계산. 그래서 **인덱스를 하나 더 다는 것은 그 테이블의 모든 INSERT 비용을
     올리는 결정**이고, "행 하나 INSERT 하고 나중에 DELETE" 는 왕복 ~4.5행이다.
-  - **비용의 주인은 봇이다** — 유저 13명이 아니라 **분당 24틱 이상 영구히 도는 마켓메이커**가 쓰기의
-    95%를 만든다. 실제 코인 38종은 봇이 없어 사실상 공짜다. 그래서 판단 기준은 딱 하나:
-    **"봇이 틱마다 남기는 행이 몇 개인가"**. 지금은 **틱당 5행**까지 내려왔다 — 상태 UPDATE 1(심리+
-    사다리+테이프가 전부 이 한 행) + 캔들 upsert 3(1m/1h/1d) + 봇 수수료 카운터 UPDATE 1.
-    다음에 줄일 수 있는 건 그 수수료 카운터 하나뿐이다(상태 행에 누적해 100틱마다 flush → 하루 −3.8만
-    행). 지금은 여유가 8배라 안 건드렸다 — 봇 재고/수수료 장부는 검증이 까다로워 굳이 손댈 이유가 없다.
+  - **~~비용의 주인은 봇이다~~ → 이제 아니다(2026-08-14).** 예전엔 분당 24틱 도는 마켓메이커가 쓰기의
+    63%를 만들었다(틱당 6행). 지금은 **틱 수와 쓰기가 분리**돼 있다 — 봇은 N틱을 메모리에서 돌리고
+    **커밋 1회 = 1행**만 쓴다(상태 UPDATE 하나에 심리+사다리+테이프+진행중 캔들+미정산 누적이 전부
+    들어있다). 실측: cron 1회에 **틱 20회 → 쓰기 3행**(전환 전이면 120행). 캔들은 **버킷이 닫힐 때만**
+    테이블로 넘어가고(1m=분당 1행), 봇 수수료·계량기는 120틱마다 한 번 정산한다.
+  - **이제 비용의 주인은 "체결"이다** — 체결 1건이 ~20행이라 하루 3,000건이면 6만 행이다. 그리고 체결
+    수를 늘리는 건 사람 손이 아니라 **자동으로 반복되는 경로**다. 그런 경로는 셋뿐이고 전부 계량·차단
+    아래에 있다(아래 서킷 브레이커): ①시장 깊이보다 큰 지정가의 **재체결** ②`continuous` 무한 조건부
+    ③봇. 특히 ①은 prod 실측으로 **주문 하나가 하루 3,000건**을 체결하고 있었다(§ PARTIAL_FILL_COOLDOWN_MS).
   - **⚠ 봇 경로에서 "행을 남기는" 설계 자체를 피할 것**: 매 틱 통째로 교체되는 스냅샷(호가 사다리,
     체결 테이프)은 **이력이 아니라 링 버퍼**이므로 행으로 쪼개면 안 된다 — 이미 UPDATE 하고 있는 상태
     행의 JSON 칸에 담으면 **쓰기 비용이 0**이다(rows written 은 행 수만 세고 바이트는 세지 않는다).
@@ -644,14 +665,15 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
          곧 다음 청구서다.** ⚠ 그래서 조건부 등에 계량을 **따로 넣으면 이중 계산**이 된다(한 번 그랬다가 정리).
        - 계량 안 하는 것: 주문 생성/취소/수정, 로그인, 퍼즐, 던전 — 전부 사람 손 속도에 묶이고 1~5행이다.
          즉 이 값은 **총계가 아니라 "폭주 가능한 몫"**(정확한 총계는 위 1번).
-       - **차단은 2단이고, 위험한 쪽을 먼저 끊는다**:
-         | 대상 | 일일선 | 월선 | 이유 |
-         | --- | --- | --- | --- |
-         | `repeating` 조건부 체결 | `REPEAT_BLOCK_DAY_ROWS` 60만 | 4,500만 | **개수 제한이 없어 N배로 늘어나는 유일한 경로**(1개=하루 35만 행 → 3개면 100만) |
-         | 마켓메이커 봇 틱 | `BOT_BLOCK_DAY_ROWS` 80만 | 4,500만 | 봇 단독으로는 여기 못 닿는다 = 최후 방어선 |
-       - **⚠ 일일선이 왜 필요한가**: 월선만 두면 반복 조건부 3개(하루 100만 = 월 3,100만)가 **월 4,500만
-         아래라 영원히 안 걸리면서** 하루 목표치는 넘긴다. 일일선 80만 × 31 = 2,480만 이므로 **일일선이
-         곧 월 보증**이기도 하다. 날짜/달이 바뀌면 자동 해제(KST 기준).
+       - **차단은 3단이고, "잃는 게 적은 쪽"부터 끊는다**(무료 플랜 기준 재설정, 2026-08-14):
+         | 대상 | 일일선 | 멈추면 잃는 것 |
+         | --- | --- | --- |
+         | 큰 지정가의 **재**체결 | `NIBBLE_BLOCK_DAY_ROWS` 45,000 | 없음에 가깝다 — 주문은 살아있고 잠시 뒤 이어서 채워진다 |
+         | `repeating` 조건부 체결 | `REPEAT_BLOCK_DAY_ROWS` 55,000 | 그 주문 하나가 쉰다(국지적) |
+         | 마켓메이커 봇 | `BOT_BLOCK_DAY_ROWS` 80,000 | 가상 코인 시장이 통째로 선다 = **최후 방어선** |
+       - 무료 한도 10만에서 2만(`DAY_RESERVE_ROWS`)을 계량 안 되는 몫(주문 생성/취소, 퍼즐, 던전)과
+         "차단 후에도 유저가 청산은 할 수 있어야 한다"는 여유로 남긴다. 날짜(KST)가 바뀌면 자동 해제.
+       - **월선은 없앴다** — 무료 플랜의 한도는 일 단위라 월 누적은 의미가 없다(`npm run d1:budget` 표시용).
        - **계속 도는 것: 유저 수동 거래·강제청산·지정가·SL/TP·1회성 조건부** — 돈이 걸린 기능을 DB 비용
          때문에 막는 건 더 큰 사고다. 봇이 멈춰도 유저는 청산할 수 있어야 한다.
        - **⚠ 계량 문장은 반드시 이미 도는 batch 에 얹을 것**(`meterStmt`) — 단독 실행하면 계량기가 왕복을
@@ -664,12 +686,12 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
          신호**이므로, 차단이 걸리면 임계값을 올리는 게 아니라 `npm run d1:budget` 으로 원인을 찾을 것.
   - **⚠ 폴링 경로 전수 점검 결과(2026-08-01)** — 클라의 모든 주기 요청 중 **D1 에 쓰기를 만드는 건 둘뿐**이고
     둘 다 위 계량·차단 아래에 있다. 새 폴링을 추가할 땐 이 표에 한 줄을 더할 수 있는지부터 확인할 것.
-    | 폴링 | 주기 | D1 쓰기 |
-    | --- | --- | --- |
-    | `useSpotPoll` → `/api/spot` | 1s | **봇 틱 6행**(게이트 0.45~1.1s) — 계량·차단 대상 |
-    | `useTriggerPoll` → `/api/state` | 2.5s | 체결이 성립할 때만 **20행** — 계량 대상, 반복은 차단 대상 |
-    | `Chart` → `/api/spot?candles=1` | 1s | **0** (캔들 조회는 봇을 굴리지 않는다 — 위 항목 참고) |
-    | `SymbolSelect` → `/api/spot?candles=1` ×2 | 5s | **0** |
+    | 폴링 | 주기 | D1 쓰기 | 요청 수(§ 10만/일) |
+    | --- | --- | --- | --- |
+    | `useSpotPoll` → `/api/spot` | 1s (탭 숨기면 정지) | **봇 커밋 1행**(게이트 0.45~1.1s) — 계량·차단 대상 | 3,600/시 |
+    | `useTriggerPoll` → `/api/state` | 2.5s | 체결이 성립할 때만 **20행** — 계량 대상, 반복·재체결은 차단 대상 | 1,440/시 |
+    | `Chart` → `/api/spot?candles=1` | 1s (탭 숨기면 정지) | **0** (캔들 조회는 봇을 굴리지 않는다) | 3,600/시 |
+    | `SymbolSelect` → `/api/spot?candles=1` ×2 | 5s (드롭다운 열었을 때만) | **0** | — |
     | `Leaderboard` → `/api/leaderboard` | 5s | **0** (읽기 전용) |
     | `useDungeonStore` → `/api/dungeon` GET | 0.5~4s | **0** (§8 — 계정당 평생 1회 stats INSERT 제외) |
     | `useMarkPrices` → OKX | 1.2s | **0** (외부 API, D1 미접촉) |
@@ -967,6 +989,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - [x] **VIP 무한 레벨(등급표 → 공식)** — 13행 상수표(VIP0~12, 1단계당 100배)를 등비수열 두 개로 교체: 진입 거래대금 `1만 × 4^(t-1)`, 요율 `0.03% × 0.79^t`(하한 0.0000001%). 요율 곡선은 **옛 표를 근사**해 실제 수수료 부담은 그대로 두고 등급 칸만 3배 촘촘하게 만들었다(1e12·1e20·1e24 에서 옛 값과 거의 일치). `vipMinVolume`/`vipRate`/`vipTierWindow` 추가, 응답에 `vipFrom`/`vipCurve` 추가(무한이라 표를 통째로 못 보냄 → 창 + 하한 별도), `fmtFeeRate` 8자리, `VipBadge` 배색 3등급당 1칸. 검증: 1~45 등급 기준선 경계 정확(로그 오차 보정), 곡선이 옛 표와 1e10~1e28 구간에서 ±20% 이내
 - [x] **아주 큰 금액/수량 축약 표시(`fmtUsdShort`/`fmtQtyShort`)** — 평가자산 1.02e31 같은 값이 콤마 표기로 나와 랭킹 행을 밀어내고 VIP 뱃지·순위를 화면 밖으로 보내던 문제(제보). 정수부가 임계 자릿수를 넘으면 한국식 단위로 축약(그 위는 지수 표기) + `title` 에 전체값. 적용: 랭킹(수수료 수익·평가자산·미실현) · 헤더 평가자산 · 주문패널 정보란(가용/명목가/증거금/수수료) · 포지션 패널(수량·증거금·PnL·주문내역) · 호가창 수량 · VIP 모달 누적 수수료. 함께 레이아웃 방어(`shrink-0`/`min-w-0`+`truncate`, 청산 수량 입력칸 폭 상한 20ch)
 - [x] **봇 심리에 탐욕/공포 심화(2026-08-12)** — 기존 모델은 추세·변동성 뭉침 같은 **가격의 통계적 성질**이지 사람의 행동이 아니었다(무드가 최근 수익률의 즉석 함수라 관성이 없고, 시장이 고점/저점을 기억하지 않아 저항 돌파·지지 붕괴가 아예 없었다). 무드 군집(herding, 실효 지속계수 0.96 로 발산 불가)·고점/저점 기억(`peak`/`trough` → 탐욕/공포 게이지)·신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄(1.5배 크고 잦다)·**투매(`capitulation`) 국면**(공포 극단에서만 열리는 V 바닥, 하루 2~3회)·레버리지 효과(떨어질 때 더 시끄럽다)·버블 피로(euphoria 는 오래 끌수록 붕괴 확률 ↑)·**호가 깊이 비대칭**(공포장 매수/매도 두께비 0.5, 광기 5.1)을 추가. 상태 컬럼 2개가 늘었지만 **D1 쓰기 비용은 0 증가**(같은 행 UPDATE). 검증: `npm run sim:bot`(새 스크립트) 20일×4회에서 종가 0.90~1.23·1분봉 폭 2.2%·국면 점유율 calm 50/rally 26/pullback 16/panic 5/euphoria 3%·수익률 왜도 -1.5, 로컬 D1 에서 두 페어 봇 틱·시장가 진입/청산·지정가 대기 정상
+- [x] **Cloudflare 무료 플랜 전환(2026-08-14)** — 읽기 1억 1,000만/일 · 쓰기 30만/일 이던 것을 무료 한도(읽기 500만 · 쓰기 10만 · **invocation당 D1 쿼리 50** · 요청 10만/일 · CPU 10ms)에 맞춰 재구조화. ①**`orders(user_id, created_at)` 복합 인덱스** — TEMP B-TREE 정렬로 유저당 35,249행을 읽던 쿼리가 읽기의 **96%(하루 1억 570만 행)** 였다. 단독 인덱스를 지워 쓰기 비용 증가 0, 쿼리 11.203ms→0.095ms. ②**차트 증분 폴링** — 1초마다 500봉 전체 재조회(하루 1,050만 행)를 "쉰 시간만큼만" 으로, 탭 숨김 시 정지. `SymbolSelect` 가 드롭다운만 열어도 봇을 굴리던 경로 제거. ③**봇 틱 = 순수 계산 + 커밋 1회** — 틱마다 D1 을 왕복(틱당 ~14쿼리·6행)하던 것을 `simulateTick`(순수) + `runBotTicks`(N틱 메모리 → 단일 batch)로. 진행 중 캔들은 `live_json` 에 누적하고 **버킷이 닫힐 때만** 테이블로 넘긴다(조회 시 병합). 봇 수수료·계량기는 120틱마다 정산. 실측 **틱 20회 → 쓰기 3행**(이전 120행). ④**cron sweep 1회 + 가격 범위 판정** — 4라운드 반복(=D1 쿼리 ~400)을 1회로 줄이되 버스트가 지나온 **기준가 경로의 최저/최고**로 트리거를 판정해 샘플링 정확도는 오히려 상승(`PriceRanges`/`rangeOfPath`). 강제청산만은 현재가 유지. `MAX_SWEEP_USERS`(8) 회전으로 유저가 늘어도 쿼리 수 고정. ⑤**부분 재체결 간격 하한 5초**(`PARTIAL_FILL_COOLDOWN_MS`) — 시장 깊이보다 큰 지정가가 재호가마다 조금씩 영원히 체결되며 **주문 하나가 하루 3,000건**을 만들던 경로(첫 체결은 그대로 즉시). ⑥**서킷 브레이커를 무료 기준 3단으로**(재체결 4.5만 → 반복 조건부 5.5만 → 봇 8만, 잃는 게 적은 순). 검증: 폴링 틱 5회=쓰기 5행, cron 3회(틱 20)=쓰기 3행·에러 0, 15초에 폴링 12회→체결 3건, 1m/1h/15m 롤업에 진행 중 봉 정상 병합, 버킷 마감 flush·유저 체결 행과의 합산, 시장가/지정가/TP(정확히 지정가에 체결) 전부 정상
 - [ ] 가상 코인 3종 이상 추가 — 페어 파라미터화·봇 재고 분리는 끝났고(`VIRTUAL_PAIRS`/`bot_inventory`) `VIRTUAL_SYMBOLS`+`spot_bot_state` 시작가 행만 추가하면 된다. 틱 예산은 코인 수로 나눠 쓰므로 비용은 안 늘지만 코인당 움직임이 성겨진다
 - [ ] 미니 RTS 확장(종족 추가, 유닛 다양화, 난이도 선택, 리플레이)
 - [ ] 펀딩비 반영

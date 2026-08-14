@@ -465,6 +465,20 @@ export default function Chart() {
       let isFirstLoad = true;
       let loadingMore = false;
       let noMore = false;
+      // ⚠ 폴링은 **최근 몇 봉만** 받는다(2026-08-14, 무료 플랜 전환 ②). 예전엔 1초마다 500봉을 통째로
+      // 다시 받았는데, 서버가 롤업(15m ← 1m 15개)까지 하므로 요청 하나가 D1 에서 최대 500×배수 행을
+      // 읽었다 — 실측 하루 1,050만 행(전체 읽기의 9%)이 **화면에 이미 있는 과거봉을 계속 다시 읽는 데**
+      // 쓰였다. 아래 병합(cut 이전은 보존)이 원래부터 부분 갱신을 전제로 짜여 있어서, 받는 개수만
+      // 줄이면 그대로 동작한다. 필요한 봉 수는 "마지막 성공 이후 흐른 시간 ÷ 인터벌 + 여유 2"로 잡아
+      // 탭이 잠깐 멈췄다 돌아와도 구멍이 안 생긴다(그보다 오래 쉬었으면 아래에서 전체 재적재).
+      const POLL_MIN_BARS = 3;
+      const FULL_BARS = 500;
+      let lastLoadAt = 0;
+      const barsToFetch = () => {
+        if (isFirstLoad || lastLoadAt === 0) return FULL_BARS;
+        const gapBars = Math.ceil((Date.now() - lastLoadAt) / 1000 / intervalSec(interval));
+        return Math.min(FULL_BARS, Math.max(POLL_MIN_BARS, gapBars + 2));
+      };
 
       const draw = (arr: Candle[]) => {
         candle.setData(
@@ -475,11 +489,15 @@ export default function Chart() {
 
       const load = async () => {
         try {
-          const { candles: fresh } = await api.spotCandles(symbol, interval, 500);
+          const want = barsToFetch();
+          const { candles: fresh } = await api.spotCandles(symbol, interval, want);
           if (cancelled || fresh.length === 0) return;
+          lastLoadAt = Date.now();
           // ⚠ 폴링 결과로 배열을 통째로 갈아끼우면 왼쪽 스크롤로 붙여둔 과거봉이 매번 날아간다
           // (1.5초마다 리셋되니 사실상 과거 조회 불가) → 최신 구간만 교체하고 그보다 앞선 구간은 보존.
-          const prev = candlesRef.current;
+          // ⚠ 단 요청 폭이 상한(FULL_BARS)에 닿았다는 건 그만큼 오래 쉬었다는 뜻이라, 받아온 구간과
+          // 기존 구간 사이에 구멍이 있을 수 있다 → 그땐 이어붙이지 말고 통째로 갈아끼운다.
+          const prev = want >= FULL_BARS ? [] : candlesRef.current;
           const cut = fresh[0].time;
           const merged = prev.length ? [...prev.filter((c) => c.time < cut), ...fresh] : fresh;
           candlesRef.current = merged;
@@ -556,11 +574,28 @@ export default function Chart() {
       const tsApiV = chartRef.current?.timeScale();
       tsApiV?.subscribeVisibleLogicalRangeChange(onRangeV);
 
-      load();
-      const t = window.setInterval(load, 1000); // 3s→1.5s→1s: OX 캔들/현재가 갱신을 더 촘촘히(체결 딜레이 감소 맥락)
+      // ⚠ **탭이 백그라운드면 폴링을 멈춘다** — useSpotPoll 과 같은 이유·같은 패턴이다(§6 D1 예산).
+      // 그쪽만 멈추고 이 폴링은 계속 돌아서, 배경 탭 하나가 초당 1회씩 캔들을 조회하는 누수가 남아
+      // 있었다(화면을 아무도 안 보는데 읽기만 나간다). 돌아오면 즉시 1회 로드하고, 그때 barsToFetch 가
+      // 쉰 시간만큼 봉을 더 받아 구멍을 메운다.
+      let t: number | undefined;
+      const start = () => {
+        if (t !== undefined) return;
+        load();
+        t = window.setInterval(load, 1000); // 3s→1.5s→1s: OX 캔들/현재가 갱신을 더 촘촘히(체결 딜레이 감소 맥락)
+      };
+      const stop = () => {
+        if (t === undefined) return;
+        window.clearInterval(t);
+        t = undefined;
+      };
+      const onVisibility = () => (document.visibilityState === 'visible' ? start() : stop());
+      onVisibility();
+      document.addEventListener('visibilitychange', onVisibility);
       return () => {
         cancelled = true;
-        window.clearInterval(t);
+        document.removeEventListener('visibilitychange', onVisibility);
+        stop();
         tsApiV?.unsubscribeVisibleLogicalRangeChange(onRangeV);
         setConnected(false);
       };

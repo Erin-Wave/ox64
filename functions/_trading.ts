@@ -25,7 +25,13 @@ import {
   sizeEps,
 } from './_shared';
 import { autoWritesBlocked } from './_budget';
-import { matchLimitPendingAgainstBook, matchMarketOxOrder, matchReduceOnlyOxPending, recordVirtualFill } from './api/spot';
+import {
+  matchLimitPendingAgainstBook,
+  matchMarketOxOrder,
+  matchReduceOnlyOxPending,
+  recordVirtualFill,
+  PARTIAL_FILL_COOLDOWN_MS,
+} from './api/spot';
 
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차(조건부 주문 부분체결 잔량 등)
 
@@ -131,9 +137,30 @@ async function loadConditionals(env: Env, uid?: string): Promise<ConditionalRow[
  * 샘플링해야 "떨어질 때마다 산다" 같은 조건이 그 사이 지나간 딥을 놓치지 않는다.
  * 반환한 prices 를 다음 라운드에 그대로 넘기면 된다.
  */
+/** 한 평가 구간에서 그 심볼이 지나온 가격 범위(§ runTriggers ranges). cron 이 봇 시뮬 경로의 최저/최고를
+ * 넘긴다 — 유저 폴링 경로는 안 넘기며, 그때는 현재가 한 점으로 판정한다(예전과 동일). */
+export type PriceRanges = Record<string, { low: number; high: number }>;
+
+/** cron 1회가 훑는 최대 유저 수(무료 플랜 invocation당 D1 쿼리 50 방어, § sweepTriggers).
+ * 현재 포지션/미체결/조건부를 가진 유저는 4명이라 회전이 아예 일어나지 않는다 — 늘어났을 때를 위한 상한이다. */
+const MAX_SWEEP_USERS = 8;
+
+/** 가격 경로 배열을 범위로 압축. 빈 배열이면 undefined(= 범위 정보 없음). */
+export function rangeOfPath(path: number[]): { low: number; high: number } | undefined {
+  if (path.length === 0) return undefined;
+  let low = path[0];
+  let high = path[0];
+  for (const p of path) {
+    if (p < low) low = p;
+    if (p > high) high = p;
+  }
+  return { low, high };
+}
+
 export async function sweepTriggers(
   env: Env,
   cachedPrices?: Record<string, number>,
+  ranges?: PriceRanges,
 ): Promise<{ checked: number; liquidated: number; prices: Record<string, number> }> {
   const positions = (await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()).results;
   const pendings = (await env.DB.prepare('SELECT * FROM pending_orders').all<PendingRow>()).results;
@@ -163,23 +190,37 @@ export async function sweepTriggers(
   const stale = symbols.filter((s) => isVirtualSymbol(s) || cachedPrices?.[s] == null);
   const prices = { ...cachedPrices, ...(await fetchPrices(env, stale)) };
 
+  // ⚠⚠ **한 invocation 에서 훑는 유저 수에 상한**을 둔다(2026-08-14, 무료 플랜). Workers/D1 무료 플랜은
+  // **invocation당 D1 쿼리 50개**가 한도이고, 넘으면 그 요청이 통째로 실패한다(= 그 분의 청산·체결이
+  // 전부 스킵). cron 1회의 고정 비용(봇 2페어 ≈ 12쿼리 + 여기 조회 3)을 빼면 유저 몫은 ~30쿼리인데,
+  // 유저 한 명이 실제로 체결되면 5~10쿼리를 쓴다. 유저가 늘어도 이 수가 늘지 않게 **분 단위로 회전**하며
+  // 나눠 훑는다 — 접속 중인 유저는 어차피 자기 폴링(checkTriggers, 2.5초)이 즉시 처리하므로, 여기서
+  // 늦어지는 건 "앱을 닫아둔 유저"뿐이고 그마저 몇 분 안에 반드시 차례가 온다.
+  const uids = [...byUser.keys()].sort(); // 정렬 = 회전 순서가 실행마다 흔들리지 않게(굶는 유저 방지)
+  const offset = uids.length > MAX_SWEEP_USERS ? Math.floor(Date.now() / 60_000) % uids.length : 0;
+  const slice =
+    uids.length <= MAX_SWEEP_USERS
+      ? uids
+      : Array.from({ length: MAX_SWEEP_USERS }, (_, i) => uids[(offset + i) % uids.length]);
+
   let liquidated = 0;
-  for (const [uid, w] of byUser) {
+  for (const uid of slice) {
+    const w = byUser.get(uid)!;
     // 한 유저가 터져도 나머지는 계속 평가한다(다음 라운드/다음 cron 에서 재시도).
     try {
-      if (await runTriggers(env, uid, w.pendings, w.positions, w.conditionals, prices)) liquidated++;
+      if (await runTriggers(env, uid, w.pendings, w.positions, w.conditionals, prices, ranges)) liquidated++;
     } catch (e) {
       console.error(`[sweepTriggers] uid=${uid}`, e);
     }
   }
-  return { checked: byUser.size, liquidated, prices };
+  return { checked: slice.length, liquidated, prices };
 }
 
 /** 실제 코인 지정가 청산(reduce-only) 정산 — mark 가 지정가를 크로스하면 대상 포지션을 그 지정가에 청산.
  * 대상 포지션(주문 side 의 반대)을 최신 상태로 다시 읽어(같은 폴링에서 물타기 등이 바꿨을 수 있음) 있으면
  * min(주문수량, 포지션수량)만큼 청산하고 pending 을 삭제한다. 포지션이 이미 없으면 고아 pending 을 정리.
  * (OX 는 봇 호가창 walking 이 필요해 spot.ts matchReduceOnlyOxPending 이 따로 담당 — 여기선 실제 코인 전용.) */
-async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark: number): Promise<void> {
+async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark: number, touch: number): Promise<void> {
   const posSide = p.side === 'short' ? 'long' : 'short'; // 청산 대상 포지션 방향(주문 side 의 반대)
   const pos = await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? AND symbol = ? AND side = ?')
     .bind(uid, p.symbol, posSide)
@@ -189,7 +230,8 @@ async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark:
     return;
   }
   // 매도청산(side short)은 가격이 지정가 이상으로 오르면, 매수청산(side long)은 지정가 이하로 내리면 체결.
-  const fills = p.side === 'short' ? mark >= p.limit_price : mark <= p.limit_price;
+  // touch = 이 구간에서 그 방향으로 가장 멀리 간 가격(범위가 없으면 mark 와 같다, § runTriggers ranges).
+  const fills = p.side === 'short' ? touch >= p.limit_price : touch <= p.limit_price;
   if (!fills) return;
 
   const closeSize = Math.min(p.size, pos.size);
@@ -254,19 +296,33 @@ function conditionalAfterFillStmt(env: Env, uid: string, c: ConditionalRow, fill
  *     "1.5 이하로 떨어져 있는 동안 계속 사 모은다". 자동으로 멈추지 않으므로 브레이크는
  *     cooldown_ms/max_fills 뿐이고, 둘 다 없으면 잔고가 바닥날 때까지 진입한다(유저가 택한 동작).
  *   - `rearm`: 한 번 실행되면 무장을 풀고, 가격이 트리거 반대편으로 돌아왔을 때만 다시 무장 → "내려갈 때마다 한 번". */
-async function settleConditionalOrder(env: Env, uid: string, c: ConditionalRow, mark: number, marks: Record<string, number>): Promise<void> {
+async function settleConditionalOrder(
+  env: Env,
+  uid: string,
+  c: ConditionalRow,
+  mark: number,
+  marks: Record<string, number>,
+  low: number,
+  high: number,
+): Promise<void> {
   const mode = repeatModeOf(c);
   // 재무장 대기 중(rearm 모드가 방금 실행된 상태) — 반대편으로 돌아왔으면 다시 무장만 하고 끝낸다.
+  // ⚠ 판정은 구간 범위로 — above 조건은 가격이 아래로 돌아와야 재무장이므로 저가를, below 는 고가를 본다
+  // (§ runTriggers ranges). 범위가 없으면 low=high=mark 라 예전과 동일하다.
   if (c.repeating && mode === 'rearm' && (c.armed ?? 1) === 0) {
     const rearm = rearmPriceOf(c);
-    const back = c.trigger_dir === 'above' ? mark <= rearm : mark >= rearm;
+    const back = c.trigger_dir === 'above' ? low <= rearm : high >= rearm;
     if (back) {
       await env.DB.prepare('UPDATE conditional_orders SET armed = 1 WHERE id = ? AND user_id = ?').bind(c.id, uid).run();
     }
     return;
   }
 
-  const triggered = c.trigger_dir === 'above' ? mark >= c.trigger_price : mark <= c.trigger_price;
+  // ⚠ 발동 판정도 구간 범위로 — 이 구간에 트리거가를 **한 번이라도 건드렸으면** 발동이다. 봇 틱을 한 번에
+  // 몰아 도는 cron 경로에서 그 사이 지나간 딥/스파이크를 놓치지 않기 위한 것(§ runTriggers ranges).
+  // 체결은 발동 시점이 아니라 **지금 호가창**에 대해 일어난다(가격이 되돌아왔으면 되돌아온 가격에 체결) —
+  // 시장가 스탑 주문의 현실적인 동작이고, 예전 4점 샘플링도 그 시점의 호가창에 체결하던 것과 같다.
+  const triggered = c.trigger_dir === 'above' ? high >= c.trigger_price : low <= c.trigger_price;
   if (!triggered) return;
 
   // ⚠ 연속 모드의 재실행 간격 — **하한 5초가 항상 적용된다**(effectiveCooldownMs, § MIN_CONTINUOUS_COOLDOWN_MS).
@@ -385,7 +441,20 @@ async function runTriggers(
   positions: PositionRow[],
   conditionals: ConditionalRow[],
   prices: Record<string, number>,
+  ranges?: PriceRanges,
 ): Promise<boolean> {
+  // ⚠ 트리거 "발동 여부"는 현재가 한 점이 아니라 **직전 평가 이후 지나온 가격 범위**로 판정한다
+  // (2026-08-14). 실제 거래소도 구간의 고가/저가로 스탑을 판정한다. 이게 필요한 이유: OX 가격은
+  // 벽시계가 아니라 봇 틱이 돌 때만 움직이는데, cron 은 1분치 틱을 한 번에 몰아 돌린다 — 그 사이
+  // 지나간 딥/스파이크를 현재가 한 점으로만 보면 통째로 놓친다("1.0 이하면 매수"인데 8번째 틱에서만
+  // 1.0 을 찍고 되돌아온 경우). 예전엔 이걸 "cron 안에서 sweep 을 4번 반복"으로 때웠는데, sweep 한 번이
+  // D1 쿼리 ~18개라 4번이면 그것만으로 무료 플랜 invocation 한도(50)를 넘겼다. 범위로 판정하면
+  // **한 번의 평가로 그 구간의 모든 딥/스파이크를 잡는다**(4점 샘플링보다 오히려 정확하다).
+  // 범위를 안 주면(유저 폴링 경로) 현재가 한 점 = 예전과 동일한 동작.
+  const lowOf = (sym: string) => ranges?.[sym]?.low ?? prices[sym];
+  const highOf = (sym: string) => ranges?.[sym]?.high ?? prices[sym];
+  // ⚠ 강제청산만은 현재가로 본다 — 순간적으로 스쳐간 저가로 계좌를 파산시키면 되돌릴 방법이 없다
+  // (스탑 체결은 유저가 예약한 것이지만 강제청산은 아니다). 보수적인 쪽을 택한다.
   if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return true; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
 
   // ── 지정가 체결 ── long: mark<=limit(싸게 매수), short: mark>=limit(비싸게 매도)
@@ -402,6 +471,10 @@ async function runTriggers(
     // OX/USDT 는 봇 호가창에 walking 매칭(runMarketMaker 와 공유하는 실제 매칭 엔진). 있는 물량만
     // 실제 호가 가격에 체결, 잔량은 대기. reduce_only(지정가 청산)면 청산 매칭으로 분기. 실제 코인은 아래로.
     if (isVirtualSymbol(p.symbol)) {
+      // ⚠ 재체결 간격 하한은 여기에도 걸어야 한다(§ spot.ts PARTIAL_FILL_COOLDOWN_MS) — 이 경로는
+      // sweepRestingOxPendings 와 **같은 주문을 각자** 매칭하므로, 여기만 빠뜨리면 하한이 통째로 무력화된다.
+      // 첫 체결(last_fill_at == null)은 그대로 즉시 처리한다.
+      if (p.last_fill_at != null && Date.now() - p.last_fill_at < PARTIAL_FILL_COOLDOWN_MS) continue;
       if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id);
       else await matchLimitPendingAgainstBook(env, p.id);
       continue;
@@ -410,11 +483,12 @@ async function runTriggers(
     // 지정가 청산(reduce-only, 실제 코인) — 로컬 호가창이 없어 mark 가 지정가를 크로스하면 그 지정가에 청산.
     // 매도청산(side short)은 mark>=limit(가격이 오르면 롱 익절), 매수청산(side long)은 mark<=limit(가격이 내리면 숏 익절).
     if (p.reduce_only) {
-      await settleReduceOnlyClose(env, uid, p, mark);
+      // 매도청산은 고가가, 매수청산은 저가가 지정가를 건드렸는지로 판정(체결가는 지정가 그대로).
+      await settleReduceOnlyClose(env, uid, p, mark, p.side === 'short' ? highOf(p.symbol) : lowOf(p.symbol));
       continue;
     }
 
-    const fills = p.side === 'long' ? mark <= p.limit_price : mark >= p.limit_price;
+    const fills = p.side === 'long' ? lowOf(p.symbol) <= p.limit_price : highOf(p.symbol) >= p.limit_price;
     if (!fills) continue;
 
     const now = Date.now();
@@ -499,13 +573,17 @@ async function runTriggers(
     if (!pos || (pos.stop_loss == null && pos.take_profit == null)) continue;
     const dir = pos.side === 'long' ? 1 : -1;
 
+    // ⚠ 발동 판정은 구간의 저가/고가로(§ runTriggers ranges) — 롱은 저가가 SL 을, 고가가 TP 를 건드렸는지.
+    // 체결가는 예전과 같이 SL/TP 값 그대로다(슬리피지 모델링 없음).
+    const low = lowOf(pos.symbol);
+    const high = highOf(pos.symbol);
     let trigger: number | null = null;
     if (pos.side === 'long') {
-      if (pos.stop_loss != null && mark <= pos.stop_loss) trigger = pos.stop_loss;
-      else if (pos.take_profit != null && mark >= pos.take_profit) trigger = pos.take_profit;
+      if (pos.stop_loss != null && low <= pos.stop_loss) trigger = pos.stop_loss;
+      else if (pos.take_profit != null && high >= pos.take_profit) trigger = pos.take_profit;
     } else {
-      if (pos.stop_loss != null && mark >= pos.stop_loss) trigger = pos.stop_loss;
-      else if (pos.take_profit != null && mark <= pos.take_profit) trigger = pos.take_profit;
+      if (pos.stop_loss != null && high >= pos.stop_loss) trigger = pos.stop_loss;
+      else if (pos.take_profit != null && low <= pos.take_profit) trigger = pos.take_profit;
     }
     if (trigger == null) continue;
 
@@ -530,7 +608,7 @@ async function runTriggers(
   for (const c of conditionals) {
     const mark = prices[c.symbol];
     if (mark == null) continue;
-    await settleConditionalOrder(env, uid, c, mark, prices);
+    await settleConditionalOrder(env, uid, c, mark, prices, lowOf(c.symbol), highOf(c.symbol));
   }
 
   return false;
