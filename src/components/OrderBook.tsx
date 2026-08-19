@@ -51,6 +51,21 @@ function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'):
   return out;
 }
 
+/** 화면이 PC 폭(Tailwind `md` = 768px)인지. ⚠ App.tsx 의 2열 그리드 분기와 **같은 경계**를 써야 한다 —
+ * 어긋나면 사이드바가 아직 안 생긴 좁은 화면에서 호가·체결을 세로로 쌓아 화면을 통째로 밀어낸다. */
+function useIsDesktop(): boolean {
+  const query = '(min-width: 768px)';
+  const [is, setIs] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const onChange = () => setIs(mq.matches);
+    onChange(); // 마운트 사이에 회전/리사이즈가 있었을 수 있다
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+  return is;
+}
+
 /** 호가창 + 체결내역 탭. 모바일에서도 한눈에 보이도록 매수(좌)·매도(우) 2열로 나란히 표시하고,
  * 각 열은 최우선호가가 맨 위로 오게 정렬한다. 클릭하면 그 가격이 지정가 주문 입력에 채워진다.
  * 체결 탭 데이터는 useTradeTape(App.tsx 에서 항상 구동)이 채우는 useMarketStore.recentTrades 를 그대로 구독. */
@@ -62,6 +77,10 @@ export default function OrderBook() {
   const spotBook = useTradingStore((s) => s.spotBook);
   // 한 화면에 보여줄 행 수(설정 → 5~50). 호가는 각 열마다, 체결은 목록 전체에 같은 값을 쓴다.
   const rows = useChartStore((s) => s.bookRows);
+  // PC 에서 호가·체결 동시 표시(설정). 모바일은 폭이 좁아 항상 탭 — 그래서 화면 폭도 같이 본다.
+  // ⚠ 훅 호출을 `&&` 뒤에 두면 안 된다(단축 평가로 렌더마다 호출 여부가 바뀌어 훅 순서가 깨진다).
+  const desktop = useIsDesktop();
+  const together = useChartStore((s) => s.bookTogether) && desktop;
   const [book, setBook] = useState<OrderBookSnapshot | null>(null);
   const [groupIdx, setGroupIdx] = useState(0);
   const [tab, setTab] = useState<'book' | 'trades'>('book');
@@ -111,111 +130,130 @@ export default function OrderBook() {
     </button>
   );
 
+  // 묶어보기 단위 버튼 — 호가 쪽에만 붇는다(체결엔 의미가 없다).
+  const groupBtn = (
+    <button
+      onClick={cycleGroup}
+      title="클릭하면 묶어보기 단위가 10배씩 바뀝니다"
+      className="ml-auto rounded px-1.5 py-0.5 text-[11px] text-muted transition hover:bg-panel2 hover:text-text"
+    >
+      {fmtPrice(groupStep, groupPrec)}
+    </button>
+  );
+  const sectionTitle = (label: string) => <span className="px-2 py-0.5 text-[11px] font-semibold text-text">{label}</span>;
+
+  const bookBody = !activeBook ? (
+    <div className="py-4 text-center text-muted">불러오는 중…</div>
+  ) : (
+    <div className="grid grid-cols-2 gap-1.5">
+      {/* 좌: 매수(bid) — 최우선호가(가격 가장 높음)가 맨 위 */}
+      <div className="overflow-y-auto" style={{ maxHeight: rows * ROW_PX }}>
+        {bids.map((b) => (
+          <button
+            key={b.price}
+            onClick={() => pick(b.price)}
+            title={b.mine ? `이 가격에 내 주문 ${fmtQty(b.mine)}` : undefined}
+            className={`relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2 ${
+              b.mine ? 'ring-1 ring-inset ring-accent/70' : ''
+            }`}
+          >
+            <span
+              className="absolute inset-y-0 left-0 bg-upDim"
+              style={{ width: `${Math.min(100, (b.qty / maxQty) * 100)}%` }}
+            />
+            {/* 내 물량은 같은 막대 위에 더 진하게 겹쳐 그려서 "이 중 얼마가 내 것"인지도 보인다 */}
+            {!!b.mine && (
+              <span
+                className="absolute inset-y-0 left-0 bg-accent/30"
+                style={{ width: `${Math.min(100, (b.mine / maxQty) * 100)}%` }}
+              />
+            )}
+            <span className="relative z-10 flex items-center gap-1 font-medium text-up">
+              {!!b.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
+              {fmtPrice(b.price, groupPrec)}
+            </span>
+            <span className={`relative z-10 ${b.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{fmtQty(b.qty)}</span>
+          </button>
+        ))}
+      </div>
+      {/* 우: 매도(ask) — 최우선호가(가격 가장 낮음)가 맨 위 */}
+      <div className="overflow-y-auto" style={{ maxHeight: rows * ROW_PX }}>
+        {asks.map((a) => (
+          <button
+            key={a.price}
+            onClick={() => pick(a.price)}
+            title={a.mine ? `이 가격에 내 주문 ${fmtQty(a.mine)}` : undefined}
+            className={`relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2 ${
+              a.mine ? 'ring-1 ring-inset ring-accent/70' : ''
+            }`}
+          >
+            <span
+              className="absolute inset-y-0 right-0 bg-downDim"
+              style={{ width: `${Math.min(100, (a.qty / maxQty) * 100)}%` }}
+            />
+            {!!a.mine && (
+              <span
+                className="absolute inset-y-0 right-0 bg-accent/30"
+                style={{ width: `${Math.min(100, (a.mine / maxQty) * 100)}%` }}
+              />
+            )}
+            <span className="relative z-10 flex items-center gap-1 font-medium text-down">
+              {!!a.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
+              {fmtPrice(a.price, groupPrec)}
+            </span>
+            <span className={`relative z-10 ${a.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{fmtQty(a.qty)}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  const tradesBody = trades.length === 0 ? (
+    <div className="py-4 text-center text-muted">체결 내역이 없습니다</div>
+  ) : (
+    <div className="overflow-auto" style={{ maxHeight: rows * ROW_PX }}>
+      {trades.slice(0, rows).map((t, i) => {
+        const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
+        return (
+          // ⚠ 3열은 반드시 **격자**로 — 예전엔 `flex justify-between` 이라 세 칸의 너비가 행마다
+          // 제각각 계산돼, 수량 자릿수가 바뀌면(604 vs 6,694) 가운데 가격이 좌우로 흔들렸다.
+          <div
+            key={`${t.time}-${i}`}
+            className="grid grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)] items-center gap-2 px-1.5 py-px leading-[14px]"
+          >
+            <span className="text-muted">{fmtTime(t.time)}</span>
+            <span className={`truncate text-right ${color}`}>{fmtPrice(t.price, prec)}</span>
+            <span className="truncate text-right text-muted">{fmtQty(t.qty)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  // PC 에서 "같이 보기" 를 켰으면 탭 없이 위(호가)·아래(체결)로 나란히 그린다. 사이드바(18rem)가 좁아
+  // 좌우로 나누면 세 칸이 되어 가격/수량이 뭉개지므로 세로로 쌓는다 — 넘치면 사이드바가 스크롤된다.
+  if (together)
+    return (
+      <div className="border-b border-border bg-panel p-1.5 text-[11px] md:border-b-0 md:border-t">
+        <div className="mb-1 flex items-center gap-1">
+          {sectionTitle('호가')}
+          {groupBtn}
+        </div>
+        {bookBody}
+        <div className="mb-1 mt-1.5 flex items-center gap-1 border-t border-border pt-1.5">{sectionTitle('체결')}</div>
+        {tradesBody}
+      </div>
+    );
+
   return (
     <div className="border-b border-border bg-panel p-1.5 text-[11px] md:border-b-0 md:border-t">
       <div className="mb-1 flex items-center gap-1">
         {tabBtn('book', '호가')}
         {tabBtn('trades', '체결')}
-        {tab === 'book' && (
-          <button
-            onClick={cycleGroup}
-            title="클릭하면 묶어보기 단위가 10배씩 바뀝니다"
-            className="ml-auto rounded px-1.5 py-0.5 text-[11px] text-muted transition hover:bg-panel2 hover:text-text"
-          >
-            {fmtPrice(groupStep, groupPrec)}
-          </button>
-        )}
+        {tab === 'book' && groupBtn}
       </div>
 
-      {tab === 'book' &&
-        (!activeBook ? (
-          <div className="py-4 text-center text-muted">불러오는 중…</div>
-        ) : (
-          <div className="grid grid-cols-2 gap-1.5">
-            {/* 좌: 매수(bid) — 최우선호가(가격 가장 높음)가 맨 위 */}
-            <div className="overflow-y-auto" style={{ maxHeight: rows * ROW_PX }}>
-              {bids.map((b) => (
-                <button
-                  key={b.price}
-                  onClick={() => pick(b.price)}
-                  title={b.mine ? `이 가격에 내 주문 ${fmtQty(b.mine)}` : undefined}
-                  className={`relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2 ${
-                    b.mine ? 'ring-1 ring-inset ring-accent/70' : ''
-                  }`}
-                >
-                  <span
-                    className="absolute inset-y-0 left-0 bg-upDim"
-                    style={{ width: `${Math.min(100, (b.qty / maxQty) * 100)}%` }}
-                  />
-                  {/* 내 물량은 같은 막대 위에 더 진하게 겹쳐 그려서 "이 중 얼마가 내 것"인지도 보인다 */}
-                  {!!b.mine && (
-                    <span
-                      className="absolute inset-y-0 left-0 bg-accent/30"
-                      style={{ width: `${Math.min(100, (b.mine / maxQty) * 100)}%` }}
-                    />
-                  )}
-                  <span className="relative z-10 flex items-center gap-1 font-medium text-up">
-                    {!!b.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
-                    {fmtPrice(b.price, groupPrec)}
-                  </span>
-                  <span className={`relative z-10 ${b.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{fmtQty(b.qty)}</span>
-                </button>
-              ))}
-            </div>
-            {/* 우: 매도(ask) — 최우선호가(가격 가장 낮음)가 맨 위 */}
-            <div className="overflow-y-auto" style={{ maxHeight: rows * ROW_PX }}>
-              {asks.map((a) => (
-                <button
-                  key={a.price}
-                  onClick={() => pick(a.price)}
-                  title={a.mine ? `이 가격에 내 주문 ${fmtQty(a.mine)}` : undefined}
-                  className={`relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2 ${
-                    a.mine ? 'ring-1 ring-inset ring-accent/70' : ''
-                  }`}
-                >
-                  <span
-                    className="absolute inset-y-0 right-0 bg-downDim"
-                    style={{ width: `${Math.min(100, (a.qty / maxQty) * 100)}%` }}
-                  />
-                  {!!a.mine && (
-                    <span
-                      className="absolute inset-y-0 right-0 bg-accent/30"
-                      style={{ width: `${Math.min(100, (a.mine / maxQty) * 100)}%` }}
-                    />
-                  )}
-                  <span className="relative z-10 flex items-center gap-1 font-medium text-down">
-                    {!!a.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
-                    {fmtPrice(a.price, groupPrec)}
-                  </span>
-                  <span className={`relative z-10 ${a.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{fmtQty(a.qty)}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
-
-      {tab === 'trades' &&
-        (trades.length === 0 ? (
-          <div className="py-4 text-center text-muted">체결 내역이 없습니다</div>
-        ) : (
-          <div className="overflow-auto" style={{ maxHeight: rows * ROW_PX }}>
-            {trades.slice(0, rows).map((t, i) => {
-              const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
-              return (
-                // ⚠ 3열은 반드시 **격자**로 — 예전엔 `flex justify-between` 이라 세 칸의 너비가 행마다
-                // 제각각 계산돼, 수량 자릿수가 바뀌면(604 vs 6,694) 가운데 가격이 좌우로 흔들렸다.
-                <div
-                  key={`${t.time}-${i}`}
-                  className="grid grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)] items-center gap-2 px-1.5 py-px leading-[14px]"
-                >
-                  <span className="text-muted">{fmtTime(t.time)}</span>
-                  <span className={`truncate text-right ${color}`}>{fmtPrice(t.price, prec)}</span>
-                  <span className="truncate text-right text-muted">{fmtQty(t.qty)}</span>
-                </div>
-              );
-            })}
-          </div>
-        ))}
+      {tab === 'book' ? bookBody : tradesBody}
     </div>
   );
 }

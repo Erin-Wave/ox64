@@ -1,6 +1,6 @@
 import { webSocket, type WebSocketSubject } from 'rxjs/webSocket';
 import { Observable, Subject } from 'rxjs';
-import { filter, map, retry, share } from 'rxjs/operators';
+import { filter, map, retry, share, throttleTime } from 'rxjs/operators';
 import type { Candle, KlineTick } from '@/types';
 
 /**
@@ -81,9 +81,15 @@ interface RawDepth {
   asks: string[][];
 }
 
-/** 심볼의 상위 N호가(5/10/20) 스트림. 1초마다 스냅샷 갱신. */
+// 호가창 갱신 간격(ms). 바이낸스 부분 호가 스트림은 1000ms / 100ms 두 가지만 주므로 100ms 로 받아
+// 여기서 원하는 주기로 솎는다. ⚠ 이건 **브라우저↔바이낸스 직결**이라 Cloudflare 요청·D1 을 하나도 쓰지
+// 않는다(가상 코인은 반대로 서버 폴링이라 주기를 못 당긴다 — CLAUDE.md §6). 200ms 로 둔 이유는 렌더
+// 부담: 표시 개수를 50 으로 잡으면 한 스냅샷이 버튼 100개라 100ms 마다 다시 그리면 모바일에서 뜨거워진다.
+const BOOK_THROTTLE_MS = 200;
+
+/** 심볼의 상위 N호가(5/10/20) 스트림. 100ms 스냅샷을 받아 BOOK_THROTTLE_MS 로 솎아 내려준다. */
 export function orderbookStream(symbol: string, levels: 5 | 10 | 20 = 10): Observable<OrderBookSnapshot> {
-  const stream = `${symbol.toLowerCase()}@depth${levels}@1000ms`;
+  const stream = `${symbol.toLowerCase()}@depth${levels}@100ms`;
   const socket$: WebSocketSubject<unknown> = webSocket({ url: `${FSTREAM}/${stream}` });
 
   return socket$.pipe(
@@ -92,6 +98,8 @@ export function orderbookStream(symbol: string, levels: 5 | 10 | 20 = 10): Obser
       bids: m.bids.map(([p, q]) => ({ price: Number(p), qty: Number(q) })),
       asks: m.asks.map(([p, q]) => ({ price: Number(p), qty: Number(q) })),
     })),
+    // leading+trailing — 첫 스냅샷은 즉시 보여주고, 마지막 것도 버리지 않는다(호가창이 낡은 채로 굳지 않게).
+    throttleTime(BOOK_THROTTLE_MS, undefined, { leading: true, trailing: true }),
     retry({ delay: 2000 }),
     share(),
   );

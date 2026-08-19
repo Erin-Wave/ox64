@@ -38,6 +38,8 @@ export default function Settings({ onClose }: { onClose: () => void }) {
   const setColorScheme = useChartStore((s) => s.setColorScheme);
   const bookRows = useChartStore((s) => s.bookRows);
   const setBookRows = useChartStore((s) => s.setBookRows);
+  const bookTogether = useChartStore((s) => s.bookTogether);
+  const toggleChart = useChartStore((s) => s.toggle);
 
   return (
     <div
@@ -127,6 +129,30 @@ export default function Settings({ onClose }: { onClose: () => void }) {
               호가창의 매수·매도 각 열과 체결 목록이 한 화면에 보여줄 행 수({BOOK_ROWS_MIN}~{BOOK_ROWS_MAX}개).
               실제 코인은 거래소 호가 스트림이 최대 20단계까지만 주므로 그보다 많이 설정해도 20줄까지만 채워집니다.
             </p>
+
+            {/* PC 전용 옵션 — 모바일은 폭이 좁아 항상 탭이다(OrderBook 이 화면 폭도 함께 본다). */}
+            <button
+              onClick={() => toggleChart('bookTogether')}
+              className={`mt-2 flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left ring-1 transition ${
+                bookTogether ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
+              }`}
+            >
+              <span className="min-w-0">
+                <span className={`block text-xs font-bold ${bookTogether ? 'text-accent' : 'text-text'}`}>
+                  PC 에서 호가 · 체결 같이 보기
+                </span>
+                <span className="mt-0.5 block text-[11px] text-muted">
+                  탭 전환 없이 호가(위)·체결(아래)을 함께 표시 — 모바일은 폭이 좁아 그대로 탭입니다
+                </span>
+              </span>
+              <span
+                className={`shrink-0 rounded px-2 py-0.5 text-[11px] font-bold ${
+                  bookTogether ? 'bg-accent/20 text-accent' : 'bg-elevated text-muted'
+                }`}
+              >
+                {bookTogether ? '켬' : '끔'}
+              </span>
+            </button>
           </section>
 
           <section>

@@ -20,7 +20,15 @@ const DEFAULTS: Record<IndicatorType, Omit<IndicatorConfig, 'id' | 'type'>> = {
 let seq = 0;
 const nextId = () => `ind_${++seq}_${Math.floor(Math.random() * 1e6)}`;
 
-type BoolFlag = 'showCountdown' | 'volume' | 'tradeMarkers' | 'positionLine' | 'slTpLines' | 'pendingLine' | 'orderBook';
+type BoolFlag =
+  | 'showCountdown'
+  | 'volume'
+  | 'tradeMarkers'
+  | 'positionLine'
+  | 'slTpLines'
+  | 'pendingLine'
+  | 'orderBook'
+  | 'bookTogether';
 
 /** 차트 표시 옵션 (localStorage 영속). */
 interface ChartState {
@@ -34,6 +42,9 @@ interface ChartState {
   // 호가창·체결내역이 한 화면에 보여줄 행 수(5~50). 각 열의 높이를 rows × 행높이로 잡아 스크롤 없이
   // 딱 그만큼 보이게 한다 — 예전엔 max-h-40(=10행) 고정이라 더 깊은 호가를 보려면 매번 스크롤해야 했다.
   bookRows: number;
+  // PC(md+, 768px 이상)에서 호가와 체결을 탭 전환 없이 위아래로 같이 보여준다. 모바일은 폭이 좁아
+  // 그대로 탭을 쓴다(이 값과 무관) — 옵션 이름에 PC 를 못 박은 이유.
+  bookTogether: boolean;
   visibleBars: number; // 처음 로드 시 보여줄 봉 개수 — 마지막으로 사용자가 확대/축소한 값을 기억
   colorScheme: ChartColorScheme;
   indicators: IndicatorConfig[];
@@ -59,11 +70,15 @@ function load(): Partial<ChartState> {
   }
 }
 function persist(s: ChartState) {
-  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook, bookRows, visibleBars, colorScheme, indicators } = s;
+  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook } = s;
+  const { bookRows, bookTogether, visibleBars, colorScheme, indicators } = s;
   try {
     localStorage.setItem(
       KEY,
-      JSON.stringify({ showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook, bookRows, visibleBars, colorScheme, indicators }),
+      JSON.stringify({
+        showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook,
+        bookRows, bookTogether, visibleBars, colorScheme, indicators,
+      }),
     );
   } catch {
     /* ignore */
@@ -85,6 +100,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   pendingLine: saved.pendingLine ?? true,
   orderBook: saved.orderBook ?? true,
   bookRows: clampRows(saved.bookRows ?? BOOK_ROWS_DEFAULT),
+  bookTogether: saved.bookTogether ?? false,
   visibleBars: saved.visibleBars ?? 38,
   colorScheme: saved.colorScheme ?? 'binance',
   indicators: saved.indicators ?? [],
