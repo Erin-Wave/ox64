@@ -1070,7 +1070,7 @@ interface TickResult {
  * **결과를 단일 batch 로 한 번만** 커밋한다. 틱 수를 늘려도 D1 왕복·쓰기가 안 늘어나므로
  * 가격 경로의 촘촘함(=품질)과 비용이 분리된다.
  */
-function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: WallRow[], now: number): TickResult {
+export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: WallRow[], now: number): TickResult {
   const step = nextMarketState(prev);
   const candidateRef = step.next.ref;
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
@@ -1194,6 +1194,16 @@ function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: WallRow[]
   // 이번 틱의 체결은 행이 아니라 링 버퍼에 얹힌다(§ 봇 합성 체결 테이프). 호출자가 준 배열을 복사해
   // 쓰는 이유: 이 batch 가 실패하면 호출자의 테이프가 오염되지 않아야 다음 틱이 깨끗한 상태로 재시도한다.
   const tape = prevTape.slice();
+  // ⚠⚠ 라벨(taker 방향)은 **인쇄된 가격의 방향**에서 나온다(tick rule / Lee-Ready 분류). 실제 시장에서
+  // taker 매수는 매도호가를 들어올리며 체결되므로 "직전 체결보다 비싸게 = 매수(초록), 싸게 = 매도(빨강)"가
+  // 성립한다. 예전엔 라벨을 `Math.random() < buyProb` 로 **가격과 완전히 독립적으로** 뽑아서 상승틱의
+  // 38.9%가 빨강, 하락틱의 43.1%가 초록으로 찍혔다(실측 9.4만 건) — 체결내역만 보면 색이 뒤집혔거나
+  // 메이커 기준으로 찍히는 것처럼 보였다("체결 롱숏 색깔이 반대인 것 같다" 제보).
+  // 국면별 taker 편향(`buyProb`)은 이제 **동가(zero-tick) 처리에만** 쓴다: 방향 정보가 없으면 직전 라벨을
+  // 이어받고(표준 tick rule), 이어받을 것도 없으면 buyProb 로 정한다. 국면의 매수/매도 쏠림은 어차피 가격
+  // 경로(ret)에 들어있어 라벨 분포로 그대로 드러난다 — 그래서 "패닉엔 빨강이 쏟아진다"는 그대로 유지된다.
+  let prevPrinted = prev.ref; // 첫 체결은 직전 기준가와 비교 — 테이프가 틱 경계에서 끊기지 않게
+  let lastSide: 'buy' | 'sell' = prevTape[prevTape.length - 1]?.takerSide ?? (Math.random() < step.buyProb ? 'buy' : 'sell');
   for (let i = 0; i < nTrades; i++) {
     const progress = (i + 1) / nTrades;
     const walk = prev.ref + (ref - prev.ref) * progress;
@@ -1217,7 +1227,9 @@ function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: WallRow[]
     volume += sz;
     notionalSum += price * sz;
 
-    const takerSide: 'buy' | 'sell' = Math.random() < step.buyProb ? 'buy' : 'sell';
+    const takerSide: 'buy' | 'sell' = price > prevPrinted ? 'buy' : price < prevPrinted ? 'sell' : lastSide;
+    lastSide = takerSide;
+    prevPrinted = price;
     tape.push({ price, size: sz, takerSide, createdAt: now + i });
   }
   const next: BotState = { ...step.next, ref };
@@ -1566,13 +1578,22 @@ const MAKER_SNAPSHOT_LIMIT = 60; // 스냅샷으로 읽어오는 봇 호가 레�
 // 영향 없음(BOT_BASE_PULL 이 anchor 를 기준선으로 약하게 tether). 봇↔봇 합성체결엔 적용 안 함.
 const ANCHOR_TRADE_PULL = 0.5;
 
+/** 이 체결을 **덮친 쪽**(taker). 유저가 시장가/marketable 지정가로 들어가면 'user', 이미 걸려 있던
+ * 유저 지정가를 봇 호가가 덮치면 'bot' — **체결내역 라벨(매수/매도 색)만** 이걸로 뒤집힌다(포지션·잔고·
+ * 상대방 기록은 유저가 실제로 사고판 방향 그대로다). 실제 거래소와 같은 규칙: 내 매수 지정가가 상대의
+ * 시장가 매도에 채워지면 그 체결은 테이프에 '매도'로 뜬다. */
+export type Aggressor = 'user' | 'bot';
+/** taker 방향 = 유저가 사고파는 방향(유저가 덮쳤을 때) 또는 그 반대(봇이 덮쳤을 때). */
+const takerSideOf = (userSide: 'buy' | 'sell', aggressor: Aggressor): 'buy' | 'sell' =>
+  aggressor === 'user' ? userSide : userSide === 'buy' ? 'sell' : 'buy';
+
 /**
  * 유저 지정가(pending_orders) 하나를 봇 호가창에 walking 매칭한다(신규 제출·대기 중 공용).
  * 증거금은 생성 시 limit_price 로 잠갔으므로 실제 체결가(더 유리)와의 차액을 환불(매수)하거나
  * 드물게 소량 추가징수(현재가 아래 매도 등, 잔고 부족 시 limit 가로 폴백)한다. 못 채운 잔량은
  * pending 에 그대로 남아 대기 → 다음 유동성/틱에서 이어서 체결(runMarketMaker·checkTriggers 가 호출).
  */
-export async function matchLimitPendingAgainstBook(env: Env, pendingId: string): Promise<void> {
+export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, aggressor: Aggressor = 'user'): Promise<void> {
   const p = await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
   // 페어는 주문 행에서 온다 — 호출부가 심볼을 따로 넘길 필요가 없고, 잘못된 페어로 매칭될 수도 없다.
   if (!p || !isVirtualSymbol(p.symbol)) return;
@@ -1583,6 +1604,8 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
   }
   const isLong = p.side === 'long';
   const makerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'; // 봇이 잡는 쪽(롱이면 봇이 매도)
+  const userSide: 'buy' | 'sell' = isLong ? 'buy' : 'sell'; // 유저가 실제로 사고파는 방향(장부·상대방 기록용)
+  const tapeSide = takerSideOf(userSide, aggressor); // 체결내역에 찍히는 taker 방향
 
   // ── 1) 필요한 값을 한 번에 확보. ⚠ 예전엔 **청크마다** pending 재조회 + 최우선호가 SELECT + 봇호가
   //        claim + 포지션 SELECT + batch 를 최대 500회 왕복해서, 체결 하나가 D1 쿼리 수백 개를 먹었다
@@ -1673,7 +1696,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string):
       isLong ? book.owner : p.user_id,
       closePx,
       filled,
-      isLong ? 'buy' : 'sell',
+      tapeSide,
       now,
     ),
     env.DB.prepare(
@@ -1886,10 +1909,12 @@ async function closePositionAgainstBook(
   limitPrice: number | null,
   pendingId: string | null,
   pendingSize: number,
+  aggressor: Aggressor = 'user',
 ): Promise<{ filled: number; avgPrice: number }> {
   const pair = pos.symbol; // 페어는 포지션 행에서 온다(호출부가 따로 넘기지 않는다)
   const closeTaker = pos.side === 'long' ? 'short' : 'long'; // 청산 방향(롱 청산=매도=short, 봇 매수호가 소비)
-  const tapeSide: 'buy' | 'sell' = pos.side === 'long' ? 'sell' : 'buy'; // 체결내역 taker 방향(롱 청산=매도)
+  const userSide: 'buy' | 'sell' = pos.side === 'long' ? 'sell' : 'buy'; // 유저가 실제로 사고파는 방향(롱 청산=매도)
+  const tapeSide = takerSideOf(userSide, aggressor); // ⚠ 체결내역 라벨만 aggressor 로 뒤집힌다(장부는 userSide)
   const makerSide: 'buy' | 'sell' = closeTaker === 'long' ? 'sell' : 'buy';
   const dir = pos.side === 'long' ? 1 : -1;
   const adverse = closeTaker === 'long' ? 1 : -1; // 사면(숏청산) 위로, 팔면(롱청산) 아래로 시장충격
@@ -1981,8 +2006,8 @@ async function closePositionAgainstBook(
     env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
       crypto.randomUUID(),
       pair,
-      tapeSide === 'buy' ? uid : book.owner,
-      tapeSide === 'buy' ? book.owner : uid,
+      userSide === 'buy' ? uid : book.owner,
+      userSide === 'buy' ? book.owner : uid,
       newRef,
       filled,
       tapeSide,
@@ -2031,7 +2056,7 @@ export function marketCloseOxPosition(env: Env, uid: string, pos: PositionRow, c
 
 /** OX 지정가 청산(reduce-only) 대기 주문 하나를 봇 호가창에 매칭한다(제출 직후·재호가 sweep·checkTriggers 공용).
  * 청산 대상 포지션이 이미 없으면(전량청산·강제청산됨) 고아 pending 을 정리한다. */
-export async function matchReduceOnlyOxPending(env: Env, pendingId: string): Promise<void> {
+export async function matchReduceOnlyOxPending(env: Env, pendingId: string, aggressor: Aggressor = 'user'): Promise<void> {
   const p = await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
   if (!p || !isVirtualSymbol(p.symbol) || !p.reduce_only) return;
   const pair = p.symbol;
@@ -2043,7 +2068,7 @@ export async function matchReduceOnlyOxPending(env: Env, pendingId: string): Pro
     await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run(); // 청산할 포지션 없음 → 정리
     return;
   }
-  await closePositionAgainstBook(env, p.user_id, pos, Math.min(p.size, pos.size), p.limit_price, pendingId, p.size);
+  await closePositionAgainstBook(env, p.user_id, pos, Math.min(p.size, pos.size), p.limit_price, pendingId, p.size, aggressor);
 }
 
 /** 대기 중인 전 유저의 OX 지정가(진입·청산)를 봇 호가창에 매칭 — runMarketMaker 가 재호가 직후 호출하므로,
@@ -2078,8 +2103,11 @@ async function sweepRestingOxPendings(env: Env, pair: string): Promise<void> {
       if (now - p.last_fill_at < PARTIAL_FILL_COOLDOWN_MS) continue;
     }
     try {
-      if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id);
-      else await matchLimitPendingAgainstBook(env, p.id);
+      // ⚠ 여기서 체결되는 주문은 **이미 걸려 있던**(resting) 유저 지정가다 — 그걸 덮친 건 방금 깔린 봇
+      // 호가이므로 taker 는 봇이고 유저는 maker 다. 그래서 체결내역 라벨은 유저 방향의 **반대**로 찍힌다
+      // (실제 거래소도 그렇다: 내 매수 지정가가 시장가 매도에 채워지면 그 체결은 '매도'로 뜬다).
+      if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id, 'bot');
+      else await matchLimitPendingAgainstBook(env, p.id, 'bot');
     } catch {
       /* 한 건 실패해도 나머지는 계속 — 다음 틱에서 재시도 */
     }

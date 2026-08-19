@@ -475,8 +475,10 @@ async function runTriggers(
       // sweepRestingOxPendings 와 **같은 주문을 각자** 매칭하므로, 여기만 빠뜨리면 하한이 통째로 무력화된다.
       // 첫 체결(last_fill_at == null)은 그대로 즉시 처리한다.
       if (p.last_fill_at != null && Date.now() - p.last_fill_at < PARTIAL_FILL_COOLDOWN_MS) continue;
-      if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id);
-      else await matchLimitPendingAgainstBook(env, p.id);
+      // 여기 오는 주문도 **걸려 있던** 지정가라 taker 는 봇이다(§ spot.ts Aggressor) — 체결내역 라벨은
+      // 유저 방향의 반대로 찍힌다. 장부(포지션·잔고·상대방)는 영향 없다.
+      if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id, 'bot');
+      else await matchLimitPendingAgainstBook(env, p.id, 'bot');
       continue;
     }
 
