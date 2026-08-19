@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { orderbookStream, type OrderBookLevel, type OrderBookSnapshot } from '@/services/binanceWs';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
+import { useChartStore } from '@/store/useChartStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { isVirtualSymbol } from '@/symbols';
 import { fmtPrice, fmtQtyShort, precisionFromTick } from '@/format';
@@ -16,6 +17,9 @@ const fmtTime = (ms: number) => {
   const p = (n: number) => String(n).padStart(2, '0');
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 };
+// 한 행의 높이(px). 행 마크업이 `leading-[14px]` + `py-px` 라 폰트 크기 설정과 무관하게 항상 16px 이다 —
+// 이 값으로 "설정한 개수만큼만" 높이를 잡는다(설정 개수를 바꿀 땐 행 마크업의 leading/padding 과 같이 볼 것).
+const ROW_PX = 16;
 const GROUP_MULTS = [1, 10, 100, 1000]; // 심볼 tick 단위의 10배씩 — 그룹 버튼을 눌러서 순환
 
 // 같은 가격대(step 배수)로 수량을 합쳐서 보여준다. bid 는 아래로(floor), ask 는 위로(ceil) 반올림 —
@@ -56,6 +60,8 @@ export default function OrderBook() {
   const trades = useMarketStore((s) => s.recentTrades[s.symbol] ?? EMPTY_TRADES);
   const virtual = isVirtualSymbol(symbol);
   const spotBook = useTradingStore((s) => s.spotBook);
+  // 한 화면에 보여줄 행 수(설정 → 5~50). 호가는 각 열마다, 체결은 목록 전체에 같은 값을 쓴다.
+  const rows = useChartStore((s) => s.bookRows);
   const [book, setBook] = useState<OrderBookSnapshot | null>(null);
   const [groupIdx, setGroupIdx] = useState(0);
   const [tab, setTab] = useState<'book' | 'trades'>('book');
@@ -84,12 +90,12 @@ export default function OrderBook() {
 
   // 정렬: bids=가격 높은 순(최우선매수=맨 위), asks=가격 낮은 순(최우선매도=맨 위) — 그대로 위→아래 렌더.
   // ⚠ 예전엔 상위 8개만 잘라서 보여줬는데, 스프레드에서 먼 곳에 큰 물량을 걸어두면(예: 벽처럼 큰
-  // 지정가) 정작 그 주문이 8번째 밖으로 밀려 화면에서 통째로 안 보이는 버그가 있었다. 서버가 애초에
-  // 가격대별 최대 BOOK_LIMIT(40) 단계까지 주므로(loadSpotMarket), 프론트도 넉넉히 보여준다(스크롤 처리).
-  // ⚠ 이 값을 줄일 땐 서버 LIMIT 과 같이 맞출 것.
-  const BOOK_DEPTH = 22;
-  const asks = useMemo(() => (activeBook ? aggregate(activeBook.asks, groupStep, 'ask').slice(0, BOOK_DEPTH) : []), [activeBook, groupStep]);
-  const bids = useMemo(() => (activeBook ? aggregate(activeBook.bids, groupStep, 'bid').slice(0, BOOK_DEPTH) : []), [activeBook, groupStep]);
+  // 지정가) 정작 그 주문이 8번째 밖으로 밀려 화면에서 통째로 안 보이는 버그가 있었다. 지금은 개수를
+  // 유저가 정한다(설정 → 호가·체결 표시 개수, 5~50).
+  // ⚠ 서버가 주는 단계 수(loadSpotMarket BOOK_LIMIT=50)가 상한이다 — 표시 개수를 더 늘릴 땐 그 값도
+  // 같이 올릴 것. 실제 코인은 바이낸스 부분 호가 스트림이 최대 20단계라 그보다 많이는 채워지지 않는다.
+  const asks = useMemo(() => (activeBook ? aggregate(activeBook.asks, groupStep, 'ask').slice(0, rows) : []), [activeBook, groupStep, rows]);
+  const bids = useMemo(() => (activeBook ? aggregate(activeBook.bids, groupStep, 'bid').slice(0, rows) : []), [activeBook, groupStep, rows]);
 
   const maxQty = Math.max(1e-9, ...bids.map((b) => b.qty), ...asks.map((a) => a.qty));
   const groupPrec = precisionFromTick(groupStep);
@@ -127,7 +133,7 @@ export default function OrderBook() {
         ) : (
           <div className="grid grid-cols-2 gap-1.5">
             {/* 좌: 매수(bid) — 최우선호가(가격 가장 높음)가 맨 위 */}
-            <div className="max-h-40 overflow-y-auto">
+            <div className="overflow-y-auto" style={{ maxHeight: rows * ROW_PX }}>
               {bids.map((b) => (
                 <button
                   key={b.price}
@@ -157,7 +163,7 @@ export default function OrderBook() {
               ))}
             </div>
             {/* 우: 매도(ask) — 최우선호가(가격 가장 낮음)가 맨 위 */}
-            <div className="max-h-40 overflow-y-auto">
+            <div className="overflow-y-auto" style={{ maxHeight: rows * ROW_PX }}>
               {asks.map((a) => (
                 <button
                   key={a.price}
@@ -192,8 +198,8 @@ export default function OrderBook() {
         (trades.length === 0 ? (
           <div className="py-4 text-center text-muted">체결 내역이 없습니다</div>
         ) : (
-          <div className="max-h-40 overflow-auto">
-            {trades.map((t, i) => {
+          <div className="overflow-auto" style={{ maxHeight: rows * ROW_PX }}>
+            {trades.slice(0, rows).map((t, i) => {
               const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
               return (
                 // ⚠ 3열은 반드시 **격자**로 — 예전엔 `flex justify-between` 이라 세 칸의 너비가 행마다

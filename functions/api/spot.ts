@@ -36,9 +36,10 @@ import { autoWritesBlocked, meterStmt } from '../_budget';
  * 절대 심볼을 하드코딩하지 말 것 — 그 순간 그 경로만 OX 전용이 되어 조용히 갈라진다.
  */
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차
-// 호가창에 내려보내는 가격대 수. ⚠ 클라(OrderBook BOOK_DEPTH)가 이보다 많이 그리려 하면 그만큼은
-// 빈 채로 남는다 — 표시 개수를 바꿀 땐 두 값을 같이 맞출 것.
-const BOOK_LIMIT = 40;
+// 호가창에 내려보내는 가격대 수 = 클라 표시 개수 상한(설정 5~50, `useChartStore.bookRows`)과 같은 값.
+// ⚠ 클라가 이보다 많이 그리려 하면 그만큼은 빈 채로 남으므로 표시 상한을 올릴 땐 여기도 같이 올릴 것.
+// 봇 사다리·유저 지정가를 메모리에서 합친 뒤 자르는 것이라 이 값을 올려도 D1 읽기·쓰기는 안 늘어난다.
+const BOOK_LIMIT = 50;
 // 가상 코인 최소 호가 단위 = **유효숫자 4자리**(가격대에 따라 틱이 10배씩 바뀐다: 0.9234→0.0001,
 // 0.002434→0.000001, 123.4→0.1 — `_shared.roundVirtual`). 봇 기준가/호가/체결가를 전부 이 틱에
 // 스냅해서, 실제 코인처럼 정해진 자릿수 이상으로는 호가·체결이 생기지 않게 한다.
@@ -519,8 +520,11 @@ export async function loadSpotMarket(env: Env, uid: string, pair: string) {
 
   return {
     book: { bids, asks },
-    // 봇 합성 체결은 상태 행의 링 버퍼(tape_json), 유저 체결은 테이블 — 시간순으로 합쳐 최근 30건.
-    trades: mergeRecentTrades(parseTape(stateRow?.tape_json), tradeRows.results, 30),
+    // 봇 합성 체결은 상태 행의 링 버퍼(tape_json), 유저 체결은 테이블 — 시간순으로 합쳐 최근 50건
+    // (클라 표시 개수 상한과 동일). ⚠ 위 SQL 의 `LIMIT 30` 은 일부러 그대로 둔다 — 테이프는 상태 행 안의
+    // JSON 이라 몇 건을 쓰든 읽기가 안 늘지만, 테이블 쪽을 늘리면 그만큼 D1 읽기가 늘어난다(1초 폴링).
+    // 한 시간 안에 유저 체결이 30건을 넘는 드문 경우에만 그 뒤쪽이 목록에서 빠진다.
+    trades: mergeRecentTrades(parseTape(stateRow?.tape_json), tradeRows.results, 50),
   };
 }
 

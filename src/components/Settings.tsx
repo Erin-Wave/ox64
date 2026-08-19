@@ -1,5 +1,10 @@
 import { useSettingsStore, type FontSize, type Theme, type TradingMode } from '@/store/useSettingsStore';
-import { useChartStore, type ChartColorScheme } from '@/store/useChartStore';
+import {
+  useChartStore,
+  BOOK_ROWS_MIN,
+  BOOK_ROWS_MAX,
+  type ChartColorScheme,
+} from '@/store/useChartStore';
 
 const THEMES: { value: Theme; label: string }[] = [
   { value: 'dark', label: '다크' },
@@ -12,6 +17,9 @@ const CHART_COLOR_SCHEMES: { value: ChartColorScheme; label: string }[] = [
   { value: 'okx', label: 'OKX' },
   { value: 'tradingview', label: '트레이딩뷰' },
 ];
+
+// 슬라이더를 잘게 끌기 어려운 모바일용 빠른 선택값(BOOK_ROWS_MIN~MAX 범위 안).
+const BOOK_ROW_PRESETS = [5, 10, 20, 30, 50];
 
 const FONT_SIZES: { value: FontSize; label: string }[] = [
   { value: 'sm', label: '작게' },
@@ -28,6 +36,8 @@ export default function Settings({ onClose }: { onClose: () => void }) {
   const setFontSize = useSettingsStore((s) => s.setFontSize);
   const colorScheme = useChartStore((s) => s.colorScheme);
   const setColorScheme = useChartStore((s) => s.setColorScheme);
+  const bookRows = useChartStore((s) => s.bookRows);
+  const setBookRows = useChartStore((s) => s.setBookRows);
 
   return (
     <div
@@ -35,7 +45,7 @@ export default function Settings({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md rounded-2xl border border-border bg-panel shadow-2xl"
+        className="max-h-[90dvh] w-full max-w-md overflow-y-auto rounded-2xl border border-border bg-panel shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
@@ -82,6 +92,41 @@ export default function Settings({ onClose }: { onClose: () => void }) {
                 </button>
               ))}
             </div>
+          </section>
+
+          <section>
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-xs font-semibold text-muted">호가 · 체결 표시 개수</h3>
+              <span className="rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold text-accent">{bookRows}개</span>
+            </div>
+            <input
+              type="range"
+              min={BOOK_ROWS_MIN}
+              max={BOOK_ROWS_MAX}
+              value={bookRows}
+              onChange={(e) => setBookRows(Number(e.target.value))}
+              className="w-full accent-accent"
+              aria-label="호가 · 체결 표시 개수"
+            />
+            <div className="mt-2 grid grid-cols-5 gap-1.5">
+              {BOOK_ROW_PRESETS.map((n) => (
+                <button
+                  key={n}
+                  onClick={() => setBookRows(n)}
+                  className={`rounded-md px-1 py-1.5 text-[11px] font-semibold ring-1 transition ${
+                    bookRows === n
+                      ? 'bg-accent/15 text-accent ring-accent'
+                      : 'bg-panel2 text-text ring-border hover:bg-elevated'
+                  }`}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-muted">
+              호가창의 매수·매도 각 열과 체결 목록이 한 화면에 보여줄 행 수({BOOK_ROWS_MIN}~{BOOK_ROWS_MAX}개).
+              실제 코인은 거래소 호가 스트림이 최대 20단계까지만 주므로 그보다 많이 설정해도 20줄까지만 채워집니다.
+            </p>
           </section>
 
           <section>

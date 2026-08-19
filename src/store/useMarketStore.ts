@@ -3,7 +3,9 @@ import type { TickerTrade } from '@/types';
 import { isVirtualSymbol } from '@/symbols';
 import { virtualPrecision } from '@/format';
 
-const MAX_TRADES = 40;
+// 체결 테이프 보관 개수. 호가창 "체결" 탭이 보여줄 수 있는 최대 행 수(설정 상한 50)와 맞춘다 —
+// 이보다 작으면 표시 개수를 50 으로 올려도 목록이 그만큼 안 찬다.
+const MAX_TRADES = 50;
 
 /**
  * 시장/UI 상태 (Zustand).
