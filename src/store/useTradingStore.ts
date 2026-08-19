@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import {
   api,
   ApiError,
+  setOrdersCursor,
   type ApiOrder,
   type ApiPendingOrder,
   type ApiConditionalOrder,
@@ -133,6 +134,10 @@ function mergeOrders(fresh: AppState['orders']): AppState['orders'] {
 }
 
 function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
+  const orders = st.ordersPartial ? mergeOrders(st.orders) : st.orders;
+  // 증분 조회 커서를 갱신한다 — 다음 폴링뿐 아니라 **주문 액션 응답까지** 이 커서로 증분을 받는다
+  // (§ api.ts setOrdersCursor: 액션마다 주문 50행을 다시 읽던 낭비 제거).
+  setOrdersCursor(orders[0]?.createdAt);
   set({
     authed: true,
     name: st.name,
@@ -149,7 +154,7 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     positions: st.positions,
     // ⚠ 증분 응답이면 기존 목록에 합친다(§ api.ts ordersPartial). 서버가 경계를 `>=` 로 잡아 마지막
     // 1건이 중복으로 올 수 있으므로 id 로 거른다 — 같은 밀리초에 두 건이 체결돼도 안 새게 하려는 것.
-    orders: st.ordersPartial ? mergeOrders(st.orders) : st.orders,
+    orders,
     pendingOrders: st.pendingOrders,
     conditionalOrders: st.conditionalOrders ?? [],
     markPrices: st.markPrices ?? {},
@@ -289,6 +294,10 @@ export const useTradingStore = create<TradingState>((set) => ({
     } catch {
       /* 무시 */
     }
+    // 증분 커서도 비운다 — 다음 로그인이 다른 계정일 수 있고, 그때 남은 커서로 증분을 요청하면
+    // 빈 목록에 최근 몇 건만 합쳐져 주문내역이 잘려 보인다(로그인 응답은 전체를 주므로 곧 복구되지만
+    // 애초에 만들 필요 없는 상태다).
+    setOrdersCursor(undefined);
     set({
       authed: false,
       name: null,

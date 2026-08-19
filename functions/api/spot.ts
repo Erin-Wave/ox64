@@ -186,10 +186,27 @@ function accrueLive(live: LiveBars, bar: { open: number; high: number; low: numb
   return closed;
 }
 
-/** 닫힌 버킷을 영속 캔들 테이블로 넘기는 문장(버킷 시각을 그 버킷 것으로 그대로 쓴다). */
-function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar): D1PreparedStatement {
-  return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v);
+/** 닫힌 버킷을 영속 캔들 테이블로 넘기는 문장(버킷 시각을 그 버킷 것으로 그대로 쓴다).
+ *
+ * ⚠ `guardLastRun` 을 주면 "그 값이 아직 `spot_bot_state.last_run` 일 때만" 반영된다(§ runBotTicks 커밋).
+ * 봇 커밋은 `last_run` 가드 하나로 선점과 커밋을 겸하는데, **D1 batch 는 조건부 UPDATE 가 0행이어도
+ * 나머지 문장을 그대로 커밋한다**(§4 editLimit 교훈) — 가드를 커밋에만 달면 경합에서 진 쪽의 캔들이
+ * 이겼을 쪽 위에 한 번 더 더해져 그 봉의 거래량이 부풀고, 1h/1d 버킷은 그 오차가 영구히 남는다.
+ * volume 이 누적(합)이라 멱등이 아니기 때문이다. 그래서 같은 가드를 이 문장에도 건다.
+ * ⚠ `INSERT ... SELECT ... ON CONFLICT` 는 파서가 ON 을 조인으로 볼 수 있어 **WHERE 절이 반드시**
+ * 있어야 한다(SQLite 문서의 우회법) — 여기선 그 WHERE 가 곧 가드다. */
+function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar, guardLastRun?: number): D1PreparedStatement {
+  if (guardLastRun === undefined) return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v);
+  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, pair, guardLastRun);
 }
+
+const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume)
+       SELECT ?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ?)
+       ON CONFLICT(pair, interval, bucket) DO UPDATE SET
+         high = MAX(spot_candles.high, excluded.high),
+         low = MIN(spot_candles.low, excluded.low),
+         close = excluded.close,
+         volume = spot_candles.volume + excluded.volume`;
 
 /** 읽기 경로용 — 진행 중 버킷을 (이미 읽어온) 영속 봉 배열 뒤에 병합한다.
  * ⚠ 같은 버킷의 행이 이미 있을 수 있다(그 사이 **유저 체결**이 직접 upsert 했을 때) → 겹치면 합친다.
@@ -605,10 +622,17 @@ const TRADE_RETENTION_MS = 6 * 3600 * 1000;
 const TRADE_PRUNE_CHANCE = 0.05; // ≈20틱마다 1회
 
 /** 체결내역을 **표시**하려고 `spot_trades` 를 읽을 때 거는 시간 범위(2026-08-14, 읽기 절감).
- * 이 테이블엔 유저 체결만 남고 봇 합성 체결은 tape_json 링 버퍼(≈3분치)에 있으므로, 화면(최근 30건 ·
- * <60s 캔들 버킷팅)에 낄 수 있는 유저 체결은 그 창 근처뿐이다. 테이프보다 넉넉하게 잡아 봇이 멈춰
- * 테이프가 낡은 상황에서도 최근 체결이 사라지지 않게 한다. 보존 기간(TRADE_RETENTION_MS, 6h)보다는 짧다. */
-const TRADE_VIEW_WINDOW_MS = 60 * 60 * 1000;
+ * 이 테이블엔 유저 체결만 남고 봇 합성 체결은 tape_json 링 버퍼(≈90초치)에 있으므로, 화면(최근 30건 ·
+ * <60s 캔들 버킷팅)에 낄 수 있는 유저 체결은 그 창 근처뿐이다.
+ *
+ * ⚠ **1시간 → 3분**(2026-08-20). 1시간짜리 창은 prod 에서 **폴링당 24행**을 읽어 하루 16.3만 행 =
+ * **전체 읽기의 41%(1위)** 였는데, 그 24행 중 화면에 낄 수 있는 건 사실상 없었다: `mergeRecentTrades`
+ * 는 테이프+테이블을 시간순으로 합쳐 **상위 50건만** 쓰고, 봇 테이프 혼자 초당 ~4.5건을 찍으므로 그
+ * 50건은 **최근 11초** 안에서 끝난다(cron 만 도는 조용한 시장이라도 ~33초). 즉 그보다 오래된 유저 체결은
+ * 읽어봐야 정렬에서 밀려 버려지는 행이었다. 3분이면 가장 조용한 시장 기준으로도 5배 여유다.
+ * ⚠ 봇이 멈춰(예산 차단 등) 테이프가 낡으면 그 테이프의 옛 항목이 상위 50건을 차지하므로, 창을
+ * 늘려도 유저 체결이 더 보이지는 않는다 — 창 길이로 해결되는 문제가 아니다. */
+const TRADE_VIEW_WINDOW_MS = 3 * 60 * 1000;
 
 // ── 봇 매매 심리 모델 ─────────────────────────────────────────────────────
 // ⚠ 예전 기준가는 `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 추세도, 변동성 뭉침도,
@@ -1314,6 +1338,16 @@ const ROWS_PER_BOT_ACCRUAL = 4; // 정산 시 usage_meter 1 + 봇 2명 카운터
  */
 async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0: number, ticks: number): Promise<number[]> {
   if (ticks <= 0) return [];
+  // ⚠ 상태 행이 아직 없으면 먼저 만든다 — 아래 커밋은 `last_run` 가드가 붙은 UPDATE 라 행이 없으면
+  // 0행이 되어 봇이 영원히 시작하지 못한다(가상 코인을 새로 개설한 직후가 정확히 그 상태다).
+  if (!row) {
+    await env.DB.prepare('INSERT OR IGNORE INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?)')
+      .bind(pair, 0, ref0)
+      .run();
+  }
+  // 이 실행이 "선점"한 시점 = 우리가 읽은 last_run. 커밋이 이 값을 가드로 써서, 그 사이 다른 요청이
+  // 커밋했으면(값이 바뀌었으면) 이번 틱을 조용히 버린다(§ 커밋 = 선점).
+  const guard = row?.last_run ?? 0;
   const wallRows = (
     await env.DB.prepare(
       'SELECT side, limit_price AS price, SUM(size) AS size FROM pending_orders WHERE symbol=? GROUP BY side, limit_price',
@@ -1347,7 +1381,7 @@ async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0
 
   const stmts: D1PreparedStatement[] = [];
   // 닫힌 버킷만 테이블로 넘긴다(진행 중 버킷은 아래 상태 행에 그대로 남아 조회 때 병합된다).
-  for (const c of closed) stmts.push(candleFlushStmt(env, pair, c.code, c.bar));
+  for (const c of closed) stmts.push(candleFlushStmt(env, pair, c.code, c.bar, guard));
 
   let pendNotional = (row?.pend_notional ?? 0) + notional;
   let pendRows = (row?.pend_rows ?? 0) + ROWS_PER_BOT_COMMIT + closed.length * ROWS_PER_CANDLE_FLUSH;
@@ -1380,9 +1414,23 @@ async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0
   // 그래서 **봇 커밋 하나의 쓰기 비용이 이 1행**이다. book_version 을 올려 이 순간 진행 중이던
   // 소비(bookWriteStmt)가 옛 사다리로 덮어쓰지 못하게 한다. last_run 도 여기서 함께 찍는다(직후 폴링이
   // 곧바로 겹쳐 requote 하지 않게 — 예전엔 버스트가 이걸 위해 UPDATE 를 한 번 더 날렸다).
+  // ⚠⚠ **커밋이 곧 선점이다**(2026-08-20, D1 쓰기 다이어트). 예전엔 게이트를 통과한 직후 `last_run` 만
+  // 찍는 **선점(claim) UPDATE 를 따로** 날려 동시 폴링의 중복 requote 를 막았다 — 그게 틱당 쓰기 1행
+  // 추가였고, prod 실측 **하루 4,688행 = 전체 쓰기의 19%** 였다(같은 행을 1초에 두 번 쓴 셈).
+  // 틱 계산은 순수 함수(simulateTick)라 **쓰기 직전에 판정해도 똑같이 막힌다**: 겹친 두 요청이 같은
+  // 상태에서 각자 계산하고, 먼저 커밋한 쪽만 이 `last_run` 가드를 통과한다(진 쪽은 0행 → 아래에서
+  // 폐기). 진 쪽이 버린 틱은 이긴 쪽이 같은 시작 상태에서 만든 틱으로 대체되므로 잃는 것도 없다.
+  // ⚠ 같은 가드를 위 캔들 flush 에도 걸었다 — batch 는 0행 UPDATE 를 실패로 보지 않으므로(§4) 가드를
+  // 커밋에만 달면 경합에서 진 쪽의 캔들만 반영돼 그 봉의 거래량이 부푼다(volume 은 누적이라 멱등이 아니고,
+  // 1h/1d 버킷은 그 오차가 영구히 남는다).
+  // ⚠ 반대로 **계량기(meterStmt)·봇 수수료(botFillStmts)·보존기간 DELETE 는 일부러 가드를 걸지 않았다** —
+  //   · 계량기·봇 수수료: 진 쪽이 더한 만큼 **과대 계상**된다(진 쪽의 pend_* 리셋은 커밋되지 않으므로
+  //     같은 몫이 나중에 한 번 더 계량된다). 예산 계량은 과소평가만 위험하고 과대평가는 안전한 방향이며,
+  //     확률도 "경합 × 120틱마다 1회" 라 무시할 수준이다. 가드를 붙이면 문장이 복잡해지는 값이 아니다.
+  //   · DELETE: 같은 조건을 두 번 실행해도 결과가 같다(멱등).
   stmts.push(
     env.DB.prepare(
-      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, book_version=book_version+1 WHERE id=?',
+      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, book_version=book_version+1 WHERE id=? AND last_run=?',
     ).bind(
       lastTs,
       state.ref,
@@ -1401,9 +1449,14 @@ async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0
       pendRows,
       pendTicks,
       pair,
+      guard,
     ),
   );
-  await env.DB.batch(stmts);
+  const res = await env.DB.batch(stmts);
+  // 커밋이 0행이면 그 사이 다른 요청(폴링·cron)이 같은 상태에서 먼저 커밋한 것 -> 이번 틱은 없던 일이다.
+  // 지나온 가격 경로도 빈 배열로 돌려야 한다: 커밋되지 않은 가격으로 트리거를 판정하면(cron 이 이
+  // 반환값을 쓴다) 실제로 존재한 적 없는 딥/스파이크로 조건부·SL/TP 가 체결된다.
+  if (res[res.length - 1]?.meta.changes !== 1) return [];
 
   // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
   // ⚠ 틱마다가 아니라 **커밋 뒤 한 번** — 호가창은 이 커밋으로 한 번 바뀌므로 그 이상은 낭비였다
@@ -1426,14 +1479,8 @@ export async function runMarketMaker(env: Env, pair: string): Promise<void> {
   // 예상 못 한 청구서보다는 낫다. 게이트를 통과한 틱에서만 물어보므로 조회가 폴링마다 늘지 않는다.
   if (await autoWritesBlocked(env, 'bot')) return;
 
-  // 재호가 틱을 원자적으로 선점(동시 폴링이 겹쳐도 이 틱은 한 번만 requote) — 조건부 upsert.
-  const claim = await env.DB.prepare(
-    'INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run WHERE spot_bot_state.last_run = ?',
-  )
-    .bind(pair, now, row?.ref_price ?? 1, last)
-    .run();
-  if (claim.meta.changes !== 1) return; // 다른 요청이 이 틱을 이미 선점 — 중복 requote 방지
-
+  // ⚠ 선점(claim)용 UPDATE 는 없다 — 커밋 자체가 `last_run` 가드로 선점을 겸한다(§ runBotTicks 커밋).
+  // 예전엔 여기서 last_run 만 찍는 조건부 upsert 를 한 번 더 날렸고, 그게 하루 4,688행이었다.
   await runBotTicks(env, pair, row, await resolveRef(env, pair, row), 1);
 }
 
@@ -1451,15 +1498,9 @@ export async function runMarketMakerBurst(env: Env, pair: string, ticks: number 
   // 기능이라 멈추면 유저 손실로 이어지고, 애초에 폭주하지도 않는다.
   if (await autoWritesBlocked(env, 'bot')) return [];
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BotStateRow>();
-  const ref0 = await resolveRef(env, pair, row);
-  // 상태 행이 아직 없으면 먼저 만든다 — 아래 상태 UPDATE 가 0행이 되어 국면이 매 틱 초기화되는 걸
-  // 막는다(cron 이 유일한 클럭인 초기 상태에서 실제로 문제가 된다).
-  if (!row) {
-    await env.DB.prepare('INSERT OR IGNORE INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?)')
-      .bind(pair, 0, ref0)
-      .run();
-  }
-  return runBotTicks(env, pair, row, ref0, ticks);
+  // ⚠ 상태 행이 없을 때의 부트스트랩은 runBotTicks 안으로 옮겼다 — 폴링 경로도 커밋이 가드 UPDATE 가
+  // 되면서 같은 처리가 필요해졌고, 두 곳에 두면 한쪽만 고쳐질 여지가 생긴다.
+  return runBotTicks(env, pair, row, await resolveRef(env, pair, row), ticks);
 }
 
 /** 유저가 OX 를 실제로 레버리지 거래(order.ts open/close)할 때 그 체결을 합성 시장에도 반영한다.

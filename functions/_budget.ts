@@ -85,25 +85,30 @@ export function meterStmt(env: Env, rows: number): D1PreparedStatement {
 // 캐시한다. Workers isolate 는 재사용되므로 실질적으로 isolate 당 분당 1회 조회가 된다.
 // ⚠ 차단이 걸린 뒤엔 캐시를 길게 잡는다(그 날/달엔 어차피 안 풀린다) — 차단 상태에서 조회를 계속하는 게
 // 제일 무의미하다. 캐시가 최대 60초 낡을 수 있어 차단이 그만큼 늦게 걸리지만, 60초분(수백 행)은 무해하다.
-let cache: { at: number; day: number; month: number } | null = null;
+let cache: { at: number; day: number } | null = null;
 const CACHE_MS = 60_000;
 const CACHE_MS_BLOCKED = 10 * 60_000;
 
-/** 이번 달/오늘 자동 쓰기 누적 추정치(한 번의 조회로 둘 다).
+/** 오늘(KST) 자동 쓰기 누적 추정치.
  * ⚠ 실패하면 0 을 돌려준다 — **계량기 고장이 시장을 멈추면 안 된다**(테이블 미생성 등으로 조회가 깨졌을 때
- * 봇이 통째로 서는 게 더 큰 사고다. 그 경우는 `npm run d1:budget` 월 점검이 잡는다). */
-export async function meterRows(env: Env): Promise<{ day: number; month: number }> {
+ * 봇이 통째로 서는 게 더 큰 사고다. 그 경우는 `npm run d1:budget` 월 점검이 잡는다).
+ *
+ * ⚠ **오늘 한 행만 읽는다**(2026-08-20). 예전엔 `WHERE day LIKE '2026-08%'` 로 이번 달 전체를 SUM 해서
+ * 월 누적까지 한 번에 구했는데, 그 월 누적을 **차단 판정에 쓰지 않는다**(무료 플랜의 한도는 일 단위라
+ * 월선은 표시용으로만 남겼다 — MONTHLY_ROW_BUDGET 주석). 대가는 조회 하나가 **그 달의 날짜 수만큼**
+ * 행을 읽는 것이었다: 월말이면 31행, prod 실측 평균 19행 × 하루 1,026회 = **하루 1.99만 행**을 "쓰지도
+ * 않는 숫자"에 썼다. 오늘 행 하나(PK 조회 1행)면 판정에 필요한 값이 전부 나온다.
+ * 월 누적이 필요한 곳(budgetStatus)은 호출 빈도가 낮으니 거기서 따로 읽는다. */
+export async function meterRows(env: Env): Promise<{ day: number }> {
   const now = Date.now();
   const blocked = cache && cache.day >= NIBBLE_BLOCK_DAY_ROWS;
-  if (cache && now - cache.at < (blocked ? CACHE_MS_BLOCKED : CACHE_MS)) return { day: cache.day, month: cache.month };
+  if (cache && now - cache.at < (blocked ? CACHE_MS_BLOCKED : CACHE_MS)) return { day: cache.day };
   const today = todayKst();
   try {
-    const row = await env.DB.prepare(
-      'SELECT COALESCE(SUM(rows_est),0) AS m, COALESCE(SUM(CASE WHEN day = ? THEN rows_est END),0) AS d FROM usage_meter WHERE day LIKE ?',
-    )
-      .bind(today, `${today.slice(0, 7)}%`)
-      .first<{ m: number; d: number }>();
-    cache = { at: now, day: row?.d ?? 0, month: row?.m ?? 0 };
+    const row = await env.DB.prepare('SELECT rows_est FROM usage_meter WHERE day = ?')
+      .bind(today)
+      .first<{ rows_est: number }>();
+    cache = { at: now, day: row?.rows_est ?? 0 };
     // 차단이 걸렸으면 로그를 남긴다 — 조용한 후퇴라 로그가 없으면 "봇이 왜 멈췄지?" 를 알 방법이 없다
     // (`cd cron && npx wrangler tail` 또는 Pages 로그로 확인). 캐시 갱신 시에만 찍어 매 호출 도배를 막는다.
     if (cache.day >= NIBBLE_BLOCK_DAY_ROWS) {
@@ -113,9 +118,9 @@ export async function meterRows(env: Env): Promise<{ day: number; month: number 
       );
     }
   } catch {
-    cache = { at: now, day: 0, month: 0 };
+    cache = { at: now, day: 0 };
   }
-  return { day: cache.day, month: cache.month };
+  return { day: cache.day };
 }
 
 const BLOCK_AT: Record<'nibble' | 'repeat' | 'bot', number> = {
@@ -145,7 +150,14 @@ export async function budgetStatus(env: Env): Promise<{
   repeatBlocked: boolean;
   botBlocked: boolean;
 }> {
-  const { day, month } = await meterRows(env);
+  const { day } = await meterRows(env);
+  // 월 누적은 여기서만 필요하다(운영 점검용) — 뜨거운 경로인 meterRows 에서 빼낸 이유는 그 주석 참고.
+  const month =
+    (
+      await env.DB.prepare('SELECT COALESCE(SUM(rows_est),0) AS m FROM usage_meter WHERE day LIKE ?')
+        .bind(`${todayKst().slice(0, 7)}%`)
+        .first<{ m: number }>()
+    )?.m ?? 0;
   return {
     day: todayKst(),
     dayRows: day,

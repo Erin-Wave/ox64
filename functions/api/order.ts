@@ -153,6 +153,13 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     return bad('invalid json');
   }
 
+  // ⚠ 주문내역 증분 커서(§ _shared.loadState ordersSince). 액션 응답도 계정 상태를 통째로 돌려주는데,
+  // 예전엔 여기에 커서를 안 실어서 **액션마다 주문 50행을 다시 읽었다** — prod 실측 하루 759회 × 50행 =
+  // 3.8만 행으로, 폴링에서 없앤 낭비(2026-08-14)가 액션 경로에만 그대로 남아 있었다. 클라가 가진 마지막
+  // 주문 시각을 보내면 그 이후만 읽는다(방금 체결된 주문은 당연히 그 이후라 응답에 포함된다).
+  // 커서가 없으면(구버전 클라·최초) 전체를 주므로 무회귀다.
+  const since = Number(body.ordersSince) || undefined;
+
   // 지정가/SL·TP/강제청산 체크는 각 액션 안에서 호출한다(수동 액션과 레이스 방지). 반환된 마크가격
   // 맵을 loadState 로 넘겨 클라가 서버와 동일 시세로 청산가/평가자산을 즉시 계산하게 한다.
 
@@ -180,7 +187,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       const { filled, avgPrice } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
       if (!(filled > 0)) return bad('체결 가능한 호가 물량이 없습니다');
       marks[symbol] = avgPrice || ref;
-      return json(await loadState(env, uid, marks));
+      return json(await loadState(env, uid, marks, since));
     }
 
     // 실제 코인: 트리거 평가와 체결가 fetch 를 병렬로 돌려 롱/숏 버튼 지연을 줄인다.
@@ -246,7 +253,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       await reflectVirtualFill(env, symbol, uid, price, side === 'long' ? 'buy' : 'sell', size);
 
       marks[symbol] = price;
-      return json(await loadState(env, uid, marks));
+      return json(await loadState(env, uid, marks, since));
     }
 
     const margin = (price * size) / leverage;
@@ -274,7 +281,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     await reflectVirtualFill(env, symbol, uid, price, side === 'long' ? 'buy' : 'sell', size);
 
     marks[symbol] = price;
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   if (body.action === 'close') {
@@ -299,7 +306,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       const { filled, avgPrice } = await marketCloseOxPosition(env, uid, pos, closeSize);
       if (!(filled > 0)) return bad('청산할 수 있는 호가 물량이 없습니다');
       if (avgPrice > 0) marks[pos.symbol] = avgPrice;
-      return json(await loadState(env, uid, marks));
+      return json(await loadState(env, uid, marks, since));
     }
 
     // 실제 코인: 외부 시세로 즉시 청산(로컬 호가창이 없어 mark 정산이 표준, 유동성 사실상 무한).
@@ -331,7 +338,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     await reflectVirtualFill(env, pos.symbol, uid, price, pos.side === 'long' ? 'sell' : 'buy', closeSize);
 
     marks[pos.symbol] = price;
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   // 지정가 청산(reduce-only) — 포지션을 지정가에 청산 예약. 증거금을 새로 잠그지 않고(청산이므로),
@@ -376,7 +383,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // mark 가 지정가를 크로스할 때 체결한다.
     if (isVirtualSymbol(pos.symbol)) await matchReduceOnlyOxPending(env, pendingId);
 
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   if (body.action === 'limitOpen') {
@@ -429,7 +436,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       await matchLimitPendingAgainstBook(env, pendingId);
     }
 
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   if (body.action === 'cancelLimit') {
@@ -445,7 +452,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(pendingId, uid),
     ]);
 
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   // 미체결(지정가) 주문의 지정가·수량 수정. 진입 지정가는 증거금을 재계산해 델타만큼 잔고를 원자 조정
@@ -486,7 +493,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
         .bind(newLimit, newSize, pendingId, uid)
         .run();
       if (isVirtualSymbol(pending.symbol)) await matchReduceOnlyOxPending(env, pendingId);
-      return json(await loadState(env, uid, marks));
+      return json(await loadState(env, uid, marks, since));
     }
 
     // 진입 지정가 — 증거금 재계산. delta(=신규-기존)만큼 잔고를 조정한다. 추가 잠금(delta>0)은 크로스
@@ -505,7 +512,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .run();
     if (isVirtualSymbol(pending.symbol)) await matchLimitPendingAgainstBook(env, pendingId);
 
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   // 조건부(스탑) 주문 생성 — 증거금을 미리 잠그지 않고(스탑 관행), 트리거 가격을 넘어서면 시장가로
@@ -557,7 +564,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     // 방금 넣은 조건부까지 포함해 평가(이미 트리거된 스탑이면 즉시 체결). marks 를 loadState 로 전달.
     const marks = await checkTriggers(env, uid);
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   // 조건부 주문 수정 — 트리거가/수량/조건(이상·이하)/레버리지 + 반복 설정을 취소 없이 바꾼다.
@@ -615,7 +622,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     // 수정 직후 재평가 — 새 조건을 이미 만족하면 그 자리에서 체결(conditionalOpen 과 동일).
     const marks = await checkTriggers(env, uid);
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   if (body.action === 'cancelConditional') {
@@ -627,7 +634,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!cond) return bad('주문을 찾을 수 없음', 404);
     // 증거금을 잠그지 않았으므로 환불 없음, 행만 삭제.
     await env.DB.prepare('DELETE FROM conditional_orders WHERE id = ? AND user_id = ?').bind(conditionalId, uid).run();
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   if (body.action === 'setSlTp') {
@@ -646,7 +653,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .bind(stopLoss, takeProfit, positionId, uid)
       .run();
 
-    return json(await loadState(env, uid, marks));
+    return json(await loadState(env, uid, marks, since));
   }
 
   return bad('알 수 없는 action');

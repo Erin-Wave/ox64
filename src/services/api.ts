@@ -144,6 +144,26 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   return data;
 }
 
+// ── 주문내역 증분 조회 커서(§ functions/_shared.ts loadState ordersSince) ─────────────────────
+// 액션 응답(POST /api/order)도 계정 상태를 통째로 돌려주는데, 예전엔 커서를 안 실어서 **액션마다 주문
+// 50행을 다시 읽었다**(prod 실측 하루 759회 × 50행 = 3.8만 행 — 폴링에선 이미 없앤 낭비가 액션 경로에만
+// 남아 있었다). 스토어가 상태를 받을 때마다(§ useTradingStore.apply) 이 커서를 갱신하고, 모든 주문
+// 액션이 그 값을 함께 보낸다.
+// ⚠ 여기 두는 이유: api.ts 는 스토어를 import 하지 않는다(그 방향이면 순환). 그래서 스토어가 밀어넣는다.
+// ⚠ 커서를 모르면 undefined → 서버가 전체 목록을 준다(최초 로드·로그인·리필. 드문 전체 응답이
+//   증분 병합이 어긋났을 때의 자기 복구 지점도 된다).
+let ordersCursor: number | undefined;
+
+/** 스토어가 계정 상태를 받을 때마다 최신 주문 시각을 여기 반영한다(되돌아가지 않게 단조 증가). */
+export function setOrdersCursor(createdAt?: number) {
+  if (createdAt == null) ordersCursor = undefined;
+  else if (ordersCursor == null || createdAt > ordersCursor) ordersCursor = createdAt;
+}
+
+/** POST /api/order 공통 — 증분 커서를 항상 함께 보낸다. */
+const orderReq = (body: Record<string, unknown>) =>
+  req<AppState>('/order', { method: 'POST', body: JSON.stringify({ ...body, ordersSince: ordersCursor }) });
+
 export const api = {
   login: (name: string, passcode: string) =>
     req<AppState>('/login', { method: 'POST', body: JSON.stringify({ name, passcode }) }),
@@ -153,11 +173,11 @@ export const api = {
   state: (ordersSince?: number) =>
     req<AppState>(ordersSince ? `/state?ordersSince=${ordersSince}` : '/state'),
   open: (p: { symbol: string; side: Side; size: number; leverage: number; stopLoss?: number | null; takeProfit?: number | null }) =>
-    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'open', ...p }) }),
+    orderReq({ action: 'open', ...p }),
   close: (positionId: string, size?: number) =>
-    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'close', positionId, size }) }),
+    orderReq({ action: 'close', positionId, size }),
   limitClose: (positionId: string, size: number, limitPrice: number) =>
-    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'limitClose', positionId, size, limitPrice }) }),
+    orderReq({ action: 'limitClose', positionId, size, limitPrice }),
   limitOpen: (p: {
     symbol: string;
     side: Side;
@@ -166,13 +186,13 @@ export const api = {
     limitPrice: number;
     stopLoss?: number | null;
     takeProfit?: number | null;
-  }) => req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'limitOpen', ...p }) }),
+  }) => orderReq({ action: 'limitOpen', ...p }),
   cancelLimit: (pendingId: string) =>
-    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'cancelLimit', pendingId }) }),
+    orderReq({ action: 'cancelLimit', pendingId }),
   editLimit: (pendingId: string, p: { limitPrice?: number; size?: number }) =>
-    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'editLimit', pendingId, ...p }) }),
+    orderReq({ action: 'editLimit', pendingId, ...p }),
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) =>
-    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'setSlTp', positionId, ...p }) }),
+    orderReq({ action: 'setSlTp', positionId, ...p }),
   conditionalOpen: (p: {
     symbol: string;
     side: Side;
@@ -190,7 +210,7 @@ export const api = {
     cooldownSec?: number | null;
     /** 최대 실행 횟수(생략/null=무제한) */
     maxFills?: number | null;
-  }) => req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'conditionalOpen', ...p }) }),
+  }) => orderReq({ action: 'conditionalOpen', ...p }),
   /** 조건부 주문 수정 — 보낸 필드만 바뀐다(증거금을 잠그지 않는 주문이라 정산 없이 UPDATE) */
   editConditional: (
     conditionalId: string,
@@ -205,9 +225,9 @@ export const api = {
       cooldownSec?: number | null;
       maxFills?: number | null;
     },
-  ) => req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'editConditional', conditionalId, ...p }) }),
+  ) => orderReq({ action: 'editConditional', conditionalId, ...p }),
   cancelConditional: (conditionalId: string) =>
-    req<AppState>('/order', { method: 'POST', body: JSON.stringify({ action: 'cancelConditional', conditionalId }) }),
+    orderReq({ action: 'cancelConditional', conditionalId }),
   refill: () => req<AppState>('/refill', { method: 'POST' }),
   leaderboard: () => req<{ leaderboard: LeaderRow[]; revenue: FeeRevenue }>('/leaderboard'),
   spotState: (pair: string) => req<SpotState>(`/spot?pair=${encodeURIComponent(pair)}`),
