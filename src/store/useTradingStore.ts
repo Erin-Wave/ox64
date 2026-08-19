@@ -165,15 +165,22 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     }
   }
 }
-// ⚠ 체결 목록을 **0.5초 간격 2슬라이스로 흘려보낸다**(2026-08-19). 봇 틱 하나가 한 번에 3~12건을
-// 찍으므로 폴링(1초)마다 그 묶음이 통째로 top 에 꽂혀, 실제로는 초당 수 건이 흐르는 시장인데도 화면은
-// "1초에 한 번 덜컥" 갱신되는 것처럼 보였다. 도착한 묶음을 시간순으로 절반씩 보여주면 목록이 초당 두 번
-// 흐른다 — **이미 받은 데이터를 순서대로 내보내는 것이라 서버 요청·D1 읽기·쓰기가 하나도 늘지 않는다**
-// (가상 코인은 폴링 주기를 못 줄인다 — 요청 10만/일·쓰기 10만/일 한도, CLAUDE.md §6).
-// 대가는 딱 하나: 이번 묶음의 **가장 새 체결이 최대 0.5초 늦게** 보인다(그동안 헤더 현재가·차트는
-// 예전처럼 즉시 갱신되므로, 목록 맨 위가 현재가를 0.5초 뒤따라간다 = 실제 거래소 테이프와 같은 모양).
-// 호가 사다리는 봇 틱당 스냅샷이 **하나뿐**이라 여기서 쪼갤 게 없다(그대로 1초).
-const REVEAL_SLICE_MS = 500; // useSpotPoll 폴링 간격(1초)의 절반 — 슬라이스 2개
+// ⚠ 체결 목록을 **0.1초 해상도로 한 건씩 흘려보낸다**(2026-08-19). 봇 틱 하나가 한 번에 3~12건을
+// 찍으므로 폴링(1초)마다 그 묶음이 통째로 top 에 꽂혀, 실제로는 초당 여러 건이 흐르는 시장인데도 화면은
+// "1초에 한 번 덜컥" 갱신되는 것처럼 보였다. 도착한 묶음을 시간순으로 나눠 내보내면 목록이 실제 테이프처럼
+// 흐른다 — **이미 받은 데이터를 순서대로 꺼내는 것이라 서버 요청·D1 읽기·쓰기가 하나도 늘지 않는다**
+// (가상 코인은 폴링 주기 자체를 못 줄인다 — 요청 10만/일·쓰기 10만/일 한도, CLAUDE.md §6).
+//
+// ⚠⚠ **해상도의 상한은 타이머가 아니라 "한 폴링에 오는 체결 건수"다.** 틱당 3~12건이라 0.1초 간격이면
+// 스텝당 1~2건 = 사실상 한 건씩 내보내는 것이고, 그보다 잘게 쪼개도 **보여줄 새 체결이 없다**(빈 스텝만
+// 늘어 리렌더만 낭비). 그래서 간격은 건수에 맞춰 REVEAL_MIN_GAP_MS~REVEAL_MAX_GAP_MS 사이에서 정한다 —
+// 3건이면 0.23초씩(듬성하게 쪼개도 흐름이 끊기지 않게), 8건 이상이면 0.1초씩.
+// 대가는 딱 하나: 이번 묶음의 **가장 새 체결이 최대 REVEAL_WINDOW_MS 늦게** 보인다(그동안 헤더 현재가·
+// 차트는 예전처럼 즉시 갱신되므로 목록 맨 위가 현재가를 반 박자 뒤따라간다 = 실제 거래소 테이프와 같은 모양).
+// 호가 사다리는 봇 틱당 스냅샷이 **하나뿐**이라 여기서 쪼갤 중간 상태가 없다(그대로 1초).
+const REVEAL_WINDOW_MS = 700; // 이 안에 묶음을 다 내보낸다(폴링 1초 — 다음 배치가 오기 전에 끝나야 한다)
+const REVEAL_MIN_GAP_MS = 100; // 사람 눈에 "흐른다"고 보이는 최소 간격. 더 잘게 쪼갤 데이터가 없다
+const REVEAL_MAX_GAP_MS = 250; // 체결이 몇 건뿐일 때도 이보다 듬성해지지 않게(멈춘 것처럼 보인다)
 let dripTimer: number | undefined;
 function clearDrip() {
   if (dripTimer === undefined) return;
@@ -181,10 +188,10 @@ function clearDrip() {
   dripTimer = undefined;
 }
 
-/** 새로 온 체결을 절반만 먼저 보여주고 나머지는 REVEAL_SLICE_MS 뒤에. 목록은 최신이 [0] 이라
- * 뒤쪽이 과거다 — 그래서 "앞에서 half 개를 뺀 것"이 오래된 절반이 된다. */
+/** 새로 온 체결을 시간순으로 조금씩 공개한다. 목록은 최신이 [0] 이라 뒤쪽이 과거다 —
+ * 그래서 "앞에서 hidden 개를 뺀 것"이 지금까지 공개된 부분이 된다. */
 function dripTrades(set: (s: Partial<TradingState>) => void, incoming: SpotTrade[]) {
-  // 새 배치가 왔으면 직전 배치의 남은 슬라이스는 버린다 — 그 체결들은 이 배치에도 들어있다.
+  // 새 배치가 왔으면 직전 배치의 남은 스텝은 버린다 — 아직 안 보여준 체결도 이 배치에 들어있다.
   clearDrip();
   const shown = useTradingStore.getState().spotTrades;
   const lastShown = shown[0]?.createdAt ?? 0;
@@ -197,12 +204,16 @@ function dripTrades(set: (s: Partial<TradingState>) => void, incoming: SpotTrade
     set({ spotTrades: incoming });
     return;
   }
-  const half = Math.ceil(fresh / 2);
-  set({ spotTrades: incoming.slice(half) });
-  dripTimer = window.setTimeout(() => {
-    dripTimer = undefined;
-    set({ spotTrades: incoming });
-  }, REVEAL_SLICE_MS);
+  const gap = Math.min(REVEAL_MAX_GAP_MS, Math.max(REVEAL_MIN_GAP_MS, Math.round(REVEAL_WINDOW_MS / fresh)));
+  const per = Math.max(1, Math.ceil(fresh / Math.max(1, Math.floor(REVEAL_WINDOW_MS / gap))));
+  let hidden = fresh - per; // 첫 스텝은 즉시 — 목록이 굼뜨게 반응하지 않게
+  set({ spotTrades: incoming.slice(hidden) });
+  const step = () => {
+    hidden = Math.max(0, hidden - per);
+    set({ spotTrades: incoming.slice(hidden) });
+    dripTimer = hidden > 0 ? window.setTimeout(step, gap) : undefined;
+  };
+  dripTimer = window.setTimeout(step, gap);
 }
 
 function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState) {
