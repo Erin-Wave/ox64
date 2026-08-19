@@ -165,8 +165,49 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     }
   }
 }
+// ⚠ 체결 목록을 **0.5초 간격 2슬라이스로 흘려보낸다**(2026-08-19). 봇 틱 하나가 한 번에 3~12건을
+// 찍으므로 폴링(1초)마다 그 묶음이 통째로 top 에 꽂혀, 실제로는 초당 수 건이 흐르는 시장인데도 화면은
+// "1초에 한 번 덜컥" 갱신되는 것처럼 보였다. 도착한 묶음을 시간순으로 절반씩 보여주면 목록이 초당 두 번
+// 흐른다 — **이미 받은 데이터를 순서대로 내보내는 것이라 서버 요청·D1 읽기·쓰기가 하나도 늘지 않는다**
+// (가상 코인은 폴링 주기를 못 줄인다 — 요청 10만/일·쓰기 10만/일 한도, CLAUDE.md §6).
+// 대가는 딱 하나: 이번 묶음의 **가장 새 체결이 최대 0.5초 늦게** 보인다(그동안 헤더 현재가·차트는
+// 예전처럼 즉시 갱신되므로, 목록 맨 위가 현재가를 0.5초 뒤따라간다 = 실제 거래소 테이프와 같은 모양).
+// 호가 사다리는 봇 틱당 스냅샷이 **하나뿐**이라 여기서 쪼갤 게 없다(그대로 1초).
+const REVEAL_SLICE_MS = 500; // useSpotPoll 폴링 간격(1초)의 절반 — 슬라이스 2개
+let dripTimer: number | undefined;
+function clearDrip() {
+  if (dripTimer === undefined) return;
+  clearTimeout(dripTimer);
+  dripTimer = undefined;
+}
+
+/** 새로 온 체결을 절반만 먼저 보여주고 나머지는 REVEAL_SLICE_MS 뒤에. 목록은 최신이 [0] 이라
+ * 뒤쪽이 과거다 — 그래서 "앞에서 half 개를 뺀 것"이 오래된 절반이 된다. */
+function dripTrades(set: (s: Partial<TradingState>) => void, incoming: SpotTrade[]) {
+  // 새 배치가 왔으면 직전 배치의 남은 슬라이스는 버린다 — 그 체결들은 이 배치에도 들어있다.
+  clearDrip();
+  const shown = useTradingStore.getState().spotTrades;
+  const lastShown = shown[0]?.createdAt ?? 0;
+  // ⚠ 식별은 id 가 아니라 **시각(createdAt)** 으로 한다. 봇 테이프는 링 버퍼(TAPE_MAX=400)라 넘칠 때
+  // 인덱스가 밀리고, id 가 `t<시각>-<인덱스>` 합성이라 같은 체결의 id 가 폴링마다 바뀐다.
+  const firstOld = incoming.findIndex((t) => t.createdAt <= lastShown);
+  const fresh = firstOld < 0 ? incoming.length : firstOld;
+  // 첫 로드(보여준 게 없음)나 새 체결이 0~1건이면 나눌 이유가 없다.
+  if (lastShown === 0 || fresh <= 1) {
+    set({ spotTrades: incoming });
+    return;
+  }
+  const half = Math.ceil(fresh / 2);
+  set({ spotTrades: incoming.slice(half) });
+  dripTimer = window.setTimeout(() => {
+    dripTimer = undefined;
+    set({ spotTrades: incoming });
+  }, REVEAL_SLICE_MS);
+}
+
 function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState) {
-  set({ spotBook: st.book, spotTrades: st.trades });
+  set({ spotBook: st.book });
+  dripTrades(set, st.trades);
 }
 
 export const useTradingStore = create<TradingState>((set) => ({
@@ -398,8 +439,10 @@ export const useTradingStore = create<TradingState>((set) => ({
   // 그대로 보인다**(EW 를 눌렀는데 OX 호가가 잠깐 보이는 식). 값이 아예 없는 게 틀린 값보다 낫다.
   // ⚠ 캔들도 함께 비운다 — 안 비우면 인터벌/심볼을 바꾼 직후 차트가 **이전 조합의 봉**을 한 번 그린다
   // (통합 폴링 응답이 오기 전까지). 차트는 spotCandlesAt 이 0 이면 아무것도 안 그린다.
-  spotClear: () =>
-    set({ spotBook: { bids: [], asks: [] }, spotTrades: [], spotCandles: [], spotCandlesAt: 0, spotCandlesKey: '' }),
+  spotClear: () => {
+    clearDrip(); // 코인이 바뀌었다 — 이전 코인의 남은 슬라이스가 새 목록에 섞이지 않게
+    set({ spotBook: { bids: [], asks: [] }, spotTrades: [], spotCandles: [], spotCandlesAt: 0, spotCandlesKey: '' });
+  },
 
   spotRefresh: async (pair: string) => {
     try {

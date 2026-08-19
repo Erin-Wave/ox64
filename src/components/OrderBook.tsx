@@ -223,7 +223,8 @@ export default function OrderBook() {
           >
             <span className="text-muted">{fmtTime(t.time)}</span>
             <span className={`truncate text-right ${color}`}>{fmtPrice(t.price, prec)}</span>
-            <span className="truncate text-right text-muted">{fmtQty(t.qty)}</span>
+            {/* 수량도 같은 방향 색으로 — 가격만 칠하면 목록을 훑을 때 매수/매도 흐름이 한눈에 안 읽힌다. */}
+            <span className={`truncate text-right ${color}`}>{fmtQty(t.qty)}</span>
           </div>
         );
       })}
