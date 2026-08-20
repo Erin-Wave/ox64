@@ -15,7 +15,7 @@ import {
   repeatModeOf,
   effectiveCooldownMs,
   MIN_CONTINUOUS_COOLDOWN_MS,
-  MAX_ORDER_SIZE,
+  clampOrderSize,
   sizeEps,
   roundVirtual,
   type Env,
@@ -78,10 +78,25 @@ function num(v: unknown): number | null {
   const n = Number(v);
   return isFinite(n) ? n : null;
 }
-/** 주문 수량 형식 검증 — 양수·유한·상한(MAX_ORDER_SIZE) 이내. 상한은 부동소수 폭주만 막는 안전장치이고
- * 실제 한도는 증거금 가드가 잡는다(_shared.MAX_ORDER_SIZE 참고 — 캡이 낮으면 정상 거래가 "수량 오류"로 막힌다). */
+/** 주문 수량 형식 검증 — **양수·유한(=숫자로 읽히는가)만** 본다. ⚠ 상한 초과는 여기서 거부하지 않는다
+ * (예전엔 `size > MAX_ORDER_SIZE` 를 "수량 오류"로 반환해서, 자릿수를 길게 넣은 입력이 곧 에러가 되어
+ * 주문 자체가 안 되는 것처럼 보였다) — 파싱 시점에 `clampOrderSize` 로 잘라 넘기고, 실제 한도는
+ * 증거금 가드가 "증거금이 부족합니다"로(OX 는 감당 가능 수량 클램프로) 판정한다. */
 function badSize(size: number): boolean {
-  return !(size > 0) || !isFinite(size) || size > MAX_ORDER_SIZE;
+  return !(size > 0) || !isFinite(size);
+}
+
+/** "증거금이 부족합니다" 를 **행동 가능한** 문구로 — 지금 이 가격·레버리지로 살 수 있는 최대 수량을
+ * 같이 알려준다. 수량 칸에 자릿수를 크게 넣으면(888…888) 이제 "수량 오류" 가 아니라 이 메시지가
+ * 뜨는데, 얼마면 되는지까지 보여야 유저가 바로 고칠 수 있다. 식·여유(0.1%)는 클라 슬라이더
+ * (OrderPanel.applyPct)와 동일하다 — 1개당 드는 돈 = 가격/레버리지 + 가격×수수료율. */
+function noMarginMsg(available: number, price: number, leverage: number, feeRate: number): string {
+  const costPerUnit = price / leverage + price * feeRate;
+  const max = costPerUnit > 0 ? (available * 0.999) / costPerUnit : 0;
+  if (!(max > 0) || !isFinite(max)) return '증거금이 부족합니다';
+  // 유효숫자 8자리(반올림 오차 1e-8 상대 → 위 0.1% 여유 안에 묻힌다), 아주 큰 값은 지수 표기.
+  const n = max >= 1e15 ? max.toExponential(4) : String(Number(max.toPrecision(8)));
+  return `증거금이 부족합니다 (최대 약 ${n} 개)`;
 }
 
 /** 무한(반복) 조건부 옵션 파싱 — conditionalOpen/editConditional 이 공유한다.
@@ -165,7 +180,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
   if (body.action === 'open') {
     const { symbol, side } = body;
-    const size = Number(body.size);
+    const size = clampOrderSize(Number(body.size));
     const leverage = Math.round(Number(body.leverage));
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
@@ -224,7 +239,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     if (existing) {
       const addMargin = (price * size) / existing.leverage;
-      if (addMargin + fee > available) return bad('증거금이 부족합니다');
+      if (addMargin + fee > available) return bad(noMarginMsg(available, price, existing.leverage, feeRate));
 
       const newSize = existing.size + size;
       const newEntry = (existing.entry_price * existing.size + price * size) / newSize;
@@ -258,7 +273,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     const margin = (price * size) / leverage;
     if (!validSlTp(side, price, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
-    if (margin + fee > available) return bad('증거금이 부족합니다');
+    if (margin + fee > available) return bad(noMarginMsg(available, price, leverage, feeRate));
 
     const posId = crypto.randomUUID();
     // 잔고 차감은 조건부 UPDATE 로 원자적 가드(balance - margin >= -uPnL ⟺ available >= margin, 크로스)
@@ -389,7 +404,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   if (body.action === 'limitOpen') {
     const marks = await checkTriggers(env, uid);
     const { symbol, side } = body;
-    const size = Number(body.size);
+    const size = clampOrderSize(Number(body.size));
     const leverage = Math.round(Number(body.leverage));
     let limitPrice = Number(body.limitPrice);
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
@@ -412,7 +427,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 크로스: 가용 = 여유잔고 + 전 포지션 미실현손익. 지정가도 이 가용 안에서 증거금을 잠근다.
     const uPnL = await unrealizedTotal(env, uid, marks);
     const available = user.balance + uPnL;
-    if (margin > available) return bad('증거금이 부족합니다');
+    if (margin > available) return bad(noMarginMsg(available, limitPrice, leverage, 0));
 
     const now = Date.now();
     const pendingId = crypto.randomUUID();
@@ -467,7 +482,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!pending) return bad('주문을 찾을 수 없음', 404);
 
     let newLimit = body.limitPrice != null ? Number(body.limitPrice) : pending.limit_price;
-    const newSize = body.size != null ? Number(body.size) : pending.size;
+    const newSize = clampOrderSize(body.size != null ? Number(body.size) : pending.size);
     if (!(newLimit > 0) || !isFinite(newLimit)) return bad('지정가 오류');
     if (badSize(newSize)) return bad('수량 오류');
     if (isVirtualSymbol(pending.symbol)) newLimit = roundVirtual(newLimit); // 가상 코인 유효숫자 4자리 틱
@@ -520,7 +535,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   // "이미 트리거 조건을 만족하는" 스탑은 그 자리에서 바로 체결시킨다(거래소 동일).
   if (body.action === 'conditionalOpen') {
     const { symbol, side } = body;
-    const size = Number(body.size);
+    const size = clampOrderSize(Number(body.size));
     const leverage = Math.round(Number(body.leverage));
     let triggerPrice = Number(body.triggerPrice);
     const triggerDir = body.triggerDir;
@@ -581,7 +596,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     let triggerPrice = body.triggerPrice != null && body.triggerPrice !== '' ? Number(body.triggerPrice) : cond.trigger_price;
     if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
     if (isOx) triggerPrice = roundVirtual(triggerPrice);
-    const size = body.size != null && body.size !== '' ? Number(body.size) : cond.size;
+    const size = clampOrderSize(body.size != null && body.size !== '' ? Number(body.size) : cond.size);
     if (badSize(size)) return bad('수량 오류');
     const triggerDir = body.triggerDir != null && body.triggerDir !== '' ? String(body.triggerDir) : cond.trigger_dir;
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
