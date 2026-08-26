@@ -7,9 +7,12 @@
  * 5일 만에 -40% 가 나왔다). 국면 bias 는 국면 점유율로 가중했을 때 합이 ~0 이어야 한다.
  *
  * 합격선(§ CLAUDE.md "장기 안정성"):
- *   - 5일 뒤 가격이 시작가의 대략 0.5~2배 안에 머문다(앵커 tether 반감기 ~14h)
- *   - 수익률 lag1 자기상관 ≈ +0.15~0.3(추세 지속), |수익률| lag1 자기상관 ≈ 0.2 이상(변동성 뭉침)
- *   - 1분봉 평균 고저폭 ≈ 1~3%
+ *   - 5~20일 뒤 가격이 시작가의 대략 0.5~2배 안에 머문다(앵커 tether)
+ *   - **추세효율 0.55 이상** — 30틱 창의 |순이동| / Σ|틱 이동|. 이게 낮으면 국면·추세가 아무리 있어도
+ *     화면엔 방향 없는 진동만 보인다("사팔사팔", 2026-08-26 재설계 전 값이 0.28 이었다)
+ *   - **국면 평균 수명 50틱 이상** — 8틱짜리 국면은 노이즈에 파묻혀 차트에 안 나타난다
+ *   - 수익률 lag1 자기상관 ≈ +0.5(추세 지속), |수익률| lag1 자기상관 ≈ 0.4 이상(변동성 뭉침)
+ *   - 1분봉 평균 고저폭 ≈ 2~3%, 틱 표준편차 ≈ 0.3% 이하(노이즈를 키워서 다이내믹을 만들면 안 된다)
  *   - 국면 점유율에 극단적 편중이 없고, capitulation 은 "가끔"(1% 미만) 나온다
  */
 import { nextMarketState, GAUGE_FULL, type BotState } from '../functions/api/spot';
@@ -37,6 +40,13 @@ interface RunStat {
   bigDown: number;  // -0.5% 넘게 빠진 틱 비율
   bigUp: number;    // +0.5% 넘게 오른 틱 비율
   bookLean: number; // 공포 구간(공포>0.5)의 평균 매수/매도 사다리 두께 비 — 1 보다 작아야 매수벽이 걷힌 것
+  // ── 2026-08-26 추가: "사팔사팔"을 숫자로 잡기 위한 지표 ──
+  regimeLen: number;  // 국면 하나의 평균 수명(틱). 예전 모델은 ~10틱이라 차트에 방향이 안 보였다
+  efficiency: number; // 추세 효율 = |구간 순이동| / Σ|틱 이동| (30틱 창). 0 에 가까우면 제자리 진동
+  swings: number;     // 하루당 8% 이상짜리 지그재그 스윙 수(급등·급락 횟수)
+  swingSize: number;  // 그 스윙들의 평균 크기
+  bigSwing: number;   // 하루당 20% 이상짜리 스윙 수
+  tickSd: number;     // 틱 수익률 표준편차(노이즈 크기)
 }
 
 function corr(a: number[], b: number[]): number {
@@ -92,6 +102,22 @@ function runOnce(): RunStat {
   let bigUp = 0;
   let leanSum = 0;
   let leanN = 0;
+  let regimeEpisodes = 1;
+  // 추세 효율(구간 순이동 / 절대이동 합) — 30틱 창마다
+  const EFF_WIN = 30;
+  let effSum = 0;
+  let effN = 0;
+  let effStart = s.ref;
+  let effAbs = 0;
+  let effPrev = s.ref;
+  // 지그재그 스윙 — 극값에서 SWING_TH 만큼 되돌리면 그 leg(직전 전환점→극값)을 스윙 하나로 센다
+  const SWING_TH = 0.08;
+  let zzPivot = s.ref; // 직전 전환점
+  let zzExt = s.ref;   // 진행 중인 극값
+  let zzDir = 1;       // 1=상승 leg, -1=하락 leg
+  let swingSum = 0;
+  let swingN = 0;
+  let bigSwingN = 0;
 
   for (let t = 0; t < TICKS; t++) {
     const step = nextMarketState(s);
@@ -99,7 +125,45 @@ function runOnce(): RunStat {
     rets.push(step.ret);
     occupancy[s.regime] = (occupancy[s.regime] ?? 0) + 1;
     if (s.regime === 'capitulation' && prevRegime !== 'capitulation') capEvents++;
+    if (s.regime !== prevRegime) regimeEpisodes++;
     prevRegime = s.regime;
+    effAbs += Math.abs(s.ref - effPrev);
+    effPrev = s.ref;
+    if ((t + 1) % EFF_WIN === 0) {
+      if (effAbs > 0) {
+        effSum += Math.abs(s.ref - effStart) / effAbs;
+        effN++;
+      }
+      effStart = s.ref;
+      effAbs = 0;
+    }
+    if (zzDir > 0) {
+      if (s.ref > zzExt) zzExt = s.ref;
+      else if (s.ref <= zzExt * (1 - SWING_TH)) {
+        const size = (zzExt - zzPivot) / zzPivot;
+        if (size > 0) {
+          swingSum += size;
+          swingN++;
+          if (size > 0.2) bigSwingN++;
+        }
+        zzPivot = zzExt;
+        zzExt = s.ref;
+        zzDir = -1;
+      }
+    } else {
+      if (s.ref < zzExt) zzExt = s.ref;
+      else if (s.ref >= zzExt * (1 + SWING_TH)) {
+        const size = (zzPivot - zzExt) / zzPivot;
+        if (size > 0) {
+          swingSum += size;
+          swingN++;
+          if (size > 0.2) bigSwingN++;
+        }
+        zzPivot = zzExt;
+        zzExt = s.ref;
+        zzDir = 1;
+      }
+    }
     min = Math.min(min, s.ref);
     max = Math.max(max, s.ref);
     peakSoFar = Math.max(peakSoFar, s.ref);
@@ -148,6 +212,15 @@ function runOnce(): RunStat {
     bigDown: bigDown / TICKS,
     bigUp: bigUp / TICKS,
     bookLean: leanN ? leanSum / leanN : NaN,
+    regimeLen: TICKS / regimeEpisodes,
+    efficiency: effN ? effSum / effN : 0,
+    swings: swingN / DAYS,
+    swingSize: swingN ? swingSum / swingN : 0,
+    bigSwing: bigSwingN / DAYS,
+    tickSd: (() => {
+      const m = rets.reduce((a, b) => a + b, 0) / rets.length;
+      return Math.sqrt(rets.reduce((a, b) => a + (b - m) ** 2, 0) / rets.length);
+    })(),
   };
 }
 
@@ -175,6 +248,11 @@ console.log(`1분봉 평균 고저폭 ${pct(avg((s) => s.barRange))}  투매 ${a
 console.log(
   `수익률 왜도 ${avg((s) => s.skew).toFixed(2)}  급락(-0.5%↓) ${pct(avg((s) => s.bigDown))} vs 급등(+0.5%↑) ${pct(avg((s) => s.bigUp))}  ` +
     `공포장 매수/매도 호가 두께비 ${avg((s) => s.bookLean).toFixed(2)}`,
+);
+console.log(
+  `국면 평균 수명 ${avg((s) => s.regimeLen).toFixed(0)}틱  추세효율(30틱) ${avg((s) => s.efficiency).toFixed(3)}  ` +
+    `틱 표준편차 ${pct(avg((s) => s.tickSd))}  스윙(8%+) ${avg((s) => s.swings).toFixed(1)}회/일(평균 ${pct(avg((s) => s.swingSize))})  ` +
+    `대형스윙(20%+) ${avg((s) => s.bigSwing).toFixed(1)}회/일`,
 );
 console.log(
   `평균 공포 ${avg((s) => s.meanFear).toFixed(3)}  평균 탐욕 ${avg((s) => s.meanGreed).toFixed(3)}  ` +

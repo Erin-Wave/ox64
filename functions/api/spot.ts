@@ -67,9 +67,10 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     // 바로 그 낭비). 시장 클럭은 호가창 폴링(useSpotPoll → 아래 loadSpotMarket 경로)만 담당한다 —
     // 지금 보고 있는 코인은 그 폴링이 1초 주기로 돌므로 체결 지연도 그대로다.
     const wantCandles = url.searchParams.get('candles');
+    let tickCtx: TickCtx | undefined; // 봇 틱이 이미 읽은 스냅샷(§ TickCtx) — 아래 호가창이 재사용
     if (!wantCandles) {
       try {
-        await runMarketMaker(env, reqPair);
+        tickCtx = await runMarketMaker(env, reqPair);
       } catch (e) {
         // 봇 실패가 유저 요청을 막으면 안 되지만(다음 폴링에서 재시도), ⚠ 조용히 삼키면 봇이 몇 시간째
         // 죽어 있어도 아무도 모른다 — 실제로 배치 문장 수 초과로 호가가 안 깔리는데 화면상 멀쩡해 보여
@@ -85,7 +86,7 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
       return json({ candles: await loadSpotCandles(env, reqPair, interval, limit, endTime) });
     }
 
-    return json(await loadSpotMarket(env, sess.uid, reqPair));
+    return json(await loadSpotMarket(env, sess.uid, reqPair, tickCtx));
   });
 }
 
@@ -490,20 +491,63 @@ function mergeRecentTrades(
  * 근본 원인) — 그래서 두 테이블을 UNION 해서 같은 가격대끼리 합산한다. long 지정가=매수 호가,
  * short 지정가=매도 호가. pending_orders 는 취소/체결되면 즉시 그 행이 사라지므로(order.ts/
  * _trading.ts) 별도 동기화 없이 항상 최신 상태가 자동으로 반영된다. */
-export async function loadSpotMarket(env: Env, uid: string, pair: string) {
+/** `pending_orders` 한 행(그 페어의 대기 지정가). 한 요청 안에서 **세 군데가 같은 목록을 쓴다** —
+ * 봇 틱의 "유저 벽" 판정 · 재호가 직후 sweep · 호가창 표시. 예전엔 셋이 각자 같은 테이블을 다시 읽어
+ * `?tick=` 요청 하나가 이 테이블을 **세 번 스캔**했다(§6 "같은 걸 반복해서 다시 읽지 않는다"). */
+export interface PendingLite {
+  id: string;
+  user_id: string;
+  side: string;
+  price: number;
+  size: number;
+  reduce_only: number;
+  last_fill_at: number | null;
+}
+
+/** 통합 폴링(`/api/state?tick=`) 한 요청 안에서 조회 결과를 물려주는 컨텍스트.
+ *
+ * ⚠ **`null` 은 "모른다"는 뜻이고, 받는 쪽은 그때만 D1 을 읽는다.** 봇 커밋이 경합에서 졌거나
+ * sweep 이 실제로 체결을 냈으면 우리가 들고 있는 사다리·대기목록이 이미 낡았으므로 반드시 null 로
+ * 되돌려야 한다 — 낡은 스냅샷을 그대로 그리면 호가창에 이미 체결된 물량이 1초 더 남는다. */
+export interface TickCtx {
+  book: BotBook | null;
+  tape: TapeTrade[] | null;
+  pendings: PendingLite[] | null;
+}
+
+/** 대기 지정가 목록 → 가격대별 합계(봇의 "유저 벽" 판정용). 예전엔 이걸 SQL `GROUP BY` 로 따로 읽었다. */
+function wallsOf(pendings: PendingLite[]): WallRow[] {
+  const m = new Map<string, WallRow>();
+  for (const p of pendings) {
+    const k = `${p.side}|${p.price}`;
+    const cur = m.get(k);
+    if (cur) cur.size += p.size;
+    else m.set(k, { side: p.side, price: p.price, size: p.size });
+  }
+  return [...m.values()];
+}
+
+export async function loadSpotMarket(env: Env, uid: string, pair: string, ctx?: TickCtx) {
   // `mine` = 그 가격대에 이 유저가 걸어둔 물량. 호가창에서 내 주문을 티나게 표시하려면 합계만으론
   // 알 수 없어서(봇 물량과 섞임) 유저 소유분을 따로 합산해 내려준다.
   // ⚠ 예전엔 봇 호가(spot_orders)와 유저 지정가(pending_orders)를 SQL 에서 UNION ALL 로 합쳤는데,
   // 봇 사다리가 JSON 한 칸으로 옮겨간 뒤로는 **봇 쪽은 메모리에서** 합친다(§ BotBook). 유저 지정가는
   // 여전히 테이블이라 SQL 로 가격대별 집계만 받아온다.
+  // ⚠ `ctx` 가 있으면 **그 요청의 봇 틱이 이미 읽어둔 값**을 그대로 쓴다(2026-08-26) — 통합 폴링에서
+  // 상태 행과 `pending_orders` 를 각각 두 번·세 번 읽던 것을 한 번으로 줄인다(§ PendingLite).
   const [stateRow, pendingRows, tradeRows] = await Promise.all([
-    env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BookRow>(),
-    env.DB.prepare(
-      `SELECT side, limit_price AS price, SUM(size) AS size, SUM(CASE WHEN user_id = ? THEN size ELSE 0 END) AS mine
+    ctx?.book && ctx.tape
+      ? Promise.resolve(null)
+      : env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BookRow>(),
+    ctx?.pendings
+      ? Promise.resolve(null)
+      : env.DB
+          .prepare(
+            `SELECT side, limit_price AS price, SUM(size) AS size, SUM(CASE WHEN user_id = ? THEN size ELSE 0 END) AS mine
          FROM pending_orders WHERE symbol = ? GROUP BY side, limit_price`,
-    )
-      .bind(uid, pair)
-      .all<{ side: string; price: number; size: number; mine: number }>(),
+          )
+          .bind(uid, pair)
+          .all<{ side: string; price: number; size: number; mine: number }>(),
     // ⚠ **시간 범위를 함께 건다**(2026-08-14). 이 조회는 1초마다 도는데 `LIMIT 30` 만 있으면 인덱스를
     // 30행 걸어가므로 **항상 30행**을 읽는다(시간당 10.8만 행 — state 다음으로 큰 읽기였다). 그런데 이
     // 테이블에 남는 건 **유저 체결뿐**이고(봇 합성 체결은 tape_json 링 버퍼로 갔다, § 봇 합성 체결 테이프)
@@ -515,7 +559,24 @@ export async function loadSpotMarket(env: Env, uid: string, pair: string) {
       .all<SpotTradeRow>(),
   ]);
 
-  const book = parseBook(stateRow?.book_json);
+  const book = ctx?.book ?? parseBook(stateRow?.book_json);
+  // ctx 로 받은 원본 목록은 가격대별로 여기서 합산한다(SQL GROUP BY 를 대신).
+  const userLevels =
+    pendingRows?.results ??
+    (() => {
+      const m = new Map<string, { side: string; price: number; size: number; mine: number }>();
+      for (const p of ctx!.pendings!) {
+        const k = `${p.side}|${p.price}`;
+        const cur = m.get(k);
+        if (cur) {
+          cur.size += p.size;
+          cur.mine += p.user_id === uid ? p.size : 0;
+        } else {
+          m.set(k, { side: p.side, price: p.price, size: p.size, mine: p.user_id === uid ? p.size : 0 });
+        }
+      }
+      return [...m.values()];
+    })();
   // 같은 가격대는 봇/유저 물량을 합산해 한 줄로(예전 SQL 의 GROUP BY price 와 동일).
   const merge = (levels: BookLevel[], userSide: string, desc: boolean) => {
     const acc = new Map<number, { price: number; size: number; mine: number }>();
@@ -529,7 +590,7 @@ export async function loadSpotMarket(env: Env, uid: string, pair: string) {
       }
     };
     for (const l of levels) if (l.size > EPS) add(l.price, l.size, 0);
-    for (const p of pendingRows.results) if (p.side === userSide) add(p.price, p.size, p.mine);
+    for (const p of userLevels) if (p.side === userSide) add(p.price, p.size, p.mine);
     return [...acc.values()].sort((a, b) => (desc ? b.price - a.price : a.price - b.price)).slice(0, BOOK_LIMIT);
   };
   const bids = merge(book.bids, 'long', true);
@@ -541,7 +602,7 @@ export async function loadSpotMarket(env: Env, uid: string, pair: string) {
     // (클라 표시 개수 상한과 동일). ⚠ 위 SQL 의 `LIMIT 30` 은 일부러 그대로 둔다 — 테이프는 상태 행 안의
     // JSON 이라 몇 건을 쓰든 읽기가 안 늘지만, 테이블 쪽을 늘리면 그만큼 D1 읽기가 늘어난다(1초 폴링).
     // 한 시간 안에 유저 체결이 30건을 넘는 드문 경우에만 그 뒤쪽이 목록에서 빠진다.
-    trades: mergeRecentTrades(parseTape(stateRow?.tape_json), tradeRows.results, 50),
+    trades: mergeRecentTrades(ctx?.tape ?? parseTape(stateRow?.tape_json), tradeRows.results, 50),
   };
 }
 
@@ -673,42 +734,77 @@ export interface BotState {
 
 // 국면별 성격. bias=틱당 추가 드리프트, volMult=변동성 배수, sizeMult=거래량 배수,
 // takerBias=체결 방향 편향(+면 매수 우위), minTicks=최소 지속 틱(국면이 1틱만에 튕기지 않게),
+// exit=최소 지속을 넘긴 뒤 매 틱 국면을 벗어날 기본 확률(평균 지속 ≈ minTicks + 1/exit),
 // bidDepth/askDepth=호가 사다리 물량 배수(공포장엔 매수벽이 사라지고 매도벽이 쌓인다),
 // spread=호가 스프레드 배수(거친 국면일수록 마켓메이커가 물러난다).
 // ⚠ 비대칭: panic 은 euphoria 보다 |bias|·volMult·sizeMult 가 모두 크다 — 실제 시장처럼 "떨어질 땐
 // 빠르고 거칠게, 오를 땐 느리게".
-// ⚠ bias 는 국면 점유율(실측 대략 calm 46 / rally 27 / pullback 18 / panic 6 / euphoria 3 /
-// capitulation 0.4%)로 가중하면 합이 거의 0 이 되도록 맞춰져 있다 — 안 맞추면 틱마다 미세한 편향이
+//
+// ⚠⚠ **2026-08-26 재설계 — "국면이 10초짜리라 추세가 안 보였다"**. 예전 값은 minTicks 2~8 에 전이
+// 확률이 매 틱 13~35% 라 **한 국면의 평균 수명이 ~10틱**이었다(접속 중이면 10초, cron 만 돌면 50초).
+// 그 사이 rally 가 만드는 이동은 0.00085×10 ≈ 0.85% 인데 같은 시간의 노이즈가 그와 비슷하거나 커서,
+// 국면은 이름만 있고 **차트에는 방향이 안 보였다** — 유저 표현으로 "사팔사팔 빠르게 하면서 느리게
+// 상승추세거나 느리게 하락추세". 지금은 국면 수명을 **한 자릿수 배로** 늘리고(평균 60~180틱) bias 를
+// 키워, 한 국면이 지나가면 봉 여러 개짜리 방향성 구간이 남는다.
+// ⚠ bias 는 국면 점유율로 가중하면 합이 거의 0 이 되도록 맞춰져 있다 — 안 맞추면 틱마다 미세한 편향이
 // 누적돼 며칠 만에 가격이 0 으로 붕괴하거나 발산한다(초기 튜닝에서 실제로 5일 만에 -40% 편향이 나왔다).
 // 값을 바꿀 땐 반드시 시뮬레이션으로 장기 안정성을 다시 확인할 것(`npm run sim:bot`).
 const REGIME_PARAMS: Record<
   Regime,
-  { bias: number; volMult: number; sizeMult: number; takerBias: number; minTicks: number; bidDepth: number; askDepth: number; spread: number }
+  { bias: number; volMult: number; sizeMult: number; takerBias: number; minTicks: number; exit: number; bidDepth: number; askDepth: number; spread: number }
 > = {
-  calm:         { bias:  0,       volMult: 0.65, sizeMult: 0.55, takerBias:  0.02, minTicks: 8, bidDepth: 1.10, askDepth: 1.10, spread: 0.90 },
-  rally:        { bias:  0.00085,  volMult: 1.05, sizeMult: 1.10, takerBias:  0.20, minTicks: 6, bidDepth: 1.25, askDepth: 0.85, spread: 0.95 },
-  euphoria:     { bias:  0.0028,  volMult: 1.80, sizeMult: 2.20, takerBias:  0.36, minTicks: 4, bidDepth: 1.45, askDepth: 0.55, spread: 1.25 },
-  pullback:     { bias: -0.0008,  volMult: 1.20, sizeMult: 0.95, takerBias: -0.18, minTicks: 3, bidDepth: 0.90, askDepth: 1.15, spread: 1.05 },
-  panic:        { bias: -0.0034,  volMult: 2.60, sizeMult: 3.00, takerBias: -0.42, minTicks: 4, bidDepth: 0.50, askDepth: 1.50, spread: 1.55 },
-  capitulation: { bias: -0.0090,  volMult: 3.60, sizeMult: 5.50, takerBias: -0.62, minTicks: 2, bidDepth: 0.28, askDepth: 1.80, spread: 2.10 },
+  calm:         { bias:  0,       volMult: 0.72, sizeMult: 0.50, takerBias:  0.02, minTicks: 60, exit: 0.007, bidDepth: 1.10, askDepth: 1.10, spread: 0.90 },
+  rally:        { bias:  0.00106, volMult: 1.05, sizeMult: 1.45, takerBias:  0.22, minTicks: 45, exit: 0.011, bidDepth: 1.30, askDepth: 0.80, spread: 0.95 },
+  euphoria:     { bias:  0.0034,  volMult: 1.85, sizeMult: 3.10, takerBias:  0.40, minTicks: 20, exit: 0.022, bidDepth: 1.55, askDepth: 0.45, spread: 1.25 },
+  pullback:     { bias: -0.00054, volMult: 1.25, sizeMult: 1.15, takerBias: -0.20, minTicks: 40, exit: 0.014, bidDepth: 0.85, askDepth: 1.20, spread: 1.05 },
+  panic:        { bias: -0.0027,  volMult: 2.70, sizeMult: 3.60, takerBias: -0.46, minTicks: 16, exit: 0.045, bidDepth: 0.45, askDepth: 1.55, spread: 1.55 },
+  capitulation: { bias: -0.0085,  volMult: 3.70, sizeMult: 6.00, takerBias: -0.66, minTicks: 6,  exit: 0.130, bidDepth: 0.25, askDepth: 1.85, spread: 2.10 },
 };
+
+// ── 추세 · 되돌림 파라미터 ────────────────────────────────────────────
+// ⚠⚠ **여기가 "사팔사팔"의 진짜 원인이었다**(2026-08-26). 예전엔 적정가(anchor) 대비 되돌림이
+// `-0.045×stretch` 로 **반감기 15틱**이나 됐고 anchor 자체도 1%/틱로 따라와서, 국면 드리프트 g 가
+// 실제로 가격에 남기는 몫은 `g×a/(k+a) = g×0.01/0.055 = g 의 18%` 뿐이었다. 즉 rally 든 panic 이든
+// **82% 가 그 자리에서 취소**되고, 남은 건 매 틱 새로 뽑는 가우시안 노이즈뿐이라 차트가 방향 없이
+// 잘게 떨렸다. 지금은 되돌림을 1/3 로 줄여(k=0.014) 드리프트의 **42%** 가 남게 하고, 대신
+//  (a) 과열이 커질수록 급격히 세지는 2차항(REVERT_SQ)으로 발산을 막고
+//  (b) anchor 를 기준선으로 당기는 장기 tether(BOT_BASE_PULL)를 비선형으로 만들어
+//      "며칠짜리 큰 파도는 허용하되 몇 배로 튀지는 못하게" 한다.
+const REVERT_LIN = 0.014;  // 적정가 대비 과열의 선형 되돌림(작을수록 추세가 오래 산다)
+const REVERT_SQ = 0.30;    // 2차 되돌림 — 과열 ±10% 부근에서 급격히 브레이크가 걸린다
+const ANCHOR_FOLLOW = 0.01; // 적정가가 현재가를 따라가는 속도(반감기 ≈ 69틱)
+// 매 틱 새로 뽑는 순수 노이즈. ⚠ **이 값을 키우면 "사팔사팔"이 그대로 돌아온다** — 다이내믹함은
+// 노이즈가 아니라 위 국면·추세·사건에서 나와야 한다(노이즈는 방향이 없어서 봉만 지저분해진다).
+const TICK_NOISE = 0.00052;
+// 추세(모멘텀)의 지속계수 — 예전 0.86(반감기 4.6틱)은 사실상 노이즈였다. 0.94 면 반감기 11틱이라
+// 한 번 잡힌 방향이 봉 하나를 넘어 이어진다. ⚠ 1 미만이어야 발산하지 않는다.
+const DRIFT_PERSIST = 0.94;
+const DRIFT_NOISE = 0.00026;
 
 // ── 탐욕/공포 게이지 · 기억 파라미터 ──────────────────────────────────
 // 최근 고점/저점은 "완전히 잊히지 않되 영원히 남지도 않게" 지수적으로 현재가 쪽으로 흘러내린다.
 // 반감기 ≈ 870틱(틱은 접속 중 ~60/분, 유휴 시 12/분이라 실시간으로 15분~1시간).
-const EXTREME_DECAY = 0.003;
+const EXTREME_DECAY = 0.005;
 // 고점 대비 이만큼 빠지면 공포 게이지가 100%(반대로 저점 대비 이만큼 오르면 탐욕 100%).
-// 봇의 1분봉 평균 고저폭이 ~2% 라 6% 는 "며칠 안에 몇 번" 나오는 수준이다.
-export const GAUGE_FULL = 0.1;
+// ⚠ 국면이 길어져 한 파도의 진폭이 커졌으므로 게이지 만점 기준도 6%→10%→**14%** 로 넓혔다. 좁게 두면
+// 게이지가 늘 1 에 붙어(포화) 전이 확률·변동성·거래량이 전부 최대치로 걸리고, 그러면 panic 점유율이
+// 폭증해 시장이 한쪽으로 굳는다(2026-08-12 튜닝에서 실제로 겪었다 — 목표는 평균 0.3 안팎).
+export const GAUGE_FULL = 0.18;
 // 무드의 군집(herding) — sentiment 가 자기 자신을 키우되 s(1-s²) 라 극단(±1)에선 0 이 되어 발산하지
-// 않는다. 실효 지속계수는 최대 0.90+0.06 = 0.96 (< 1) 이라 수학적으로도 폭주가 불가능하다.
-const HERD_GAIN = 0.06;
-// 신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄 — **연쇄 쪽이 1.6배 크고 자주 터진다**(공포가 탐욕보다
+// 않는다. 실효 지속계수는 최대 0.93+0.05 = 0.98 (< 1) 이라 수학적으로도 폭주가 불가능하다.
+// ⚠ 지속계수를 0.90→0.93 으로 올렸다 — 무드가 국면보다 짧게 살면 국면이 길어져도 "다들 사는 중"이
+//   중간에 식어버려 확신(conviction) 배수가 안 붙는다.
+const MOOD_PERSIST = 0.91;
+const HERD_GAIN = 0.05;
+// 신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄 — **연쇄 쪽이 1.5배 크고 자주 터진다**(공포가 탐욕보다
 // 빠르다). 둘 다 "그 방향으로 이미 쏠려 있을 때만" 발동해서, 평상시엔 아무 일도 일어나지 않는다.
-const FOMO_CHANCE = 0.05;
-const FOMO_KICK = 0.004;
-const CASCADE_CHANCE = 0.08;
-const CASCADE_KICK = 0.006;
+// ⚠⚠ **킥은 이제 그 틱의 수익률이 아니라 `drift`(추세) 에 꽂힌다**(2026-08-26). 예전엔 한 틱만 튀고
+// 끝나서 다음 봉이면 흔적도 없었다 — 사람이 "돌파했다"고 읽으려면 그 뒤로 몇 봉이 따라와야 한다.
+// drift 는 DRIFT_PERSIST 로 감쇠하므로 킥 k 는 총 `k/(1-0.94) ≈ 17k` 만큼의 이동으로 풀린다.
+const FOMO_CHANCE = 0.035;
+const FOMO_KICK = 0.00075;
+const CASCADE_CHANCE = 0.055;
+const CASCADE_KICK = 0.00112;
 
 const ROUND_STEP_TICKS = 50; // 라운드넘버 자석이 잡아당기는 심리적 가격대 간격(틱 개수 — 절대값이면 가격대가 바뀔 때 무의미해진다)
 
@@ -878,10 +974,14 @@ function humanSize(raw: number): number {
   return Math.round(v);
 }
 // 적정가(anchor)가 아주 약하게 끌려가는 장기 기준선. 국면 bias 를 아무리 맞춰도 랜덤워크는 며칠 단위로
-// 얼마든지 멀리 갈 수 있어서(0 에 붙거나 수십 배로 뜀), 반감기 ~14시간짜리 약한 복원력을 하나 둔다.
-// 며칠 단위 추세는 그대로 살아있고 "몇 주 뒤 가격이 무의미해지는" 것만 막는다.
+// 얼마든지 멀리 갈 수 있어서(0 에 붙거나 수십 배로 뜀), 약한 복원력을 하나 둔다.
+// ⚠ **비선형 tether**(2026-08-26): 예전엔 기준선까지의 거리에 비례하는 선형 복원이라, 되돌림을 약하게
+// 만들어 추세가 길어진 지금은 며칠 단위로 몇 배씩 표류할 수 있다. 반대로 세게 걸면 며칠짜리 파도가
+// 통째로 죽는다. 그래서 **로그 거리의 제곱으로** 세지게 했다 — ±30% 부근에선 거의 안 느껴지고(파도
+// 허용), 2배/반토막으로 벌어지면 급격히 끌어당긴다(가격이 무의미해지는 것만 방지).
 const BOT_BASE_PRICE = 1;
-const BOT_BASE_PULL = 0.00002;
+const BOT_BASE_PULL = 0.00004;
+const BOT_BASE_PULL_CURVE = 2.5; // |log 거리| 가 커질수록 복원력이 세지는 정도
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /** 표준정규 난수(Box-Muller) — 균등분포보다 꼬리가 있어 가격 움직임이 자연스럽다. */
@@ -894,13 +994,19 @@ function gauss(): number {
 /** 국면 전이 — 최소 지속시간을 지킨 뒤 심리/과열도에 따라 확률적으로 넘어간다.
  * 상승은 단계를 밟아 올라가지만(calm→rally→euphoria) 꼭대기에선 곧장 panic 으로 떨어질 수 있다.
  *
- * ⚠ 전이 확률이 이제 **고정 상수가 아니라 탐욕/공포 게이지의 함수**다(2026-08-12). 예전엔 "rally 에서
+ * ⚠ 전이 확률은 고정 상수가 아니라 **탐욕/공포 게이지의 함수**다(2026-08-12). 예전엔 "rally 에서
  * 20% 확률로 pullback" 처럼 무드와 무관한 주사위라, 국면 이름만 심리였지 정작 전환 시점은 심리와
  * 아무 상관이 없었다(무섭지 않은데 공포장이 시작되고, 다들 탐욕적인데 조용히 식었다). 지금은
- *  - 탐욕이 강할수록 rally→euphoria 가 쉬워지고(추격매수),
+ *  - 무드가 쏠린 쪽 국면이 훨씬 잘 열리고(군중이 방향을 정한다),
+ *  - 탐욕이 달아오를수록 rally→euphoria 가 쉬워지고(추격매수),
  *  - **euphoria 는 오래 끌수록·많이 벌어질수록 무너지기 쉽다**(버블 피로 — 고정 34% 였을 땐 꼭대기가
  *    얼마나 높든 붕괴 확률이 같아서 "고점일수록 위험하다"는 감각이 없었다),
- *  - 공포가 극단이고 낙폭이 깊을 때만 panic→capitulation(투매)이 열린다. */
+ *  - 공포가 극단이고 낙폭이 깊을 때만 panic→capitulation(투매)이 열린다.
+ *
+ * ⚠⚠ **확률의 기준선이 국면마다 하나(`REGIME_PARAMS.exit`)로 모였다**(2026-08-26). 예전엔 분기마다
+ * 0.13·0.26·0.34 같은 숫자가 흩어져 있어서 "이 국면이 평균 몇 틱 사는가"를 읽을 수 없었고, 그래서
+ * 아무도 그게 10틱짜리라는 걸 눈치채지 못했다. 지금은 평균 수명이 대략 `minTicks + 1/exit` 로 바로
+ * 읽히고, 심리 배수는 그 기준선에 곱해진다. */
 function nextRegime(
   s: BotState,
   stretch: number,
@@ -908,43 +1014,54 @@ function nextRegime(
   fear: number, // 0(평온) ~ 1(극단적 공포) — 최근 고점 대비 낙폭
   greed: number, // 0 ~ 1 — 최근 저점 대비 상승폭
 ): { regime: Regime; regimeTicks: number } {
+  const P = REGIME_PARAMS[s.regime];
   const age = s.regimeTicks + 1;
-  if (age < REGIME_PARAMS[s.regime].minTicks) return { regime: s.regime, regimeTicks: age };
+  if (age < P.minTicks) return { regime: s.regime, regimeTicks: age };
   const start = (regime: Regime) => ({ regime, regimeTicks: 0 });
   const roll = Math.random();
   switch (s.regime) {
-    case 'calm':
-      if (sentiment > 0.35 && roll < 0.18 + 0.16 * greed) return start('rally');
-      if (sentiment < -0.35 && roll < 0.14 + 0.18 * fear) return start('pullback');
-      if (roll < 0.04) return start(sentiment >= 0 ? 'rally' : 'pullback');
-      break;
-    case 'rally':
-      if (stretch > 0.02 && sentiment > 0.4 && roll < 0.18 + 0.25 * greed) return start('euphoria'); // 과열 진입(추격매수)
-      if (roll < 0.13 + 0.14 * fear) return start('pullback'); // 차익실현
-      if (roll < 0.26) return start('calm');
-      break;
-    case 'euphoria': {
-      // 버블 피로 — 오래 버틸수록, 적정가에서 멀어질수록 붕괴 확률이 커진다(최대 78%).
-      const fatigue = clamp(0.16 + 0.035 * age + 6 * Math.max(0, stretch), 0, 0.78);
-      if (roll < fatigue) return start('panic'); // 꼭대기에서 곧장 급락 — 상승보다 하락이 빠르다
-      if (roll < fatigue + 0.2) return start('pullback');
+    case 'calm': {
+      // 조용한 장은 스스로 깨지지 않는다 — 무드가 한쪽으로 쏠려야 방향이 생긴다.
+      const up = P.exit * (0.6 + 2.4 * Math.max(0, sentiment) + 1.5 * greed);
+      const down = P.exit * (0.55 + 2.2 * Math.max(0, -sentiment) + 1.3 * fear);
+      if (roll < up) return start('rally');
+      if (roll < up + down) return start('pullback');
       break;
     }
-    case 'pullback':
-      if (stretch < -0.02 && sentiment < -0.4 && roll < 0.16 + 0.2 * fear) return start('panic'); // 투매 전환
-      if (roll < 0.28) return start('calm');
-      if (roll < 0.42) return start('rally'); // 저가 매수 유입
+    case 'rally': {
+      // 과열 진입(추격매수) — 여기서 급등이 나온다. 적정가 위로 충분히 올라오고 무드가 탐욕일 때만.
+      const heat = stretch > 0.010 && sentiment > 0.25 ? P.exit * (1.1 + 4.5 * greed) : 0;
+      const cool = P.exit * (0.85 + 1.8 * fear);
+      if (roll < heat) return start('euphoria');
+      if (roll < heat + cool) return start(sentiment < -0.1 || fear > 0.3 ? 'pullback' : 'calm');
       break;
-    case 'panic':
+    }
+    case 'euphoria': {
+      // 버블 피로 — 오래 버틸수록, 적정가에서 멀어질수록 무너지기 쉽다.
+      const fatigue = clamp(P.exit * (1 + 0.03 * age) + 1.4 * Math.max(0, stretch - 0.02), 0, 0.4);
+      if (roll < fatigue) return start('panic'); // 꼭대기에서 곧장 급락 — 상승보다 하락이 빠르다
+      if (roll < fatigue + P.exit) return start('pullback');
+      break;
+    }
+    case 'pullback': {
+      const crack = stretch < -0.015 && sentiment < -0.4 && fear > 0.45 ? P.exit * (0.4 + 1.5 * fear) : 0; // 투매 전환
+      const heal = P.exit * (0.85 + 1.7 * greed);
+      if (roll < crack) return start('panic');
+      if (roll < crack + heal) return start(sentiment > 0.1 || greed > 0.3 ? 'rally' : 'calm');
+      break;
+    }
+    case 'panic': {
       // 공포가 바닥까지 갔을 때만 열리는 마지막 단계 — 투매(항복). 짧고 격렬하다.
-      if (fear > 0.9 && sentiment < -0.7 && roll < 0.03) return start('capitulation');
-      if (roll < 0.34) return start('calm'); // 진정
-      if (roll < 0.46) return start('rally'); // 데드캣 바운스
+      const flush = fear > 0.8 && sentiment < -0.6 ? P.exit * 0.35 : 0;
+      const settle = P.exit * (0.9 + 1.5 * greed);
+      if (roll < flush) return start('capitulation');
+      if (roll < flush + settle) return start(roll < flush + settle * 0.3 ? 'rally' : 'calm'); // 데드캣 바운스 / 진정
       break;
+    }
     case 'capitulation':
-      // 투매는 오래 못 간다 — 팔 사람이 다 팔고 나면 반등한다(V 바닥). 평균 3~4틱.
-      if (roll < 0.5) return start('rally'); // 안도 랠리
-      if (roll < 0.8) return start('calm');
+      // 투매는 오래 못 간다 — 팔 사람이 다 팔고 나면 반등한다(V 바닥).
+      if (roll < P.exit * 0.6) return start('rally'); // 안도 랠리
+      if (roll < P.exit) return start('calm');
       break;
   }
   return { regime: s.regime, regimeTicks: age };
@@ -981,20 +1098,36 @@ export function nextMarketState(s: BotState): {
   //    커지고 상한(clamp)에 붙어버린다.
   const volEff = vol * (1 + 0.4 * fear);
 
-  // 2) 추세 지속 — 방향이 한 번 잡히면 감쇠하며 몇 틱 이어진다.
-  const drift = s.drift * 0.86 + gauss() * 0.0004 * vol;
+  // 2) 추세 지속(모멘텀) — 방향이 한 번 잡히면 감쇠하며 이어진다(반감기 ≈ 11틱).
+  let drift = s.drift * DRIFT_PERSIST + gauss() * DRIFT_NOISE * vol;
+
+  // 2b) 사건 — 최근 고점 돌파(FOMO 추격매수)와 최근 저점 붕괴(손절 연쇄). 실제 차트에서 사람이 읽는
+  //     사건은 대부분 이 둘이다. ⚠ **연쇄가 추격보다 크고 자주** 터진다(계단으로 오르고 엘리베이터로
+  //     떨어진다). 그 방향으로 이미 쏠려 있을 때만 발동하므로 평상시엔 아무 일도 안 일어난다.
+  //     ⚠⚠ 킥은 `ret` 이 아니라 **`drift` 에 꽂는다**(2026-08-26) — 예전처럼 그 틱에만 더하면 한 틱
+  //     튀고 끝나서 다음 봉이면 흔적이 없었다. drift 에 넣으면 감쇠하며 여러 틱 이어져 "돌파 후 추격"
+  //     처럼 보인다(킥 k 는 총 k/(1-DRIFT_PERSIST) ≈ 17k 의 이동으로 풀린다).
+  let event = 0;
+  if (s.ref >= peak - EPS && s.sentiment > 0.3 && Math.random() < FOMO_CHANCE) {
+    event = FOMO_KICK * (0.5 + Math.random()) * volEff;
+  } else if (s.ref <= trough + EPS && s.sentiment < -0.3 && Math.random() < CASCADE_CHANCE) {
+    event = -CASCADE_KICK * (0.5 + Math.random()) * volEff;
+  }
+  drift = clamp(drift + event, -0.02, 0.02); // 안전장치 — 사건이 겹쳐도 틱당 2% 를 넘지 않는다
 
   // 3) 군중 심리 — 최근 추세·과열도·고저점 대비 위치가 쌓여 탐욕/공포가 된다(국면 전이의 방아쇠).
   //    ⚠ 여기에 **군집(herding)** 을 더했다: 무드는 자기 자신을 되먹여 한 번 쏠리면 한동안 유지된다
-  //    (s(1-s²) 라 극단에선 0 이 되어 포화 — 실효 지속계수 ≤ 0.96 이므로 발산 불가).
+  //    (s(1-s²) 라 극단에선 0 이 되어 포화 — 실효 지속계수 ≤ 0.98 이므로 발산 불가).
   const herd = HERD_GAIN * s.sentiment * (1 - s.sentiment * s.sentiment);
-  const sentiment = clamp(s.sentiment * 0.9 + herd + 40 * drift + 2.6 * stretch + 0.05 * (greed - 1.4 * fear), -1, 1);
+  const sentiment = clamp(s.sentiment * MOOD_PERSIST + herd + 45 * drift + 1.6 * stretch + 0.05 * (greed - 1.2 * fear), -1, 1);
 
   const { regime, regimeTicks } = nextRegime(s, stretch, sentiment, fear, greed);
   const P = REGIME_PARAMS[regime];
 
   // 4) 평균회귀 — 벌어질수록 제곱으로 강해진다(무한 발산 방지 + "너무 올랐다" 심리).
-  const revert = -0.045 * stretch - 0.7 * stretch * Math.abs(stretch);
+  //    ⚠ 선형항이 예전의 1/3 이다(§ REVERT_LIN) — 이게 강하면 국면 드리프트가 그 자리에서 취소돼
+  //    추세가 안 보이고 노이즈만 남는다.
+  const revert = -REVERT_LIN * stretch - REVERT_SQ * stretch * Math.abs(stretch);
 
   // 5) 라운드넘버 자석 — 심리적 지지/저항 근처에서 잠시 머뭇거린다.
   //    단 무드가 극단이면 그런 자리는 그냥 뚫고 지나간다(확신에 찬 군중은 저항을 안 본다).
@@ -1005,30 +1138,28 @@ export function nextMarketState(s: BotState): {
 
   // 6) 확신(conviction) — 국면 드리프트는 군중이 그 방향으로 쏠려 있을수록 세진다. 같은 rally 라도
   //    "다들 사고 있는 rally"가 더 가파르다.
-  const conviction = 1 + 0.7 * clamp(sentiment * Math.sign(P.bias), 0, 1);
+  const conviction = 1 + 0.9 * clamp(sentiment * Math.sign(P.bias), 0, 1);
 
-  // 7) 사건 — 최근 고점 돌파(FOMO 추격매수)와 최근 저점 붕괴(손절 연쇄). 실제 차트에서 사람이 읽는
-  //    사건은 대부분 이 둘이다. ⚠ **연쇄가 추격보다 크고 자주** 터진다(계단으로 오르고 엘리베이터로
-  //    떨어진다). 그 방향으로 이미 쏠려 있을 때만 발동하므로 평상시엔 아무 일도 안 일어난다.
-  let event = 0;
-  if (s.ref >= peak - EPS && sentiment > 0.35 && Math.random() < FOMO_CHANCE) {
-    event += FOMO_KICK * (0.5 + Math.random()) * volEff;
-  } else if (s.ref <= trough + EPS && sentiment < -0.35 && Math.random() < CASCADE_CHANCE) {
-    event -= CASCADE_KICK * (0.5 + Math.random()) * volEff;
-  }
-
-  // 8) 이번 틱 수익률 + 팻테일(가끔 튀는 급등락). 팻테일도 비대칭이다 — 공포장의 급락(투매 flush)이
+  // 7) 이번 틱 수익률 + 팻테일(가끔 튀는 급등락). 팻테일도 비대칭이다 — 공포장의 급락(투매 flush)이
   //    탐욕장의 급등(숏스퀴즈)보다 크고 잦다.
-  let ret = drift + revert + magnet + P.bias * conviction + event + gauss() * 0.00095 * volEff * P.volMult;
-  if (Math.random() < 0.03) ret *= 2 + Math.random() * 2;
-  if (fear > 0.5 && Math.random() < 0.008) ret -= (0.003 + 0.007 * Math.random()) * volEff;
-  else if (greed > 0.6 && Math.random() < 0.005) ret += (0.003 + 0.005 * Math.random()) * volEff;
+  //    ⚠ 순수 노이즈(TICK_NOISE)는 방향이 없어서 키워봐야 봉만 지저분해진다 — 다이내믹함은 위의
+  //    drift·국면 bias·사건에서 나온다.
+  let ret = drift + revert + magnet + P.bias * conviction + gauss() * TICK_NOISE * volEff * P.volMult;
+  if (Math.random() < 0.025) ret *= 2 + Math.random() * 2;
+  if (fear > 0.5 && Math.random() < 0.008) ret -= (0.004 + 0.009 * Math.random()) * volEff;
+  else if (greed > 0.6 && Math.random() < 0.005) ret += (0.004 + 0.007 * Math.random()) * volEff;
 
   const ref = roundOx(clamp(s.ref * (1 + ret), 0.0001, 1e6));
 
-  // 9) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증(공포가 거래를 만든다).
+  // 8) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증(공포가 거래를 만든다).
+  //    ⚠ 탐욕 쪽에도 배수를 준다(2026-08-26) — "급등하면 매수도 많이 붙어야" 급등처럼 보인다. 예전엔
+  //    공포에만 배수가 붙어서 상승장은 조용하고 하락장만 시끄러웠다.
   const intensity = clamp(0.5 + Math.abs(ret) / 0.003, 0.45, 6);
-  const nextAnchor = anchor * 0.99 + ref * 0.01;
+  const nextAnchor = anchor * (1 - ANCHOR_FOLLOW) + ref * ANCHOR_FOLLOW;
+  // 적정가는 가격을 느리게 따라가되(장기 추세 허용), 기준선에서 멀어질수록 **제곱으로** 세지는 약한
+  // 복원력에 끌린다(§ BOT_BASE_PULL) — ±30% 파도는 그대로 두고 몇 배 표류만 막는다.
+  const dev = Math.log(nextAnchor / BOT_BASE_PRICE);
+  const tether = clamp(BOT_BASE_PULL * dev * (1 + BOT_BASE_PULL_CURVE * Math.abs(dev)), -0.01, 0.01);
   // 호가 깊이의 비대칭 — 공포장엔 매수벽이 걷히고 매도벽이 쌓인다(그래서 같은 크기 시장가 매도라도
   // 패닉 때 훨씬 깊게 파고든다). 탐욕장은 반대. 심리가 가격뿐 아니라 유동성으로도 드러나는 부분이다.
   const lean = clamp(sentiment, -1, 1);
@@ -1038,8 +1169,7 @@ export function nextMarketState(s: BotState): {
       drift,
       vol,
       sentiment,
-      // 적정가는 가격을 느리게 따라가되(장기 추세 허용), 아주 약하게 기준선으로도 끌린다(무한 표류 방지).
-      anchor: nextAnchor + (BOT_BASE_PRICE - nextAnchor) * BOT_BASE_PULL,
+      anchor: nextAnchor * (1 - tether),
       regime,
       regimeTicks,
       // 고점/저점 기억은 새 극값이면 즉시 갱신되고, 아니면 현재가 쪽으로 서서히 잊힌다.
@@ -1047,7 +1177,7 @@ export function nextMarketState(s: BotState): {
       trough: Math.min(ref, trough + (ref - trough) * EXTREME_DECAY),
     },
     ret,
-    sizeMult: P.sizeMult * intensity * (1 + 0.5 * fear),
+    sizeMult: P.sizeMult * intensity * (1 + 0.5 * fear + 0.4 * greed),
     buyProb: clamp(0.5 + P.takerBias + 0.18 * lean + (ret >= 0 ? 0.18 : -0.18), 0.05, 0.95),
     // 변동성이 크면 마켓메이커가 물러나 호가가 벌어진다(국면 배수까지 곱하되 상한을 둔다 — 안 두면
     // 투매 때 깊은 레벨이 몇 %씩 벌어져 시장가 슬리피지가 비현실적으로 커진다).
@@ -1263,7 +1393,7 @@ export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: Wa
 // 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
 // 읽히고, 값이 비었거나(anchor=0=미초기화) 알 수 없는 regime 이면 안전한 기본값으로 떨어진다.
 const BOT_STATE_COLS =
-  'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, tape_json, live_json, pend_notional, pend_rows, pend_ticks';
+  'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, book_json, tape_json, live_json, pend_notional, pend_rows, pend_ticks';
 const REGIMES: readonly Regime[] = ['calm', 'rally', 'euphoria', 'pullback', 'panic', 'capitulation'];
 
 interface BotStateRow {
@@ -1277,6 +1407,7 @@ interface BotStateRow {
   regime_ticks: number;
   peak: number;   // 최근 고점 기억(0=미초기화 → 현재가로 시작)
   trough: number; // 최근 저점 기억(0=미초기화)
+  book_json: string | null; // 봇 호가 사다리(§ BotBook) — 게이트에 막힌 폴링도 이 값으로 호가창을 그린다
   tape_json: string | null; // 봇 합성 체결 링 버퍼(§ 봇 합성 체결 테이프) — 틱이 이어받아 append 한다
   live_json: string | null; // 진행 중(안 닫힌) 캔들 버킷들(§ live_json) — 닫힐 때만 spot_candles 로 넘어간다
   pend_notional: number;    // 아직 봇 수수료 카운터에 안 넘긴 합성체결 명목금액
@@ -1336,8 +1467,15 @@ const ROWS_PER_BOT_ACCRUAL = 4; // 정산 시 usage_meter 1 + 봇 2명 카운터
  * ⚠ 체결 시각은 절대 과거로 소급하지 않는다(마감된 봉이 변하던 버그) — 각 틱의 시각은 그 틱을 실제로
  * 실행하는 시점(단조 증가)이다. +10ms 는 틱 내부 체결끼리 겹치지 않게 하는 최소 간격.
  */
-async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0: number, ticks: number): Promise<number[]> {
-  if (ticks <= 0) return [];
+async function runBotTicks(
+  env: Env,
+  pair: string,
+  row: BotStateRow | null,
+  ref0: number,
+  ticks: number,
+): Promise<{ path: number[]; ctx: TickCtx }> {
+  const nothing: TickCtx = { book: null, tape: null, pendings: null };
+  if (ticks <= 0) return { path: [], ctx: nothing };
   // ⚠ 상태 행이 아직 없으면 먼저 만든다 — 아래 커밋은 `last_run` 가드가 붙은 UPDATE 라 행이 없으면
   // 0행이 되어 봇이 영원히 시작하지 못한다(가상 코인을 새로 개설한 직후가 정확히 그 상태다).
   if (!row) {
@@ -1348,13 +1486,18 @@ async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0
   // 이 실행이 "선점"한 시점 = 우리가 읽은 last_run. 커밋이 이 값을 가드로 써서, 그 사이 다른 요청이
   // 커밋했으면(값이 바뀌었으면) 이번 틱을 조용히 버린다(§ 커밋 = 선점).
   const guard = row?.last_run ?? 0;
-  const wallRows = (
+  // ⚠ 이 한 번의 조회가 **셋을 먹여 살린다**(2026-08-26): 벽 판정 · 아래 sweep · 호출자의 호가창 표시.
+  // 예전엔 셋이 각자 `pending_orders WHERE symbol=?` 를 읽어 `?tick=` 요청 하나가 같은 테이블을 세 번
+  // 스캔했다. 집계(GROUP BY)를 메모리로 옮겨도 **읽는 행 수는 같다** — SQLite 는 집계하려고 어차피
+  // 그 행들을 다 훑기 때문(§6 과금 모델). 즉 순수하게 쿼리 2개와 스캔 2번이 사라진다.
+  const pendings = (
     await env.DB.prepare(
-      'SELECT side, limit_price AS price, SUM(size) AS size FROM pending_orders WHERE symbol=? GROUP BY side, limit_price',
+      'SELECT id, user_id, side, limit_price AS price, size, reduce_only, last_fill_at FROM pending_orders WHERE symbol=?',
     )
       .bind(pair)
-      .all<WallRow>()
+      .all<PendingLite>()
   ).results;
+  const wallRows = wallsOf(pendings);
 
   let state = toBotState(row, ref0);
   let tape = parseTape(row?.tape_json);
@@ -1377,7 +1520,7 @@ async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0
     closed.push(...accrueLive(live, r.bar, ts));
     path.push(r.next.ref);
   }
-  if (!book) return path;
+  if (!book) return { path, ctx: { book: null, tape: null, pendings } };
 
   const stmts: D1PreparedStatement[] = [];
   // 닫힌 버킷만 테이블로 넘긴다(진행 중 버킷은 아래 상태 행에 그대로 남아 조회 때 병합된다).
@@ -1456,32 +1599,42 @@ async function runBotTicks(env: Env, pair: string, row: BotStateRow | null, ref0
   // 커밋이 0행이면 그 사이 다른 요청(폴링·cron)이 같은 상태에서 먼저 커밋한 것 -> 이번 틱은 없던 일이다.
   // 지나온 가격 경로도 빈 배열로 돌려야 한다: 커밋되지 않은 가격으로 트리거를 판정하면(cron 이 이
   // 반환값을 쓴다) 실제로 존재한 적 없는 딥/스파이크로 조건부·SL/TP 가 체결된다.
-  if (res[res.length - 1]?.meta.changes !== 1) return [];
+  if (res[res.length - 1]?.meta.changes !== 1) return { path: [], ctx: { book: null, tape: null, pendings } };
 
   // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
   // ⚠ 틱마다가 아니라 **커밋 뒤 한 번** — 호가창은 이 커밋으로 한 번 바뀌므로 그 이상은 낭비였다
   // (예전엔 버스트 12틱이면 sweep 도 12번 돌아 쿼리를 그만큼 먹었다).
-  await sweepRestingOxPendings(env, pair);
-  return path;
+  // ⚠ 대기 주문이 하나도 없으면 sweep 자체를 건너뛴다 — 위 조회가 이미 "없다"를 알려줬으므로 예전처럼
+  // 같은 테이블을 다시 읽어 빈 목록을 확인할 이유가 없다(가장 흔한 경로가 쿼리 0개가 된다).
+  const touched = pendings.length > 0 && (await sweepRestingOxPendings(env, pair, pendings));
+  // sweep 이 실제로 체결을 냈으면 우리가 든 사다리·대기목록은 이미 낡았다 → 호출자가 다시 읽게 한다.
+  return { path, ctx: touched ? { book: null, tape: null, pendings: null } : { book, tape, pendings } };
 }
 
-/** 폴링(유저 접속) 시 호출 — 재호가 게이트를 통과할 때만 한 틱을 돈다. */
-export async function runMarketMaker(env: Env, pair: string): Promise<void> {
+/** 폴링(유저 접속) 시 호출 — 재호가 게이트를 통과할 때만 한 틱을 돈다.
+ *
+ * ⚠ 반환값은 **이 요청이 이미 읽어둔 시장 스냅샷**(§ TickCtx)이다. 통합 폴링(`/api/state?tick=`)이
+ * 이걸 `loadSpotMarket` 에 그대로 넘겨 상태 행과 대기 주문을 다시 읽지 않게 한다 — 게이트에 막힌
+ * 폴링(가장 흔한 경로)도 여기서 읽은 행 하나로 호가창까지 그려진다. */
+export async function runMarketMaker(env: Env, pair: string): Promise<TickCtx> {
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`)
     .bind(pair)
     .first<BotStateRow>();
   const now = Date.now();
   const last = row?.last_run ?? 0;
 
+  // 게이트에 막혔거나 예산이 걸렸으면 틱은 없지만 **방금 읽은 행이 곧 현재 시장**이라 그대로 넘긴다
+  // (대기 주문은 안 읽었으므로 pendings=null → 호가창 쪽에서만 읽는다).
+  const asRead: TickCtx = { book: parseBook(row?.book_json), tape: parseTape(row?.tape_json), pendings: null };
   const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
-  if (now - last < gate) return; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
+  if (now - last < gate) return asRead; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
   // ⚠ 이번 달 D1 쓰기 예산을 넘겼으면 봇을 돌리지 않는다(§ _budget.ts) — 시장이 멈추는 건 아프지만
   // 예상 못 한 청구서보다는 낫다. 게이트를 통과한 틱에서만 물어보므로 조회가 폴링마다 늘지 않는다.
-  if (await autoWritesBlocked(env, 'bot')) return;
+  if (await autoWritesBlocked(env, 'bot')) return asRead;
 
   // ⚠ 선점(claim)용 UPDATE 는 없다 — 커밋 자체가 `last_run` 가드로 선점을 겸한다(§ runBotTicks 커밋).
   // 예전엔 여기서 last_run 만 찍는 조건부 upsert 를 한 번 더 날렸고, 그게 하루 4,688행이었다.
-  await runBotTicks(env, pair, row, await resolveRef(env, pair, row), 1);
+  return (await runBotTicks(env, pair, row, await resolveRef(env, pair, row), 1)).ctx;
 }
 
 /**
@@ -1500,7 +1653,7 @@ export async function runMarketMakerBurst(env: Env, pair: string, ticks: number 
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BotStateRow>();
   // ⚠ 상태 행이 없을 때의 부트스트랩은 runBotTicks 안으로 옮겼다 — 폴링 경로도 커밋이 가드 UPDATE 가
   // 되면서 같은 처리가 필요해졌고, 두 곳에 두면 한쪽만 고쳐질 여지가 생긴다.
-  return runBotTicks(env, pair, row, await resolveRef(env, pair, row), ticks);
+  return (await runBotTicks(env, pair, row, await resolveRef(env, pair, row), ticks)).path;
 }
 
 /** 유저가 OX 를 실제로 레버리지 거래(order.ts open/close)할 때 그 체결을 합성 시장에도 반영한다.
@@ -2126,13 +2279,9 @@ export async function matchReduceOnlyOxPending(env: Env, pendingId: string, aggr
  */
 export const PARTIAL_FILL_COOLDOWN_MS = 5_000;
 
-async function sweepRestingOxPendings(env: Env, pair: string): Promise<void> {
-  const pendings = (
-    await env.DB.prepare('SELECT id, reduce_only, last_fill_at FROM pending_orders WHERE symbol=?')
-      .bind(pair)
-      .all<{ id: string; reduce_only: number; last_fill_at: number | null }>()
-  ).results;
+async function sweepRestingOxPendings(env: Env, pair: string, pendings: PendingLite[]): Promise<boolean> {
   const now = Date.now();
+  let touched = false;
   // 이미 부분 체결된 주문이 하나라도 있으면 예산을 확인한다(없으면 조회조차 안 한다 — 흔한 경로가 공짜).
   const nibbling = pendings.some((p) => p.last_fill_at != null);
   const throttled = nibbling && (await autoWritesBlocked(env, 'nibble'));
@@ -2147,10 +2296,12 @@ async function sweepRestingOxPendings(env: Env, pair: string): Promise<void> {
       // ⚠ 여기서 체결되는 주문은 **이미 걸려 있던**(resting) 유저 지정가다 — 그걸 덮친 건 방금 깔린 봇
       // 호가이므로 taker 는 봇이고 유저는 maker 다. 그래서 체결내역 라벨은 유저 방향의 **반대**로 찍힌다
       // (실제 거래소도 그렇다: 내 매수 지정가가 시장가 매도에 채워지면 그 체결은 '매도'로 뜬다).
+      touched = true; // 매칭을 시도한 순간부터 사다리·대기목록 스냅샷은 못 믿는다(호출자가 다시 읽는다)
       if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id, 'bot');
       else await matchLimitPendingAgainstBook(env, p.id, 'bot');
     } catch {
       /* 한 건 실패해도 나머지는 계속 — 다음 틱에서 재시도 */
     }
   }
+  return touched;
 }

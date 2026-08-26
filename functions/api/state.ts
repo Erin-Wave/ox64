@@ -1,6 +1,6 @@
 import { type Ctx, bad, json, safe, missingEnv, getSession, loadState } from '../_shared';
 import { checkTriggers } from '../_trading';
-import { loadSpotMarket, loadSpotCandles, runMarketMaker, VIRTUAL_PAIRS } from './spot';
+import { loadSpotMarket, loadSpotCandles, runMarketMaker, VIRTUAL_PAIRS, type TickCtx } from './spot';
 
 /** GET /api/state — 로그인 사용자의 잔고+포지션+주문
  *
@@ -33,8 +33,11 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
       if (!VIRTUAL_PAIRS.includes(pair)) return bad('알 수 없는 페어');
       // 이 폴링이 곧 봇 마켓메이커 클럭이다(예전 /api/spot 폴링이 하던 역할). 봇 실패가 유저 요청을
       // 막으면 안 되지만 조용히 삼키지도 않는다 — 봇이 죽어도 화면은 멀쩡해 보여 원인 추적이 어렵다.
+      // ⚠ 반환된 컨텍스트(§ TickCtx)를 아래 loadSpotMarket 에 넘긴다 — 봇 틱이 이미 읽은 상태 행과
+      // 대기 주문을 호가창이 다시 읽지 않게 하는 것뿐이고, 실패하면 null 이라 예전처럼 각자 읽는다.
+      let tickCtx: TickCtx | undefined;
       try {
-        await runMarketMaker(env, pair);
+        tickCtx = await runMarketMaker(env, pair);
       } catch (e) {
         console.error(`[ox64] runMarketMaker(${pair}) failed:`, e instanceof Error ? e.message : e);
       }
@@ -42,7 +45,7 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
       const bars = Math.min(1000, Math.max(1, Number(url.searchParams.get('bars')) || 2));
       const wantState = url.searchParams.get('state') === '1';
       const [market, candles, state] = await Promise.all([
-        loadSpotMarket(env, sess.uid, pair),
+        loadSpotMarket(env, sess.uid, pair, tickCtx),
         loadSpotCandles(env, pair, interval, bars),
         // 계정 상태를 실을 때만 트리거 평가(checkTriggers)도 함께 돈다 = 이 요청이 체결 클럭이 된다.
         // 안 실을 땐 계정 데이터를 한 행도 읽지 않는다.
