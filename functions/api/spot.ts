@@ -980,7 +980,7 @@ function humanSize(raw: number): number {
 // 통째로 죽는다. 그래서 **로그 거리의 제곱으로** 세지게 했다 — ±30% 부근에선 거의 안 느껴지고(파도
 // 허용), 2배/반토막으로 벌어지면 급격히 끌어당긴다(가격이 무의미해지는 것만 방지).
 const BOT_BASE_PRICE = 1;
-const BOT_BASE_PULL = 0.00004;
+const BOT_BASE_PULL = 0.000012;
 const BOT_BASE_PULL_CURVE = 2.5; // |log 거리| 가 커질수록 복원력이 세지는 정도
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
