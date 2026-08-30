@@ -237,7 +237,7 @@ function candleUpsertOne(env: Env, pair: string, price: number, size: number, no
 /** 최근 체결을 interval 버킷으로 묶어 OHLCV 를 만든다(1s 등 단기 인터벌 + 영속 캔들 폴백 전용).
  * ⚠ 봇 합성 체결은 이제 테이블이 아니라 상태 행의 링 버퍼(tape_json)에 있다(§ 봇 합성 체결 테이프) —
  * 유저 체결(spot_trades)과 병합해서 버킷팅한다. 그래서 이 함수가 볼 수 있는 과거 범위는 링 버퍼 길이
- * (TAPE_MAX ≈ 90초)로 제한되는데, <60s 인터벌은 애초에 과거 페이지가 없고(loadSpotCandles) 기본
+ * ((TAPE_MAX ≈ 70초)로 제한되는데, <60s 인터벌은 애초에 과거 페이지가 없고(loadSpotCandles) 기본
  * 표시가 ~38봉이라 실사용엔 영향이 없다.
  * ⚠ 유저 체결 쪽은 반드시 "가장 최신"부터(DESC 로 뽑아 ASC 재정렬) — ASC LIMIT 이면 행이 한도를 넘는
  * 순간 새 거래가 창 밖으로 밀려 차트 마지막 봉이 멈춘다. */
@@ -436,10 +436,10 @@ export interface TapeTrade {
 }
 
 // 링 버퍼 길이 — 1s 캔들이 이 테이프를 버킷팅해 만들어지므로 "몇 초치까지 그릴 수 있나"를 정한다.
-// 봇이 초당 ~4.5건을 찍으므로 400건 ≈ 90초 ≈ 1s 봉 90개(차트 기본 표시가 ~38봉이라 넉넉하다. <60s 는
+// 봇이 초당 ~10건을 찍으므로 700건 ≈ 70초 ≈ 1s 봉 70개(차트 기본 표시가 ~38봉이라 넉넉하다. <60s 는
 // 애초에 과거 페이지가 없어 스크롤로 더 받아올 수도 없다 — loadSpotCandles 참고).
 // ⚠ 늘려도 rows written 은 그대로 1행이지만(비용 무관) 매 틱 직렬화/파싱하는 바이트가 커진다.
-const TAPE_MAX = 400;
+const TAPE_MAX = 700;
 
 /** JSON → 테이프. 컬럼이 비었거나(마이그레이션 직후) 깨졌으면 빈 배열 — 봇이 다음 틱부터 다시 채운다. */
 function parseTape(json: string | null | undefined): TapeTrade[] {
@@ -638,13 +638,24 @@ const BOT_TICK_MAX_MS = 950;
 // 같다 — 호가창은 가격대별 합계만 보여주므로). 8단계는 스프레드 근처 몇 줄만 차서 휑했다.
 const BOT_LEVELS_PER_SIDE = 22;
 
-// ⚠ 한 틱에 찍는 합성 체결의 개수·크기 — 예전엔 5~45 짜리 1건이라 캔들 거래량이 수백에 그쳤다("봇이
-// 쫄보"). 실제 시장처럼 보이도록 매 틱 여러 건을 큰 물량으로 찍는다(테이프도 붐비고 거래량도 유의미).
+// ⚠ 한 틱에 찍는 합성 체결의 개수·평균 크기 — 예전엔 5~45 짜리 1건이라 캔들 거래량이 수백에 그쳤다
+// ("봇이 쫄보"). 실제 시장처럼 보이도록 매 틱 여러 건을 찍는다(테이프도 붐비고 거래량도 유의미).
 // 아래 심리 모델이 국면·변동성에 따라 이 값에 배수를 걸어 "패닉엔 거래량 폭증, 잔잔할 땐 한산"을 만든다.
-const BOT_TRADES_PER_TICK_MIN = 3;
-const BOT_TRADES_PER_TICK_MAX = 6;
-const BOT_TRADE_SIZE_MIN = 1000;
-const BOT_TRADE_SIZE_MAX = 8000;
+//
+// ⚠⚠ 크기는 **평균값 하나**만 정하고 실제 수량은 `orderSize` 의 계층 분포에서 뽑는다(2026-08-31).
+// 예전엔 `uniform(1000, 8000)` 이라 체결 수량이 죄다 네 자리에 뭉쳐 있어서 **개미와 세력이 구분되지
+// 않았다**("수량이 네 자리 아니면 다섯 자리로만 나온다" 제보) — 실제 테이프는 100개짜리와 20만개짜리가
+// 섞여 흐른다. 겸사겸사 **건수를 2배로 늘리고 평균 크기를 절반으로** 낮췄다: 개미 체결이 실제로 보이려면
+// 건수가 있어야 하고, 곱이 그대로라 **캔들 거래량(=차트 히스토그램 스케일)은 변하지 않는다**.
+// 테이프는 링 버퍼 JSON 이라 건수를 늘려도 D1 쓰기·읽기는 그대로 1행이다(§6).
+const BOT_TRADES_PER_TICK_MIN = 6;
+const BOT_TRADES_PER_TICK_MAX = 14;
+// ⚠ 2,250 이 아니라 2,370 인 이유: 건수 clamp 상한이 12 → 26 으로 바뀌어 거래량이 폭증하는 국면
+// (sizeMult > 6.8)에서 옛 공식보다 5% 낮게 잘린다. 같은 심리 경로로 대조해 그만큼 올려 맞췄다
+// (실측 틱당 거래량 전 95,049 → 후 94,9xx). 캔들 거래량이 배포 전후로 달라 보이면 안 된다.
+const BOT_TRADE_MEAN = 2370;
+/** 호가 한 단계(가격대)의 평균 물량 — 이것도 여러 주문의 합으로 만든다(아래 placeQuote). */
+const BOOK_LEVEL_MEAN = 6000;
 const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에 몰아 돌리는 틱 수(시장이 계속 살아있게)
 // ⚠ cron 백오프 — "마지막 재호가가 이만큼 이내면 유저 폴링이 클럭 역할을 하는 중"으로 본다.
 // /api/spot 폴링은 1초 주기라 보고 있는 동안엔 last_run 이 항상 몇 초 이내다. 반대로 cron 이 직접 찍은
@@ -936,12 +947,6 @@ function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): {
 }
 
 /**
- * 주문 수량. ⚠ 예전엔 전부 1,000 / 5,000 처럼 딱 떨어지게 맞췄는데 그러면 그것대로 기계 같다 —
- * 실제 호가창은 여러 사람이 제각각 넣은 값이라 2,384 개 같은 어중간한 수량이 대부분이고, 딱 떨어지는
- * 수량은 가끔 섞일 뿐이다(가격과 달리 수량엔 라운드 넘버 심리가 약하다). 그래서 기본은 정수로만
- * 다듬고, 18% 만 눈에 띄게 떨어지는 수량으로 만든다.
- */
-/**
  * 유저가 걸어둔 "벽"을 한 틱에 얼마나 소비할지.
  *
  * ⚠ 예전엔 벽 크기와 무관하게 항상 2,000~10,000 이라, 100만주 벽이면 뚫는 데 수십 분이 걸리고 그동안
@@ -965,13 +970,57 @@ function wallAbsorbSize(wallSize: number, regime: Regime, sentiment: number): nu
   return humanSize(Math.min(wallSize, Math.max(floor, wallSize * pct)));
 }
 
-function humanSize(raw: number): number {
+/**
+ * 주문 수량 하나를 "사람이 넣은 것처럼" 다듬는다. ⚠ 예전엔 전부 1,000 / 5,000 처럼 딱 떨어지게 맞췄는데
+ * 그러면 그것대로 기계 같다 — 실제 호가창은 여러 사람이 제각각 넣은 값이라 2,384 개 같은 어중간한 수량이
+ * 대부분이고, 딱 떨어지는 수량은 가끔 섞일 뿐이다(가격과 달리 수량엔 라운드 넘버 심리가 약하다).
+ * ⚠ 라운드로 만들 확률은 **계층마다 다르다**(2026-08-31) — 개미는 "100개/500개"처럼 손으로 딱 떨어지게
+ * 넣고, 세력·알고리즘은 큰 물량을 잘게 쪼개 넣으므로(아이스버그) 어중간한 수량이 나온다. 격자도 값 크기를
+ * 따라가야 한다(140 개를 5,000 격자로 반올림하면 개미 주문이 통째로 사라진다).
+ */
+function humanSize(raw: number, roundProb = 0.18): number {
   const v = Math.max(1, raw);
-  if (Math.random() < 0.18) {
-    const step = v >= 20000 ? 5000 : v >= 8000 ? 1000 : v >= 2000 ? 500 : 100;
+  if (Math.random() < roundProb) {
+    const step =
+      v >= 20000 ? 5000 : v >= 8000 ? 1000 : v >= 2000 ? 500 : v >= 800 ? 100 : v >= 200 ? 50 : v >= 80 ? 10 : 5;
     return Math.max(step, Math.round(v / step) * step);
   }
   return Math.round(v);
+}
+
+// ── 개미 · 세력 · 고래 — 주문 크기의 계층 분포(2026-08-31) ────────────────────
+// ⚠ 예전엔 체결도 호가도 `uniform(1000, 8000)` / `uniform(2000, 10000)` 한 줄이라 **모든 수량이 네다섯
+// 자리에 뭉쳐 있었다**("수량이 네 자리 아니면 다섯 자리로만 나온다 — 개미와 세력이 구분이 안 된다" 제보).
+// 실제 거래소의 주문 크기는 균등분포가 아니라 **멱함수(로그 스케일에서 넓게 퍼진) 분포**다: 건수의 절반
+// 이상은 개미가 만들고, 거래량의 대부분은 소수의 세력·고래가 만든다. 그래서 계층을 먼저 뽑고(가중치 w)
+// 그 계층 안에서 **로그균등**으로 배수를 뽑는다 — 로그균등이라 같은 계층 안에서도 자릿수가 흩어진다.
+//
+// lo/hi 는 "평균 대비 배수"라 이 표는 가격대·국면과 무관하게 재사용된다(호출자가 평균만 정한다).
+// ⚠ 합이 정확히 1 이어야 한다(마지막 계층으로 폴백하므로 넘치면 그쪽이 조용히 커진다).
+const SIZE_TIERS: readonly { w: number; lo: number; hi: number; round: number }[] = [
+  { w: 0.56, lo: 0.012, hi: 0.16, round: 0.55 }, // 개미 — 건수는 절반 이상이지만 거래량 몫은 2%
+  { w: 0.3, lo: 0.16, hi: 1.3, round: 0.3 },     // 일반 개인
+  { w: 0.115, lo: 1.3, hi: 10, round: 0.12 },    // 세력(기관·알고리즘) — 거래량의 3분의 1
+  { w: 0.025, lo: 10, hi: 70, round: 0.06 },     // 고래 — 40건에 1건인데 거래량의 절반을 만든다
+];
+// 로그균등 U(lo,hi) 의 기댓값은 (hi-lo)/ln(hi/lo). 계층 가중 평균이 1 이 되도록 나눠 주면 호출자가 준
+// `mean` 이 실제 평균과 일치한다 — 이 정규화가 있어야 분포를 손봐도 **캔들 거래량이 흔들리지 않는다**.
+const SIZE_TIER_MEAN = SIZE_TIERS.reduce((sum, t) => sum + (t.w * (t.hi - t.lo)) / Math.log(t.hi / t.lo), 0);
+
+/** 평균이 `mean` 인 주문 수량 하나(계층 혼합 + 계층별 라운드 넘버 심리). */
+function orderSize(mean: number): number {
+  const u = Math.random();
+  let acc = 0;
+  let tier = SIZE_TIERS[SIZE_TIERS.length - 1];
+  for (const t of SIZE_TIERS) {
+    acc += t.w;
+    if (u < acc) {
+      tier = t;
+      break;
+    }
+  }
+  const mult = tier.lo * Math.pow(tier.hi / tier.lo, Math.random()); // 계층 안에서 로그균등
+  return humanSize((mean * mult) / SIZE_TIER_MEAN, tier.round);
 }
 // 적정가(anchor)가 아주 약하게 끌려가는 장기 기준선. 국면 bias 를 아무리 맞춰도 랜덤워크는 며칠 단위로
 // 얼마든지 멀리 갈 수 있어서(0 에 붙거나 수십 배로 뜀), 약한 복원력을 하나 둔다.
@@ -1309,10 +1358,16 @@ export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: Wa
     // 광기든 호가창은 똑같이 생겼고 심리는 가격에서만 보였다. 지금은 공포장이면 매수벽이 걷히고
     // (시장가 매도가 훨씬 깊게 파고든다) 매도벽이 쌓인다 — 탐욕장은 반대.
     const depthMult = side === 'buy' ? step.bidDepthMult : step.askDepthMult;
-    (side === 'buy' ? book.bids : book.asks).push({
-      price,
-      size: humanSize((2000 + Math.random() * 8000) * sizeMult * depthMult),
-    });
+    // ⚠ 한 가격대의 물량은 "그 자리에 걸린 **여러 주문의 합**"이다(호가창은 가격별 SUM 만 보여준다).
+    // 그래서 1~3명이 각자 계층 분포(orderSize)에서 뽑은 수량을 합친다 — 어떤 자리는 개미 하나뿐이라
+    // 얇고(수백 개) 어떤 자리는 세력이 껴서 두껍다(수만~수십만). 예전엔 전 레벨이 2,000~10,000 균등이라
+    // 호가창이 어디를 봐도 같은 자릿수였고, 시장가가 어느 구간을 지나든 저항이 똑같았다.
+    // 깊은 레벨일수록 대기 물량이 두껍다(depthTilt) — 평균이 1 이라 **총 유동성은 예전과 같다**.
+    const depthTilt = 0.6 + 0.8 * depth;
+    const orders = 1 + Math.floor(Math.random() * 3);
+    let size = 0;
+    for (let i = 0; i < orders; i++) size += orderSize((BOOK_LEVEL_MEAN * sizeMult * depthMult * depthTilt) / orders);
+    (side === 'buy' ? book.bids : book.asks).push({ price, size });
   };
   for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
     const depth = level / (BOT_LEVELS_PER_SIDE - 1);
@@ -1334,12 +1389,15 @@ export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: Wa
   // 합성 체결을 여러 건 찍는다. ⚠ 예전엔 전부 같은 가격(ref)이라 봉 안에 구조가 없었다(몸통만 있고
   // 꼬리가 없는 캔들) — 지금은 직전 기준가에서 새 기준가로 "걸어가면서" 노이즈를 얹어 찍으므로 봉마다
   // 시가/고가/저가/종가가 제대로 생긴다. 마지막 체결은 정확히 ref(=종가)로 맞춰 기준가와 어긋나지 않게.
-  // 건수·크기는 심리 모델의 sizeMult(국면·움직임 크기)에 비례하고, 드물게 고래 물량이 섞인다.
+  // 건수·크기는 심리 모델의 sizeMult(국면·움직임 크기)에 비례한다 — 건수는 √배, 평균 크기는 1배로
+  // 나눠 걸어서 거래량이 sizeMult^1.5 로 반응한다(패닉엔 "자주 그리고 크게" 체결된다).
+  // ⚠ 개별 수량은 여기서 정하지 않는다 — 계층 분포(orderSize)가 개미/세력/고래를 섞는다.
   const nTrades = clamp(
     Math.round((BOT_TRADES_PER_TICK_MIN + Math.random() * (BOT_TRADES_PER_TICK_MAX - BOT_TRADES_PER_TICK_MIN)) * Math.sqrt(step.sizeMult)),
-    2,
-    12,
+    3,
+    26,
   );
+  const tradeMean = BOT_TRADE_MEAN * step.sizeMult;
   let volume = 0;
   let notionalSum = 0; // 봇 수수료 산정용(합성 체결의 명목금액 합)
   let high = ref;
@@ -1361,7 +1419,13 @@ export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: Wa
   for (let i = 0; i < nTrades; i++) {
     const progress = (i + 1) / nTrades;
     const walk = prev.ref + (ref - prev.ref) * progress;
-    const jitter = 1 + gauss() * 0.0005 * step.next.vol;
+    // ⚠ 수량을 **가격보다 먼저** 뽑는다 — 큰 체결일수록 그 자리에서 가격을 더 밀어내야 하기 때문이다
+    // (시장충격). 개미 체결은 최우선호가 하나를 먹고 끝이라 가격이 거의 안 움직이고, 고래가 들어오면
+    // 여러 단계를 관통해 봉에 꼬리가 남는다. 예전엔 크기와 가격이 완전히 독립이라 테이프에 20만개가
+    // 찍혀도 차트는 아무 일 없다는 듯 흘렀다("세력이 밀어올렸다"가 어디에도 안 보였다).
+    const sz = orderSize(tradeMean);
+    const impact = Math.min(4.5, 0.55 + 0.75 * Math.sqrt(sz / tradeMean));
+    const jitter = 1 + gauss() * 0.0005 * step.next.vol * impact;
     // 체결도 호가창과 같은 이유로 라운드 가격에 몰린다 — 실제 시장에서 체결은 "거기 걸려 있던 호가"
     // 가격에 일어나는데, 그 호가들이 위 humanQuotePrice 로 라운드 가격에 뭉쳐 있기 때문. 테이프만
     // 어중간한 값이면 호가창과 따로 노는 시장으로 보인다. 마지막 체결은 기준가(=종가)와 정확히 일치시킨다.
@@ -1375,9 +1439,6 @@ export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: Wa
     high = Math.max(high, price);
     low = Math.min(low, price);
 
-    let sz = (BOT_TRADE_SIZE_MIN + Math.random() * (BOT_TRADE_SIZE_MAX - BOT_TRADE_SIZE_MIN)) * step.sizeMult;
-    if (Math.random() < 0.04) sz *= 2.5 + Math.random() * 4; // 가끔 고래가 크게 친다(팻테일 거래량)
-    sz = humanSize(sz);
     volume += sz;
     notionalSum += price * sz;
 
