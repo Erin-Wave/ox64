@@ -109,11 +109,12 @@ const PERSIST_INTERVALS: readonly [string, number][] = [
 ];
 
 /** 한 묶음의 체결(OHLCV)을 모든 영속 인터벌의 캔들에 반영하는 upsert 문장들.
- * 버킷이 없으면 새로 만들고(open 은 이때만 기록), 있으면 high/low/close/volume 만 갱신(open 유지).
+ * 버킷이 없으면 새로 만들고, 있으면 시각을 비교해 open/close 를 골라 넣고 high/low/volume 을 누적한다.
  * 모든 spot_trades INSERT 경로가 이 문장들을 같은 batch 에 함께 넣어 차트 히스토리를 영구 보존한다.
  * ⚠ 여기 넘기는 값은 반드시 같은 batch 에 INSERT 하는 spot_trades 들과 일치해야 한다 — 어긋나면
  * 캔들과 체결내역이 서로 다른 시장을 보여주게 된다(마켓메이커 한 틱은 여러 건을 찍으므로 그 묶음의
- * OHLC 를 그대로 넘긴다). now 가 과거면 이미 마감된 봉이 변조되므로 항상 현재 이후 시각일 것. */
+ * OHLC 를 그대로 넘긴다). now 가 과거면 이미 마감된 봉이 변조되므로 항상 현재 이후 시각일 것.
+ * 이 경로는 유저 체결(한 순간에 끝난다)이라 시가·종가 시각이 둘 다 now 다. */
 function candleUpsertStmts(
   env: Env,
   pair: string,
@@ -122,17 +123,33 @@ function candleUpsertStmts(
 ): D1PreparedStatement[] {
   return PERSIST_INTERVALS.map(([code, sec]) => {
     const bucket = Math.floor(now / (sec * 1000)) * (sec * 1000);
-    return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, bucket, bar.open, bar.high, bar.low, bar.close, bar.volume);
+    return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, bucket, bar.open, bar.high, bar.low, bar.close, bar.volume, now, now);
   });
 }
 
 // ⚠ 누적 upsert 라 같은 버킷에 여러 번 써도 값이 맞는다(high/low 는 극값, volume 은 합). 이 성질 덕에
 // "봇은 버킷이 닫힐 때 자기 몫을 한 번에" / "유저 체결은 그때그때" 따로 써도 결과가 정확히 합쳐진다.
-const CANDLE_UPSERT_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)
+//
+// ⚠⚠ **open/close 는 "먼저 쓴 쪽"이 아니라 "먼저 체결된 쪽"이 이긴다**(2026-09-02 버그 수정).
+// 예전엔 `open` 을 ON CONFLICT 에서 아예 건드리지 않아 **그 버킷에 먼저 INSERT 한 쪽이 시가를 가졌다**.
+// 그건 봇이 틱마다 테이블을 쓰던 시절엔 맞는 근사였지만(봇이 초당 몇 번 도니 거의 항상 봇이 먼저였다),
+// 2026-08-14 에 봇 캔들을 live_json 에 모았다가 **버킷이 닫힐 때만** flush 하게 바꾸면서 그 전제가 무너졌다 —
+// 진행 중인 버킷엔 봇의 행이 아예 없으므로 **유저 체결이 항상 첫 INSERT**가 되고, 그 버킷의 시가가 통째로
+// 유저의 체결가(시장가 walking 이라 슬리피지 포함)로 덮였다. 1m 뿐 아니라 1h·1d 도 같이 오염되고
+// (그것들이 5m/4h 롤업의 원본이다), flush 가 open 을 안 건드리므로 그 오차가 **영구히 남았다**.
+// 진짜 불변식은 "open = 그 버킷의 가장 이른 체결가 / close = 가장 늦은 체결가" 이고, 그걸 쓰는 주체가
+// 둘(봇 flush / 유저 체결)이라 **시각을 같이 써야만** 가릴 수 있다 — 그게 open_at/close_at 이다.
+// (컬럼을 늘려도 인덱스가 안 늘어 **쓰기 행 수는 그대로**다, §6 과금 모델.)
+// ⚠ 마이그레이션 전 행은 open_at=0 이라 새 쓰기가 open 을 못 이긴다(= 예전 동작 유지). 배포 시점에
+// 진행 중이던 버킷 하나만 해당되고 그 뒤로는 자연히 해소된다.
+const CANDLE_UPSERT_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume, open_at, close_at) VALUES (?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(pair, interval, bucket) DO UPDATE SET
+         open = CASE WHEN excluded.open_at < spot_candles.open_at THEN excluded.open ELSE spot_candles.open END,
+         open_at = MIN(spot_candles.open_at, excluded.open_at),
          high = MAX(spot_candles.high, excluded.high),
          low = MIN(spot_candles.low, excluded.low),
-         close = excluded.close,
+         close = CASE WHEN excluded.close_at >= spot_candles.close_at THEN excluded.close ELSE spot_candles.close END,
+         close_at = MAX(spot_candles.close_at, excluded.close_at),
          volume = spot_candles.volume + excluded.volume`;
 
 // ── 진행 중(안 닫힌) 캔들 버킷 = spot_bot_state.live_json (2026-08-14, § D1 예산) ─────────────
@@ -140,6 +157,19 @@ const CANDLE_UPSERT_SQL = `INSERT INTO spot_candles (pair, interval, bucket, ope
 // 들고 있는 것이다(사다리·테이프와 정확히 같은 실수). 여기 누적했다가 **버킷이 닫힐 때만** 테이블로
 // 넘긴다 → 1m 은 분당 1행, 1h 은 시간당 1행. 진행 중 버킷은 loadSpotCandles 가 읽을 때 붙여주므로
 // 차트의 마지막 봉은 예전과 똑같이 실시간으로 움직인다.
+/** 영속 캔들 한 행(읽기 경로). open_at/close_at 은 시가·종가가 찍힌 시각 — 진행 중 버킷을 병합할 때
+ * "봇과 유저 중 누가 먼저/나중에 찍었나"를 가리는 데 쓴다(§ CANDLE_UPSERT_SQL). */
+interface CandleRow {
+  bucket: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  open_at: number;
+  close_at: number;
+}
+
 interface LiveBar {
   b: number; // 버킷 시작 시각(ms)
   o: number;
@@ -147,6 +177,10 @@ interface LiveBar {
   l: number;
   c: number;
   v: number;
+  // 시가/종가가 **찍힌 시각**(§ CANDLE_UPSERT_SQL). 같은 버킷을 유저 체결도 쓰기 때문에, flush 할 때
+  // "봇의 첫 틱이 유저 체결보다 빨랐나"를 이 값으로 가린다 — 없으면 먼저 INSERT 한 쪽이 시가를 가져간다.
+  ot?: number;
+  ct?: number;
 }
 type LiveBars = Record<string, LiveBar>;
 
@@ -158,7 +192,10 @@ function parseLive(json: string | null | undefined): LiveBars {
     // 손상된 항목은 조용히 버린다 — 진행 중 봉 하나를 잃을 뿐이고, 다음 틱이 새로 시작한다.
     const out: LiveBars = {};
     for (const [code, b] of Object.entries(v)) {
-      if (b && typeof b.b === 'number' && typeof b.c === 'number') out[code] = b;
+      if (!b || typeof b.b !== 'number' || typeof b.c !== 'number') continue;
+      // 옛 형식(시각 없음)은 "버킷 시작 시각에 열렸다"로 본다 — 봇 틱은 버킷 맨 앞부터 도니 그게 맞고,
+      // 다음 틱이 곧바로 실제 값으로 덮는다(ct 는 매 틱 갱신).
+      out[code] = { ...b, ot: typeof b.ot === 'number' ? b.ot : b.b, ct: typeof b.ct === 'number' ? b.ct : b.b };
     }
     return out;
   } catch {
@@ -176,12 +213,13 @@ function accrueLive(live: LiveBars, bar: { open: number; high: number; low: numb
       // ⚠ 과거 버킷일 때만 넘긴다 — 시계가 뒤로 가는 이상 상황에서 미래 버킷을 "닫힌 것"으로 쓰면
       // 이미 마감된 봉을 다시 건드리게 된다(§ 마감된 봉은 불변).
       if (cur && cur.b < bucket) closed.push({ code, bar: cur });
-      live[code] = { b: bucket, o: bar.open, h: bar.high, l: bar.low, c: bar.close, v: bar.volume };
+      live[code] = { b: bucket, o: bar.open, h: bar.high, l: bar.low, c: bar.close, v: bar.volume, ot: now, ct: now };
     } else {
       cur.h = Math.max(cur.h, bar.high);
       cur.l = Math.min(cur.l, bar.low);
       cur.c = bar.close;
       cur.v += bar.volume;
+      cur.ct = now;
     }
   }
   return closed;
@@ -197,35 +235,50 @@ function accrueLive(live: LiveBars, bar: { open: number; high: number; low: numb
  * ⚠ `INSERT ... SELECT ... ON CONFLICT` 는 파서가 ON 을 조인으로 볼 수 있어 **WHERE 절이 반드시**
  * 있어야 한다(SQLite 문서의 우회법) — 여기선 그 WHERE 가 곧 가드다. */
 function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar, guardLastRun?: number): D1PreparedStatement {
-  if (guardLastRun === undefined) return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v);
-  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, pair, guardLastRun);
+  const ot = b.ot ?? b.b;
+  const ct = b.ct ?? b.b;
+  if (guardLastRun === undefined) return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct);
+  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, pair, guardLastRun);
 }
 
-const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume)
-       SELECT ?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ?)
+const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume, open_at, close_at)
+       SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ?)
        ON CONFLICT(pair, interval, bucket) DO UPDATE SET
+         open = CASE WHEN excluded.open_at < spot_candles.open_at THEN excluded.open ELSE spot_candles.open END,
+         open_at = MIN(spot_candles.open_at, excluded.open_at),
          high = MAX(spot_candles.high, excluded.high),
          low = MIN(spot_candles.low, excluded.low),
-         close = excluded.close,
+         close = CASE WHEN excluded.close_at >= spot_candles.close_at THEN excluded.close ELSE spot_candles.close END,
+         close_at = MAX(spot_candles.close_at, excluded.close_at),
          volume = spot_candles.volume + excluded.volume`;
 
 /** 읽기 경로용 — 진행 중 버킷을 (이미 읽어온) 영속 봉 배열 뒤에 병합한다.
  * ⚠ 같은 버킷의 행이 이미 있을 수 있다(그 사이 **유저 체결**이 직접 upsert 했을 때) → 겹치면 합친다.
  * 두 쪽은 서로 다른 체결 묶음이라 volume 은 더하는 게 맞다(중복 아님).
- * ⚠ open 은 먼저 쓴 쪽 것이 남는다 — 봇이 초당 몇 번씩 도니 거의 항상 봇의 첫 체결가지만, 그 버킷에
- * 유저 체결이 먼저 들어온 드문 경우엔 유저 체결가가 시가가 된다(같은 봉 안의 값이라 시각적으로 무해). */
-function mergeLiveBar(asc: { bucket: number; open: number; high: number; low: number; close: number; volume: number }[], live: LiveBar | undefined) {
+ * ⚠ open/close 는 **시각으로** 가린다 — 커밋 경로(CANDLE_UPSERT_SQL)와 정확히 같은 규칙이어야 한다.
+ * 안 그러면 버킷이 닫히는 순간(진행 중 → 테이블) 시가가 바뀌어 보인다. 진행 중인 봉은 거의 항상 봇이
+ * 먼저 열었으므로(봇 틱은 버킷 맨 앞부터 돈다) 유저가 그 버킷에 시장가를 내도 시가는 그대로 유지된다. */
+function mergeLiveBar(asc: CandleRow[], live: LiveBar | undefined) {
   if (!live) return asc;
+  const ot = live.ot ?? live.b;
+  const ct = live.ct ?? live.b;
   const last = asc[asc.length - 1];
   if (last && last.bucket === live.b) {
+    if (ot < last.open_at) {
+      last.open = live.o;
+      last.open_at = ot;
+    }
     last.high = Math.max(last.high, live.h);
     last.low = Math.min(last.low, live.l);
-    last.close = live.c;
+    if (ct >= last.close_at) {
+      last.close = live.c;
+      last.close_at = ct;
+    }
     last.volume += live.v;
     return asc;
   }
   if (last && live.b < last.bucket) return asc; // 이미 넘어간 버킷(경합) — 무시
-  asc.push({ bucket: live.b, open: live.o, high: live.h, low: live.l, close: live.c, volume: live.v });
+  asc.push({ bucket: live.b, open: live.o, high: live.h, low: live.l, close: live.c, volume: live.v, open_at: ot, close_at: ct });
   return asc;
 }
 
@@ -300,11 +353,11 @@ export async function loadSpotCandles(env: Env, pair: string, intervalCode: stri
   const [rowsRes, liveRow] = await Promise.all([
     env.DB.prepare(
       endTimeMs
-        ? 'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
-        : 'SELECT bucket, open, high, low, close, volume FROM spot_candles WHERE pair = ? AND interval = ? ORDER BY bucket DESC LIMIT ?',
+        ? 'SELECT bucket, open, high, low, close, volume, open_at, close_at FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
+        : 'SELECT bucket, open, high, low, close, volume, open_at, close_at FROM spot_candles WHERE pair = ? AND interval = ? ORDER BY bucket DESC LIMIT ?',
     )
       .bind(...(endTimeMs ? [pair, srcCode, endTimeMs, limit * ratio] : [pair, srcCode, limit * ratio]))
-      .all<{ bucket: number; open: number; high: number; low: number; close: number; volume: number }>(),
+      .all<CandleRow>(),
     endTimeMs
       ? Promise.resolve(null)
       : env.DB.prepare('SELECT live_json FROM spot_bot_state WHERE id = ?').bind(pair).first<{ live_json: string | null }>(),

@@ -248,6 +248,13 @@ CREATE TABLE IF NOT EXISTS spot_candles (
   low      REAL NOT NULL,
   close    REAL NOT NULL,
   volume   REAL NOT NULL DEFAULT 0,
+  -- ⚠ 시가/종가가 **찍힌 시각**(ms). 한 버킷을 쓰는 주체가 둘이라(봇은 버킷이 닫힐 때 live_json 을
+  -- flush, 유저 체결은 그때그때) "먼저 INSERT 한 쪽"이 아니라 "먼저/나중에 체결된 쪽"이 시가/종가를
+  -- 갖게 하려면 시각이 필요하다(§ functions/api/spot.ts CANDLE_UPSERT_SQL). 없던 시절엔 진행 중 버킷에
+  -- 봇 행이 아예 없어서 **유저 시장가 체결이 그 봉의 시가를 통째로 덮었다**(1m·1h·1d 전부, 영구히).
+  -- 인덱스가 아니라 컬럼이라 쓰기 행 수는 그대로다(§6 과금 모델).
+  open_at  INTEGER NOT NULL DEFAULT 0,
+  close_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (pair, interval, bucket)   -- (pair,interval) 로 조회 + bucket 정렬을 이 인덱스로 커버
 );
 
@@ -530,3 +537,13 @@ CREATE INDEX IF NOT EXISTS idx_dungeon_players_room ON dungeon_players(room_code
 -- 코드 배포 전에 먼저 적용할 것(sweepRestingOxPendings 가 last_fill_at 을 SELECT/UPDATE 한다).
 -- ALTER TABLE pending_orders ADD COLUMN last_fill_at INTEGER;
 -- DROP INDEX IF EXISTS idx_fee_ledger_time;
+
+-- ⚠ 일회성 마이그레이션 (2026-09-02 추가, 캔들 시가 오염 수정): spot_candles 에 시가/종가 시각.
+-- 위 CREATE TABLE 에는 이미 포함돼 있지만 기존 DB(=prod)엔 CREATE TABLE IF NOT EXISTS 가 컬럼을
+-- 더해주지 않으므로 최초 1회만 아래를 직접 실행할 것.
+-- ⚠⚠ **코드 배포 전에 먼저 적용돼야 한다** — 모든 체결의 캔들 upsert 와 봇의 캔들 flush 가 이 컬럼을
+-- 쓰므로, 없으면 체결 batch 가 통째로 롤백된다(= 거래·시장이 멈춘다).
+-- 기존 행은 0 이 되고, 0 은 "가장 이른 시각"이라 그 행들의 시가는 예전 값 그대로 유지된다
+-- (배포 시점에 진행 중이던 버킷 하나만 해당 — 다음 버킷부터는 정상).
+-- ALTER TABLE spot_candles ADD COLUMN open_at INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_candles ADD COLUMN close_at INTEGER NOT NULL DEFAULT 0;

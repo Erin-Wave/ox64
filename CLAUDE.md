@@ -27,7 +27,7 @@
 ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
-├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산, +last_fill_at=부분 재체결 간격 하한]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks/peak/trough=봇 심리상태(고점·저점 기억 포함), +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼, +live_json=진행 중 캔들 버킷, +pend_notional/pend_rows/pend_ticks=봇 수수료·계량기 누적]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
+├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산, +last_fill_at=부분 재체결 간격 하한]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들 +open_at/close_at=시가·종가 체결 시각]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks/peak/trough=봇 심리상태(고점·저점 기억 포함), +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼, +live_json=진행 중 캔들 버킷, +pend_notional/pend_rows/pend_ticks=봇 수수료·계량기 누적]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── scripts/                운영 스크립트 — d1-budget.mjs(D1 쓰기 예산 점검, §6) · sim-bot.ts(봇 심리 모델 장기 시뮬레이션, `npm run sim:bot` — 심리 파라미터를 바꿨으면 반드시 돌릴 것)
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조(rgb(var(--color-x) / <alpha-value>)) — 실제 값은 src/index.css 테마 블록
@@ -593,6 +593,19 @@ ox64/
   정확히 같다. 원본을 `limit × 배수` 만큼 더 읽고 `slice(-limit)` 로 잘라내므로, 페이지 맨 왼쪽 봉이
   드물게 부분 집계일 수 있다(스크롤 페이지 경계에서만, 시각적으로 무해). **인터벌을 추가할 땐 그게 1m/
   1h/1d 중 하나의 정수배인지 확인할 것** — 아니면 가장 가까운 하위 인터벌로 떨어져 버킷이 어긋난다.
+  **⚠⚠ 한 버킷의 `open`/`close` 는 "먼저 쓴 쪽"이 아니라 "먼저·나중에 **체결된** 쪽"이 갖는다
+  (`spot_candles.open_at`/`close_at`, 2026-09-02 버그 수정)** — 같은 버킷에 쓰는 주체가 둘(봇은 버킷이
+  닫힐 때 `live_json` 을 flush, 유저 체결은 그때그때)이라 시각 없이는 가릴 수가 없다. 예전엔 upsert 가
+  `open` 을 아예 안 건드려 **그 버킷에 먼저 INSERT 한 쪽이 시가를 가졌는데**, 2026-08-14 에 봇 캔들을
+  `live_json` 에 모으면서 **진행 중 버킷엔 봇 행이 아예 없게** 되어 전제가 깨졌다: 유저가 시장가를 내면
+  그게 항상 첫 INSERT 라 **그 봉의 시가가 유저 체결가(호가창 walking 이라 슬리피지 포함)로 덮였다**.
+  1m 뿐 아니라 **1h·1d 도 같이** 오염되고(그게 5m/4h/1w 롤업의 원본이다), flush 도 `open` 을 안 건드려
+  그 오차가 **영구히 남았다**("봉이 새로 만들어지는 타이밍에 첫 시장가 매매를 하면 시가가 바뀐다" 제보).
+  지금은 `CANDLE_UPSERT_SQL`/`CANDLE_FLUSH_GUARDED_SQL` 이 `open_at` 이 더 이른 쪽의 `open` 을,
+  `close_at` 이 더 늦은 쪽의 `close` 를 남기고, **읽기 경로(`mergeLiveBar`)도 정확히 같은 규칙**을 쓴다
+  (다르면 버킷이 닫히는 순간 시가가 바뀌어 보인다). 컬럼이 늘어도 인덱스는 안 늘어 **쓰기 행 수는 그대로**
+  다(§6 과금 모델). ⚠ 새 체결 경로를 추가할 때 `candleUpsertStmts` 에 넘기는 `now` 는 **그 체결이 실제로
+  일어난 시각**이어야 한다 — 그게 시가/종가 판정의 유일한 근거다.
 - **평단선/SL·TP선/청산가/미실현PnL/강제청산은 전부 공짜**: OX 포지션도 `positions` 테이블의 평범한
   한 행이라, `Chart.tsx`(심볼 필터)·`PositionsPanel.tsx`(청산가 계산)·`_trading.ts`(강제청산 평가) 가
   이미 심볼에 무관하게 동작하므로 별도 구현 없이 실제 코인과 똑같이 표시·평가된다.
@@ -633,6 +646,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
     `ALTER TABLE spot_bot_state ADD COLUMN live_json TEXT` / `pend_notional REAL NOT NULL DEFAULT 0` / `pend_rows INTEGER NOT NULL DEFAULT 0` / `pend_ticks INTEGER NOT NULL DEFAULT 0` / `ALTER TABLE pending_orders ADD COLUMN last_fill_at INTEGER`
     그리고 **인덱스 교체**(쓰기 비용 증가 0, 읽기 96% 감소): `CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at)` + `DROP INDEX IF EXISTS idx_orders_user` + `DROP INDEX IF EXISTS idx_fee_ledger_time`(읽는 코드가 없는데 체결마다 1행씩 비용만 냈다).
     **⚠ `usage_meter` 의 오늘 행은 전환 시 한 번 리셋해야 한다** — 예전 단가(틱당 7행)로 쌓인 값이라 새 임계값(§6, 일 8만)에서 즉시 차단이 걸린다. `DELETE FROM usage_meter WHERE day = <오늘 KST>`.
+  - **⚠ `spot_candles.open_at`/`close_at`(캔들 시가 오염 수정, 2026-09-02)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE spot_candles ADD COLUMN open_at INTEGER NOT NULL DEFAULT 0"` 및 동일 형식으로 `close_at INTEGER NOT NULL DEFAULT 0`. **코드 배포 전에 먼저 적용돼야 한다** — 모든 체결의 캔들 upsert 와 봇의 캔들 flush 가 이 컬럼을 쓰므로 없으면 체결 batch 가 통째로 롤백된다(= 거래가 멈춘다). prod·로컬 적용 완료. 기존 행은 0(=가장 이른 시각)이라 시가가 예전 값 그대로 유지되고, 배포 시점에 진행 중이던 버킷 하나만 해당된다.
   - **⚠ `dungeon_stats`/`dungeon_rooms`/`dungeon_players`(5분 던전, §8, 2026-07-27)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/dungeon` 코드가 이 테이블들을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩·퍼즐 라우트와 완전히 분리돼 있어 없어도 그쪽엔 영향 없고 `/api/dungeon` 만 500 이 된다(방어적 try/catch 없음 — 격리돼 있어 불필요 판단).
 - **Secret**: `SESSION_SECRET` = `wrangler pages secret put SESSION_SECRET --project-name ox64` 로 production 에 설정됨(랜덤 32B hex). wrangler.toml 엔 두지 않음.
 - 재적용 명령: 스키마 `npx wrangler d1 execute ox64 --remote --file=./schema.sql` / 시크릿 `echo <값> | npx wrangler pages secret put SESSION_SECRET --project-name ox64`.
@@ -1170,6 +1184,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - [x] **봇을 다이내믹하게 — 급등/급락이 보이는 차트(2026-08-26)** — "사팔사팔 빠르게 하면서 느리게 상승/하락추세" 제보. 심리 항목은 다 들어있었는데 **국면 수명이 8틱**이고 **평균회귀가 국면 드리프트의 82%를 즉시 취소**해서, 화면에 남는 건 매 틱 새로 뽑는 노이즈뿐이었다. 국면 수명 8→67틱(전이 확률 기준선을 국면마다 `exit` 하나로 모아 "평균 몇 틱 사는가"가 읽히게), 되돌림 0.045→0.014(+2차항으로 과열 ±10% 급브레이크), 모멘텀 지속 0.86→0.94, **노이즈는 오히려 0.00095→0.00052 로 축소**, FOMO/손절연쇄 킥을 그 틱이 아니라 `drift` 에 꽂아 여러 틱 이어지게(돌파 후 추격), 상승장 거래량 배수 추가(`1+0.5×공포+0.4×탐욕`, rally/euphoria sizeMult 상향), 장기 tether 를 로그 거리의 제곱으로. **컬럼 추가 없음 = D1 비용 증가 0**. 실측(`npm run sim:bot` 20일×4회): 추세효율 0.28→**0.58**, 8% 스윙 평균 크기 12.3%→20.8%, 20% 대형 스윙 3→75회/일, 1분봉 폭 2.18→2.70%, **틱 표준편차는 0.31%→0.27% 로 감소**(노이즈는 줄고 방향만 커졌다), 45일 종가 0.71~1.92(범위 0.16~5.35)로 장기 안정. ⚠ 장기 tether 세기는 **prod 의 현재 가격에 그대로 꽂히므로** sim 만 보고 정하면 안 된다(처음 잡은 값이 당시 OX 2.68 을 하루 -90% 로 끌어내리는 세기였다)
 - [x] **D1 다이어트 3차 — 한 요청 안의 중복 조회 제거(2026-08-26)** — `?tick=` 요청 하나가 `pending_orders` 를 **세 번**(봇 벽 판정·sweep·호가창), 봇 상태 행을 **두 번** 읽고 있었다. `runMarketMaker` 가 자기가 읽은 스냅샷을 반환하고(`TickCtx`) 호가창이 그걸 재사용 → 쿼리 3개·스캔 2번 제거, 대기 주문이 없으면 sweep 조회 자체를 건너뛴다. 봇 커밋이 경합에서 졌거나 sweep 이 체결을 냈으면 스냅샷을 `null` 로 되돌려 다시 읽게 한다(낡은 호가창 방지). 로컬 D1 검증: 순차 폴링 10회=커밋 10, **동시 폴링 8회=커밋 정확히 1**(8개 응답 모두 사다리 23/22 정상), 내 지정가가 호가창에 `mine` 으로 표시, 대량 지정가의 sweep 재체결(5초 하한)로 포지션 증가·호가 상승, 시장가 진입/청산(166만개, PnL 정상), cron 버스트 페어당 12틱→쓰기 1행·에러 0
 - [x] **봇 수량에 개미·세력·고래 계층(2026-08-31)** — "수량이 네 자리 아니면 다섯 자리로만 나온다, 개미와 세력이 구분이 안 된다" 제보. 원인은 체결 `uniform(1000,8000)` · 호가 `uniform(2000,10000)` 한 줄이라 **모든 수량이 좁은 구간에 뭉쳐** 있던 것(실측 체결의 95%가 네다섯 자리). 실제 거래소처럼 계층을 먼저 뽑고 그 안에서 **로그균등**으로 크기를 뽑는 분포(`SIZE_TIERS`/`orderSize`)로 교체 — 건수의 56%는 개미(수십~수백 개)가 만들고 거래량의 48%는 상위 1%(고래)가 만든다. 호가 한 단계는 **1~3명의 주문 합**이라 어떤 자리는 개미 하나뿐이라 얇고 어떤 자리는 세력이 껴서 두껍다. 큰 체결은 그 자리에서 가격을 밀어(시장충격 √배, 평균 배수 0.98 이라 봉 폭 불변) 봉에 꼬리를 남긴다. 라운드 수량 확률도 계층별로 달리했다(개미 55% "100개/500개" vs 세력 12% 아이스버그). 체결 **건수를 2배로 늘리고 평균 크기를 절반으로** 낮춰 캔들 거래량은 그대로(같은 심리 경로 대조: 틱당 100,981 → 100,984, 호가 총 유동성 +0.2%). `TAPE_MAX` 400 → 700(링 버퍼가 2배 빨리 도는 만큼, 행 수는 그대로라 과금 무관). 가격 모델을 안 건드려 `npm run sim:bot` 지표 전부 불변(추세효율 0.58·국면 수명 66틱·1분봉 2.76%). 로컬 D1 검증: 호가창 자릿수 2~5자리 혼재(144 / 170 / 1,191 / 50,086)·호가 역전 0·22단계 유지, 시장가 3,000개와 200만개 진입·전량 청산·marketable 지정가 즉시 체결·대기 지정가 호가창 `mine` 표시 정상, 40,000틱 시뮬에서 체결 자릿수 2자리 23%/3자리 40%/4자리 26%/5자리 9%/6자리 1.6%
+- [x] **시장가 매매가 그 봉의 시가를 덮던 버그 수정(2026-09-02)** — "봉이 새로 만들어지는 타이밍에 첫 시장가 매매를 하면 시가가 바뀐다"는 제보. 원인은 튜닝이 아니라 두 쓰기 주체의 **순서 규칙**이었다: 캔들 upsert 가 `open` 을 ON CONFLICT 에서 안 건드려 "그 버킷에 먼저 INSERT 한 쪽"이 시가를 가졌는데, 2026-08-14 에 봇 캔들을 `live_json` 에 모아 **버킷이 닫힐 때만** flush 하게 바꾸면서 **진행 중 버킷엔 봇 행이 아예 없게** 됐다 → 유저 시장가가 항상 첫 INSERT 가 되어 그 봉의 시가가 **체결가(walking 슬리피지 포함)로 덮였고**, flush 도 `open` 을 안 건드려 영구히 남았다. 1m 뿐 아니라 1h·1d 까지 오염돼 5m/4h/1w 롤업이 전부 그 시가를 물려받았다. `open_at`/`close_at` 컬럼을 두고 **"먼저 체결된 쪽이 시가, 나중에 체결된 쪽이 종가"** 로 바꿨다(커밋·flush·읽기 병합 세 경로가 같은 규칙). 인덱스가 아니라 컬럼이라 **D1 쓰기 비용 증가 0**. 로컬 D1 검증: 봇 시가 1.075 인 진행 중 1m 봉에 30만개 시장가 매수(체결가 1.0899) → 예전이면 시가가 1.085 로 덮였을 행이 실제로 그렇게 기록되지만(open_at 이 늦다) **서버가 내려주는 봉은 1m/5m/1h/1d 전부 시가 1.075 유지**, 고가 1.106·거래량 505,212(봇 205,212 + 유저 300,000) 정상 합산, 버킷 마감 flush 후 테이블 행의 시가도 1.075 로 교정, 동시 폴링 8회에 커밋 정확히 1회(가드 무회귀), 진입/청산 경로 에러 0
 - [ ] 가상 코인 3종 이상 추가 — 페어 파라미터화·봇 재고 분리는 끝났고(`VIRTUAL_PAIRS`/`bot_inventory`) `VIRTUAL_SYMBOLS`+`spot_bot_state` 시작가 행만 추가하면 된다. 틱 예산은 코인 수로 나눠 쓰므로 비용은 안 늘지만 코인당 움직임이 성겨진다
 - [ ] 미니 RTS 확장(종족 추가, 유닛 다양화, 난이도 선택, 리플레이)
 - [ ] 펀딩비 반영
