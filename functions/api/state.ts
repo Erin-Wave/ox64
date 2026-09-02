@@ -1,5 +1,5 @@
 import { type Ctx, bad, json, safe, missingEnv, getSession, loadState } from '../_shared';
-import { checkTriggers } from '../_trading';
+import { scanTriggers } from '../_trading';
 import { loadSpotMarket, loadSpotCandles, runMarketMaker, VIRTUAL_PAIRS, type TickCtx } from './spot';
 
 /** GET /api/state — 로그인 사용자의 잔고+포지션+주문
@@ -44,20 +44,26 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
       const interval = url.searchParams.get('interval') || '1m';
       const bars = Math.min(1000, Math.max(1, Number(url.searchParams.get('bars')) || 2));
       const wantState = url.searchParams.get('state') === '1';
+      // ⚠ 봇 틱이 이미 읽은 것을 아래 셋이 그대로 물려받는다(§ spot.ts TickCtx) — 호가창(사다리·테이프·
+      // 대기주문) · 차트 마지막 봉(live) · OX 체결가(ref). 넘기지 않으면 같은 상태 행을 세 번 읽는다.
       const [market, candles, state] = await Promise.all([
         loadSpotMarket(env, sess.uid, pair, tickCtx),
-        loadSpotCandles(env, pair, interval, bars),
-        // 계정 상태를 실을 때만 트리거 평가(checkTriggers)도 함께 돈다 = 이 요청이 체결 클럭이 된다.
+        loadSpotCandles(env, pair, interval, bars, undefined, tickCtx?.live),
+        // 계정 상태를 실을 때만 트리거 평가도 함께 돈다 = 이 요청이 체결 클럭이 된다.
         // 안 실을 땐 계정 데이터를 한 행도 읽지 않는다.
-        wantState ? checkTriggers(env, sess.uid).then((marks) => loadState(env, sess.uid, marks, since)) : Promise.resolve(null),
+        wantState
+          ? scanTriggers(env, sess.uid, tickCtx?.ref != null ? { [pair]: tickCtx.ref } : undefined).then((scan) =>
+              loadState(env, sess.uid, scan.prices, since, scan.fresh),
+            )
+          : Promise.resolve(null),
       ]);
       return json({ market, candles, state });
     }
 
     // 지정가/SL/TP 체결 체크 — 폴링 시점마다 평가(서버에 cron 없음, functions/_trading.ts 참고).
     // 반환된 마크가격을 loadState 에 넘겨 클라가 청산가/평가자산을 서버와 동일 시세로 즉시 계산하게 한다.
-    const marks = await checkTriggers(env, sess.uid);
-    const state = await loadState(env, sess.uid, marks, since);
+    const scan = await scanTriggers(env, sess.uid);
+    const state = await loadState(env, sess.uid, scan.prices, since, scan.fresh);
     if (!state) return bad('unauthorized', 401);
     return json(state);
   });

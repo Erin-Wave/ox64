@@ -413,7 +413,31 @@ async function settleConditionalOrder(
 
 // 반환값 = 이번에 받아온 마크가격 맵(loadState 로 넘겨 클라가 서버와 동일한 시세로 청산가/평가자산을
 // 즉시 계산하게 한다 — 추가 fetch 없이 재사용). 포지션/미체결/조건부가 없으면 빈 맵.
-export async function checkTriggers(env: Env, uid: string): Promise<Record<string, number>> {
+export async function checkTriggers(env: Env, uid: string, seed?: Record<string, number>): Promise<Record<string, number>> {
+  return (await scanTriggers(env, uid, seed)).prices;
+}
+
+/** checkTriggers 가 읽은 그 유저의 계정 데이터. `null` 이면 "평가 중에 뭔가 바뀌었을 수 있다"는 뜻이라
+ * 호출자가 다시 읽어야 한다(§ scanTriggers). */
+export interface TriggerScan {
+  prices: Record<string, number>;
+  fresh: { positions: PositionRow[]; pendings: PendingRow[]; conditionals: ConditionalRow[] } | null;
+}
+
+/**
+ * checkTriggers 의 본체 — 평가에 쓴 스냅샷까지 돌려준다.
+ *
+ * ⚠⚠ **왜 스냅샷을 돌려주나**(2026-09-02, 4차 다이어트): `/api/state` 폴링 하나가 positions·
+ * pending_orders·conditional_orders 를 **각각 두 번** 읽고 있었다 — 트리거 평가(여기)가 한 번, 응답을
+ * 만드는 `loadState` 가 한 번. 평가가 아무것도 안 바꿨다면 두 번째 읽기는 방금 읽은 것을 그대로 다시
+ * 읽는 것뿐이다(§6 "같은 걸 한 요청 안에서 두 번 읽지 않는다").
+ *
+ * ⚠ 재사용 판정은 **"뭘 썼는지 추적"이 아니라 "쓸 수가 없었음"으로** 한다 — 쓰기 지점마다 플래그를
+ * 세우는 방식은 새 트리거 기능을 추가할 때 한 곳만 빠뜨려도 응답이 조용히 낡는다. 대기 지정가도,
+ * 조건부도, SL/TP 도 없으면 runTriggers 가 실행할 수 있는 쓰기는 강제청산뿐이고 그건 반환값으로 안다
+ * → 그 경우에만 재사용한다. 나머지(뭔가 걸어둔 유저)는 예전처럼 다시 읽으므로 **무회귀**다.
+ */
+export async function scanTriggers(env: Env, uid: string, seed?: Record<string, number>): Promise<TriggerScan> {
   const pendings = (
     await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ?').bind(uid).all<PendingRow>()
   ).results;
@@ -421,14 +445,22 @@ export async function checkTriggers(env: Env, uid: string): Promise<Record<strin
     await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()
   ).results;
   const conditionals = await loadConditionals(env, uid);
-  if (pendings.length === 0 && positions.length === 0 && conditionals.length === 0) return {};
+  const fresh = { positions, pendings, conditionals };
+  if (pendings.length === 0 && positions.length === 0 && conditionals.length === 0) {
+    return { prices: { ...seed }, fresh };
+  }
 
   const symbols = [
     ...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol), ...conditionals.map((c) => c.symbol)]),
   ];
-  const prices = await fetchPrices(env, symbols);
-  await runTriggers(env, uid, pendings, positions, conditionals, prices);
-  return prices;
+  const prices = await fetchPrices(env, symbols, seed);
+  const liquidated = await runTriggers(env, uid, pendings, positions, conditionals, prices);
+  const canWrite =
+    liquidated ||
+    pendings.length > 0 ||
+    conditionals.length > 0 ||
+    positions.some((p) => p.stop_loss != null || p.take_profit != null);
+  return { prices, fresh: canWrite ? null : fresh };
 }
 
 /** 트리거 평가 본체 — 한 유저의 데이터·시세를 이미 손에 쥔 상태에서 강제청산 → 지정가 → SL/TP →

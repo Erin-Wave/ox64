@@ -334,7 +334,14 @@ async function bucketTradesToCandles(env: Env, pair: string, bucketMs: number, l
 /** OX 캔들 로드. 1m 이상은 영속 테이블(spot_candles)에서 읽어 히스토리가 시간이 지나도 사라지지 않게
  * 한다. 1s(및 <60s)는 단기 조회라 최신 거래 버킷팅. 영속 테이블이 아직 빈 인터벌(신규 배포 직후,
  * 거래가 아직 안 쌓인 상태)은 거래 버킷팅으로 폴백해 차트가 비지 않게 한다. */
-export async function loadSpotCandles(env: Env, pair: string, intervalCode: string, limit: number, endTimeMs?: number) {
+export async function loadSpotCandles(
+  env: Env,
+  pair: string,
+  intervalCode: string,
+  limit: number,
+  endTimeMs?: number,
+  liveCtx?: LiveBars | null,
+) {
   const sec = intervalSecFromCode(intervalCode);
   const bucketMs = sec * 1000;
   // ⚠ 1s 등 <60s 는 영속 테이블이 없어(최신 거래 버킷팅) 과거 페이지가 존재하지 않는다 —
@@ -358,11 +365,14 @@ export async function loadSpotCandles(env: Env, pair: string, intervalCode: stri
     )
       .bind(...(endTimeMs ? [pair, srcCode, endTimeMs, limit * ratio] : [pair, srcCode, limit * ratio]))
       .all<CandleRow>(),
-    endTimeMs
+    // ⚠ 통합 폴링(`?tick=`)에선 봇 틱이 방금 읽고 쓴 값을 그대로 받는다(§ TickCtx) — 같은 요청 안에서
+    // 같은 행을 두 번 읽지 않는다. 과거 페이지(endTimeMs)엔 진행 중 봉이 아예 관계없다.
+    endTimeMs || liveCtx
       ? Promise.resolve(null)
       : env.DB.prepare('SELECT live_json FROM spot_bot_state WHERE id = ?').bind(pair).first<{ live_json: string | null }>(),
   ]);
-  const asc = mergeLiveBar(rowsRes.results.reverse(), parseLive(liveRow?.live_json)[srcCode]);
+  const live = endTimeMs ? undefined : (liveCtx ?? parseLive(liveRow?.live_json))[srcCode];
+  const asc = mergeLiveBar(rowsRes.results.reverse(), live);
   // 과거 페이지 요청인데 결과가 없으면 진짜로 더 없는 것 — 거래 버킷팅 폴백으로 최신 구간을
   // 돌려주면 클라가 "받았다"고 착각해 같은 구간을 무한히 다시 붙인다.
   if (asc.length === 0) return endTimeMs ? [] : bucketTradesToCandles(env, pair, bucketMs, limit);
@@ -566,6 +576,12 @@ export interface TickCtx {
   book: BotBook | null;
   tape: TapeTrade[] | null;
   pendings: PendingLite[] | null;
+  // ⚠ 아래 둘도 **같은 상태 행에서 나온다**(2026-09-02, 4차 다이어트). 예전엔 `?tick=` 요청 하나가
+  // `spot_bot_state` 를 세 번 읽었다 — 봇 틱(전체 행) · loadSpotCandles(live_json) · fetchPrice(ref_price).
+  // 봇 틱이 방금 읽고 쓴 값을 그대로 넘기면 뒤의 둘이 사라진다(값도 오히려 정확하다 — 재조회는 방금
+  // 커밋한 값을 다시 읽는 것뿐이다).
+  live: LiveBars | null; // 진행 중(안 닫힌) 캔들 버킷들 — 차트의 마지막 봉
+  ref: number | null; // 이 틱 뒤의 기준가 = OX 체결가 소스
 }
 
 /** 대기 지정가 목록 → 가격대별 합계(봇의 "유저 벽" 판정용). 예전엔 이걸 SQL `GROUP BY` 로 따로 읽었다. */
@@ -1588,7 +1604,7 @@ async function runBotTicks(
   ref0: number,
   ticks: number,
 ): Promise<{ path: number[]; ctx: TickCtx }> {
-  const nothing: TickCtx = { book: null, tape: null, pendings: null };
+  const nothing: TickCtx = { book: null, tape: null, pendings: null, live: null, ref: null };
   if (ticks <= 0) return { path: [], ctx: nothing };
   // ⚠ 상태 행이 아직 없으면 먼저 만든다 — 아래 커밋은 `last_run` 가드가 붙은 UPDATE 라 행이 없으면
   // 0행이 되어 봇이 영원히 시작하지 못한다(가상 코인을 새로 개설한 직후가 정확히 그 상태다).
@@ -1634,7 +1650,7 @@ async function runBotTicks(
     closed.push(...accrueLive(live, r.bar, ts));
     path.push(r.next.ref);
   }
-  if (!book) return { path, ctx: { book: null, tape: null, pendings } };
+  if (!book) return { path, ctx: { book: null, tape: null, pendings, live: null, ref: null } };
 
   const stmts: D1PreparedStatement[] = [];
   // 닫힌 버킷만 테이블로 넘긴다(진행 중 버킷은 아래 상태 행에 그대로 남아 조회 때 병합된다).
@@ -1713,7 +1729,7 @@ async function runBotTicks(
   // 커밋이 0행이면 그 사이 다른 요청(폴링·cron)이 같은 상태에서 먼저 커밋한 것 -> 이번 틱은 없던 일이다.
   // 지나온 가격 경로도 빈 배열로 돌려야 한다: 커밋되지 않은 가격으로 트리거를 판정하면(cron 이 이
   // 반환값을 쓴다) 실제로 존재한 적 없는 딥/스파이크로 조건부·SL/TP 가 체결된다.
-  if (res[res.length - 1]?.meta.changes !== 1) return { path: [], ctx: { book: null, tape: null, pendings } };
+  if (res[res.length - 1]?.meta.changes !== 1) return { path: [], ctx: { book: null, tape: null, pendings, live: null, ref: null } };
 
   // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
   // ⚠ 틱마다가 아니라 **커밋 뒤 한 번** — 호가창은 이 커밋으로 한 번 바뀌므로 그 이상은 낭비였다
@@ -1722,7 +1738,13 @@ async function runBotTicks(
   // 같은 테이블을 다시 읽어 빈 목록을 확인할 이유가 없다(가장 흔한 경로가 쿼리 0개가 된다).
   const touched = pendings.length > 0 && (await sweepRestingOxPendings(env, pair, pendings));
   // sweep 이 실제로 체결을 냈으면 우리가 든 사다리·대기목록은 이미 낡았다 → 호출자가 다시 읽게 한다.
-  return { path, ctx: touched ? { book: null, tape: null, pendings: null } : { book, tape, pendings } };
+  // ⚠ sweep 이 체결을 냈으면 사다리·대기목록은 이미 낡았고(호출자가 다시 읽는다) 기준가도 그 체결로
+  // 옮겨갔다 → 둘 다 버린다. **진행 중 캔들(live)만은 그대로 유효하다** — 체결은 `spot_candles` 에
+  // 직접 쓰지 이 칸을 건드리지 않고, 그 테이블 쪽은 어차피 조회할 때 새로 읽기 때문이다.
+  return {
+    path,
+    ctx: touched ? { book: null, tape: null, pendings: null, live, ref: null } : { book, tape, pendings, live, ref: state.ref },
+  };
 }
 
 /** 폴링(유저 접속) 시 호출 — 재호가 게이트를 통과할 때만 한 틱을 돈다.
@@ -1739,7 +1761,13 @@ export async function runMarketMaker(env: Env, pair: string): Promise<TickCtx> {
 
   // 게이트에 막혔거나 예산이 걸렸으면 틱은 없지만 **방금 읽은 행이 곧 현재 시장**이라 그대로 넘긴다
   // (대기 주문은 안 읽었으므로 pendings=null → 호가창 쪽에서만 읽는다).
-  const asRead: TickCtx = { book: parseBook(row?.book_json), tape: parseTape(row?.tape_json), pendings: null };
+  const asRead: TickCtx = {
+    book: parseBook(row?.book_json),
+    tape: parseTape(row?.tape_json),
+    pendings: null,
+    live: parseLive(row?.live_json),
+    ref: row?.ref_price ?? null,
+  };
   const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
   if (now - last < gate) return asRead; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
   // ⚠ 이번 달 D1 쓰기 예산을 넘겼으면 봇을 돌리지 않는다(§ _budget.ts) — 시장이 멈추는 건 아프지만

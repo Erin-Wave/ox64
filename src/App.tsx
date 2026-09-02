@@ -8,6 +8,7 @@ import Login from '@/components/Login';
 import Leaderboard from '@/components/Leaderboard';
 import Settings from '@/components/Settings';
 import VipModal from '@/components/VipModal';
+import RefillModal from '@/components/RefillModal';
 import { useTradingStore } from '@/store/useTradingStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useChartStore } from '@/store/useChartStore';
@@ -15,6 +16,7 @@ import { useMarkPrices } from '@/hooks/useMarkPrices';
 import { useTriggerPoll } from '@/hooks/useTriggerPoll';
 import { useSpotPoll } from '@/hooks/useSpotPoll';
 import { useTradeTape } from '@/hooks/useTradeTape';
+import { useEquity } from '@/hooks/useEquity';
 
 export default function App() {
   const init = useTradingStore((s) => s.init);
@@ -26,6 +28,10 @@ export default function App() {
   const [showRank, setShowRank] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showVip, setShowVip] = useState(false);
+  // 파산(평가자산 0 이하) 안내 팝업 — 강제청산으로 자산이 0 이 된 사람에게 "하루 3회 무료 리필"을 알린다.
+  // ⚠ 한 번 닫으면 **자산이 0 을 벗어날 때까지** 다시 뜨지 않는다(2.5초 폴링마다 다시 뜨면 아무것도 못 한다).
+  // 리필을 받으면 평가자산이 0 을 넘으므로 자동으로 초기화되고, 다음에 또 파산하면 다시 뜬다.
+  const [refillDismissed, setRefillDismissed] = useState(false);
 
   // 현재 심볼 + 보유 포지션 심볼들의 가격 폴링 (다른 심볼 PnL 갱신)
   useMarkPrices();
@@ -35,6 +41,11 @@ export default function App() {
   useSpotPoll();
   // 현재 심볼 체결 테이프(OrderBook "체결" 탭 + Header 현재가 색상이 둘 다 구독)
   useTradeTape();
+
+  const { broke } = useEquity();
+  useEffect(() => {
+    if (!broke) setRefillDismissed(false);
+  }, [broke]);
 
   // 앱 시작 시 세션(쿠키) 확인 (1회)
   useEffect(() => {
@@ -77,6 +88,7 @@ export default function App() {
       {showRank && <Leaderboard onClose={() => setShowRank(false)} />}
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
       {showVip && <VipModal onClose={() => setShowVip(false)} />}
+      {broke && !refillDismissed && <RefillModal onClose={() => setRefillDismissed(true)} />}
     </div>
   );
 }

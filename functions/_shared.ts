@@ -313,9 +313,11 @@ export async function fetchPrice(env: Env, symbol: string): Promise<number> {
   }
   throw new Error(`시세 조회 실패 (${last})`);
 }
-export async function fetchPrices(env: Env, symbols: string[]): Promise<Record<string, number>> {
-  const uniq = [...new Set(symbols)];
-  const out: Record<string, number> = {};
+export async function fetchPrices(env: Env, symbols: string[], seed?: Record<string, number>): Promise<Record<string, number>> {
+  // ⚠ `seed` = 이 요청이 **이미 손에 쥔** 가격(§ spot.ts TickCtx). 통합 폴링에선 봇 틱이 방금 커밋한
+  // OX 기준가가 그것이라, 다시 읽으면 같은 행을 한 번 더 읽는 것뿐이다.
+  const out: Record<string, number> = { ...seed };
+  const uniq = [...new Set(symbols)].filter((s) => out[s] == null);
   await Promise.all(
     uniq.map(async (s) => {
       try {
@@ -567,7 +569,23 @@ export function effectiveCooldownMs(cooldownMs: number | null | undefined): numb
  * marks: 이미 받아둔 마크가격 맵(대개 checkTriggers 가 방금 fetch 한 것) — 넘기면 그대로 재사용해
  * 추가 시세 fetch 를 피한다. 안 넘기고 보유 심볼이 있으면 여기서 한 번 조회한다. 응답의 markPrices 는
  * 클라가 서버와 "동일한 시세"로 청산가/평가자산을 즉시(폴링 지연 없이) 계산하게 해준다(§청산가 표시). */
-export async function loadState(env: Env, uid: string, marks?: Record<string, number>, ordersSince?: number) {
+/** checkTriggers 가 이미 읽어둔 그 유저의 계정 데이터(§ _trading.ts scanTriggers). 넘기면 loadState 가
+ * positions/pending_orders/conditional_orders 를 **다시 읽지 않는다** — 폴링 하나가 같은 세 테이블을 두
+ * 번 읽던 것을 없앤다. 트리거 평가가 뭔가 바꿨을 수 있으면 호출자가 넘기지 않으므로(그때는 null) 항상
+ * 최신 데이터가 응답에 실린다. */
+export interface StateSnapshot {
+  positions: PositionRow[];
+  pendings: PendingRow[];
+  conditionals: ConditionalRow[];
+}
+
+export async function loadState(
+  env: Env,
+  uid: string,
+  marks?: Record<string, number>,
+  ordersSince?: number,
+  snapshot?: StateSnapshot | null,
+) {
   const user = await env.DB.prepare(
     'SELECT id, name, balance, refill_count, refill_date, total_volume, total_fees FROM users WHERE id = ?',
   )
@@ -576,11 +594,15 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
   if (!user) return null;
   const vip = vipOf(user.total_volume ?? 0);
   const refillsLeft = user.refill_date === todayKst() ? Math.max(0, REFILL_DAILY_LIMIT - user.refill_count) : REFILL_DAILY_LIMIT;
-  const positions = (
-    await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? ORDER BY opened_at DESC')
-      .bind(uid)
-      .all<PositionRow>()
-  ).results;
+  // ⚠ 정렬은 SQL 이 아니라 메모리에서 — 재사용 스냅샷은 `ORDER BY` 없이 읽힌 것이라, 여기서 맞추지
+  // 않으면 목록 순서가 폴링마다 들쭉날쭉해진다(클라는 서버 순서를 그대로 그린다).
+  const positions = snapshot
+    ? [...snapshot.positions].sort((a, b) => b.opened_at - a.opened_at)
+    : (
+        await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? ORDER BY opened_at DESC')
+          .bind(uid)
+          .all<PositionRow>()
+      ).results;
   // ⚠ 주문내역은 **증분으로** 준다(2026-08-14, 읽기 절감). 이 목록은 화면에 그대로 쌓아두는 이력이라
   // 폴링마다 같은 50행을 다시 읽을 이유가 없는데, 그게 `/api/state` 읽기 65행 중 50행이었다(폴링 2.5초 →
   // 시간당 7.2만 행). 클라가 가진 마지막 주문 시각을 보내면 그 이후 것만 읽으므로 평상시 0~1행이다.
@@ -599,21 +621,25 @@ export async function loadState(env: Env, uid: string, marks?: Record<string, nu
           .bind(uid)
           .all<OrderRow>()
   ).results;
-  const pending = (
-    await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ? ORDER BY created_at DESC')
-      .bind(uid)
-      .all<PendingRow>()
-  ).results;
+  const pending = snapshot
+    ? [...snapshot.pendings].sort((a, b) => b.created_at - a.created_at)
+    : (
+        await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ? ORDER BY created_at DESC')
+          .bind(uid)
+          .all<PendingRow>()
+      ).results;
   // 조건부(스탑) 주문 — 신규 테이블이라 배포 직후 아직 없을 수 있으므로 방어적으로 감싼다(없으면 빈 배열).
-  let conditionals: ConditionalRow[] = [];
-  try {
-    conditionals = (
-      await env.DB.prepare('SELECT * FROM conditional_orders WHERE user_id = ? ORDER BY created_at DESC')
-        .bind(uid)
-        .all<ConditionalRow>()
-    ).results;
-  } catch {
-    /* conditional_orders 테이블 미생성(마이그레이션 전) — 조건부 없음으로 처리 */
+  let conditionals: ConditionalRow[] = snapshot ? [...snapshot.conditionals].sort((a, b) => b.created_at - a.created_at) : [];
+  if (!snapshot) {
+    try {
+      conditionals = (
+        await env.DB.prepare('SELECT * FROM conditional_orders WHERE user_id = ? ORDER BY created_at DESC')
+          .bind(uid)
+          .all<ConditionalRow>()
+      ).results;
+    } catch {
+      /* conditional_orders 테이블 미생성(마이그레이션 전) — 조건부 없음으로 처리 */
+    }
   }
   const heldSymbols = [
     ...new Set([...positions.map((p) => p.symbol), ...pending.map((p) => p.symbol), ...conditionals.map((c) => c.symbol)]),

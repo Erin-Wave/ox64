@@ -5,6 +5,7 @@ import { fmtPrice, fmtUsd, fmtUsdShort } from '@/format';
 import SymbolSelect from '@/components/SymbolSelect';
 import Logo from './Logo';
 import VipBadge from './VipBadge';
+import { useEquity } from '@/hooks/useEquity';
 
 export default function Header({
   onOpenRank,
@@ -20,8 +21,6 @@ export default function Header({
   const lastTakerSide = useMarketStore(selectLastTakerSide);
   const precisions = useMarketStore((s) => s.precisions);
   const connected = useMarketStore((s) => s.connected);
-  const balance = useTradingStore((s) => s.balance);
-  const positions = useTradingStore((s) => s.positions);
   const refillsLeft = useTradingStore((s) => s.refillsLeft);
   const refill = useTradingStore((s) => s.refill);
   const busy = useTradingStore((s) => s.busy);
@@ -37,21 +36,11 @@ export default function Header({
   const vipFrom = useTradingStore((s) => s.vipFrom);
   const vipProgress =
     vipNextAt == null ? 1 : Math.min(1, Math.max(0, (totalVolume - vipFrom) / Math.max(1, vipNextAt - vipFrom)));
-  const prices = useMarketStore((s) => s.prices);
   const [showMenu, setShowMenu] = useState(false);
 
-  // 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익). 진입 시 잔고에서 빠진 증거금도 담보라
-  // 포함해야 포지션을 열자마자 평가자산이 증거금만큼 깎여 보이지 않는다(서버 강제청산/리필 판정과 동일한 정의).
-  const equityKnown = positions.every((p) => prices[p.symbol] != null);
-  const equity =
-    balance +
-    positions.reduce((a, p) => {
-      const margin = (p.entryPrice * p.size) / p.leverage;
-      const live = prices[p.symbol];
-      const u = live == null ? 0 : (live - p.entryPrice) * p.size * (p.side === 'long' ? 1 : -1);
-      return a + margin + u;
-    }, 0);
-  const canRefill = equityKnown && equity <= 0;
+  // 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익) — 식은 `useEquity` 한 곳에만 둔다
+  // (파산 팝업 RefillModal 과 같은 판정을 써야 "버튼은 활성인데 팝업은 안 뜨는" 어긋남이 안 생긴다).
+  const { equity, broke: canRefill } = useEquity();
   // 마지막 체결이 매수 테이커면 매수색, 매도 테이커면 매도색 — 아직 체결이 없으면 기본색.
   const priceColor = lastTakerSide === 'buy' ? 'text-up' : lastTakerSide === 'sell' ? 'text-down' : 'text-text';
 
