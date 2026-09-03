@@ -4,7 +4,7 @@ import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useChartStore } from '@/store/useChartStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { isVirtualSymbol } from '@/symbols';
-import { fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
+import { fmtPct, fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
 
 const EMPTY_TRADES: TickerTrade[] = [];
@@ -51,21 +51,52 @@ function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'):
   return out;
 }
 
-/** 직전 체결 대비 강세(up)/약세(down) — 실제 거래소 테이프의 틱 인디케이터와 같은 규칙(Lee-Ready):
- * 직전 체결보다 비싸면 강세, 싸면 약세, 같으면 **직전 방향을 이어받는다**.
- * ⚠ 색(테이커 방향)과는 다른 정보다 — 색은 "누가 덮쳤나", 이건 "그래서 가격이 올랐나". 매수 체결이
- * 이어져도 같은 가격에 계속 찍히면 강세가 아니다.
- * ⚠ 계산은 **필터 이전의 원본 테이프**로 해야 한다. 걸러낸 목록에서 이웃끼리 비교하면 중간에 빠진
- * 체결을 건너뛴 비교가 되어 실제와 다른 방향이 나온다. */
-type Tick = 'up' | 'down' | 'flat';
-function withTicks(trades: TickerTrade[]): (TickerTrade & { tick: Tick })[] {
-  const out = new Array<TickerTrade & { tick: Tick }>(trades.length);
-  let dir: Tick = 'flat';
-  for (let i = trades.length - 1; i >= 0; i--) {
-    // trades 는 최신이 [0] 이므로 오래된 것(뒤)부터 훑어야 방향 계승이 성립한다.
-    const prev = trades[i + 1];
-    if (prev) dir = trades[i].price > prev.price ? 'up' : trades[i].price < prev.price ? 'down' : dir;
-    out[i] = { ...trades[i], tick: dir };
+/** 체결 강세·약세 **레벨** — "이 가격이 그 시점의 평균보다 싼가/비싼가"를 0~±3 으로 매긴다.
+ * (+)=평균보다 비싸게 체결(강세) / (−)=평균보다 싸게 체결(약세) / 0=평균 근처.
+ *
+ * ⚠ 직전 체결 대비 상승·하락(틱 방향)이 아니다 — 그건 테이커 방향(행 색)과 거의 같은 정보라 화면에
+ * 새로 알려주는 게 없다. 여기서 보려는 건 "지금 이 가격이 싼 가격인지"이므로 **최근 체결들의 평균**과
+ * 비교한다.
+ *
+ * ⚠ 기준 평균은 **그 체결 직전의 최근 STRENGTH_WINDOW 건**(trailing)이다. 목록 전체에 "지금의 평균"
+ * 하나를 쓰면 가격이 추세를 타는 동안 옛 행들이 전부 한쪽 색으로 다시 칠해지고(리페인트) 목록이 통째로
+ * 빨갛거나 파래져서 읽을 수가 없다. 각 행이 자기 시점의 평균을 갖고 있으면 새 체결이 들어와도 이미
+ * 찍힌 행의 레벨은 변하지 않는다.
+ *
+ * ⚠ 산포는 표준편차가 아니라 **평균절대편차(MAD)** 로 잰다 — 가격 자체가 큰 값이라(BTC 10만 대)
+ * `E[x²] − E[x]²` 는 자릿수 상쇄로 정밀도가 날아간다. MAD 는 제곱을 안 써서 그 문제가 없고 창이
+ * 60건뿐이라 매 행마다 직접 훑어도 싸다.
+ * 문턱(MAD 배수)은 정규분포 기준 대략 상위 34% / 8% / 0.5% 에 해당하도록 잡았다 — 1레벨이 너무 흔하면
+ * 목록이 온통 칠해져서 "은은한 배경"이 아니라 소음이 된다. */
+type Strength = { lvl: number; ref: number };
+const STRENGTH_WINDOW = 60; // 기준 평균을 내는 최근 체결 수
+const STRENGTH_MIN_SAMPLES = 8; // 이보다 적으면 평균이 의미 없어 레벨 0
+const STRENGTH_STEPS = [1.2, 2.2, 3.5]; // |가격−평균| ÷ MAD 문턱 → 1 / 2 / 3 레벨
+function withStrength(trades: TickerTrade[]): (TickerTrade & Strength)[] {
+  const n = trades.length;
+  const out = new Array<TickerTrade & Strength>(n);
+  const win: number[] = []; // 이 체결 **직전**의 최근 가격들(오래된 것부터)
+  for (let i = n - 1; i >= 0; i--) {
+    // trades 는 최신이 [0] 이므로 오래된 것(뒤)부터 훑어야 trailing 평균이 성립한다.
+    const price = trades[i].price;
+    let lvl = 0;
+    let ref = price;
+    if (win.length >= STRENGTH_MIN_SAMPLES) {
+      let sum = 0;
+      for (const w of win) sum += w;
+      ref = sum / win.length;
+      let dev = 0;
+      for (const w of win) dev += Math.abs(w - ref);
+      const mad = dev / win.length;
+      if (mad > 0) {
+        const z = Math.abs(price - ref) / mad;
+        const step = z >= STRENGTH_STEPS[2] ? 3 : z >= STRENGTH_STEPS[1] ? 2 : z >= STRENGTH_STEPS[0] ? 1 : 0;
+        lvl = price >= ref ? step : -step;
+      }
+    }
+    out[i] = { ...trades[i], lvl, ref };
+    win.push(price);
+    if (win.length > STRENGTH_WINDOW) win.shift();
   }
   return out;
 }
@@ -105,7 +136,7 @@ export default function OrderBook() {
   const filterBasis = useChartStore((s) => s.tradeFilterBasis);
   const filterMin = useChartStore((s) => s.tradeFilterMin);
   const filterMax = useChartStore((s) => s.tradeFilterMax);
-  const showTick = useChartStore((s) => s.tradeTick);
+  const showStrength = useChartStore((s) => s.tradeStrength);
   const toggleChart = useChartStore((s) => s.toggle);
   const [book, setBook] = useState<OrderBookSnapshot | null>(null);
   const [groupIdx, setGroupIdx] = useState(0);
@@ -151,7 +182,9 @@ export default function OrderBook() {
   const hasBound = filterMin != null || filterMax != null;
   const filtering = filterOn && hasBound;
   const shownTrades = useMemo(() => {
-    const tape = withTicks(trades);
+    // ⚠ 레벨은 **필터 이전 원본 테이프**로 계산한다 — 걸러낸 목록의 평균은 "시장의 평균"이 아니다
+    // (고래만 보기 필터를 켜면 고래 체결끼리의 평균이 되어 전혀 다른 값이 나온다).
+    const tape = withStrength(trades);
     if (!filtering) return tape.slice(0, rows);
     return tape
       .filter((t) => {
@@ -290,35 +323,39 @@ export default function OrderBook() {
       <div className="overflow-auto" style={listH}>
         {shownTrades.map((t, i) => {
           const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
-          // 강세/약세 인디케이터 — 직전 체결 대비 가격 방향(설정으로 끌 수 있다).
-          const tickMark = t.tick === 'up' ? '▲' : t.tick === 'down' ? '▼' : '·';
-          const tickColor = t.tick === 'up' ? 'text-up' : t.tick === 'down' ? 'text-down' : 'text-muted';
+          // 강세·약세 레벨(0~±3) → 가격 칸 배경 바. 레벨이 높을수록 바가 길어지고 아주 조금 진해진다
+          // ("은은하게" — 숫자를 읽는 데 방해되면 안 된다). +는 평균보다 비싸게(강세), −는 싸게(약세).
+          const lvl = showStrength ? t.lvl : 0;
+          const mag = Math.abs(lvl);
+          const gapPct = t.ref > 0 ? ((t.price - t.ref) / t.ref) * 100 : 0;
           return (
-            // ⚠ 3열(+인디케이터)은 반드시 **격자**로 — 예전엔 `flex justify-between` 이라 세 칸의 너비가
-            // 행마다 제각각 계산돼, 수량 자릿수가 바뀌면(604 vs 6,694) 가운데 가격이 좌우로 흔들렸다.
+            // ⚠ 3열은 반드시 **격자**로 — 예전엔 `flex justify-between` 이라 세 칸의 너비가 행마다
+            // 제각각 계산돼, 수량 자릿수가 바뀌면(604 vs 6,694) 가운데 가격이 좌우로 흔들렸다.
             <div
               key={`${t.time}-${i}`}
-              className={`grid items-center gap-2 px-1.5 py-px leading-[14px] ${
-                showTick
-                  ? 'grid-cols-[auto_auto_minmax(0,1fr)_minmax(0,1fr)]'
-                  : 'grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)]'
-              }`}
+              className="grid grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)] items-center gap-2 px-1.5 py-px leading-[14px]"
             >
               <span className="text-muted">{fmtTime(t.time)}</span>
-              {showTick && (
-                <span
-                  className={`text-[9px] leading-none ${tickColor}`}
-                  title={t.tick === 'up' ? '직전 체결보다 강세' : t.tick === 'down' ? '직전 체결보다 약세' : '직전 체결과 같은 가격'}
-                >
-                  {tickMark}
-                </span>
-              )}
-              <span className={`truncate text-right ${color}`}>{fmtPriceShort(t.price, prec, 9)}</span>
-              {/* 수량도 같은 방향 색으로 — 가격만 칠하면 목록을 훑을 때 매수/매도 흐름이 한눈에 안 읽힌다. */}
               <span
-                className={`truncate text-right ${color}`}
-                title={`거래대금 ${fmtUsd(t.price * t.qty)} USDT`}
+                className="relative block overflow-hidden rounded-sm"
+                title={
+                  mag === 0
+                    ? undefined
+                    : `최근 ${STRENGTH_WINDOW}건 평균 ${fmtPriceShort(t.ref, prec, 9)} 대비 ${
+                        gapPct >= 0 ? '+' : ''
+                      }${fmtPct(gapPct, 3)}% · ${lvl > 0 ? '강세' : '약세'} ${mag}레벨`
+                }
               >
+                {mag > 0 && (
+                  <span
+                    className={`absolute inset-y-0 right-0 ${lvl > 0 ? 'bg-up' : 'bg-down'}`}
+                    style={{ width: `${mag * 34}%`, opacity: 0.1 + 0.05 * mag }}
+                  />
+                )}
+                <span className={`relative block truncate text-right ${color}`}>{fmtPriceShort(t.price, prec, 9)}</span>
+              </span>
+              {/* 수량도 같은 방향 색으로 — 가격만 칠하면 목록을 훑을 때 매수/매도 흐름이 한눈에 안 읽힌다. */}
+              <span className={`truncate text-right ${color}`} title={`거래대금 ${fmtUsd(t.price * t.qty)} USDT`}>
                 {fmtQty(t.qty)}
               </span>
             </div>

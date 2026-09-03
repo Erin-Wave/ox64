@@ -52,7 +52,7 @@ export default function Settings({ onClose }: { onClose: () => void }) {
   const tradeFilterBasis = useChartStore((s) => s.tradeFilterBasis);
   const tradeFilterMin = useChartStore((s) => s.tradeFilterMin);
   const tradeFilterMax = useChartStore((s) => s.tradeFilterMax);
-  const tradeTick = useChartStore((s) => s.tradeTick);
+  const tradeStrength = useChartStore((s) => s.tradeStrength);
   const setTradeFilter = useChartStore((s) => s.setTradeFilter);
   // 입력칸은 로컬 문자열이 진실원본(OrderPanel 수량칸과 같은 이유) — 스토어는 숫자라 지우는 도중
   // ''→0→'0' 으로 되돌아와 타이핑이 막힌다. 스토어엔 확정값만 밀어넣는다(빈칸=제한 없음=null).
@@ -248,26 +248,26 @@ export default function Settings({ onClose }: { onClose: () => void }) {
             </p>
 
             <button
-              onClick={() => toggleChart('tradeTick')}
+              onClick={() => toggleChart('tradeStrength')}
               className={`mt-2 flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left ring-1 transition ${
-                tradeTick ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
+                tradeStrength ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
               }`}
             >
               <span className="min-w-0">
-                <span className={`block text-xs font-bold ${tradeTick ? 'text-accent' : 'text-text'}`}>
-                  강세 · 약세 표시 (<span className="text-up">▲</span>
-                  <span className="text-down">▼</span>)
+                <span className={`block text-xs font-bold ${tradeStrength ? 'text-accent' : 'text-text'}`}>
+                  강세 · 약세 레벨 배경
                 </span>
                 <span className="mt-0.5 block text-[11px] text-muted">
-                  체결 가격 옆에 직전 체결 대비 방향을 표시 — 색(테이커 방향)과 달리 "그래서 가격이 올랐나"를 봅니다
+                  체결 가격 뒤에 <span className="text-text">그 시점 평균보다 싸게(약세) · 비싸게(강세)</span> 체결됐는지를
+                  1~3 레벨 바로 은은하게 깝니다 — 많이 벗어날수록 바가 길어집니다(마우스를 올리면 평균 대비 %)
                 </span>
               </span>
               <span
                 className={`shrink-0 rounded px-2 py-0.5 text-[11px] font-bold ${
-                  tradeTick ? 'bg-accent/20 text-accent' : 'bg-elevated text-muted'
+                  tradeStrength ? 'bg-accent/20 text-accent' : 'bg-elevated text-muted'
                 }`}
               >
-                {tradeTick ? '켬' : '끔'}
+                {tradeStrength ? '켬' : '끔'}
               </span>
             </button>
           </section>

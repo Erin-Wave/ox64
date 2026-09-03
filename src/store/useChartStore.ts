@@ -30,7 +30,7 @@ type BoolFlag =
   | 'orderBook'
   | 'bookTogether'
   | 'tradeFilterOn'
-  | 'tradeTick';
+  | 'tradeStrength';
 
 /** 체결 목록 필터 기준 — 수량(코인 개수) 또는 거래대금(가격×수량, USDT). */
 export type TradeFilterBasis = 'qty' | 'notional';
@@ -67,9 +67,11 @@ interface ChartState {
   tradeFilterBasis: TradeFilterBasis;
   tradeFilterMin: number | null;
   tradeFilterMax: number | null;
-  // 체결 행 가격 옆에 직전 체결 대비 강세(▲)/약세(▼) 표시. 색(테이커 방향)과는 다른 정보다 —
-  // 색은 "누가 덮쳤나", 이건 "그래서 가격이 올랐나 내렸나"다(같은 방향 체결이 이어져도 가격은 제자리일 수 있다).
-  tradeTick: boolean;
+  // 체결 가격 배경에 "지금 이 가격이 싼가/비싼가"를 **레벨(0~±3)** 로 은은하게 깐다.
+  // ⚠ 직전 체결 대비 상승/하락(틱 방향)이 아니다 — 그건 행 색(테이커 방향)과 거의 같은 정보라 새로
+  // 알려주는 게 없다. 그 시점의 **최근 체결 평균** 대비 얼마나 벗어났는지를 재므로 "평균보다 좀 싸게
+  // 체결"이 약세 1레벨, 더 싸면 2레벨이 된다(§ OrderBook withStrength).
+  tradeStrength: boolean;
   visibleBars: number; // 처음 로드 시 보여줄 봉 개수 — 마지막으로 사용자가 확대/축소한 값을 기억
   colorScheme: ChartColorScheme;
   indicators: IndicatorConfig[];
@@ -98,14 +100,14 @@ function load(): Partial<ChartState> {
 function persist(s: ChartState) {
   const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook } = s;
   const { bookRows, bookTogether, visibleBars, colorScheme, indicators } = s;
-  const { tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeTick } = s;
+  const { tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength } = s;
   try {
     localStorage.setItem(
       KEY,
       JSON.stringify({
         showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook,
         bookRows, bookTogether, visibleBars, colorScheme, indicators,
-        tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeTick,
+        tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength,
       }),
     );
   } catch {
@@ -140,7 +142,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   tradeFilterBasis: saved.tradeFilterBasis ?? 'notional',
   tradeFilterMin: cleanLimit(saved.tradeFilterMin),
   tradeFilterMax: cleanLimit(saved.tradeFilterMax),
-  tradeTick: saved.tradeTick ?? true,
+  tradeStrength: saved.tradeStrength ?? true,
   visibleBars: saved.visibleBars ?? 38,
   colorScheme: saved.colorScheme ?? 'binance',
   indicators: saved.indicators ?? [],
