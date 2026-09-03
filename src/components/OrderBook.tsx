@@ -351,10 +351,11 @@ export default function OrderBook() {
                 {mag > 0 && (
                   // ⚠ 바는 **왼쪽에서** 자란다 — 가격 숫자가 오른쪽 정렬이라 오른쪽에 붙이면 바가 숫자
                   // 밑에 깔려 글자를 읽기 어렵고, 레벨(길이)도 눈으로 비교가 안 된다(시작점이 제각각).
-                  // 농도는 아주 낮게(8~14%) — 배경이지 강조가 아니다.
+                  // 농도는 6~22% — 배경이지 강조가 아니라 낮게 두되, 너무 옅으면 레벨 차이가 안 읽힌다
+                  // (4~16% 는 "안 보인다"는 쪽이었고, 3단계 시절의 15~25% 는 숫자를 가릴 만큼 진했다).
                   <span
                     className={`absolute inset-y-0 left-0 ${lvl > 0 ? 'bg-up' : 'bg-down'}`}
-                    style={{ width: `${(mag / STRENGTH_MAX_LEVEL) * 100}%`, opacity: 0.04 + (mag / STRENGTH_MAX_LEVEL) * 0.12 }}
+                    style={{ width: `${(mag / STRENGTH_MAX_LEVEL) * 100}%`, opacity: 0.06 + (mag / STRENGTH_MAX_LEVEL) * 0.16 }}
                   />
                 )}
                 <span className={`relative block truncate text-right ${color}`}>{fmtPriceShort(t.price, prec, 9)}</span>
