@@ -66,14 +66,17 @@ function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'):
  * ⚠ 산포는 표준편차가 아니라 **평균절대편차(MAD)** 로 잰다 — 가격 자체가 큰 값이라(BTC 10만 대)
  * `E[x²] − E[x]²` 는 자릿수 상쇄로 정밀도가 날아간다. MAD 는 제곱을 안 써서 그 문제가 없고 창이
  * 60건뿐이라 매 행마다 직접 훑어도 싸다.
- * 레벨은 **0~±STRENGTH_MAX_LEVEL(20)** 로 잘게 나눈다 — 3단계였을 땐 "조금 싼가 많이 싼가"가 세 칸으로
- * 뭉개져서 목록을 훑어도 미세한 차이가 안 보였다. MAD 0.2배마다 한 레벨이라 평범한 체결이 4~8레벨,
- * 눈에 띄게 벗어난 체결이 12레벨 위, 20레벨은 사실상 이상치다. */
+ * 레벨은 **0~±STRENGTH_MAX_LEVEL(50)** 로 잘게 나눈다 — 3단계였을 땐 "조금 싼가 많이 싼가"가 세 칸으로
+ * 뭉개져서 목록을 훑어도 미세한 차이가 안 보였다. MAD 0.08배마다 한 레벨이라 평범한 체결이 10~25레벨,
+ * 눈에 띄게 벗어난 체결이 30레벨 위, 50레벨은 사실상 이상치다. */
 type Strength = { lvl: number; ref: number };
 const STRENGTH_WINDOW = 60; // 기준 평균을 내는 최근 체결 수
 const STRENGTH_MIN_SAMPLES = 8; // 이보다 적으면 평균이 의미 없어 레벨 0
-const STRENGTH_MAX_LEVEL = 20; // 레벨 상한(그 이상 벗어나면 전부 최대 레벨)
-const STRENGTH_Z_PER_LEVEL = 0.2; // MAD 이 배수마다 한 레벨씩(=20레벨이면 MAD 4배 = 대략 3σ)
+const STRENGTH_MAX_LEVEL = 50; // 레벨 상한(그 이상 벗어나면 전부 최대 레벨)
+// ⚠ 눈금(MAD 배수)과 상한은 **같이** 정해야 한다 — 상한만 올리고 눈금을 그대로 두면 포화 지점이 멀어져
+// (MAD 10배 = 8σ) 평범한 체결이 전부 바닥 레벨로 깔려 바가 안 보인다. 곱이 4 로 유지되게 잡는다:
+// 최대 레벨 = MAD 4배 ≈ 3σ(사실상 이상치), 평범한 체결은 그 40% 언저리.
+const STRENGTH_Z_PER_LEVEL = 0.08; // MAD 이 배수마다 한 레벨씩(50레벨 = MAD 4배)
 function withStrength(trades: TickerTrade[]): (TickerTrade & Strength)[] {
   const n = trades.length;
   const out = new Array<TickerTrade & Strength>(n);

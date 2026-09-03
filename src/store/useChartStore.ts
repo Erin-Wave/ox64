@@ -67,7 +67,7 @@ interface ChartState {
   tradeFilterBasis: TradeFilterBasis;
   tradeFilterMin: number | null;
   tradeFilterMax: number | null;
-  // 체결 가격 배경에 "지금 이 가격이 싼가/비싼가"를 **레벨(0~±20)** 로 은은하게 깐다.
+  // 체결 가격 배경에 "지금 이 가격이 싼가/비싼가"를 **레벨(0~±50)** 로 은은하게 깐다.
   // ⚠ 직전 체결 대비 상승/하락(틱 방향)이 아니다 — 그건 행 색(테이커 방향)과 거의 같은 정보라 새로
   // 알려주는 게 없다. 그 시점의 **최근 체결 평균** 대비 얼마나 벗어났는지를 재므로 "평균보다 좀 싸게
   // 체결"이 약세 1레벨, 더 싸면 2레벨이 된다(§ OrderBook withStrength).

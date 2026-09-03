@@ -259,7 +259,7 @@ export default function Settings({ onClose }: { onClose: () => void }) {
                 </span>
                 <span className="mt-0.5 block text-[11px] text-muted">
                   체결 가격 뒤에 <span className="text-text">그 시점 평균보다 싸게(약세) · 비싸게(강세)</span> 체결됐는지를
-                  <span className="text-text"> 1~20 레벨</span> 바로 은은하게 깝니다 — 많이 벗어날수록 바가 길어집니다
+                  <span className="text-text"> 1~50 레벨</span> 바로 은은하게 깝니다 — 많이 벗어날수록 바가 길어집니다
                   (마우스를 올리면 평균 대비 %와 레벨)
                 </span>
               </span>
