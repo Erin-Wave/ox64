@@ -51,59 +51,69 @@ function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'):
   return out;
 }
 
-/** 체결 강세·약세 **레벨** — "이 가격이 그 시점의 평균보다 싼가/비싼가"를 0~±3 으로 매긴다.
+/** 체결 강세·약세 **레벨** — "이 가격이 그 시점의 평균보다 싼가/비싼가"를 0~±50 으로 매긴다.
  * (+)=평균보다 비싸게 체결(강세) / (−)=평균보다 싸게 체결(약세) / 0=평균 근처.
  *
  * ⚠ 직전 체결 대비 상승·하락(틱 방향)이 아니다 — 그건 테이커 방향(행 색)과 거의 같은 정보라 화면에
- * 새로 알려주는 게 없다. 여기서 보려는 건 "지금 이 가격이 싼 가격인지"이므로 **최근 체결들의 평균**과
+ * 새로 알려주는 게 없다. 여기서 보려는 건 "지금 이 가격이 싼 가격인지"이므로 **최근 체결들의 중심**과
  * 비교한다.
  *
- * ⚠ 기준 평균은 **그 체결 직전의 최근 STRENGTH_WINDOW 건**(trailing)이다. 목록 전체에 "지금의 평균"
- * 하나를 쓰면 가격이 추세를 타는 동안 옛 행들이 전부 한쪽 색으로 다시 칠해지고(리페인트) 목록이 통째로
- * 빨갛거나 파래져서 읽을 수가 없다. 각 행이 자기 시점의 평균을 갖고 있으면 새 체결이 들어와도 이미
- * 찍힌 행의 레벨은 변하지 않는다.
+ * ⚠ 기준은 그 체결 **직전 STRENGTH_WINDOW 건**(trailing)이다. 목록 전체에 "지금의 중심" 하나를 쓰면
+ * 가격이 추세를 타는 동안 옛 행들이 전부 한쪽 색으로 다시 칠해지고(리페인트) 목록이 통째로 빨갛거나
+ * 파래져서 읽을 수가 없다. 각 행이 자기 시점 기준을 갖고 있으면 새 체결이 들어와도 레벨이 안 변한다.
  *
- * ⚠ 산포는 표준편차가 아니라 **평균절대편차(MAD)** 로 잰다 — 가격 자체가 큰 값이라(BTC 10만 대)
- * `E[x²] − E[x]²` 는 자릿수 상쇄로 정밀도가 날아간다. MAD 는 제곱을 안 써서 그 문제가 없고 창이
- * 60건뿐이라 매 행마다 직접 훑어도 싸다.
- * 레벨은 **0~±STRENGTH_MAX_LEVEL(50)** 로 잘게 나눈다 — 3단계였을 땐 "조금 싼가 많이 싼가"가 세 칸으로
- * 뭉개져서 목록을 훑어도 미세한 차이가 안 보였다. MAD 0.08배마다 한 레벨이라 평범한 체결이 10~25레벨,
- * 눈에 띄게 벗어난 체결이 30레벨 위, 50레벨은 사실상 이상치다. */
+ * ⚠⚠ 중심·산포는 평균/평균절대편차가 아니라 **중앙값 / 중앙절대편차**다(robust). 예전엔 평균을 썼는데,
+ * 대량 시장가가 호가를 훑으며 찍는 프린트들이 **자기들끼리 잣대를 부풀려서** 뒤로 갈수록 z 가 오히려
+ * 작아졌다("대량 매수했는데 가격은 오르는데 바 길이가 다 똑같다" 제보). 중앙값은 창의 소수를 차지하는
+ * 그 프린트들에 안 끌려가므로, 스윕이 진행될수록 레벨이 실제로 커진다.
+ *
+ * ⚠⚠ z→레벨 매핑은 **꺾은선**이다. 평상시 틱 노이즈(z≈1~3)와 대량 체결(z가 수십~수백)은 자릿수가
+ * 100배 차이라 한 가지 눈금으로는 둘 다 못 담는다 — 선형으로 잡으면 스윕이 전부 최대 레벨에 박히고
+ * (실제로 그랬다), 스윕에 맞춰 눈금을 늘리면 평상시 바가 사라진다. 그래서 **무릎(z=2.5)까지는 선형**
+ * (평상시 화면 느낌 유지: 평균 18레벨)이고 그 위는 **로그로 압축**해 z=600 까지 레벨 30→50 으로 늘린다.
+ * 실측(6,000틱 시뮬): 평상시 평균 18.3레벨·포화 0%, 4.66→4.76 스윕 8건이 38→45 로 단조 증가.
+ *
+ * ⚠ 계산은 **표시할 행에 대해서만** 한다(필터·자르기 뒤). 창이 120건이고 중앙값 계산에 정렬이 두 번
+ * 들어가는데 버퍼 400건 전부에 돌리면 폴링마다 수십만 연산이 된다. 창은 **필터 이전 원본 테이프**에서
+ * 가져와야 한다 — 걸러낸 목록의 중심은 "시장의 중심"이 아니다(고래만 보기 필터면 고래끼리의 평균이 된다). */
 type Strength = { lvl: number; ref: number };
-const STRENGTH_WINDOW = 60; // 기준 평균을 내는 최근 체결 수
-const STRENGTH_MIN_SAMPLES = 8; // 이보다 적으면 평균이 의미 없어 레벨 0
-const STRENGTH_MAX_LEVEL = 50; // 레벨 상한(그 이상 벗어나면 전부 최대 레벨)
-// ⚠ 눈금(MAD 배수)과 상한은 **같이** 정해야 한다 — 상한만 올리고 눈금을 그대로 두면 포화 지점이 멀어져
-// (MAD 10배 = 8σ) 평범한 체결이 전부 바닥 레벨로 깔려 바가 안 보인다. 곱이 4 로 유지되게 잡는다:
-// 최대 레벨 = MAD 4배 ≈ 3σ(사실상 이상치), 평범한 체결은 그 40% 언저리.
-const STRENGTH_Z_PER_LEVEL = 0.08; // MAD 이 배수마다 한 레벨씩(50레벨 = MAD 4배)
-function withStrength(trades: TickerTrade[]): (TickerTrade & Strength)[] {
-  const n = trades.length;
-  const out = new Array<TickerTrade & Strength>(n);
-  const win: number[] = []; // 이 체결 **직전**의 최근 가격들(오래된 것부터)
-  for (let i = n - 1; i >= 0; i--) {
-    // trades 는 최신이 [0] 이므로 오래된 것(뒤)부터 훑어야 trailing 평균이 성립한다.
-    const price = trades[i].price;
-    let lvl = 0;
-    let ref = price;
-    if (win.length >= STRENGTH_MIN_SAMPLES) {
-      let sum = 0;
-      for (const w of win) sum += w;
-      ref = sum / win.length;
-      let dev = 0;
-      for (const w of win) dev += Math.abs(w - ref);
-      const mad = dev / win.length;
-      if (mad > 0) {
-        const z = Math.abs(price - ref) / mad;
-        const step = Math.min(STRENGTH_MAX_LEVEL, Math.round(z / STRENGTH_Z_PER_LEVEL));
-        lvl = price >= ref ? step : -step;
-      }
-    }
-    out[i] = { ...trades[i], lvl, ref };
-    win.push(price);
-    if (win.length > STRENGTH_WINDOW) win.shift();
-  }
-  return out;
+const STRENGTH_WINDOW = 120; // 기준을 잡는 최근 체결 수
+const STRENGTH_MIN_SAMPLES = 8; // 이보다 적으면 기준이 의미 없어 레벨 0
+const STRENGTH_MAX_LEVEL = 50;
+const STRENGTH_KNEE_Z = 2.5; // 여기까지는 선형(평상시 구간)
+const STRENGTH_KNEE_LEVEL = 30;
+const STRENGTH_TAIL_T = 3; // 로그 꼬리의 완만함
+const STRENGTH_TAIL_Z = 600; // 이 이상 벗어나면 최대 레벨(≈ 노이즈의 600배)
+const STRENGTH_TAIL_DEN = Math.log1p((STRENGTH_TAIL_Z - STRENGTH_KNEE_Z) / STRENGTH_TAIL_T);
+
+/** 중앙값(입력 배열은 그대로 둔다). */
+function median(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+/** trades[i] 의 강세·약세 레벨. trades 는 최신이 [0] 이므로 **뒤쪽(i+1…)이 그 이전 체결**이다. */
+function strengthAt(trades: TickerTrade[], i: number): Strength {
+  const price = trades[i].price;
+  const win: number[] = [];
+  for (let j = i + 1; j < trades.length && win.length < STRENGTH_WINDOW; j++) win.push(trades[j].price);
+  if (win.length < STRENGTH_MIN_SAMPLES) return { lvl: 0, ref: price };
+  const center = median(win);
+  const devs = win.map((w) => Math.abs(w - center));
+  let scale = median(devs);
+  // 창의 절반 이상이 같은 가격이면 중앙절대편차가 0 이 된다(호가가 거의 안 움직이는 구간) → 평균으로 폴백.
+  if (!(scale > 0)) scale = devs.reduce((a, b) => a + b, 0) / devs.length;
+  if (!(scale > 0)) return { lvl: 0, ref: center };
+  const z = Math.abs(price - center) / scale;
+  const raw =
+    z <= STRENGTH_KNEE_Z
+      ? (z / STRENGTH_KNEE_Z) * STRENGTH_KNEE_LEVEL
+      : STRENGTH_KNEE_LEVEL +
+        (STRENGTH_MAX_LEVEL - STRENGTH_KNEE_LEVEL) *
+          Math.min(1, Math.log1p((z - STRENGTH_KNEE_Z) / STRENGTH_TAIL_T) / STRENGTH_TAIL_DEN);
+  const step = Math.min(STRENGTH_MAX_LEVEL, Math.round(raw));
+  return { lvl: price >= center ? step : -step, ref: center };
 }
 
 /** 화면이 PC 폭(Tailwind `md` = 768px)인지. ⚠ App.tsx 의 2열 그리드 분기와 **같은 경계**를 써야 한다 —
@@ -187,16 +197,19 @@ export default function OrderBook() {
   const hasBound = filterMin != null || filterMax != null;
   const filtering = filterOn && hasBound;
   const shownTrades = useMemo(() => {
-    // ⚠ 레벨은 **필터 이전 원본 테이프**로 계산한다 — 걸러낸 목록의 평균은 "시장의 평균"이 아니다
-    // (고래만 보기 필터를 켜면 고래 체결끼리의 평균이 되어 전혀 다른 값이 나온다).
-    const tape = withStrength(trades);
-    if (!filtering) return tape.slice(0, rows);
-    return tape
-      .filter((t) => {
-        const v = filterBasis === 'qty' ? t.qty : t.price * t.qty;
-        return (filterMin == null || v >= filterMin) && (filterMax == null || v <= filterMax);
-      })
-      .slice(0, rows);
+    const pass = (t: TickerTrade) => {
+      if (!filtering) return true;
+      const v = filterBasis === 'qty' ? t.qty : t.price * t.qty;
+      return (filterMin == null || v >= filterMin) && (filterMax == null || v <= filterMax);
+    };
+    // 먼저 걸러서 화면에 나갈 행만 고르고(≤ rows), 레벨은 그 행들에 대해서만 계산한다 —
+    // 단 창(기준 체결들)은 **원본 테이프**에서 가져온다(§ strengthAt).
+    const out: (TickerTrade & Strength)[] = [];
+    for (let i = 0; i < trades.length && out.length < rows; i++) {
+      if (!pass(trades[i])) continue;
+      out.push({ ...trades[i], ...strengthAt(trades, i) });
+    }
+    return out;
   }, [trades, filtering, filterBasis, filterMin, filterMax, rows]);
 
   const tabBtn = (t: typeof tab, label: string) => (
@@ -346,7 +359,7 @@ export default function OrderBook() {
                 title={
                   mag === 0
                     ? undefined
-                    : `최근 ${STRENGTH_WINDOW}건 평균 ${fmtPriceShort(t.ref, prec, 9)} 대비 ${
+                    : `최근 ${STRENGTH_WINDOW}건 중앙값 ${fmtPriceShort(t.ref, prec, 9)} 대비 ${
                         gapPct >= 0 ? '+' : ''
                       }${fmtPct(gapPct, 3)}% · ${lvl > 0 ? '강세' : '약세'} ${mag}레벨 (최대 ${STRENGTH_MAX_LEVEL})`
                 }
