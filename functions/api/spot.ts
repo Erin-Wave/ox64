@@ -528,6 +528,67 @@ function serializeTape(trades: TapeTrade[]): string {
   );
 }
 
+// ── 유저 체결은 "한 줄"이 아니라 walking 한 만큼 여러 줄로 찍는다(2026-09-03) ─────────────
+// ⚠ 예전엔 시장가 한 방을 **1건으로 집계**해 찍었다(체결 테이프에 "3,000,000개" 한 줄, 가격은 마지막
+// 체결가). 실제 거래소는 maker 주문 하나하나가 별도 체결로 인쇄되므로 사다리를 walking 하면 그 단계
+// 수만큼 줄이 생긴다("내 시장가가 체결창에 합쳐서 나온다" 제보). 집계했던 이유는 **순전히 비용**이다 —
+// `spot_trades` INSERT 는 1건이 **3 rows written**(행 1 + 암묵 PK + 인덱스, §6 과금 모델)이라 실사다리
+// 22단계 + 합성 24스텝을 전부 찍으면 체결 하나가 138행이 된다. 봇 테이프처럼 JSON 링 버퍼에 얹으면
+// 공짜지만(§ 봇 합성 체결 테이프) 그 칸은 봇이 매 틱 통째로 덮어써서 **유저 체결이 몇 %는 사라진다** —
+// 자기 매매가 체결창에 안 보이는 건 표시용 손실로 넘길 수 없다. 그래서 행으로 찍되 **줄 수를
+// 상한으로 묶는다**: 작은 주문은 예전처럼 1~3줄, 아무리 큰 주문도 USER_PRINT_MAX 줄(=18행)에서 멈춘다.
+const USER_PRINT_MAX = 6;
+
+/** walking 체결들을 화면에 찍을 프린트로 묶는다. 같은 가격은 한 줄로 합치고(사다리 한 단계 = 한 체결),
+ * 그래도 상한을 넘으면 **연속 구간**을 가중평균가로 묶는다(가격이 걸어간 순서는 그대로 유지된다). */
+function splitPrints(fills: { price: number; size: number }[], max = USER_PRINT_MAX): { price: number; size: number }[] {
+  const merged: { price: number; size: number }[] = [];
+  for (const f of fills) {
+    if (!(f.size > EPS)) continue;
+    const last = merged[merged.length - 1];
+    if (last && last.price === f.price) last.size += f.size;
+    else merged.push({ price: f.price, size: f.size });
+  }
+  if (merged.length <= max) return merged;
+  const per = Math.ceil(merged.length / max);
+  const out: { price: number; size: number }[] = [];
+  for (let i = 0; i < merged.length; i += per) {
+    const chunk = merged.slice(i, i + per);
+    const size = chunk.reduce((a, c) => a + c.size, 0);
+    const cost = chunk.reduce((a, c) => a + c.price * c.size, 0);
+    out.push({ price: size > EPS ? roundOx(cost / size) : chunk[0].price, size });
+  }
+  return out;
+}
+
+/** 프린트들을 `spot_trades` 행으로. ⚠ 시각을 1ms 씩 벌려 찍는다(마지막이 정확히 now) — 같은 ms 에 몰면
+ * (a)정렬이 불안정해 walking 순서가 화면에서 뒤섞이고 (b)클라가 새 체결을 **시각**으로 식별하므로
+ * (useTradingStore.dripTrades) 한 건만 새 것으로 보고 나머지를 흘려보내지 않는다. 1ms 씩이라 캔들
+ * 버킷은 그대로다(§ 체결 시각은 소급하지 않는다 — 여기서도 미래로는 절대 안 찍는다). */
+function userTradeStmts(
+  env: Env,
+  pair: string,
+  prints: { price: number; size: number }[],
+  buyerId: string,
+  sellerId: string,
+  tapeSide: 'buy' | 'sell',
+  now: number,
+): D1PreparedStatement[] {
+  const n = prints.length;
+  return prints.map((t, i) =>
+    env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
+      crypto.randomUUID(),
+      pair,
+      buyerId,
+      sellerId,
+      t.price,
+      t.size,
+      tapeSide,
+      now - (n - 1 - i),
+    ),
+  );
+}
+
 /** 표시·버킷팅용 최근 체결 = 봇 테이프(JSON) + 유저 체결(spot_trades) 을 시간순으로 병합.
  * ⚠ 테이프 항목엔 행 id 가 없으므로 (시각, 가격) 으로 합성 키를 만든다 — 리스트 렌더 key 용도라 유일하면 된다. */
 function mergeRecentTrades(
@@ -1965,6 +2026,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
   let low = Infinity;
   let lastPx = 0;
   let remaining = p.size;
+  let walked: { price: number; size: number }[] = []; // 체결 테이프에 찍을 실제 체결들(가격대별)
   for (const level of makerLevels(book, makerSide, p.limit_price)) {
     if (remaining <= EPS) break;
     const take = Math.min(remaining, level.size);
@@ -1973,6 +2035,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
     remaining -= take;
     filled += take;
     cost += level.price * take;
+    walked.push({ price: level.price, size: take });
     if (openPx === 0) openPx = level.price;
     high = Math.max(high, level.price);
     low = Math.min(low, level.price);
@@ -2013,6 +2076,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
       cost = p.limit_price * filled;
       posMargin = locked;
       feeTotal = cost * limitFeeRate;
+      walked = [{ price: p.limit_price, size: filled }]; // 전량 지정가로 정산됐으니 테이프도 그 가격 한 줄
     }
     refund = 0;
   }
@@ -2023,15 +2087,13 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
   const stmts: D1PreparedStatement[] = [
     bookWriteStmt(env, pair, book, bookRow?.book_version ?? 0),
     ...oxPositionStmts(env, pair, existing, p.user_id, p.side, fillAvg, filled, effLev, posMargin, p.stop_loss, p.take_profit, now),
-    // 체결 테이프는 1건(이번 매칭 = 한 번의 체결 이벤트)으로 집계하고, 캔들은 walking 구간의 OHLC 로
-    // 남긴다 — 청크별로 쪼개 찍으면 체결내역이 사다리 단계 수만큼 넘친다.
-    env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
-      crypto.randomUUID(),
+    // 체결 테이프는 walking 한 가격대별로 여러 줄(상한 USER_PRINT_MAX), 캔들은 walking 구간의 OHLC.
+    ...userTradeStmts(
+      env,
       pair,
+      splitPrints(walked),
       isLong ? p.user_id : book.owner,
       isLong ? book.owner : p.user_id,
-      closePx,
-      filled,
       tapeSide,
       now,
     ),
@@ -2119,11 +2181,16 @@ export async function matchMarketOxOrder(
     remaining -= take;
   }
   // 실제 사다리를 다 먹으면 봇 무한 유동성(합성)으로 잔량 흡수 — 고정 스텝·상한 시장충격(슬리피지 완만).
+  // ⚠ 램프의 **기준은 사다리를 다 먹은 지점**(마지막 체결가)이지 주문 전 기준가가 아니다. 예전엔 `est`
+  // 에서 다시 시작해서, 사다리 위쪽(예 1.156)까지 먹고도 합성 첫 스텝이 1.130 으로 **되돌아갔다** —
+  // 체결을 1건으로 집계해 찍던 시절엔 안 보였지만, 이제 walking 을 가격대별로 찍으므로 체결창에 가격이
+  // 위아래로 튀는 게 그대로 드러난다(실제 거래소의 한 번의 sweep 은 절대 되돌아가지 않는다).
   if (remaining > EPS) {
+    const synthBase = planned.length ? planned[planned.length - 1].price : est;
     const synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
     for (let idx = 1; remaining > EPS && idx <= SYNTH_STEPS * 4; idx++) {
       const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
-      const price = roundOx(Math.max(0.0001, est * (1 + openAdverse * impact)));
+      const price = roundOx(Math.max(0.0001, synthBase * (1 + openAdverse * impact)));
       const take = Math.min(remaining, synthChunk);
       planned.push({ level: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], price, size: take });
       remaining -= take;
@@ -2145,6 +2212,7 @@ export async function matchMarketOxOrder(
   let low = Infinity;
   let lastPx = est;
   const makerFills = new Map<string, BotFill>();
+  const settled: { price: number; size: number }[] = []; // 체결 테이프에 찍을 실제 체결들(가격대별)
   for (const f of planned) {
     const perUnit = f.price / effLev + f.price * feeRate;
     let sz = f.size;
@@ -2163,6 +2231,7 @@ export async function matchMarketOxOrder(
     low = Math.min(low, f.price);
     lastPx = f.price;
     addBotFill(makerFills, f.makerUserId, f.price * sz, sz);
+    settled.push({ price: f.price, size: sz });
     if (f.level) f.level.size -= sz; // 실제 사다리 물량 소비(참조라 그대로 book 에 반영된다)
     if (sz < f.size - EPS) break; // 가용 소진 — 여기서 멈춤
   }
@@ -2188,15 +2257,15 @@ export async function matchMarketOxOrder(
   // 환불/재시도 없이 체결은 그대로 성립. 이 best-effort 가 예전 claim-실패-스핀 정체를 없앤 그 원칙이다).
   stmts.push(bookWriteStmt(env, pair, book, st?.book_version ?? 0));
   stmts.push(...oxPositionStmts(env, pair, existing0, uid, side, avgPrice, filled, effLev, totalMargin, sl, tp, now));
-  // 체결 테이프는 1건(시장가=한 번의 체결 이벤트)으로 집계 기록. 봇 상대라 counterparty 는 표시용.
+  // 체결 테이프는 **walking 한 가격대별로 여러 줄**(§ userTradeStmts) — 예전엔 1건으로 집계해서 큰
+  // 시장가가 "한 줄에 몇 백만 개"로 찍혔다. 봇 상대라 counterparty 는 표시용.
   stmts.push(
-    env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
-      crypto.randomUUID(),
+    ...userTradeStmts(
+      env,
       pair,
+      splitPrints(settled),
       isLong ? uid : BOT_USER_IDS[0],
       isLong ? BOT_USER_IDS[0] : uid,
-      newRef,
-      filled,
       isLong ? 'buy' : 'sell',
       now,
     ),
@@ -2282,10 +2351,12 @@ async function closePositionAgainstBook(
   // 시장가 청산은 봇 무한 유동성으로 잔량 흡수. ⚠ 지정가 청산(limitPrice != null)은 크로스되는 호가가
   // 없으면 잔량을 대기시킨다(합성 안 함 — 기존 동작 유지).
   if (remaining > EPS && limitPrice == null) {
+    // ⚠ 진입과 같은 규칙 — 램프 기준은 사다리를 다 먹은 지점(마지막 체결가)이다(위 matchMarketOxOrder 참고).
+    const synthBase = planned.length ? planned[planned.length - 1].price : est;
     const synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
     for (let idx = 1; remaining > EPS && idx <= SYNTH_STEPS * 4; idx++) {
       const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
-      const price = roundOx(Math.max(0.0001, est * (1 + adverse * impact)));
+      const price = roundOx(Math.max(0.0001, synthBase * (1 + adverse * impact)));
       const take = Math.min(remaining, synthChunk);
       planned.push({ level: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], price, size: take });
       remaining -= take;
@@ -2338,14 +2409,14 @@ async function closePositionAgainstBook(
   );
   // 소비한 사다리를 best-effort 로 되쓴다(재호가가 끼었으면 0행 — 봇은 무한 유동성이라 체결은 성립).
   stmts.push(bookWriteStmt(env, pair, book, st?.book_version ?? 0));
+  // 청산도 walking 한 가격대별로 여러 줄(§ userTradeStmts) — 진입과 같은 규칙.
   stmts.push(
-    env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
-      crypto.randomUUID(),
+    ...userTradeStmts(
+      env,
       pair,
+      splitPrints(planned.map((f) => ({ price: f.price, size: f.size }))),
       userSide === 'buy' ? uid : book.owner,
       userSide === 'buy' ? book.owner : uid,
-      newRef,
-      filled,
       tapeSide,
       now,
     ),

@@ -185,7 +185,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
     if (badSize(size)) return bad('수량 오류');
-    if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
+    if (!(leverage >= 1 && leverage <= 250)) return bad('레버리지 1~250');
 
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
@@ -410,7 +410,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
     if (badSize(size)) return bad('수량 오류');
-    if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
+    if (!(leverage >= 1 && leverage <= 250)) return bad('레버리지 1~250');
     if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
     // OX 는 4자리 틱(0.0001) 정합성 유지 — 유저가 더 세밀한 지정가를 넣어도 호가창/체결이 4자리를 넘지 않게.
     if (isVirtualSymbol(symbol)) limitPrice = roundVirtual(limitPrice);
@@ -542,7 +542,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
     if (badSize(size)) return bad('수량 오류');
-    if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
+    if (!(leverage >= 1 && leverage <= 250)) return bad('레버리지 1~250');
     if (!(triggerPrice > 0) || !isFinite(triggerPrice)) return bad('트리거 가격 오류');
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
     if (isVirtualSymbol(symbol)) triggerPrice = roundVirtual(triggerPrice); // 가상 코인 유효숫자 4자리 틱
@@ -601,7 +601,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const triggerDir = body.triggerDir != null && body.triggerDir !== '' ? String(body.triggerDir) : cond.trigger_dir;
     if (triggerDir !== 'above' && triggerDir !== 'below') return bad('트리거 방향 오류');
     const leverage = body.leverage != null && body.leverage !== '' ? Math.round(Number(body.leverage)) : cond.leverage;
-    if (!(leverage >= 1 && leverage <= 200)) return bad('레버리지 1~200');
+    if (!(leverage >= 1 && leverage <= 250)) return bad('레버리지 1~250');
     const repeating = body.repeating === undefined ? !!cond.repeating : body.repeating === true || body.repeating === 1;
 
     const rep = parseRepeatOpts(body, triggerPrice, triggerDir, isOx, {

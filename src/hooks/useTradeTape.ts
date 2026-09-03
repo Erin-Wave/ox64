@@ -13,7 +13,7 @@ export function useTradeTape() {
   const symbol = useMarketStore((s) => s.symbol);
   const virtual = isVirtualSymbol(symbol);
   const pushTrade = useMarketStore((s) => s.pushTrade);
-  const setRecentTrades = useMarketStore((s) => s.setRecentTrades);
+  const mergeTrades = useMarketStore((s) => s.mergeTrades);
   const spotTrades = useTradingStore((s) => s.spotTrades);
 
   useEffect(() => {
@@ -26,9 +26,11 @@ export function useTradeTape() {
 
   useEffect(() => {
     if (!virtual) return;
-    setRecentTrades(
+    // ⚠ 갈아끼우지 않고 **새로 들어온 것만 얹는다**(mergeTrades) — 서버가 매 폴링 최근 50건만 주는데
+    // 그대로 교체하면 버퍼가 영영 50건이라 체결 필터를 켰을 때 화면이 계속 빈다(§ MAX_TRADES).
+    mergeTrades(
       symbol,
       spotTrades.map((t) => ({ price: t.price, qty: t.size, takerSide: t.takerSide, time: t.createdAt })),
     );
-  }, [virtual, symbol, spotTrades, setRecentTrades]);
+  }, [virtual, symbol, spotTrades, mergeTrades]);
 }

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtPrice, fmtQty, fmtQtyShort, fmtUsd, fmtUsdShort, fmtPct, fmtNumInput, unfmtNum } from '@/format';
+import { fmtPrice, fmtPriceShort, fmtQty, fmtQtyShort, fmtUsd, fmtUsdShort, fmtPct, fmtNumInput, unfmtNum } from '@/format';
 import type { ApiOrder } from '@/services/api';
 
 type Tab = 'positions' | 'pending' | 'conditional' | 'history';
@@ -16,6 +16,21 @@ const fmtTime = (ms: number) => new Date(ms).toLocaleString('sv-SE', { timeZone:
  * 실제 실행 간격이 어긋나지 않는다. */
 const MIN_COOLDOWN_SEC = 5;
 const effCooldownSec = (cooldownMs: number) => Math.max(MIN_COOLDOWN_SEC, (cooldownMs || 0) / 1000);
+
+/** 슬라이더가 만든 수량을 입력칸 문자열로. ⚠ 1e21 이상은 String/toFixed 가 지수 표기("1e+21")를 줘서
+ * 입력칸이 사람이 못 읽는 값이 된다(OrderPanel trimNum 과 같은 이유) → Intl 로 전체 자릿수를 편다. */
+/** 입력칸 문자열 → 슬라이더 위치(%). 비어 있으면 "전량"이라 100% 로 본다. */
+const closePctOf = (raw: string | undefined, closable: number): number => {
+  const n = Number(raw ?? '');
+  if (!raw || !(n > 0) || !(closable > 0)) return 100;
+  return Math.max(0, Math.min(100, Math.round((n / closable) * 100)));
+};
+
+const qtyInputStr = (n: number): string => {
+  if (!(n > 0)) return '';
+  if (n >= 1e21) return n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 });
+  return String(Number(n.toFixed(8)));
+};
 
 /** 보유 포지션 목록 + 실시간 미실현 손익/ROE·청산가 (OKX 스타일).
  * 탭: 포지션 / (Standard) 미체결 지정가 / 주문내역. */
@@ -256,10 +271,19 @@ export default function PositionsPanel() {
                           {p.side === 'long' ? '롱' : '숏'} 크로스 {p.leverage}x
                         </span>
                       </td>
-                      <td className="px-3 py-2.5 text-right text-text">{live != null ? fmtPrice(live, prec) : '—'}</td>
-                      <td className="px-3 py-2.5 text-right text-text">{fmtPrice(p.entryPrice, prec)}</td>
-                      <td className="px-3 py-2.5 text-right text-down">
-                        {liq != null && liq > 0 ? fmtPrice(liq, prec) : '—'}
+                      {/* ⚠ 가격도 축약한다(전체값은 title) — 특히 **청산가**는 숏에서 진입가 + 평가자산/수량
+                          이라 1e20 을 예사로 넘고, 그 한 칸이 표 전체를 밀어냈다(§format.fmtPriceShort). */}
+                      <td className="px-3 py-2.5 text-right text-text" title={live != null ? `${fmtPrice(live, prec)} USDT` : undefined}>
+                        {live != null ? fmtPriceShort(live, prec, 10) : '—'}
+                      </td>
+                      <td className="px-3 py-2.5 text-right text-text" title={`${fmtPrice(p.entryPrice, prec)} USDT`}>
+                        {fmtPriceShort(p.entryPrice, prec, 10)}
+                      </td>
+                      <td
+                        className="px-3 py-2.5 text-right text-down"
+                        title={liq != null && liq > 0 ? `강제청산 예상가 ${fmtPrice(liq, prec)} USDT` : undefined}
+                      >
+                        {liq != null && liq > 0 ? fmtPriceShort(liq, prec, 10) : '—'}
                       </td>
                       <td className="px-3 py-2.5 text-right text-text">
                         {/* 수량·증거금은 1e30 까지 가므로 축약(전체값은 title) — §format.fmtQtyShort */}
@@ -301,9 +325,13 @@ export default function PositionsPanel() {
                             >
                               {p.stopLoss != null || p.takeProfit != null ? (
                                 <span className="space-x-1">
-                                  <span className="text-down">{p.stopLoss != null ? fmtPrice(p.stopLoss, prec) : '—'}</span>
+                                  <span className="text-down" title={p.stopLoss != null ? fmtPrice(p.stopLoss, prec) : undefined}>
+                                    {p.stopLoss != null ? fmtPriceShort(p.stopLoss, prec, 9) : '—'}
+                                  </span>
                                   <span>/</span>
-                                  <span className="text-up">{p.takeProfit != null ? fmtPrice(p.takeProfit, prec) : '—'}</span>
+                                  <span className="text-up" title={p.takeProfit != null ? fmtPrice(p.takeProfit, prec) : undefined}>
+                                    {p.takeProfit != null ? fmtPriceShort(p.takeProfit, prec, 9) : '—'}
+                                  </span>
                                 </span>
                               ) : (
                                 '설정'
@@ -331,6 +359,7 @@ export default function PositionsPanel() {
                         )}
                       </td>
                       <td className="px-3 py-2.5 text-right">
+                        <div className="flex flex-col items-stretch gap-1">
                         <div className="flex items-center justify-end gap-1">
                           {standard && (
                             <>
@@ -367,6 +396,33 @@ export default function PositionsPanel() {
                           >
                             청산
                           </button>
+                        </div>
+                        {/* 청산 수량 슬라이더 — 숫자를 직접 치지 않고 비중으로 정한다(주문 패널 슬라이더와 같은 감각).
+                            ⚠ 값의 진실원본은 위 입력칸 문자열이고 슬라이더 위치는 거기서 **파생**한다(별도 상태를
+                            두면 둘이 어긋난다). 입력칸이 비어 있으면 "전량"이므로 100% 로 보여주고, 100 으로
+                            끌면 다시 빈칸으로 되돌린다(전량 = 비움 이라는 기존 의미를 유지). */}
+                        {standard && closable > 0 && (
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              type="range"
+                              min={0}
+                              max={100}
+                              value={closePctOf(closeAmt[p.id], closable)}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                setCloseAmt((st) => ({
+                                  ...st,
+                                  [p.id]: v >= 100 ? '' : qtyInputStr((closable * v) / 100),
+                                }));
+                              }}
+                              title="청산 수량 비중 — 청산 가능 수량 기준"
+                              className="h-1 w-full min-w-[3rem] accent-down"
+                            />
+                            <span className="w-8 shrink-0 text-right text-[10px] tabular-nums text-muted">
+                              {closePctOf(closeAmt[p.id], closable)}%
+                            </span>
+                          </div>
+                        )}
                         </div>
                       </td>
                     </tr>
@@ -434,7 +490,9 @@ export default function PositionsPanel() {
                             className="w-20 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
                           />
                         ) : (
-                          fmtPrice(o.limitPrice, precisionOf(precisions, o.symbol))
+                          <span title={`${fmtPrice(o.limitPrice, precisionOf(precisions, o.symbol))} USDT`}>
+                            {fmtPriceShort(o.limitPrice, precisionOf(precisions, o.symbol), 10)}
+                          </span>
                         )}
                       </td>
                       <td className="px-3 py-2.5 text-right text-text">
@@ -561,12 +619,12 @@ export default function PositionsPanel() {
                         ) : (
                           <>
                             <span className="text-muted">{c.triggerDir === 'above' ? '≥ ' : '≤ '}</span>
-                            {fmtPrice(c.triggerPrice, prec)}
+                            <span title={`${fmtPrice(c.triggerPrice, prec)} USDT`}>{fmtPriceShort(c.triggerPrice, prec, 10)}</span>
                             {/* 재무장 대기 중이면 다시 무장되는 가격을 함께 보여준다 */}
                             {c.repeating && c.repeatMode === 'rearm' && !c.armed && (
                               <div className="text-[10px] text-muted">
                                 재무장 {c.triggerDir === 'above' ? '≤ ' : '≥ '}
-                                {fmtPrice(c.rearmPrice ?? c.triggerPrice, prec)}
+                                {fmtPriceShort(c.rearmPrice ?? c.triggerPrice, prec, 9)}
                               </div>
                             )}
                           </>
@@ -779,7 +837,9 @@ export default function PositionsPanel() {
                           {KIND_LABEL[o.kind]}
                         </span>
                       </td>
-                      <td className="px-3 py-2 text-right text-text">{fmtPrice(o.price, prec)}</td>
+                      <td className="px-3 py-2 text-right text-text" title={`${fmtPrice(o.price, prec)} USDT`}>
+                        {fmtPriceShort(o.price, prec, 10)}
+                      </td>
                       <td className="px-3 py-2 text-right text-text" title={fmtQty(o.size)}>
                         {fmtQtyShort(o.size)}
                       </td>

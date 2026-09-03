@@ -28,7 +28,23 @@ type BoolFlag =
   | 'slTpLines'
   | 'pendingLine'
   | 'orderBook'
-  | 'bookTogether';
+  | 'bookTogether'
+  | 'tradeFilterOn'
+  | 'tradeTick';
+
+/** 체결 목록 필터 기준 — 수량(코인 개수) 또는 거래대금(가격×수량, USDT). */
+export type TradeFilterBasis = 'qty' | 'notional';
+
+/** 체결 목록 필터. ⚠ **모든 심볼에 같은 값이 적용된다**(심볼별로 따로 기억하지 않는다) — 유저가 그렇게
+ * 쓰겠다고 정한 동작이다. 그래서 수량 기준은 심볼을 옮기면 의미가 크게 달라진다(BTC 0.5개 vs PEPE
+ * 수십억 개) — 심볼을 넘나들며 쓸 거면 거래대금 기준이 맞다(설정 화면에도 그렇게 적어뒀다).
+ * min/max 는 null 이면 그쪽 제한 없음. 표시(필터)일 뿐이라 서버·D1 과는 무관하다. */
+export interface TradeFilter {
+  on: boolean;
+  basis: TradeFilterBasis;
+  min: number | null;
+  max: number | null;
+}
 
 /** 차트 표시 옵션 (localStorage 영속). */
 interface ChartState {
@@ -45,11 +61,21 @@ interface ChartState {
   // PC(md+, 768px 이상)에서 호가와 체결을 탭 전환 없이 위아래로 같이 보여준다. 모바일은 폭이 좁아
   // 그대로 탭을 쓴다(이 값과 무관) — 옵션 이름에 PC 를 못 박은 이유.
   bookTogether: boolean;
+  // 체결 목록 필터(전 심볼 공통, 표시 전용). on 이 꺼져 있으면 min/max 값은 남겨두고 무시만 한다 —
+  // 껐다 켤 때 값을 다시 입력하지 않아도 되게.
+  tradeFilterOn: boolean;
+  tradeFilterBasis: TradeFilterBasis;
+  tradeFilterMin: number | null;
+  tradeFilterMax: number | null;
+  // 체결 행 가격 옆에 직전 체결 대비 강세(▲)/약세(▼) 표시. 색(테이커 방향)과는 다른 정보다 —
+  // 색은 "누가 덮쳤나", 이건 "그래서 가격이 올랐나 내렸나"다(같은 방향 체결이 이어져도 가격은 제자리일 수 있다).
+  tradeTick: boolean;
   visibleBars: number; // 처음 로드 시 보여줄 봉 개수 — 마지막으로 사용자가 확대/축소한 값을 기억
   colorScheme: ChartColorScheme;
   indicators: IndicatorConfig[];
   toggle: (k: BoolFlag) => void;
   setBookRows: (n: number) => void;
+  setTradeFilter: (patch: Partial<TradeFilter>) => void;
   setVisibleBars: (n: number) => void;
   setColorScheme: (cs: ChartColorScheme) => void;
   addIndicator: (type: IndicatorType) => void;
@@ -72,12 +98,14 @@ function load(): Partial<ChartState> {
 function persist(s: ChartState) {
   const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook } = s;
   const { bookRows, bookTogether, visibleBars, colorScheme, indicators } = s;
+  const { tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeTick } = s;
   try {
     localStorage.setItem(
       KEY,
       JSON.stringify({
         showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook,
         bookRows, bookTogether, visibleBars, colorScheme, indicators,
+        tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeTick,
       }),
     );
   } catch {
@@ -90,6 +118,13 @@ function persist(s: ChartState) {
 const clampRows = (n: number) =>
   Number.isFinite(n) ? Math.min(BOOK_ROWS_MAX, Math.max(BOOK_ROWS_MIN, Math.round(n))) : BOOK_ROWS_DEFAULT;
 
+/** 필터 경계값 정리 — 0/음수/NaN/빈값은 "제한 없음"(null)으로 본다. 0 을 경계로 두면 "0 이상"이라
+ * 아무것도 못 거르면서 필터가 켜진 것처럼 보인다. */
+const cleanLimit = (v: unknown): number | null => {
+  const n = typeof v === 'string' ? Number(v) : (v as number);
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : null;
+};
+
 const saved = load();
 export const useChartStore = create<ChartState>((set, get) => ({
   showCountdown: saved.showCountdown ?? true,
@@ -101,6 +136,11 @@ export const useChartStore = create<ChartState>((set, get) => ({
   orderBook: saved.orderBook ?? true,
   bookRows: clampRows(saved.bookRows ?? BOOK_ROWS_DEFAULT),
   bookTogether: saved.bookTogether ?? false,
+  tradeFilterOn: saved.tradeFilterOn ?? false,
+  tradeFilterBasis: saved.tradeFilterBasis ?? 'notional',
+  tradeFilterMin: cleanLimit(saved.tradeFilterMin),
+  tradeFilterMax: cleanLimit(saved.tradeFilterMax),
+  tradeTick: saved.tradeTick ?? true,
   visibleBars: saved.visibleBars ?? 38,
   colorScheme: saved.colorScheme ?? 'binance',
   indicators: saved.indicators ?? [],
@@ -110,6 +150,15 @@ export const useChartStore = create<ChartState>((set, get) => ({
   },
   setBookRows: (n) => {
     set({ bookRows: clampRows(n) });
+    persist(get());
+  },
+  setTradeFilter: (patch) => {
+    const next: Partial<ChartState> = {};
+    if (patch.on !== undefined) next.tradeFilterOn = patch.on;
+    if (patch.basis !== undefined) next.tradeFilterBasis = patch.basis;
+    if (patch.min !== undefined) next.tradeFilterMin = cleanLimit(patch.min);
+    if (patch.max !== undefined) next.tradeFilterMax = cleanLimit(patch.max);
+    set(next);
     persist(get());
   },
   setVisibleBars: (n) => {

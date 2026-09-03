@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtUsd } from '@/format';
+import { fmtUsd, fmtUsdShort } from '@/format';
 import { useEquity } from '@/hooks/useEquity';
 
 /** 서버(`functions/api/refill.ts`)의 지급 조건과 같은 값 — 화면 문구가 실제 지급과 어긋나지 않게 여기 모아둔다. */
@@ -51,7 +51,9 @@ export default function RefillModal({ onClose }: { onClose: () => void }) {
         <div className="mb-4 rounded-xl border border-border bg-bg p-3">
           <div className="flex items-baseline justify-between text-xs">
             <span className="text-muted">현재 평가자산</span>
-            <span className="font-bold tabular-nums text-text">{fmtUsd(equity)} USDT</span>
+            <span className="font-bold tabular-nums text-text" title={`${fmtUsd(equity)} USDT`}>
+              {fmtUsdShort(equity, 9)} USDT
+            </span>
           </div>
           <div className="mt-1.5 flex items-baseline justify-between text-xs">
             <span className="text-muted">오늘 남은 무료 리필</span>

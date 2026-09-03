@@ -1,10 +1,13 @@
+import { useState } from 'react';
 import { useSettingsStore, type FontSize, type Theme, type TradingMode } from '@/store/useSettingsStore';
 import {
   useChartStore,
   BOOK_ROWS_MIN,
   BOOK_ROWS_MAX,
   type ChartColorScheme,
+  type TradeFilterBasis,
 } from '@/store/useChartStore';
+import { fmtNumInput, unfmtNum } from '@/format';
 
 const THEMES: { value: Theme; label: string }[] = [
   { value: 'dark', label: '다크' },
@@ -20,6 +23,11 @@ const CHART_COLOR_SCHEMES: { value: ChartColorScheme; label: string }[] = [
 
 // 슬라이더를 잘게 끌기 어려운 모바일용 빠른 선택값(BOOK_ROWS_MIN~MAX 범위 안).
 const BOOK_ROW_PRESETS = [5, 10, 20, 30, 50];
+
+const TRADE_BASES: { value: TradeFilterBasis; label: string; desc: string }[] = [
+  { value: 'notional', label: '거래대금', desc: '가격 × 수량 (USDT)' },
+  { value: 'qty', label: '수량', desc: '코인 개수' },
+];
 
 const FONT_SIZES: { value: FontSize; label: string }[] = [
   { value: 'sm', label: '작게' },
@@ -40,6 +48,17 @@ export default function Settings({ onClose }: { onClose: () => void }) {
   const setBookRows = useChartStore((s) => s.setBookRows);
   const bookTogether = useChartStore((s) => s.bookTogether);
   const toggleChart = useChartStore((s) => s.toggle);
+  const tradeFilterOn = useChartStore((s) => s.tradeFilterOn);
+  const tradeFilterBasis = useChartStore((s) => s.tradeFilterBasis);
+  const tradeFilterMin = useChartStore((s) => s.tradeFilterMin);
+  const tradeFilterMax = useChartStore((s) => s.tradeFilterMax);
+  const tradeTick = useChartStore((s) => s.tradeTick);
+  const setTradeFilter = useChartStore((s) => s.setTradeFilter);
+  // 입력칸은 로컬 문자열이 진실원본(OrderPanel 수량칸과 같은 이유) — 스토어는 숫자라 지우는 도중
+  // ''→0→'0' 으로 되돌아와 타이핑이 막힌다. 스토어엔 확정값만 밀어넣는다(빈칸=제한 없음=null).
+  const [minInput, setMinInput] = useState(tradeFilterMin != null ? String(tradeFilterMin) : '');
+  const [maxInput, setMaxInput] = useState(tradeFilterMax != null ? String(tradeFilterMax) : '');
+  const unitLabel = tradeFilterBasis === 'qty' ? '개' : 'USDT';
 
   return (
     <div
@@ -151,6 +170,104 @@ export default function Settings({ onClose }: { onClose: () => void }) {
                 }`}
               >
                 {bookTogether ? '켬' : '끔'}
+              </span>
+            </button>
+          </section>
+
+          <section>
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-xs font-semibold text-muted">체결 목록 필터</h3>
+              <button
+                onClick={() => toggleChart('tradeFilterOn')}
+                className={`rounded px-2 py-0.5 text-[11px] font-bold ring-1 transition ${
+                  tradeFilterOn ? 'bg-accent/15 text-accent ring-accent' : 'bg-panel2 text-muted ring-border hover:bg-elevated'
+                }`}
+              >
+                {tradeFilterOn ? '켬' : '끔'}
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {TRADE_BASES.map((b) => (
+                <button
+                  key={b.value}
+                  onClick={() => setTradeFilter({ basis: b.value })}
+                  className={`rounded-lg px-3 py-2 text-left ring-1 transition ${
+                    tradeFilterBasis === b.value
+                      ? 'bg-accent/15 ring-accent'
+                      : 'bg-panel2 ring-border hover:bg-elevated'
+                  }`}
+                >
+                  <div className={`text-xs font-bold ${tradeFilterBasis === b.value ? 'text-accent' : 'text-text'}`}>
+                    {b.label}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-muted">{b.desc}</div>
+                </button>
+              ))}
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <div>
+                <label className="mb-1 block text-[10px] text-muted">이 값 이상만</label>
+                <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                  <input
+                    value={fmtNumInput(minInput)}
+                    onChange={(e) => {
+                      const v = unfmtNum(e.target.value);
+                      setMinInput(v);
+                      setTradeFilter({ min: v ? Number(v) : null });
+                    }}
+                    inputMode="decimal"
+                    placeholder="제한 없음"
+                    className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                  />
+                  <span className="shrink-0 px-2 text-[10px] text-muted">{unitLabel}</span>
+                </div>
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] text-muted">이 값 이하만</label>
+                <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                  <input
+                    value={fmtNumInput(maxInput)}
+                    onChange={(e) => {
+                      const v = unfmtNum(e.target.value);
+                      setMaxInput(v);
+                      setTradeFilter({ max: v ? Number(v) : null });
+                    }}
+                    inputMode="decimal"
+                    placeholder="제한 없음"
+                    className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                  />
+                  <span className="shrink-0 px-2 text-[10px] text-muted">{unitLabel}</span>
+                </div>
+              </div>
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-muted">
+              체결 목록에 이 범위의 체결만 보여줍니다(호가·차트·거래엔 영향 없는 <span className="text-text">표시 필터</span>).
+              설정은 <span className="text-text">모든 심볼에 똑같이</span> 적용되므로, 심볼을 옮겨 다니며 쓸 거면
+              가격대에 상관없는 <span className="text-text">거래대금</span> 기준이 편합니다(수량 기준은 BTC 0.5개와 PEPE
+              수십억 개가 같은 잣대를 받습니다). 필터가 걸려 있으면 체결 탭에 뱃지가 뜨고, 뱃지를 누르면 바로 꺼집니다.
+            </p>
+
+            <button
+              onClick={() => toggleChart('tradeTick')}
+              className={`mt-2 flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left ring-1 transition ${
+                tradeTick ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
+              }`}
+            >
+              <span className="min-w-0">
+                <span className={`block text-xs font-bold ${tradeTick ? 'text-accent' : 'text-text'}`}>
+                  강세 · 약세 표시 (<span className="text-up">▲</span>
+                  <span className="text-down">▼</span>)
+                </span>
+                <span className="mt-0.5 block text-[11px] text-muted">
+                  체결 가격 옆에 직전 체결 대비 방향을 표시 — 색(테이커 방향)과 달리 "그래서 가격이 올랐나"를 봅니다
+                </span>
+              </span>
+              <span
+                className={`shrink-0 rounded px-2 py-0.5 text-[11px] font-bold ${
+                  tradeTick ? 'bg-accent/20 text-accent' : 'bg-elevated text-muted'
+                }`}
+              >
+                {tradeTick ? '켬' : '끔'}
               </span>
             </button>
           </section>

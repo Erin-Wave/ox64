@@ -120,6 +120,16 @@ export function fmtUsdShort(v: number | null | undefined, maxIntDigits = 12): st
   return shortNum(v, maxIntDigits, fmtUsd);
 }
 
+/** 가격 — 길면 한국식 단위로 축약. 짧으면 fmtPrice 와 동일.
+ * ⚠ 가격도 얼마든지 커진다 — **청산가**가 대표적이다(숏 포지션의 청산가 = 진입가 + 평가자산/수량 이라
+ * 잔고가 크고 수량이 작으면 1e20 을 예사로 넘는다). 그런데 표 안의 가격 칸은 폭이 정해져 있어서
+ * 콤마 표기 그대로 두면 그 한 칸이 표 전체를 밀어낸다(제보: "청산가가 너무 길게 나온다").
+ * 축약한 자리엔 반드시 `title` 로 fmtPrice 전체값을 붙일 것. */
+export function fmtPriceShort(v: number | null | undefined, prec: number, maxIntDigits = 12): string {
+  if (v == null || !isFinite(v)) return '—';
+  return shortNum(v, maxIntDigits, (n) => fmtPrice(n, prec));
+}
+
 /** 수량 — 길면 한국식 단위로 축약. 짧으면 fmtQty 와 동일. */
 export function fmtQtyShort(v: number | null | undefined, maxIntDigits = 12): string {
   if (v == null || !isFinite(v)) return '—';

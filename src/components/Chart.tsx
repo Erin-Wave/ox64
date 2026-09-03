@@ -23,7 +23,7 @@ import { useChartStore, type IndicatorConfig, type IndicatorType, type ChartColo
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol } from '@/symbols';
-import { fmtPrice, fmtQty, virtualPrecision } from '@/format';
+import { fmtPrice, fmtPriceShort, fmtQtyShort, virtualPrecision } from '@/format';
 import Clock from '@/components/Clock';
 import type { Candle } from '@/types';
 
@@ -181,7 +181,7 @@ export default function Chart() {
         sell: o.side === 'short',
         reduceOnly: o.reduceOnly,
         conditional: false,
-        label: `${o.reduceOnly ? '청산 ' : ''}${o.side === 'long' ? '매수' : '매도'} ${fmtQty(o.size)}`,
+        label: `${o.reduceOnly ? '청산 ' : ''}${o.side === 'long' ? '매수' : '매도'} ${fmtQtyShort(o.size, 9)}`,
       });
     }
     for (const c2 of conditionalOrders) {
@@ -197,7 +197,7 @@ export default function Chart() {
         conditional: true,
         label: `조건부${c2.repeating ? '∞' : ''} ${c2.side === 'long' ? '롱' : '숏'} ${
           c2.triggerDir === 'above' ? '≥' : '≤'
-        } ${fmtQty(c2.size)}${c2.repeating && c2.repeatMode === 'rearm' && !c2.armed ? ' (재무장 대기)' : ''}`,
+        } ${fmtQtyShort(c2.size, 9)}${c2.repeating && c2.repeatMode === 'rearm' && !c2.armed ? ' (재무장 대기)' : ''}`,
       });
     }
     const prev = pendBtnsRef.current;
@@ -841,7 +841,7 @@ export default function Chart() {
             lineWidth: 1,
             lineStyle: LineStyle.LargeDashed,
             axisLabelVisible: true,
-            title: `${p.reduceOnly ? '청산 ' : ''}${p.side === 'long' ? '매수' : '매도'} ${fmtQty(p.size)}`,
+            title: `${p.reduceOnly ? '청산 ' : ''}${p.side === 'long' ? '매수' : '매도'} ${fmtQtyShort(p.size, 9)}`,
           }),
         );
       }
@@ -856,7 +856,7 @@ export default function Chart() {
             axisLabelVisible: true,
             title: `조건부${cd.repeating ? '∞' : ''} ${cd.side === 'long' ? '롱' : '숏'} ${
               cd.triggerDir === 'above' ? '≥' : '≤'
-            } ${fmtQty(cd.size)}`,
+            } ${fmtQtyShort(cd.size, 9)}`,
           }),
         );
         // 재무장 대기 중이면 "여기까지 돌아오면 다시 무장" 지점도 흐린 점선으로 보여준다
@@ -1028,9 +1028,10 @@ export default function Chart() {
           <div className="pointer-events-none absolute left-2 top-1.5 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px]">
             <span className="font-semibold text-text">{symbol.replace('USDT', '')}</span>
             <span className="text-muted">{fmtKst(legend.time, subMinute)}</span>
-            <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.open, prec)}</span></span>
-            <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.high, prec)}</span></span>
-            <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmtPrice(legend.low, prec)}</span></span>
+            {/* 레전드도 축약 — 좁은 한 줄에 OHLCV + 인디케이터가 다 들어가서 한 값만 길어도 줄이 깨진다 */}
+            <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.open, prec, 9)}</span></span>
+            <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.high, prec, 9)}</span></span>
+            <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.low, prec, 9)}</span></span>
             <span className="text-muted">
               종{' '}
               <span className={up ? 'text-up' : 'text-down'}>
@@ -1038,7 +1039,7 @@ export default function Chart() {
                 {chgPct != null && ` (${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%)`}
               </span>
             </span>
-            <span className="text-muted">거래량 <span className="text-text">{fmtQty(legend.volume)}</span></span>
+            <span className="text-muted">거래량 <span className="text-text">{fmtQtyShort(legend.volume, 9)}</span></span>
             {opts.indicators.map((ind, idx) => {
               const val = indLegend[ind.id];
               if (val == null) return null;

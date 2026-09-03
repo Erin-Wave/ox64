@@ -3,9 +3,10 @@ import type { TickerTrade } from '@/types';
 import { isVirtualSymbol } from '@/symbols';
 import { virtualPrecision } from '@/format';
 
-// 체결 테이프 보관 개수. 호가창 "체결" 탭이 보여줄 수 있는 최대 행 수(설정 상한 50)와 맞춘다 —
-// 이보다 작으면 표시 개수를 50 으로 올려도 목록이 그만큼 안 찬다.
-const MAX_TRADES = 50;
+// 체결 테이프 보관 개수. 화면에 그리는 건 최대 50행(설정 상한)이지만 **버퍼는 훨씬 크게** 잡는다 —
+// 체결 필터(설정 → 체결 목록 필터, 예 "거래대금 1만 USDT 이상만")를 켜면 최근 50건 중 조건에 맞는 게
+// 한두 건뿐이라 목록이 계속 텅 비기 때문이다. 순수 클라 메모리(작은 객체 400개)라 요청·D1 비용은 0.
+const MAX_TRADES = 400;
 
 /**
  * 시장/UI 상태 (Zustand).
@@ -37,7 +38,7 @@ interface MarketState {
   setChartClickPrice: (price: number) => void;
   setPriceTarget: (target: string) => void;
   pushTrade: (symbol: string, trade: TickerTrade) => void;
-  setRecentTrades: (symbol: string, trades: TickerTrade[]) => void;
+  mergeTrades: (symbol: string, trades: TickerTrade[]) => void;
 }
 
 const KEY = 'ox64_market_opts_v1';
@@ -95,7 +96,19 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   setPriceTarget: (priceTarget) => set((s) => (s.priceTarget === priceTarget ? s : { priceTarget })),
   pushTrade: (symbol, trade) =>
     set((s) => ({ recentTrades: { ...s.recentTrades, [symbol]: [trade, ...(s.recentTrades[symbol] ?? [])].slice(0, MAX_TRADES) } })),
-  setRecentTrades: (symbol, trades) => set((s) => ({ recentTrades: { ...s.recentTrades, [symbol]: trades } })),
+  // 가상 코인(폴링)용 — 서버가 매번 "최근 50건"을 통째로 주므로 예전엔 그대로 갈아끼웠다. 그러면 버퍼가
+  // 영원히 50건이라 필터를 걸었을 때 볼 게 없다(50건 창을 벗어난 큰 체결이 화면에서 사라진다).
+  // 그래서 **새로 들어온 것만 앞에 얹는다**(최신이 [0]).
+  // ⚠ 새 체결 식별은 id 가 아니라 **시각(createdAt)** 으로 한다 — 봇 테이프가 링 버퍼라 같은 체결의
+  //   합성 id(`t<시각>-<인덱스>`)가 폴링마다 바뀐다(useTradingStore.dripTrades 와 같은 규칙).
+  mergeTrades: (symbol, trades) =>
+    set((s) => {
+      const cur = s.recentTrades[symbol] ?? [];
+      const lastAt = cur[0]?.time ?? 0;
+      const fresh = trades.filter((t) => t.time > lastAt);
+      if (fresh.length === 0) return cur.length ? s : { recentTrades: { ...s.recentTrades, [symbol]: trades.slice(0, MAX_TRADES) } };
+      return { recentTrades: { ...s.recentTrades, [symbol]: [...fresh, ...cur].slice(0, MAX_TRADES) } };
+    }),
 }));
 
 /** 현재 보는 심볼의 최신가(선택자 헬퍼). */

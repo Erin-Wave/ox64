@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useMarketStore, selectLastPrice, selectLastTakerSide, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtPrice, fmtUsd, fmtUsdShort } from '@/format';
+import { fmtPrice, fmtPriceShort, fmtUsd, fmtUsdShort } from '@/format';
 import SymbolSelect from '@/components/SymbolSelect';
 import Logo from './Logo';
 import VipBadge from './VipBadge';
@@ -53,9 +53,13 @@ export default function Header({
         <div className="hidden h-6 w-px bg-border sm:block" />
         <SymbolSelect />
         {/* 연결 상태는 텍스트 없이 점 색으로만(초록=실시간, 회색=끊김) */}
-        <span className={`flex min-w-0 items-center gap-1 truncate text-xs font-bold sm:text-[15px] ${priceColor}`}>
+        <span
+          className={`flex min-w-0 items-center gap-1 truncate text-xs font-bold sm:text-[15px] ${priceColor}`}
+          title={lastPrice != null ? `${fmtPrice(lastPrice, precisionOf(precisions, symbol))} USDT` : undefined}
+        >
           <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${connected ? 'bg-up' : 'bg-muted'}`} />
-          {lastPrice != null ? fmtPrice(lastPrice, precisionOf(precisions, symbol)) : '—'}
+          {/* 가격도 길면 축약 — OX 는 상한이 1e6 이지만 실제 코인/미래 코인까지 같은 규칙으로 둔다(§fmtPriceShort) */}
+          {lastPrice != null ? fmtPriceShort(lastPrice, precisionOf(precisions, symbol), 9) : '—'}
         </span>
       </div>
 

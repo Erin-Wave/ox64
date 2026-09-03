@@ -16,6 +16,10 @@ type RepeatMode = 'continuous' | 'rearm';
  * 보여줘야 "설정한 대로 안 돈다"는 혼란이 없다. */
 const MIN_COOLDOWN_SEC = 5;
 
+/** 레버리지 상한 — 서버 검증(functions/api/order.ts `leverage <= 250`)과 **같은 값**이어야 한다.
+ * 슬라이더만 올리면 서버가 "레버리지 1~250" 으로 거부하고, 서버만 올리면 화면에서 못 고른다. */
+const MAX_LEVERAGE = 250;
+
 /** 주문 패널 (OKX 스타일). 체결가는 서버가 결정.
  * Easy 모드: 시장가만. Standard 모드: 시장가 + 지정가 + SL/TP. */
 export default function OrderPanel() {
@@ -404,7 +408,7 @@ export default function OrderPanel() {
         <input
           type="range"
           min={1}
-          max={200}
+          max={MAX_LEVERAGE}
           value={leverage}
           disabled={!!existingPosition}
           onChange={(e) => setLeverage(Number(e.target.value))}

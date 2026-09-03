@@ -57,14 +57,18 @@ export const MONTHLY_ROW_BUDGET = FREE_DAY_ROW_LIMIT * 31;
 //   봇 틱 7행 = 상태 UPDATE 1 + 캔들 upsert 3(1m/1h/1d) + 봇 수수료 카운터 1 + 이 계량기 1 = 6
 //               ⚠ 실측 평균은 6.3 이다 — 캔들 upsert 가 **새 버킷이면 2행**(행 1 + PK 인덱스 1)이라
 //               분/시/일이 넘어갈 때 조금 더 든다. 과소평가는 차단을 늦게 걸리게 하므로 7 로 올려 잡는다.
-//   체결 20행 = users 1 + positions 1~3 + orders 3 + fee_ledger 4 + 계량기 1
-//               (+ OX 는 체결테이프 3 + 캔들 3 + 봇 정산 1 + 재고 2 + 사다리 1 → 20 근처)
+//   체결 24행 = users 1 + positions 1~3 + orders 3 + fee_ledger 4 + 계량기 1
+//               (+ OX 는 체결테이프 3~18 + 캔들 3 + 봇 정산 1 + 재고 2 + 사다리 1)
+//               ⚠ 20 → 24 (2026-09-03): OX 체결 테이프가 walking 한 가격대별로 **최대 6줄**을 찍는다
+//               (§ spot.ts USER_PRINT_MAX — 예전엔 1줄로 집계). 3행 × 6줄 = 18행이 최악이고 실사용
+//               평균은 2~4줄이라 +6 정도다. 이 단가가 곧 반복 조건부·재체결 차단선의 환산율이므로
+//               **줄 상한을 올리면 여기도 같이 올릴 것**(과소평가는 차단을 늦게 걸리게 한다).
 // ⚠ D1 은 한 문장의 비용을 **"바뀐 행 1 + 갱신된 인덱스 항목 수"** 로 센다(암묵 PK 인덱스도 포함).
 // 실측: spot_trades INSERT 3(=1+PK+1), fee_ledger INSERT 4(=1+PK+2), 비인덱스 컬럼 UPDATE 1.
 // 그래서 **인덱스를 하나 더 다는 것은 그 테이블 모든 INSERT 비용을 올리는 결정**이다.
 // ⚠ 봇 단가는 이제 "틱당"이 아니라 **"커밋당"** 이라 여기 없다 — 버스트는 틱을 몇 개 돌든 상태 행을
 // 한 번만 쓴다(§ spot.ts ROWS_PER_BOT_COMMIT). 틱 수와 쓰기가 분리된 게 이번 전환의 핵심이다.
-export const ROWS_PER_FILL = 20;
+export const ROWS_PER_FILL = 24;
 
 /** KST(UTC+9) 기준 오늘 날짜. ⚠ `_shared.todayKst` 와 같은 로직이지만 **일부러 복사**했다 —
  * `_shared.ts` 가 이 파일의 `meterStmt` 를 쓰므로, 여기서 `_shared` 의 값을 import 하면 런타임 순환
