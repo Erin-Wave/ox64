@@ -823,9 +823,12 @@ const MICRO_MID_FOLLOW = 0.35;
 const HUNT_CHANCE = 0.012;
 const HUNT_MIN = 0.0018;
 const HUNT_RAND = 0.006;
-/** 틱 내부 체결 시각을 펼 창(ms). ⚠ runBotTicks 의 틱 간 최소 간격(10ms)을 넘으면 안 된다 —
- * 넘으면 다음 틱의 체결과 시각이 뒤섞여 테이프 정렬이 깨진다. */
+/** 틱 내부 체결 시각을 펼 창(ms)과 틱 사이의 최소 간격. ⚠ **창 ≤ 간격** 이어야 한다 — 넘으면 다음 틱의
+ * 체결과 시각이 뒤섞여 테이프 정렬이 깨진다(예전 `now + i` 는 건수가 11 을 넘으면 그렇게 됐다). */
 const TICK_PRINT_SPAN_MS = 10;
+const TICK_SPACING_MS = 10;
+/** 틱 시각 출발점이 벽시계보다 앞설 수 있는 한도(§ runBotTicks). */
+const TS_SEED_MAX_AHEAD_MS = 2000;
 /** 호가 한 단계(가격대)의 평균 물량 — 이것도 여러 주문의 합으로 만든다(아래 placeQuote). */
 const BOOK_LEVEL_MEAN = 6000;
 const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에 몰아 돌리는 틱 수(시장이 계속 살아있게)
@@ -1875,7 +1878,7 @@ const ROWS_PER_BOT_ACCRUAL = 4; // 정산 시 usage_meter 1 + 봇 2명 카운터
  * ⚠ 벽(유저 지정가)은 이 실행 동안 바뀔 수 없으므로 한 번만 읽어 전 틱이 공유한다. 어느 호가가
  * 그 틱의 "벽"인지는 기준가에 따라 달라지므로 판정 자체는 simulateTick 이 매 틱 다시 한다.
  * ⚠ 체결 시각은 절대 과거로 소급하지 않는다(마감된 봉이 변하던 버그) — 각 틱의 시각은 그 틱을 실제로
- * 실행하는 시점(단조 증가)이다. +10ms 는 틱 내부 체결끼리 겹치지 않게 하는 최소 간격.
+ * 실행하는 시점(단조 증가)이고, `TICK_SPACING_MS` 는 틱 내부 체결끼리 겹치지 않게 하는 최소 간격이다.
  */
 async function runBotTicks(
   env: Env,
@@ -1916,10 +1919,17 @@ async function runBotTicks(
   let notional = 0;
   const closed: { code: string; bar: LiveBar }[] = [];
   const path: number[] = []; // 이 실행이 지나온 기준가들 — 트리거를 여러 지점에서 평가하는 데 쓴다
-  let prevTs = 0;
+  // ⚠ 틱 시각의 출발점은 0 이 아니라 **테이프의 마지막 체결 시각**이다(2026-09-07). 버스트는 틱을 몇 개
+  // 돌든 실제로는 몇 ms 밖에 안 걸리므로 `prevTs + TICK_SPACING_MS` 로 앞당겨 찍는데(과거로 소급하면
+  // 마감된 봉이 변한다), 그러면 12틱 버스트의 마지막 체결이 벽시계보다 ~120ms 앞에 놓인다. 그 직후
+  // 들어온 폴링이 `Date.now()` 에서 다시 시작하면 그 구간이 **테이프에서 시각 역행**으로 남는다
+  // (prod 실측 700건 중 14건 — 목록 순서가 어긋나고 클라의 새 체결 식별(dripTrades)이 몇 건을 놓친다).
+  // 마지막 체결 시각에서 이어 붙이면 전역 단조가 보장된다. ⚠ 미래로 폭주하지 않게 상한을 둔다 —
+  // 어떤 이유로든 먼 미래 시각이 한 번 들어오면 그 뒤 모든 틱이 거기에 묶여버린다.
+  let prevTs = Math.min(tape[tape.length - 1]?.createdAt ?? 0, Date.now() + TS_SEED_MAX_AHEAD_MS);
   let lastTs = Date.now();
   for (let i = 0; i < ticks; i++) {
-    const ts = Math.max(Date.now(), prevTs + 10);
+    const ts = Math.max(Date.now(), prevTs + TICK_SPACING_MS);
     prevTs = ts;
     lastTs = ts;
     const r = simulateTick(state, tape, wallRows, ts);
