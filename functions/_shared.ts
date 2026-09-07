@@ -3,7 +3,7 @@
 // 직접 받아 쓴다 → 클라이언트가 가격이나 잔고를 조작해도 반영되지 않는다.
 
 // ⚠ `_budget.ts` 는 이 파일에서 **타입만** import 한다(런타임 순환 없음, 그쪽 todayKst 사본 주석 참고).
-import { meterStmt, ROWS_PER_FILL } from './_budget';
+import { meterStmt, rowsForFill } from './_budget';
 
 // 최소 D1 타입 (workers-types 의존 없이 배포 가능하게 직접 선언)
 export interface D1Result<T = unknown> {
@@ -450,6 +450,9 @@ export function feeAccrualStmts(
   rate: number,
   fee: number,
   now: number,
+  /** 이 체결이 체결 테이프(`spot_trades`)에 찍은 줄 수 — OX walking 경로만 넘긴다(§ _budget.rowsForFill).
+   * 0/미지정이면 flat 단가에 이미 포함된 몫으로 본다. */
+  prints = 0,
 ): D1PreparedStatement[] {
   return [
     env.DB.prepare('UPDATE users SET total_volume = total_volume + ?, total_fees = total_fees + ? WHERE id = ?').bind(
@@ -464,7 +467,7 @@ export function feeAccrualStmts(
     // 여기 한 줄이면 시장가/지정가/지정가청산/SL·TP/조건부(1회성·반복)/강제청산/OX walking 이 전부 잡힌다
     // — 경로마다 흩뿌리면 새 체결 경로를 추가할 때 빠뜨리고, 그 누락이 곧 다음 청구서다.
     // 그래서 조건부 경로 등에 계량을 **따로 넣으면 이중 계산**이 된다(넣지 말 것).
-    meterStmt(env, ROWS_PER_FILL),
+    meterStmt(env, rowsForFill(prints)),
   ];
 }
 export interface SpotOrderRow {

@@ -58,17 +58,29 @@ export const MONTHLY_ROW_BUDGET = FREE_DAY_ROW_LIMIT * 31;
 //               ⚠ 실측 평균은 6.3 이다 — 캔들 upsert 가 **새 버킷이면 2행**(행 1 + PK 인덱스 1)이라
 //               분/시/일이 넘어갈 때 조금 더 든다. 과소평가는 차단을 늦게 걸리게 하므로 7 로 올려 잡는다.
 //   체결 24행 = users 1 + positions 1~3 + orders 3 + fee_ledger 4 + 계량기 1
-//               (+ OX 는 체결테이프 3~18 + 캔들 3 + 봇 정산 1 + 재고 2 + 사다리 1)
-//               ⚠ 20 → 24 (2026-09-03): OX 체결 테이프가 walking 한 가격대별로 **최대 6줄**을 찍는다
-//               (§ spot.ts USER_PRINT_MAX — 예전엔 1줄로 집계). 3행 × 6줄 = 18행이 최악이고 실사용
-//               평균은 2~4줄이라 +6 정도다. 이 단가가 곧 반복 조건부·재체결 차단선의 환산율이므로
-//               **줄 상한을 올리면 여기도 같이 올릴 것**(과소평가는 차단을 늦게 걸리게 한다).
+//               (+ OX 는 체결테이프 3줄까지 9 + 캔들 3 + 봇 정산 1 + 재고 2 + 사다리 1)
+//               ⚠⚠ **테이프 프린트는 이제 flat 단가에 안 들어있다**(2026-09-07). 상한을 6줄 → 20줄로
+//               올렸는데(§ spot.ts USER_PRINT_MAX) 그걸 flat 단가에 넉넉히 반영하면 60행이 되어,
+//               프린트가 1~3줄뿐인 **대다수의 평범한 체결까지 3배로 과대 계상**된다 — 그러면 차단선이
+//               실제 사용량보다 훨씬 먼저 걸려 반복 조건부·재체결이 이유 없이 멈춘다. 그래서 flat 단가는
+//               "프린트 3줄까지"만 품고, 그 이상은 실제로 찍은 줄 수를 `feeAccrualStmts(..., prints)` 로
+//               받아 정확히 더한다(계량 문장은 그대로 1개 — **왕복·행 증가 0**).
+//               ⚠ 새 체결 경로가 프린트를 여러 줄 찍는다면 그 줄 수를 반드시 넘길 것(누락은 과소계상).
 // ⚠ D1 은 한 문장의 비용을 **"바뀐 행 1 + 갱신된 인덱스 항목 수"** 로 센다(암묵 PK 인덱스도 포함).
 // 실측: spot_trades INSERT 3(=1+PK+1), fee_ledger INSERT 4(=1+PK+2), 비인덱스 컬럼 UPDATE 1.
 // 그래서 **인덱스를 하나 더 다는 것은 그 테이블 모든 INSERT 비용을 올리는 결정**이다.
 // ⚠ 봇 단가는 이제 "틱당"이 아니라 **"커밋당"** 이라 여기 없다 — 버스트는 틱을 몇 개 돌든 상태 행을
 // 한 번만 쓴다(§ spot.ts ROWS_PER_BOT_COMMIT). 틱 수와 쓰기가 분리된 게 이번 전환의 핵심이다.
 export const ROWS_PER_FILL = 24;
+/** `spot_trades` INSERT 1건의 비용 = 행 1 + 암묵 PK 인덱스 1 + idx_spot_trades_pair 1 (실측 3행). */
+export const ROWS_PER_TAPE_PRINT = 3;
+/** 위 flat 단가(ROWS_PER_FILL)가 이미 품고 있는 프린트 줄 수 — 이걸 넘는 줄만 추가 계상한다. */
+export const PRINTS_IN_ROWS_PER_FILL = 3;
+
+/** 체결 1건의 계량값. `prints` = 그 체결이 체결 테이프에 실제로 찍은 줄 수(0=모름/1줄 취급). */
+export function rowsForFill(prints = 0): number {
+  return ROWS_PER_FILL + ROWS_PER_TAPE_PRINT * Math.max(0, prints - PRINTS_IN_ROWS_PER_FILL);
+}
 
 /** KST(UTC+9) 기준 오늘 날짜. ⚠ `_shared.todayKst` 와 같은 로직이지만 **일부러 복사**했다 —
  * `_shared.ts` 가 이 파일의 `meterStmt` 를 쓰므로, 여기서 `_shared` 의 값을 import 하면 런타임 순환

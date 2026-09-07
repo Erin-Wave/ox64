@@ -14,11 +14,29 @@
  *   - 수익률 lag1 자기상관 ≈ +0.5(추세 지속), |수익률| lag1 자기상관 ≈ 0.4 이상(변동성 뭉침)
  *   - 1분봉 평균 고저폭 ≈ 2~3%, 틱 표준편차 ≈ 0.3% 이하(노이즈를 키워서 다이내믹을 만들면 안 된다)
  *   - 국면 점유율에 극단적 편중이 없고, capitulation 은 "가끔"(1% 미만) 나온다
+ *   - **로그드리프트/틱 |값| 2e-6 이하** — 종가는 log-normal 이라 8회 평균으로도 2배씩 흔들리지만
+ *     이 값은 표본이 수백만이라 SE 가 0.01e-6 수준이다. 편향은 여기서 본다(위험선 28e-6 = 5일에 2.4배).
+ *     ⚠ 산술평균이 아니라 **산술평균 − 분산/2** 여야 한다 — 가격은 곱으로 누적되기 때문
+ *   - **세션 활성도 평균 ~1.00** (§ sessionActivity) — 1 이 아니면 전체 변동성·거래량이 조용히 바뀐
+ *     것이다. 기본 7일(정확히 한 주)이어야 이 값이 1 로 나온다(평일만 돌리면 1.08)
+ *   - **코일 비 1 미만** — 오래 눌린 관망이 갓 시작한 관망보다 조용해야 "수축 후 확장"이 성립한다
+ *   - 체결 테이프: **틱당 거래량 ~10만**(분포를 바꿔도 총량은 보존한다는 불변식),
+ *     **상승틱 매수라벨 70%+ / 하락틱 20% 내외**(라벨과 가격의 인과가 살아있나),
+ *     방향 전환율 25~40%(호가 바운스가 한 색 블록으로 뭉치지 않았나)
+ *     ⚠ "라벨-가격 불일치"는 0 이 목표가 **아니다** — 2026-09-07 이전엔 라벨을 가격 방향에서
+ *     되짚었으니 정의상 0% 였을 뿐이다(동어반복). 지금은 방향이 가격을 만들므로, 시장이 흐름과
+ *     반대로 걸어갈 때 생기는 10~20% 는 실제 거래소 데이터의 tick-rule 오분류율과 같은 값이다.
  */
-import { nextMarketState, GAUGE_FULL, type BotState } from '../functions/api/spot';
+import { nextMarketState, simulateTick, sessionActivity, GAUGE_FULL, type BotState, type TapeTrade } from '../functions/api/spot';
 
 const TICKS_PER_MIN = 20; // 접속 중 ~60/분, 유휴(cron) 12/분 사이의 대표값
-const DAYS = Number(process.env.SIM_DAYS) || 5;   // SIM_DAYS=20 처럼 늘려 더 긴 안정성 확인
+const MS_PER_TICK = 60_000 / TICKS_PER_MIN;
+// ⚠ 벽시계를 넘겨야 한다 — 모델이 하루 리듬(§ sessionActivity)을 타므로 `Date.now()` 로 고정해 돌리면
+// 하루 중 한 시각의 성격만 측정하게 된다. 월요일 00:00 UTC 에서 출발해 틱마다 실제 시간만큼 흘린다.
+const T0 = Date.UTC(2026, 0, 5, 0, 0, 0); // 2026-01-05 = 월요일
+// ⚠ 기본값이 **7일(정확히 한 주)** 이다 — 모델이 주말 한산함을 타므로 5일로 돌리면 평일만 보게 되어
+// 세션 활성도 평균이 1.08 로 나오고(주 평균은 1.00) 변동성·거래량이 실제보다 높게 측정된다.
+const DAYS = Number(process.env.SIM_DAYS) || 7;   // SIM_DAYS=21 처럼 늘려 더 긴 안정성 확인
 const TICKS = Math.round(TICKS_PER_MIN * 60 * 24 * DAYS);
 const RUNS = Number(process.env.SIM_RUNS) || 8;
 
@@ -47,6 +65,15 @@ interface RunStat {
   swingSize: number;  // 그 스윙들의 평균 크기
   bigSwing: number;   // 하루당 20% 이상짜리 스윙 수
   tickSd: number;     // 틱 수익률 표준편차(노이즈 크기)
+  meanRet: number;    // 틱당 평균 수익률(산술) — 아래 로그드리프트의 원재료
+  logEnd: number;     // ln(종가) — 로그로 평균해야 log-normal 분포의 중심이 제대로 나온다
+  // ── 2026-09-07 추가: 하루 리듬이 실제로 살아있나 ──
+  actMean: number;    // 세션 활성도 평균(반드시 ~1.00 — 아니면 전체 변동성이 조용히 바뀐 것이다)
+  busySd: number;     // 활발한 시간대(활성도>1.2)의 틱 표준편차
+  quietSd: number;    // 한산한 시간대(활성도<0.7)의 틱 표준편차 — busy 보다 확실히 작아야 한다
+  busyVol: number;    // 활발한 시간대의 평균 거래량 배수
+  quietVol: number;   // 한산한 시간대의 평균 거래량 배수
+  coilRatio: number;  // 오래 눌린 관망(calm 300틱+)의 |ret| ÷ 갓 시작한 관망(60틱 이하) — 1 보다 작아야 수축이다
 }
 
 function corr(a: number[], b: number[]): number {
@@ -118,12 +145,42 @@ function runOnce(): RunStat {
   let swingSum = 0;
   let swingN = 0;
   let bigSwingN = 0;
+  let actSum = 0;
+  let busyS2 = 0;
+  let busyN = 0;
+  let quietS2 = 0;
+  let quietN = 0;
+  let busyVolSum = 0;
+  let quietVolSum = 0;
+  let oldCalm = 0;
+  let oldCalmN = 0;
+  let newCalm = 0;
+  let newCalmN = 0;
 
   for (let t = 0; t < TICKS; t++) {
-    const step = nextMarketState(s);
+    const step = nextMarketState(s, T0 + t * MS_PER_TICK);
     s = step.next;
     rets.push(step.ret);
     occupancy[s.regime] = (occupancy[s.regime] ?? 0) + 1;
+    actSum += step.activity;
+    if (step.activity > 1.2) {
+      busyS2 += step.ret * step.ret;
+      busyVolSum += step.sizeMult;
+      busyN++;
+    } else if (step.activity < 0.7) {
+      quietS2 += step.ret * step.ret;
+      quietVolSum += step.sizeMult;
+      quietN++;
+    }
+    if (s.regime === 'calm') {
+      if (s.regimeTicks > 300) {
+        oldCalm += Math.abs(step.ret);
+        oldCalmN++;
+      } else if (s.regimeTicks <= 60) {
+        newCalm += Math.abs(step.ret);
+        newCalmN++;
+      }
+    }
     if (s.regime === 'capitulation' && prevRegime !== 'capitulation') capEvents++;
     if (s.regime !== prevRegime) regimeEpisodes++;
     prevRegime = s.regime;
@@ -221,6 +278,99 @@ function runOnce(): RunStat {
       const m = rets.reduce((a, b) => a + b, 0) / rets.length;
       return Math.sqrt(rets.reduce((a, b) => a + (b - m) ** 2, 0) / rets.length);
     })(),
+    meanRet: rets.reduce((a, b) => a + b, 0) / rets.length,
+    logEnd: Math.log(s.ref),
+    actMean: actSum / TICKS,
+    busySd: busyN ? Math.sqrt(busyS2 / busyN) : NaN,
+    quietSd: quietN ? Math.sqrt(quietS2 / quietN) : NaN,
+    busyVol: busyN ? busyVolSum / busyN : NaN,
+    quietVol: quietN ? quietVolSum / quietN : NaN,
+    coilRatio: oldCalmN && newCalmN ? oldCalm / oldCalmN / (newCalm / newCalmN) : NaN,
+  };
+}
+
+/**
+ * 체결 테이프(미세구조) 검증 — 가격 모델과 달리 여기선 `simulateTick` 을 그대로 돌려야 한다.
+ * ⚠ 메인 루프에 섞지 않는다: 틱마다 테이프 배열(최대 700건)을 복사하므로 14만 틱을 돌리면 1억 번의
+ * 복사가 난다. 미세구조는 정상성 지표라 2만 틱이면 충분하다.
+ *
+ * 보는 것: ①라벨과 가격 방향의 일치율(불일치가 크면 "색이 반대"로 읽힌다) ②호가 바운스가 실제로
+ * 일어나는가(연속 두 체결의 방향이 바뀌는 비율) ③같은 방향이 이어지는 런 길이(주문 흐름 군집)
+ * ④수량 자릿수 분포(개미~고래) ⑤틱당 건수와 거래량(캔들 거래량 불변 확인) ⑥꼬리(스톱헌팅) 빈도.
+ */
+function runTape(ticks = 20_000) {
+  let s: BotState = { ref: 1, drift: 0, vol: 1, sentiment: 0, anchor: 1, regime: 'calm', regimeTicks: 0, peak: 1, trough: 1 };
+  let tape: TapeTrade[] = [];
+  let prints = 0;
+  let volume = 0;
+  let up = 0;
+  let down = 0;
+  let flat = 0;
+  let mislabel = 0;
+  let flips = 0;
+  let pairs = 0;
+  let runLen = 0;
+  let runs = 0;
+  let curRun = 0;
+  let prevSide: 'buy' | 'sell' | null = null;
+  const digits: Record<number, number> = {};
+  let wickSum = 0;
+  let bigWick = 0;
+  for (let t = 0; t < ticks; t++) {
+    const now = T0 + t * MS_PER_TICK;
+    const before = tape.length;
+    const r = simulateTick(s, tape, [], now);
+    const fresh = r.tape.slice(Math.max(0, r.tape.length - (r.tape.length - before <= 0 ? 0 : r.tape.length - before)));
+    let prevPx = s.ref;
+    for (const x of fresh) {
+      prints++;
+      volume += x.size;
+      const d = x.price - prevPx;
+      if (d > 0) up++;
+      else if (d < 0) down++;
+      else flat++;
+      if ((d > 0 && x.takerSide === 'sell') || (d < 0 && x.takerSide === 'buy')) mislabel++;
+      if (prevSide) {
+        pairs++;
+        if (prevSide !== x.takerSide) flips++;
+      }
+      if (prevSide === x.takerSide) curRun++;
+      else {
+        if (curRun > 0) {
+          runLen += curRun;
+          runs++;
+        }
+        curRun = 1;
+      }
+      prevSide = x.takerSide;
+      prevPx = x.price;
+      const dg = String(Math.round(x.size)).length;
+      digits[dg] = (digits[dg] ?? 0) + 1;
+    }
+    // 꼬리 = 봉 몸통(|종가-시가|) 밖으로 삐져나온 부분
+    const body = Math.abs(r.bar.close - r.bar.open);
+    const wick = (r.bar.high - r.bar.low - body) / r.bar.close;
+    wickSum += wick;
+    if (wick > 0.006) bigWick++;
+    s = r.next;
+    tape = r.tape;
+  }
+  const dgTotal = Object.values(digits).reduce((a, b) => a + b, 0);
+  return {
+    perTick: prints / ticks,
+    volPerTick: volume / ticks,
+    meanSize: volume / prints,
+    labelMismatch: mislabel / prints,
+    upShare: up / prints,
+    flatShare: flat / prints,
+    flipRate: pairs ? flips / pairs : 0,
+    runLen: runs ? runLen / runs : 0,
+    wick: wickSum / ticks,
+    bigWick: bigWick / ticks,
+    digits: Object.entries(digits)
+      .sort((a, b) => Number(a[0]) - Number(b[0]))
+      .map(([k, v]) => `${k}자리 ${((v / dgTotal) * 100).toFixed(0)}%`)
+      .join(' / '),
   };
 }
 
@@ -259,9 +409,45 @@ console.log(
     `공포>0.75 ${pct(avg((s) => s.hiFear))}  평균 |무드| ${avg((s) => s.absMood).toFixed(3)}`,
 );
 console.log(
+  // ⚠ 편향은 **로그드리프트**(= 산술평균 − 분산/2)로 본다. 가격은 곱으로 누적되므로 실제 성장률은
+  // 이 값이고, 산술평균만 보면 분산이 큰 모델이 항상 "상승 편향"처럼 보인다. 표본이 수백만이라
+  // SE 가 0.01e-6 수준이어서 종가(log-normal, 8회 평균으로도 2배씩 흔들린다)보다 1000배 정밀하다.
+  `로그드리프트/틱 ${((avg((s) => s.meanRet) - avg((s) => s.tickSd) ** 2 / 2) * 1e6).toFixed(2)}e-6 ` +
+    `(편향 지표 — |값| 2 이하 권장, 위험선 28)  ` +
+    `기하평균 종가 ${Math.exp(avg((s) => s.logEnd)).toFixed(4)}`,
+);
+console.log(
+  `세션 활성도 평균 ${avg((s) => s.actMean).toFixed(3)}(반드시 ~1.00)  ` +
+    `활발한 시간 틱sd ${pct(avg((s) => s.busySd))} vs 한산한 시간 ${pct(avg((s) => s.quietSd))}  ` +
+    `거래량 배수 ${avg((s) => s.busyVol).toFixed(2)} vs ${avg((s) => s.quietVol).toFixed(2)}  ` +
+    `코일(긴 관망/짧은 관망 변동성) ${avg((s) => s.coilRatio).toFixed(2)}`,
+);
+console.log(
   '국면 점유율: ' +
     Object.entries(occ)
       .sort((a, b) => b[1] - a[1])
       .map(([k, v]) => `${k} ${((v / total) * 100).toFixed(1)}%`)
       .join(' / '),
 );
+
+// ── 체결 테이프(미세구조) ──
+const tp = runTape();
+console.log('\n── 체결 테이프(미세구조, 2만 틱) ──');
+console.log(
+  `틱당 ${tp.perTick.toFixed(1)}건  평균수량 ${Math.round(tp.meanSize).toLocaleString()}  틱당 거래량 ${Math.round(
+    tp.volPerTick,
+  ).toLocaleString()}`,
+);
+console.log(
+  `라벨-가격 불일치 ${pct(tp.labelMismatch)}  상승틱 비중 ${pct(tp.upShare)}  동가 ${pct(tp.flatShare)}  ` +
+    `방향 전환율(호가 바운스) ${pct(tp.flipRate)}  같은 방향 평균 런 ${tp.runLen.toFixed(2)}건`,
+);
+console.log(`봉 꼬리 평균 ${pct(tp.wick)}  긴 꼬리(0.6%+) 틱 비율 ${pct(tp.bigWick)}`);
+console.log(`수량 자릿수: ${tp.digits}`);
+// 하루 리듬을 눈으로 — KST 시각별 활성도
+const byHour: string[] = [];
+for (let h = 0; h < 24; h += 2) {
+  const utc = Date.UTC(2026, 0, 5, (h + 15) % 24, 0, 0); // KST h 시 = UTC h-9
+  byHour.push(`${String(h).padStart(2, '0')}시 ${sessionActivity(utc).toFixed(2)}`);
+}
+console.log(`KST 시각별 활성도(평일): ${byHour.join(' / ')}`);
