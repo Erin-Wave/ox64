@@ -32,7 +32,7 @@
 
 ```
 ox64/
-├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드
+├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드 + **구글 애드센스 스니펫**(pagead2 async, client=ca-pub-6831535776648677 — 광고 단위는 아직 없고 자동 광고/사이트 인증용 로더만)
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
 ├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산, +last_fill_at=부분 재체결 간격 하한]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들 +open_at/close_at=시가·종가 체결 시각]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks/peak/trough=봇 심리상태(고점·저점 기억 포함), +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼, +live_json=진행 중 캔들 버킷, +pend_notional/pend_rows/pend_ticks=봇 수수료·계량기 누적]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
 ├── docs/HISTORY.md         완료된 작업의 배경·수정 내용·검증 기록(§10 에서 분리 — 규칙의 진실원본은 언제나 이 문서 본문)
@@ -62,6 +62,7 @@ ox64/
 ├── public/
 │   ├── favicon.png         아이콘(원본 src/resources/images/icon2_256.png)
 │   ├── _redirects          `/* /index.html 200` — SPA 폴백(Functions/정적파일이 먼저 매칭되므로 /api/* 는 영향 없음). /b, /5m, /s1 로 직접 진입/새로고침해도 index.html 이 서빙되게 함
+│   ├── ads.txt             애드센스 판매자 선언(`google.com, pub-6831535776648677, DIRECT, f08c47fec0942fa0`) — 없으면 AdSense 가 "수익 손실 위험"으로 경고한다. 정적 파일이 `_redirects` 보다 먼저 매칭되므로 /ads.txt 로 그대로 서빙됨
 │   └── fonts/              ProximaNova-{Light,Regular,Semibold,Extrabold}.ttf
 └── src/                    ── 프론트 ──
     ├── App.tsx             세션확인→Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달
