@@ -195,12 +195,16 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 전량 체결하던 게 "20만개가 최우선호가보다 싸게 즉시 체결"되던 버그의 원인 → 실제 매칭으로 교체.
     if (isVirtualSymbol(symbol)) {
       const marks = await checkTriggers(env, uid);
-      const ref = await fetchPrice(env, symbol);
+      // ⚠ 트리거 평가가 이미 이 심볼의 기준가를 읽었으면 그걸 쓴다 — 같은 행(spot_bot_state)을 한 요청에서
+      // 두 번 읽던 자리다. 무료 플랜은 invocation 당 D1 쿼리가 50 뿐이라(§6) 대량 시장가에선 이 한 개가
+      // 한도를 넘기는 마지막 한 개가 될 수 있다(§ spot.ts userTradeStmts).
+      const ref = marks[symbol] ?? (await fetchPrice(env, symbol));
       if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
       // 크로스: 여유잔고 + 전 포지션 미실현손익까지 증거금으로 walking 체결에 쓸 수 있게 uPnL 을 넘긴다.
       const uPnL = await unrealizedTotal(env, uid, marks);
-      const { filled, avgPrice } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
-      if (!(filled > 0)) return bad('체결 가능한 호가 물량이 없습니다');
+      const { filled, avgPrice, reason } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
+      // 사유를 구분해서 답한다 — 잔고 레이스로 못 넣은 걸 "호가 물량이 없다"로 답하면 원인을 오해한다.
+      if (!(filled > 0)) return bad(reason === 'margin' ? '증거금이 부족합니다 (잔고가 방금 바뀌었을 수 있습니다)' : '체결 가능한 호가 물량이 없습니다');
       marks[symbol] = avgPrice || ref;
       return json(await loadState(env, uid, marks, since));
     }

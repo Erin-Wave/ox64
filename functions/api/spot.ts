@@ -558,10 +558,15 @@ function splitPrints(fills: { price: number; size: number }[], max = USER_PRINT_
     else merged.push({ price: f.price, size: f.size });
   }
   if (merged.length <= max) return merged;
-  const per = Math.ceil(merged.length / max);
+  // ⚠ 묶을 때는 **정확히 max 칸**으로 나눈다(2026-09-08). 예전엔 `per = ceil(n/max)` 로 구간 크기를 먼저
+  // 정하고 그 크기로 잘랐는데, 그러면 줄 수가 `ceil(n/per)` 로 떨어져 **상한의 절반 언저리가 된다** —
+  // 실측(prod 시장가 33건): 46개 가격대 → per=3 → **16줄**로, 상한을 6→20 으로 올렸는데도 20줄이
+  // 나오는 경우가 없었다("20건인데 적게 나온다" 제보). n=21 이면 per=2 → 11줄로 절반이 되는 것도 같은 이유다.
+  // 인덱스를 균등 분할하면 구간 크기가 1 차이로 섞이면서 줄 수는 항상 max 이다.
   const out: { price: number; size: number }[] = [];
-  for (let i = 0; i < merged.length; i += per) {
-    const chunk = merged.slice(i, i + per);
+  for (let k = 0; k < max; k++) {
+    const chunk = merged.slice(Math.floor((k * merged.length) / max), Math.floor(((k + 1) * merged.length) / max));
+    if (chunk.length === 0) continue; // merged.length > max 이라 생기지 않지만 방어적으로
     const size = chunk.reduce((a, c) => a + c.size, 0);
     const cost = chunk.reduce((a, c) => a + c.price * c.size, 0);
     out.push({ price: size > EPS ? roundOx(cost / size) : chunk[0].price, size });
@@ -569,10 +574,21 @@ function splitPrints(fills: { price: number; size: number }[], max = USER_PRINT_
   return out;
 }
 
+/** 한 INSERT 문장에 넣는 체결 행 수 — **D1 바운드 파라미터 상한이 쿼리당 100개**라 8컬럼 × 12행 = 96 이 최대다. */
+const TRADE_INSERT_ROWS = 12;
+
 /** 프린트들을 `spot_trades` 행으로. ⚠ 시각을 1ms 씩 벌려 찍는다(마지막이 정확히 now) — 같은 ms 에 몰면
  * (a)정렬이 불안정해 walking 순서가 화면에서 뒤섞이고 (b)클라가 새 체결을 **시각**으로 식별하므로
  * (useTradingStore.dripTrades) 한 건만 새 것으로 보고 나머지를 흘려보내지 않는다. 1ms 씩이라 캔들
- * 버킷은 그대로다(§ 체결 시각은 소급하지 않는다 — 여기서도 미래로는 절대 안 찍는다). */
+ * 버킷은 그대로다(§ 체결 시각은 소급하지 않는다 — 여기서도 미래로는 절대 안 찍는다).
+ *
+ * ⚠⚠ **한 줄에 한 문장이 아니라 다중행 INSERT 다(2026-09-08, "시장가가 가끔 씹힌다" 수정)**: 무료 플랜은
+ * **invocation 하나당 D1 쿼리 50개**가 상한이고 `DB.batch` 는 문장 하나하나가 그 1개로 잡힌다(§6). 프린트
+ * 상한을 6→20 으로 올린 순간 시장가 한 방의 문장 수가 그만큼 늘어, 실측 기준 한 요청이 47~51 쿼리가 되어
+ * **주문 크기·보유 심볼 수에 따라 어떤 날은 넘고 어떤 날은 안 넘는** 상태가 됐다(= "가끔" 씹힌다). 넘으면
+ * batch 가 통째로 던져지는데 잔고 차감(charge)은 그 앞에서 이미 확정되므로 **증거금만 나가고 포지션은 안
+ * 생긴다** — 표시 문제가 아니라 돈 문제다. 다중행으로 묶으면 20줄이 **문장 2개**가 되어(행 수·과금은 동일)
+ * 같은 요청이 30 쿼리 아래로 내려간다. ⚠ 줄 수를 더 늘리더라도 여기 문장 수는 12줄당 1개씩만 는다. */
 function userTradeStmts(
   env: Env,
   pair: string,
@@ -583,38 +599,57 @@ function userTradeStmts(
   now: number,
 ): D1PreparedStatement[] {
   const n = prints.length;
-  return prints.map((t, i) =>
-    env.DB.prepare('INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(
-      crypto.randomUUID(),
-      pair,
-      buyerId,
-      sellerId,
-      t.price,
-      t.size,
-      tapeSide,
-      now - (n - 1 - i),
-    ),
-  );
+  const stmts: D1PreparedStatement[] = [];
+  for (let off = 0; off < n; off += TRADE_INSERT_ROWS) {
+    const chunk = prints.slice(off, off + TRADE_INSERT_ROWS);
+    const binds: unknown[] = [];
+    chunk.forEach((t, k) => {
+      binds.push(crypto.randomUUID(), pair, buyerId, sellerId, t.price, t.size, tapeSide, now - (n - 1 - (off + k)));
+    });
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES ${chunk
+          .map(() => '(?,?,?,?,?,?,?,?)')
+          .join(',')}`,
+      ).bind(...binds),
+    );
+  }
+  return stmts;
 }
 
 /** 표시·버킷팅용 최근 체결 = 봇 테이프(JSON) + 유저 체결(spot_trades) 을 시간순으로 병합.
- * ⚠ 테이프 항목엔 행 id 가 없으므로 (시각, 가격) 으로 합성 키를 만든다 — 리스트 렌더 key 용도라 유일하면 된다. */
+ * ⚠ 테이프 항목엔 행 id 가 없으므로 (시각, 인덱스) 로 합성 키를 만든다 — 리스트 렌더 key 용도라 유일하면 된다.
+ *
+ * ⚠⚠ **유저 체결은 상한에 걸려도 잘라내지 않는다(2026-09-08)**: 예전엔 둘을 합쳐 시간순 상위 `limit`(50)만
+ * 남겼는데, 봇 한 틱이 몰리면(flurry) 프린트를 최대 40건까지 찍으므로 그 틱 하나가 창의 대부분을 먹고 **유저
+ * 시장가 한 방의 프린트 16~20줄 중 뒤쪽이 통째로 잘려나갔다**. 게다가 클라는 새 체결을 시각으로만 식별해
+ * (`t.time > lastAt`) **한 번 잘린 프린트는 다음 폴링에 다시 실려도 영영 화면에 안 나온다** — 자기 매매가
+ * 체결창에서 사라지는 건 표시용 손실로 넘길 수 없다(§ userTradeStmts 와 같은 판단). 유저 체결은 위 SQL 이
+ * 이미 `LIMIT 30` 으로 묶여 있으므로 전부 실어도 목록이 30+limit 을 넘지 않고, **테이프는 상태 행 안의 JSON
+ * 이라 몇 건을 담든 D1 읽기가 늘지 않는다**(요청·쓰기 증가 0 — 응답 바이트만 조금 는다). */
 function mergeRecentTrades(
   tape: TapeTrade[],
   userRows: SpotTradeRow[],
   limit: number,
 ): { id: string; price: number; size: number; takerSide: 'buy' | 'sell' | null; createdAt: number }[] {
-  const merged = [
-    ...tape.map((t, i) => ({ id: `t${t.createdAt}-${i}`, price: t.price, size: t.size, takerSide: t.takerSide, createdAt: t.createdAt })),
-    ...userRows.map((r) => ({
-      id: r.id,
-      price: r.price,
-      size: r.size,
-      takerSide: (r.taker_side as 'buy' | 'sell' | null) ?? null,
-      createdAt: r.created_at,
-    })),
-  ];
-  return merged.sort((a, b) => b.createdAt - a.createdAt).slice(0, limit);
+  const userItems = userRows.map((r) => ({
+    id: r.id,
+    price: r.price,
+    size: r.size,
+    takerSide: (r.taker_side as 'buy' | 'sell' | null) ?? null,
+    createdAt: r.created_at,
+  }));
+  // 테이프는 오래된 것부터 쌓이므로(append) 뒤쪽이 최신 — 남은 자리만큼 뒤에서 가져온다.
+  const tapeItems = tape.map((t, i) => ({
+    id: `t${t.createdAt}-${i}`,
+    price: t.price,
+    size: t.size,
+    takerSide: t.takerSide,
+    createdAt: t.createdAt,
+  }));
+  // ⚠ `slice(-0)` 은 배열 전체를 돌려준다 — room 이 0 이면 명시적으로 빈 배열이어야 한다.
+  const room = Math.max(0, limit - userItems.length);
+  return [...userItems, ...(room > 0 ? tapeItems.slice(-room) : [])].sort((a, b) => b.createdAt - a.createdAt);
 }
 
 /** 호가창·체결내역 "표시용" 데이터 — 특정 유저의 개인 데이터가 아니라 시장 전체를 보여준다.
@@ -2365,7 +2400,7 @@ export async function matchMarketOxOrder(
   sl: number | null,
   tp: number | null,
   floorPnL = 0, // 크로스 가용 = 여유잔고 + floorPnL(전 포지션 미실현손익). balance 는 -floorPnL 까지 허용.
-): Promise<{ filled: number; avgPrice: number }> {
+): Promise<{ filled: number; avgPrice: number; reason?: 'liquidity' | 'margin' }> {
   const isLong = side === 'long';
   const openMakerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'; // 봇이 잡는 쪽(롱 진입이면 봇이 매도)
   const openAdverse = isLong ? 1 : -1; // 사면 위로, 팔면 아래로 시장충격
@@ -2376,8 +2411,14 @@ export async function matchMarketOxOrder(
     .bind(uid, pair, side)
     .first<PositionRow>();
   const effLev = existing0 ? existing0.leverage : leverage; // 물타기 시 기존 레버리지 고정
-  const feeRate = await feeRateOf(env, uid);
-  const bal0 = (await env.DB.prepare('SELECT balance FROM users WHERE id=?').bind(uid).first<{ balance: number }>())?.balance ?? 0;
+  // ⚠ 잔고와 요율은 **같은 users 행**이라 한 번에 읽는다 — 예전엔 feeRateOf(total_volume) 와 balance 를
+  // 따로 읽어 같은 행을 두 번 조회했다(§6 "같은 걸 한 요청 안에서 두 번 읽지 않는다"). 무료 플랜은
+  // invocation 당 쿼리가 50 뿐이라 이런 한 개가 실제로 체결 성패를 가른다(§ userTradeStmts).
+  const me = await env.DB.prepare('SELECT balance, total_volume FROM users WHERE id=?')
+    .bind(uid)
+    .first<{ balance: number; total_volume: number }>();
+  const feeRate = vipOf(me?.total_volume ?? 0).rate;
+  const bal0 = me?.balance ?? 0;
   // 기준가·적정가와 **봇 사다리를 같은 한 행에서** 함께 읽는다(예전엔 호가창을 따로 SELECT 했다).
   const st = await env.DB.prepare(`SELECT ref_price, anchor, ${BOOK_COLS} FROM spot_bot_state WHERE id=?`)
     .bind(pair)
@@ -2388,7 +2429,7 @@ export async function matchMarketOxOrder(
   const perUnitEst = est / effLev + est * feeRate;
   const affordableUnits = perUnitEst > 0 ? ((bal0 + floorPnL) * 0.999) / perUnitEst : 0;
   const target = Math.min(size, Math.max(0, affordableUnits));
-  if (target <= EPS) return { filled: 0, avgPrice: 0 };
+  if (target <= EPS) return { filled: 0, avgPrice: 0, reason: 'margin' };
 
   // ── 2) 위에서 함께 읽어온 봇 사다리를 메모리에서 walking(청크마다 왕복하지 않는다). ──
   const book = parseBook(st?.book_json);
@@ -2457,7 +2498,7 @@ export async function matchMarketOxOrder(
     if (f.level) f.level.size -= sz; // 실제 사다리 물량 소비(참조라 그대로 book 에 반영된다)
     if (sz < f.size - EPS) break; // 가용 소진 — 여기서 멈춤
   }
-  if (filled <= EPS) return { filled: 0, avgPrice: 0 };
+  if (filled <= EPS) return { filled: 0, avgPrice: 0, reason: 'liquidity' };
 
   const avgPrice = cost / filled;
   const totalMargin = cost / effLev; // Σ(price*size)/effLev
@@ -2471,7 +2512,10 @@ export async function matchMarketOxOrder(
   const charge = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
     .bind(totalMargin + feeTotal, uid, totalMargin + feeTotal, -floorPnL)
     .run();
-  if (charge.meta.changes !== 1) return { filled: 0, avgPrice: 0 }; // 레이스로 가용 부족 → 다음 시도
+  // ⚠ 여기서 0행이면 "호가가 없어서"가 아니라 **읽은 뒤 잔고가 바뀌어서**다(동시 폴링의 트리거 체결·
+  // 강제청산 등). 호출부가 "체결 가능한 호가 물량이 없습니다" 라고만 답하면 원인을 완전히 오해하게 되므로
+  // 사유를 구분해 돌려준다.
+  if (charge.meta.changes !== 1) return { filled: 0, avgPrice: 0, reason: 'margin' }; // 레이스로 가용 부족 → 다음 시도
 
   // ── 5) 나머지를 단일 batch 로 적용(포지션 병합 + 소비한 실제 호가 + 체결테이프 + 기준가/적정가 + 캔들 + 부기). ──
   const stmts: D1PreparedStatement[] = [];
@@ -2696,13 +2740,25 @@ export async function matchReduceOnlyOxPending(env: Env, pendingId: string, aggr
  */
 export const PARTIAL_FILL_COOLDOWN_MS = 5_000;
 
+/** ⚠ 한 요청에서 이 sweep 이 실제로 체결시키는 대기 주문 수 상한(2026-09-08).
+ *
+ * 체결 하나가 (포지션+주문+원장+체결테이프+캔들+봇정산) 문장 십수 개짜리 batch 라, 크로스된 지정가가
+ * 여러 개면 **한 invocation 이 무료 플랜의 D1 쿼리 상한(50)을 그대로 넘긴다** — 넘는 순간 그 뒤 모든
+ * 바인딩 호출이 던져지므로 봇 커밋도 응답 생성도 함께 죽어 `/api/state?tick=` 이 통째로 500 이 된다
+ * (지금은 대기 주문이 없어 안 터졌을 뿐인 잠복 함정이다). 넘긴 주문은 다음 틱(≈1초 뒤)에 이어서
+ * 체결되고, **첫 체결은 항상 우선**이라 "방금 낸 주문이 즉시 체결되는 체감"은 그대로 유지된다. */
+const MAX_SWEEP_FILLS = 2;
+
 async function sweepRestingOxPendings(env: Env, pair: string, pendings: PendingLite[]): Promise<boolean> {
   const now = Date.now();
   let touched = false;
+  let fills = 0;
   // 이미 부분 체결된 주문이 하나라도 있으면 예산을 확인한다(없으면 조회조차 안 한다 — 흔한 경로가 공짜).
   const nibbling = pendings.some((p) => p.last_fill_at != null);
   const throttled = nibbling && (await autoWritesBlocked(env, 'nibble'));
-  for (const p of pendings) {
+  // 첫 체결(아직 한 번도 안 채워진 주문)을 앞세운다 — 상한에 걸려 미뤄지는 건 "이미 조금씩 채워지는 중"인 쪽이어야 한다.
+  for (const p of [...pendings].sort((a, b) => (a.last_fill_at == null ? 0 : 1) - (b.last_fill_at == null ? 0 : 1))) {
+    if (fills >= MAX_SWEEP_FILLS) break; // 나머지는 다음 틱에서(§ MAX_SWEEP_FILLS)
     // ⚠ 첫 체결은 절대 늦추지 않는다(last_fill_at == null) — 유저가 방금 낸 주문이 즉시 체결되는 체감은
     // 이 사이트가 여러 번 튜닝해온 핵심이다. 하한은 **재체결**에만 건다.
     if (p.last_fill_at != null) {
@@ -2714,6 +2770,7 @@ async function sweepRestingOxPendings(env: Env, pair: string, pendings: PendingL
       // 호가이므로 taker 는 봇이고 유저는 maker 다. 그래서 체결내역 라벨은 유저 방향의 **반대**로 찍힌다
       // (실제 거래소도 그렇다: 내 매수 지정가가 시장가 매도에 채워지면 그 체결은 '매도'로 뜬다).
       touched = true; // 매칭을 시도한 순간부터 사다리·대기목록 스냅샷은 못 믿는다(호출자가 다시 읽는다)
+      fills++;
       if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id, 'bot');
       else await matchLimitPendingAgainstBook(env, p.id, 'bot');
     } catch {
