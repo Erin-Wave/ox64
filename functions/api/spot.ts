@@ -412,7 +412,7 @@ export interface BookLevel {
   price: number;
   size: number;
 }
-interface BotBook {
+export interface BotBook {
   owner: string; // 이 사다리를 깐 봇(체결 시 재고/현금/수수료 정산 대상)
   bids: BookLevel[];
   asks: BookLevel[];
@@ -837,11 +837,22 @@ const FLURRY_CHANCE = 0.18;
 const FLURRY_MULT = 2.05;
 const LULL_MULT = 0.77;
 const FLURRY_MEAN = FLURRY_CHANCE * FLURRY_MULT + (1 - FLURRY_CHANCE) * LULL_MULT;
-/** 같은 방향 체결이 이어질 확률(주문 분할·군집). 0.5 면 동전던지기, 1 이면 한 틱이 통째로 한 방향.
- * ⚠ 너무 높이면 테이프가 **한 색 블록**으로 뭉쳐 호가 바운스가 사라진다(실측 0.62 에서 방향 전환율이
- * 17% 까지 떨어졌다 — 실제 테이프는 40% 안팎이다). 0.2 면 전환율 ~27% + 같은 방향 평균 런 ~3.7건
- * (국면 편향 buyProb 이 이미 한쪽으로 쏠려 있어서 실제 전환율은 1−FLOW_PERSIST 보다 낮게 나온다). */
-const FLOW_PERSIST = 0.2;
+/** 주문 쪼개기(아이스버그·TWAP) — 큰 주문 하나를 잘게 나눠 **같은 방향·비슷한 수량**으로 연달아 낸다.
+ * 실제 테이프에서 "지금 누가 계속 사고 있다"를 알아보는 가장 흔한 단서다(2,384 / 2,391 / 2,384 / 2,370 …).
+ * 예전엔 매 프린트가 완전히 독립 추출이라 고래 한 건 뒤에 개미 한 건이 오는 식이어서, 테이프를 아무리
+ * 들여다봐도 **한 사람의 의도가 이어지는 모습**이 없었다(사람이 아니라 주사위가 내는 주문처럼 보였다).
+ * ⚠⚠ 쪼갤지 말지는 **뽑힌 수량과 무관하게** 정해야 한다 — "큰 주문일 때만 쪼갠다"로 조건을 걸면 자식
+ * 프린트의 주변분포가 큰 쪽으로 조건화돼(E[크기 | 큰 주문] > 평균) **캔들 거래량이 조용히 늘어난다**
+ * (§ "평균 보존" 불변식). 무조건 뽑으면 각 프린트의 주변분포가 그대로 `orderSize` 라 총량이 정확히
+ * 보존되고, 자식 절반은 개미 크기(= 손으로 여러 번 누르는 사람)·40건에 1건은 고래의 분할 매집이 된다.
+ * ⚠ 예전의 `FLOW_PERSIST`(같은 방향이 이어질 확률 0.2)는 사실 이 현상의 **조잡한 대용품**이었다 —
+ * "왜 같은 방향이 이어지는가"를 설명하지 못한 채 숫자만 있었다. 원인을 모델에 넣었으므로 그 상수는
+ * 아예 지웠다(방향은 매 건 국면 편향 `buyProb` 에서 새로 뽑고, 이어짐은 부모 주문이 만든다). 실측
+ * 전환율은 28.2% → 25.8% 로 실제 테이프 수준(25~40%)을 유지한다. */
+const SLICE_CHANCE = 0.2;
+const SLICE_MIN = 2;   // 자식 최소 건수
+const SLICE_RAND = 4;  // 자식 수 = SLICE_MIN + floor(rand × SLICE_RAND)
+const SLICE_JITTER = 0.12; // 자식끼리의 크기 흔들림(완전히 똑같으면 그것도 기계적이다)
 /** 최우선 매수/매도호가의 half-spread — 사다리 최상단(level 0 ≈ 0.0008)과 같은 자리에 찍히게 맞춘다. */
 const MICRO_HALF_SPREAD = 0.0006;
 /** 큰 체결이 사다리를 파고드는 깊이 계수(수량 √배에 비례)와 그 상한. */
@@ -865,7 +876,25 @@ const TICK_SPACING_MS = 10;
 /** 틱 시각 출발점이 벽시계보다 앞설 수 있는 한도(§ runBotTicks). */
 const TS_SEED_MAX_AHEAD_MS = 2000;
 /** 호가 한 단계(가격대)의 평균 물량 — 이것도 여러 주문의 합으로 만든다(아래 placeQuote). */
-const BOOK_LEVEL_MEAN = 6000;
+const BOOK_LEVEL_MEAN = 6450;
+// ── 호가창의 지속(resting)과 취소(cancel) ─────────────────────────────────────
+/** 최우선호가 근처 / 가장 깊은 자리의 주문이 이 틱에 **취소·재호가될 확률**. 사람이 만드는 호가창엔
+ * 성격이 다른 두 종류가 섞여 있다 — 초 단위로 넣고 빼는 마켓메이커(최우선호가 경쟁)와, 걸어두고
+ * 기다리는 지정가(깊은 자리, 몇 분씩 그대로 앉아 있다). 예전엔 매 틱 사다리를 통째로 새로 뽑아서
+ * 사실상 **둘 다 100%** 였다(§ simulateTick 사다리). */
+const QUOTE_CHURN_TOP = 0.55;
+/** 사다리의 기하 — 최우선호가 스프레드 / 레벨 간격 / 레벨마다 실리는 지터. ⚠ 슬롯 귀속 판정
+ * (§ placeQuote)이 이 값들로 구간을 계산하므로 **한 곳에만** 적는다: 예전엔 목표가 계산과 최대 거리
+ * 계산이 각자 0.0006/0.00055/0.0004 를 적고 있어서, 한쪽만 고치면 살아있는 주문이 조용히 버려진다. */
+const SPREAD_BASE = 0.0006;
+const LEVEL_STEP = 0.00055;
+const LEVEL_JITTER = 0.0004;
+const LEVEL_HALF_STEP = LEVEL_STEP / 2;
+const QUOTE_CHURN_DEEP = 0.06;
+/** 살아남은 주문의 물량이 조금 바뀔 확률·폭(일부 취소 / 같은 자리에 추가 주문).
+ * ⚠ 배수의 평균이 정확히 1 이어야 총 유동성이 보존된다. */
+const QUOTE_RESIZE_CHANCE = 0.3;
+const QUOTE_RESIZE_RAND = 0.22;
 const BOT_BURST_TICKS = 12; // cron 이 접속 유무와 무관하게 한 번에 몰아 돌리는 틱 수(시장이 계속 살아있게)
 // ⚠ cron 백오프 — "마지막 재호가가 이만큼 이내면 유저 폴링이 클럭 역할을 하는 중"으로 본다.
 // /api/spot 폴링은 1초 주기라 보고 있는 동안엔 last_run 이 항상 몇 초 이내다. 반대로 cron 이 직접 찍은
@@ -1218,12 +1247,28 @@ const PRICE_GRIDS: readonly { ticks: number; sizeMult: number; pull: number }[] 
   { ticks: 5, sizeMult: 1.9, pull: 0.65 }, // 1.405
 ];
 
+/** 가격(격자 인덱스)에 묶인 결정론적 0~1 난수 — **같은 가격이면 언제나 같은 값**이다(xorshift 해시).
+ * ⚠⚠ 여기서 `Math.random()` 을 쓰면 안 된다: 라운드 가격의 벽이 매 틱 주사위를 다시 굴려 **1초마다
+ * 생겼다 사라진다**. 실제 시장의 1.4500 짜리 벽은 그 자리에 계속 있고, 그래서 사람이 "저 벽을 뚫으면
+ * 간다"고 읽는다. 가격에서 파생하므로 상태 컬럼도 필요 없다(D1 비용 0). */
+function priceHash(idx: number, salt: number): number {
+  let h = (Math.imul(Math.round(idx), 2654435761) + Math.imul(salt, 40503)) >>> 0;
+  h ^= h >>> 15;
+  h = Math.imul(h, 2246822519) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 3266489917) >>> 0;
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
 /**
  * 목표 호가를 사람이 좋아하는 라운드 가격으로 끌어당긴다.
  * ⚠ 매수는 내림(floor), 매도는 올림(ceil) — 항상 mid 에서 "멀어지는" 방향으로만 스냅되므로
  * 최우선매수 > 최우선매도로 역전될 수 없다(호가 역전 방지의 핵심).
  * depth(0=최우선호가 ~ 1=가장 깊은 레벨)가 클수록 굵은 격자까지 허용한다 — 최우선호가는 촘촘하게
  * 경쟁하고, 멀리 있는 주문일수록 라운드 가격에 뭉치는 실제 호가창의 모습.
+ * ⚠ "그 격자에 붙을지"는 난수가 아니라 **가격 자체의 해시**로 정한다(§ priceHash) — 그래야 특정 가격이
+ * 계속 벽이고 나머지는 계속 평범한 자리다(=사람이 기억하는 지지·저항). 대신 `depth` 는 문턱(tol)에만
+ * 남긴다: 여기에도 depth 를 곱하면 같은 가격이 레벨에 따라 붙었다 말았다 해서 다시 깜빡인다.
  */
 function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): { price: number; sizeMult: number } {
   const tol = 0.0009 + depth * 0.0022; // 이만큼 넘게 끌려가야 하면 그 격자는 포기(사다리가 뭉개지지 않게)
@@ -1236,7 +1281,7 @@ function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): {
     const idx = side === 'buy' ? Math.floor(ticks + 1e-9) : Math.ceil(ticks - 1e-9);
     const snapped = idx * step;
     if (Math.abs(snapped - target) / target > tol) continue;
-    if (Math.random() > g.pull * (0.6 + 0.7 * depth)) continue;
+    if (priceHash(idx, g.ticks) > g.pull) continue;
     return { price: roundOx(snapped), sizeMult: g.sizeMult };
   }
   return { price: roundOx(target), sizeMult: 1 }; // 어느 격자에도 안 붙으면 원래 값(어중간한 가격도 섞여야 자연스럽다)
@@ -1610,8 +1655,20 @@ interface TickResult {
  * 지금은 계산만 하고 아무것도 안 쓴다 → 호출자(runBotTicks)가 N틱을 메모리에서 이어 돌린 뒤
  * **결과를 단일 batch 로 한 번만** 커밋한다. 틱 수를 늘려도 D1 왕복·쓰기가 안 늘어나므로
  * 가격 경로의 촘촘함(=품질)과 비용이 분리된다.
+ *
+ * ⚠ **순서가 뒤집혀 있다(2026-09-08)**: 체결(테이프)을 먼저 찍고 **그 결과로** 사다리를 만든다.
+ * 사다리가 이전 틱의 사다리를 물려받기 때문이다(§ keepResting) — 이번 틱에 가격이 지나간 자리의
+ * 호가는 "체결된 것"이라 사라져야 하고, 그걸 알려면 이번 틱의 고가·저가가 먼저 있어야 한다.
+ * ⚠ 그래서 `prevBook` 을 받는다. 호출자는 직전 틱이 만든 사다리(첫 틱이면 D1 의 `book_json`)를
+ * 그대로 넘겨야 한다 — **유저 체결이 파먹은 자리가 그 안에 남아 있어야** 시장충격이 호가창에 남는다.
  */
-export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: WallRow[], now: number): TickResult {
+export function simulateTick(
+  prev: BotState,
+  prevTape: TapeTrade[],
+  prevBook: BotBook,
+  wallRows: WallRow[],
+  now: number,
+): TickResult {
   // ⚠ 벽시계를 심리 모델에 넘긴다 — 하루 리듬(§ sessionActivity)이 이 값으로 결정된다.
   const step = nextMarketState(prev, now);
   const candidateRef = step.next.ref;
@@ -1664,67 +1721,7 @@ export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: Wa
     if (wallBid != null && p < wallBid) return roundOx(wallBid);
     return p;
   }
-
-  // ⚠ 매 틱 사다리를 통째로 새로 만든다(호가 역전 방지 — 봇이 2명이라 옛 호가가 남으면 최우선매수 >
-  // 최우선매도가 생긴다). 예전엔 이게 "spot_orders 전 행 DELETE + 44행 INSERT" 였지만, 지금 사다리는
-  // 아래 상태 UPDATE 의 book_json 한 칸이라 **비우는 문장도 까는 문장도 필요 없다**(§ BotBook).
-  const book: BotBook = { owner: actor, bids: [], asks: [] };
-  // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 타이트하게(최우선호가가 mid 에 바싹) 잡되 깊은
-  // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
-  // ⚠ 변동성이 높은 국면(패닉/과열)에선 spreadMult 로 호가가 벌어진다 — 실제 마켓메이커가 리스크를 피해
-  // 물러나는 행동이라, 거친 구간에 시장가로 들어가면 슬리피지가 커진다.
-  // ⚠ 가격은 humanQuotePrice 로 라운드 가격에 끌어당기고(가격 군집), 그 자리엔 물량을 몇 배로 얹는다
-  // (심리적 벽). 같은 가격으로 두 레벨이 겹치면 원래 목표가로 되돌려 사다리 깊이를 유지한다 —
-  // 겹친 채 두면 호가창에 보이는 단계 수가 줄어든다(loadSpotMarket 이 가격별로 SUM 하므로).
-  const usedPrices: Record<'buy' | 'sell', Set<number>> = { buy: new Set(), sell: new Set() };
-  // ⚠ 겹칠 땐 **mid 에서 한 틱씩 더 멀리** 민다(예전엔 원래 목표가로 되돌렸다). 유효숫자 4자리 틱은
-  // 가격대에 따라 굵어서(1.05 근처면 0.001) 레벨 간 목표 간격이 한 틱보다 좁아질 수 있고, 그러면
-  // 되돌린 목표가도 이미 쓴 가격이라 사다리가 몇 단계로 뭉개진다.
-  const placeQuote = (side: 'buy' | 'sell', target: number, depth: number) => {
-    const q = humanQuotePrice(target, side, depth);
-    let price = q.price;
-    let sizeMult = q.sizeMult;
-    if (usedPrices[side].has(price)) {
-      const dir = side === 'buy' ? -1 : 1;
-      let p = price;
-      while (usedPrices[side].has(p) && p > 0) p = roundOx(p + dir * virtualTick(p));
-      if (!(p > 0)) return; // 매수 사다리가 0 아래로 갈 정도면 그 레벨은 그냥 생략
-      price = p;
-      sizeMult = 1;
-    }
-    usedPrices[side].add(price);
-    // ⚠ 물량에 **국면별 깊이 배수**를 건다(2026-08-12) — 예전엔 양쪽이 항상 같은 두께라, 패닉이든
-    // 광기든 호가창은 똑같이 생겼고 심리는 가격에서만 보였다. 지금은 공포장이면 매수벽이 걷히고
-    // (시장가 매도가 훨씬 깊게 파고든다) 매도벽이 쌓인다 — 탐욕장은 반대.
-    const depthMult = side === 'buy' ? step.bidDepthMult : step.askDepthMult;
-    // ⚠ 한 가격대의 물량은 "그 자리에 걸린 **여러 주문의 합**"이다(호가창은 가격별 SUM 만 보여준다).
-    // 그래서 1~3명이 각자 계층 분포(orderSize)에서 뽑은 수량을 합친다 — 어떤 자리는 개미 하나뿐이라
-    // 얇고(수백 개) 어떤 자리는 세력이 껴서 두껍다(수만~수십만). 예전엔 전 레벨이 2,000~10,000 균등이라
-    // 호가창이 어디를 봐도 같은 자릿수였고, 시장가가 어느 구간을 지나든 저항이 똑같았다.
-    // 깊은 레벨일수록 대기 물량이 두껍다(depthTilt) — 평균이 1 이라 **총 유동성은 예전과 같다**.
-    const depthTilt = 0.6 + 0.8 * depth;
-    const orders = 1 + Math.floor(Math.random() * 3);
-    let size = 0;
-    for (let i = 0; i < orders; i++) size += orderSize((BOOK_LEVEL_MEAN * sizeMult * depthMult * depthTilt) / orders);
-    (side === 'buy' ? book.bids : book.asks).push({ price, size });
-  };
-  for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
-    const depth = level / (BOT_LEVELS_PER_SIDE - 1);
-    const spread = (0.0006 + level * 0.00055 + Math.random() * 0.0004) * step.spreadMult;
-    placeQuote('buy', ref * (1 - spread), depth);
-    placeQuote('sell', ref * (1 + spread), depth);
-  }
-  // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 얹는다 — 아래 sweep 이 유저 벽을 그 가격에 소비.
-  // 물량은 **벽 크기에 비례**한다(wallAbsorbSize) — 고정 크기면 큰 벽을 영원히 못 뚫는다.
-  if (press === 'up') {
-    book.bids.push({ price: ref, size: wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment) });
-  } else if (press === 'down') {
-    book.asks.push({ price: ref, size: wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment) });
-  }
-  // 가격 우선순위대로 정렬해 둔다 — 매칭(makerLevels)도 호가창 표시도 이 순서를 그대로 쓴다.
-  book.bids.sort((a, b) => b.price - a.price);
-  book.asks.sort((a, b) => a.price - b.price);
-
+  // ── 이번 틱의 체결(테이프) ─ ⚠ 사다리보다 **먼저** 계산한다(§ 함수 주석: 지나간 자리의 호가는 체결된다)
   // 합성 체결을 여러 건 찍는다. ⚠ 예전엔 전부 같은 가격(ref)이라 봉 안에 구조가 없었다(몸통만 있고
   // 꼬리가 없는 캔들) — 지금은 직전 기준가에서 새 기준가로 "걸어가면서" 노이즈를 얹어 찍으므로 봉마다
   // 시가/고가/저가/종가가 제대로 생긴다. 마지막 체결은 정확히 ref(=종가)로 맞춰 기준가와 어긋나지 않게.
@@ -1785,19 +1782,39 @@ export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: Wa
   // (걷는 폭이 스프레드보다 큰 대형 봉에서만 어긋난다).
   // ⚠ 그래도 라벨을 가격과 **독립적으로** 뽑아선 안 된다(2026-08-19 의 그 버그) — 여기선 방향이 가격을
   // 만들기 때문에 종속성이 유지된다. 새 체결 경로를 추가할 때 이 인과를 끊지 말 것.
-  let flowSide: 'buy' | 'sell' = prevTape[prevTape.length - 1]?.takerSide ?? (Math.random() < step.buyProb ? 'buy' : 'sell');
+  // 첫 프린트가 곧바로 다시 뽑으므로 이 초기값 자체는 쓰이지 않는다(쪼개진 주문이 아닐 때는 매 건 새로 뽑는다).
+  let flowSide: 'buy' | 'sell' = Math.random() < step.buyProb ? 'buy' : 'sell';
   const half = MICRO_HALF_SPREAD * step.spreadMult; // 최우선호가의 half-spread(사다리 최상단과 같은 값)
   let mid = prev.ref; // 호가 중간값 — 흐름이 밀고(시장충격) 목표 경로가 되돌린다(§ MICRO_MID_FOLLOW)
+  // ⑤ 주문 쪼개기(§ SLICE_CHANCE) — 지금 "쪼개진 주문"을 흘려보내는 중인지. 진행 중이면 방향과 수량이
+  //    그 부모 주문에 묶인다(같은 사람이 같은 의도로 계속 내는 주문이라 방향·크기가 이어진다).
+  let sliceLeft = 0;
+  let sliceSize = 0;
+  let sliceSide: 'buy' | 'sell' = 'buy';
   for (let i = 0; i < nTrades; i++) {
     const progress = (i + 1) / nTrades;
     const walk = prev.ref + (ref - prev.ref) * progress;
-    // ① 테이커 방향 — 주문 흐름은 강하게 자기상관한다(큰 주문을 잘게 쪼개 넣으므로 같은 방향이 연달아
-    //    찍힌다). 매 건 독립으로 뽑으면 매수·매도가 무작위로 섞여 "매수세가 붙는다"가 화면에 안 보인다.
-    flowSide = Math.random() < FLOW_PERSIST ? flowSide : Math.random() < step.buyProb ? 'buy' : 'sell';
+    // ① 테이커 방향 + ⑤ 주문 쪼개기 — 쪼개진 주문이 흐르는 중이면 방향·수량이 부모에 묶이고, 아니면
+    //    새로 뽑는다(그때 낮은 확률로 새 부모 주문이 시작된다).
     // ⚠ 수량을 **가격보다 먼저** 뽑는다 — 큰 체결일수록 사다리를 깊이 파고들어 가격을 밀어낸다.
     //   개미 체결은 최우선호가 하나를 먹고 끝이라 가격이 거의 안 움직이고, 고래가 들어오면 여러 단계를
     //   관통해 봉에 꼬리가 남는다(예전엔 크기와 가격이 독립이라 20만개가 찍혀도 차트는 아무 일 없었다).
-    const sz = orderSize(tradeMean);
+    let sz: number;
+    if (sliceLeft > 0) {
+      flowSide = sliceSide;
+      sz = humanSize(sliceSize * (1 + (Math.random() - 0.5) * 2 * SLICE_JITTER), 0.05);
+      sliceLeft--;
+    } else {
+      flowSide = Math.random() < step.buyProb ? 'buy' : 'sell';
+      sz = orderSize(tradeMean);
+      // ⚠ 쪼갤지 말지는 **뽑힌 수량과 무관하게** 정한다(§ SLICE_CHANCE) — 크기로 조건을 걸면 자식
+      //   프린트의 주변분포가 큰 쪽으로 조건화돼 캔들 거래량이 조용히 늘어난다.
+      if (Math.random() < SLICE_CHANCE) {
+        sliceSide = flowSide;
+        sliceSize = sz;
+        sliceLeft = SLICE_MIN - 1 + Math.floor(Math.random() * SLICE_RAND);
+      }
+    }
     const dig = Math.min(MICRO_DIG_MAX, MICRO_DIG * Math.max(0, Math.sqrt(sz / tradeMean) - 0.6)); // ③ 파고든 깊이
     const dir = flowSide === 'buy' ? 1 : -1;
     // ③ 파고든 만큼 **mid 자체가 밀린다**(사다리가 소비됐다) — 그리고 목표 경로가 서서히 되돌린다.
@@ -1834,6 +1851,144 @@ export function simulateTick(prev: BotState, prevTape: TapeTrade[], wallRows: Wa
     // 넘기면 다음 틱의 시각(최소 +10ms)을 넘어서서 테이프 정렬이 틱 경계에서 뒤섞였다.
     tape.push({ price, size: sz, takerSide, createdAt: now + Math.round((i * (TICK_PRINT_SPAN_MS - 1)) / Math.max(1, nTrades - 1)) });
   }
+
+  // ── 사다리는 매 틱 다시 태어나지 않는다 — 살아남은 주문 위에 새 호가를 얹는다(2026-09-08) ──────
+  // ⚠⚠ 예전엔 매 틱 44개 레벨의 **가격과 물량을 전부 새로 뽑았다**(그 전엔 "spot_orders 전 행 DELETE +
+  // 44행 INSERT" 였고, 사다리를 book_json 한 칸으로 옮겨 비용은 0 이 됐지만 **내용은 여전히 매 틱
+  // 통째로 새것**이었다). 그래서 호가창을 1초마다 보면 44줄의 숫자가 전부 바뀌었다 — 실제 호가창은
+  // 절대 그렇게 안 생긴다. 진짜 시장의 호가엔 성격이 다른 두 종류가 섞여 있다: 초 단위로 넣고 빼는
+  // 마켓메이커(최우선호가 경쟁)와, 걸어두고 기다리는 지정가(깊은 자리 — 몇 분씩 그대로 앉아 있다).
+  // 게다가 통째로 새로 깔면 **유저가 대량 체결로 파먹은 자리가 1초 뒤 감쪽같이 복구**돼서 시장충격이
+  // 호가창에 전혀 남지 않았다(내가 벽을 먹었는데 다음 폴링에 벽이 그대로 있다).
+  // 그래서 이전 사다리를 물려받아 세 규칙으로 굴린다 — 상태는 이미 매 틱 쓰던 `book_json` 하나뿐이라
+  // **D1 읽기·쓰기 증가가 0** 이다(§6 "봇 경로에서 행을 남기는 설계를 피할 것"):
+  //   ① 이번 틱에 가격이 지나간 자리의 호가는 **체결된 것**이므로 사라진다(매수는 저가 이상, 매도는 고가 이하)
+  //   ② 남은 주문은 mid 에 가까울수록 잘 취소된다(§ QUOTE_CHURN_TOP — 최우선호가는 거의 매 틱 재호가되고
+  //      멀리 걸어둔 주문은 인내심이 있다). 거친 국면일수록 전체적으로 더 자주 넣고 뺀다.
+  //   ③ 사다리의 **슬롯마다** "그 자리에 이미 앉아 있는 주문"을 찾아 쓰고, 없는 자리에만 새로 깐다
+  //      → 레벨 수와 총 유동성은 예전과 같은데(둘 다 실측 대조) 가격 간격만 불규칙해진다 — 어떤 자리는
+  //      비고, 라운드 가격의 벽은 여러 틱 동안 같은 자리에 남는다(§ priceHash 로 벽 위치 자체도 고정).
+  //      ⚠ "살아남은 주문을 먼저 다 앉히고 남은 자리에 새 호가"로 짜면 안 된다 — mid 쪽 생존자가 정원
+  //      (22)을 먹어치워 **깊은 레벨이 아예 안 깔리고** 총 유동성이 실측 35% 빠졌다(§ placeQuote).
+  // ⚠ 호가 역전은 여전히 **원천적으로** 불가능하다: 살아남는 매수는 전부 이번 틱 저가보다 아래
+  //   (< low ≤ ref), 살아남는 매도는 전부 고가보다 위(> high ≥ ref)이고, 새 호가는 ref 기준 양쪽으로만
+  //   깔린다(humanQuotePrice 의 floor/ceil 규칙). 즉 "체결된 자리는 사라진다"가 곧 역전 방지다.
+  const book: BotBook = { owner: actor, bids: [], asks: [] };
+  // 기준가 주변에 여러 단계로 유동성을 깐다. 스프레드는 타이트하게(최우선호가가 mid 에 바싹) 잡되 깊은
+  // 레벨로 갈수록 벌어지며 대량 주문엔 슬리피지가 생긴다. 물량을 크게 깔아 유저 주문이 시원하게 체결되게 한다.
+  // ⚠ 변동성이 높은 국면(패닉/과열)에선 spreadMult 로 호가가 벌어진다 — 실제 마켓메이커가 리스크를 피해
+  // 물러나는 행동이라, 거친 구간에 시장가로 들어가면 슬리피지가 커진다.
+  // ⚠ 가격은 humanQuotePrice 로 라운드 가격에 끌어당기고(가격 군집), 그 자리엔 물량을 몇 배로 얹는다
+  // (심리적 벽). 같은 가격으로 두 레벨이 겹치면 mid 에서 한 틱씩 더 밀어 사다리 깊이를 유지한다 —
+  // 겹친 채 두면 호가창에 보이는 단계 수가 줄어든다(loadSpotMarket 이 가격별로 SUM 하므로).
+  const usedPrices: Record<'buy' | 'sell', Set<number>> = { buy: new Set(), sell: new Set() };
+  // 사다리가 덮는 최대 거리(가장 깊은 레벨) — 이 밖으로 밀려난 옛 주문은 마켓메이커가 거둬 다시 깐다.
+  const maxSpread = (SPREAD_BASE + (BOT_LEVELS_PER_SIDE - 1) * LEVEL_STEP + LEVEL_JITTER) * step.spreadMult;
+  // 거친 국면일수록 호가를 전반적으로 더 자주 넣고 뺀다(마켓메이커가 리스크를 피해 물러났다 들어온다).
+  const churnMult = clamp(step.spreadMult, 0.7, 2.2);
+  /** 규칙 ①② — 이전 사다리에서 "아직 살아있는" 주문만 골라 남긴다(가격 우선순위 순서 유지). */
+  const survivors = (side: 'buy' | 'sell'): BookLevel[] => {
+    const out: BookLevel[] = [];
+    for (const l of side === 'buy' ? prevBook.bids : prevBook.asks) {
+      if (!(l.size > EPS) || !(l.price > 0)) continue;
+      if (side === 'buy' ? l.price >= low : l.price <= high) continue; // ① 가격이 지나갔다 = 체결됐다
+      const dist = Math.abs(l.price / ref - 1) / maxSpread;
+      if (!(dist <= 1)) continue; // 사다리 범위 밖(가격이 멀리 갔다) — 재호가 대상
+      const churn = QUOTE_CHURN_DEEP + (QUOTE_CHURN_TOP - QUOTE_CHURN_DEEP) * (1 - dist);
+      if (Math.random() < churn * churnMult) continue; // ② 취소·재호가
+      // 남아 있는 주문도 가끔 일부만 취소되거나 같은 자리에 물량이 더 붙는다(배수 평균 1 = 총량 보존).
+      const size =
+        Math.random() < QUOTE_RESIZE_CHANCE ? l.size * (1 + (Math.random() - 0.5) * 2 * QUOTE_RESIZE_RAND) : l.size;
+      if (!(size > EPS)) continue;
+      out.push({ price: l.price, size: Math.max(1, Math.round(size)) });
+    }
+    return out;
+  };
+  const resting: Record<'buy' | 'sell', BookLevel[]> = { buy: survivors('buy'), sell: survivors('sell') };
+  // 슬롯 하나가 자기 것으로 인정하는 가격 폭(= 레벨 간격의 절반).
+  // ⚠ 귀속 판정은 **지터를 뺀 슬롯 중심**(LEVEL_STEP 격자)으로 해야 한다 — 목표가에는 매 틱 0~LEVEL_JITTER
+  // 의 지터가 실려서, 그 값을 중심으로 잡으면 인접 슬롯 사이에 최대 간격의 73%짜리 **틈**이 생기고 그 틈에
+  // 떨어진 살아있는 주문이 통째로 버려진다(실측: 지속 33% → 8%, 레벨 22 → 16.6).
+  const slotBand = LEVEL_HALF_STEP * step.spreadMult * ref;
+  /** 규칙 ③ — 이 슬롯 자리에 **이미 앉아 있는 주문**이 있으면 그대로 쓴다(새로 깔지 않는다). */
+  const claimResting = (side: 'buy' | 'sell', level: number): boolean => {
+    // 이 슬롯이 가져갈 |가격 − ref| 구간. 최우선호가 슬롯은 안쪽이 열려 있고(더 타이트한 주문도 여기 귀속),
+    // 가장 깊은 슬롯은 바깥이 열려 있다(사다리 끝 바깥의 잔여 주문까지 흡수 — 이미 maxSpread 로 걸렀다).
+    const center = (SPREAD_BASE + level * LEVEL_STEP + LEVEL_JITTER / 2) * step.spreadMult * ref;
+    const lo = level === 0 ? 0 : center - slotBand;
+    const hi = level === BOT_LEVELS_PER_SIDE - 1 ? Infinity : center + slotBand;
+    const pool = resting[side];
+    for (let i = 0; i < pool.length; i++) {
+      const l = pool[i];
+      const d = Math.abs(l.price - ref);
+      if (d < lo || d > hi) continue;
+      pool.splice(i, 1);
+      if (usedPrices[side].has(l.price)) return false; // 앞 슬롯이 이미 쓴 가격(있을 수 없지만 방어)
+      usedPrices[side].add(l.price);
+      (side === 'buy' ? book.bids : book.asks).push(l);
+      return true;
+    }
+    return false;
+  };
+  // ⚠ 겹칠 땐 **mid 에서 한 틱씩 더 멀리** 민다(예전엔 원래 목표가로 되돌렸다). 유효숫자 4자리 틱은
+  // 가격대에 따라 굵어서(1.05 근처면 0.001) 레벨 간 목표 간격이 한 틱보다 좁아질 수 있고, 그러면
+  // 되돌린 목표가도 이미 쓴 가격이라 사다리가 몇 단계로 뭉개진다.
+  const placeQuote = (side: 'buy' | 'sell', target: number, level: number) => {
+    const dst = side === 'buy' ? book.bids : book.asks;
+    if (dst.length >= BOT_LEVELS_PER_SIDE) return;
+    const depth = level / (BOT_LEVELS_PER_SIDE - 1);
+    const q = humanQuotePrice(target, side, depth);
+    let price = q.price;
+    let sizeMult = q.sizeMult;
+    if (usedPrices[side].has(price)) {
+      const dir = side === 'buy' ? -1 : 1;
+      let p = price;
+      while (usedPrices[side].has(p) && p > 0) p = roundOx(p + dir * virtualTick(p));
+      if (!(p > 0)) return; // 매수 사다리가 0 아래로 갈 정도면 그 레벨은 그냥 생략
+      price = p;
+      sizeMult = 1;
+    }
+    usedPrices[side].add(price);
+    // ⚠ 물량에 **국면별 깊이 배수**를 건다(2026-08-12) — 예전엔 양쪽이 항상 같은 두께라, 패닉이든
+    // 광기든 호가창은 똑같이 생겼고 심리는 가격에서만 보였다. 지금은 공포장이면 매수벽이 걷히고
+    // (시장가 매도가 훨씬 깊게 파고든다) 매도벽이 쌓인다 — 탐욕장은 반대.
+    const depthMult = side === 'buy' ? step.bidDepthMult : step.askDepthMult;
+    // ⚠ 한 가격대의 물량은 "그 자리에 걸린 **여러 주문의 합**"이다(호가창은 가격별 SUM 만 보여준다).
+    // 그래서 1~3명이 각자 계층 분포(orderSize)에서 뽑은 수량을 합친다 — 어떤 자리는 개미 하나뿐이라
+    // 얇고(수백 개) 어떤 자리는 세력이 껴서 두껍다(수만~수십만). 예전엔 전 레벨이 2,000~10,000 균등이라
+    // 호가창이 어디를 봐도 같은 자릿수였고, 시장가가 어느 구간을 지나든 저항이 똑같았다.
+    // 깊은 레벨일수록 대기 물량이 두껍다(depthTilt) — 평균이 1 이라 **총 유동성은 예전과 같다**.
+    const depthTilt = 0.6 + 0.8 * depth;
+    const orders = 1 + Math.floor(Math.random() * 3);
+    let size = 0;
+    for (let i = 0; i < orders; i++) size += orderSize((BOOK_LEVEL_MEAN * sizeMult * depthMult * depthTilt) / orders);
+    dst.push({ price, size });
+  };
+  // 1차 — 슬롯마다 살아있는 주문을 배정한다. ⚠⚠ 새 호가보다 **먼저** 해야 한다: 라운드 가격 격자가
+  // 고정돼 있어서(§ priceHash) 새 호가가 살아있는 주문과 같은 가격에 내려앉기 쉽고, 순서를 섞으면 그
+  // 주문이 "이미 쓴 가격"으로 밀려 통째로 버려진다(실측: 틱당 생존 19.8 중 13.4 가 그렇게 사라져
+  // 지속률이 33% → 7% 로 주저앉았다).
+  const filled: Record<'buy' | 'sell', boolean[]> = { buy: [], sell: [] };
+  for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
+    filled.buy[level] = claimResting('buy', level);
+    filled.sell[level] = claimResting('sell', level);
+  }
+  // 2차 — 빈 자리에만 새 호가를 깐다.
+  for (let level = 0; level < BOT_LEVELS_PER_SIDE; level++) {
+    const spread = (SPREAD_BASE + level * LEVEL_STEP + Math.random() * LEVEL_JITTER) * step.spreadMult;
+    if (!filled.buy[level]) placeQuote('buy', ref * (1 - spread), level);
+    if (!filled.sell[level]) placeQuote('sell', ref * (1 + spread), level);
+  }
+  // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 얹는다 — 아래 sweep 이 유저 벽을 그 가격에 소비.
+  // 물량은 **벽 크기에 비례**한다(wallAbsorbSize) — 고정 크기면 큰 벽을 영원히 못 뚫는다.
+  if (press === 'up') {
+    book.bids.push({ price: ref, size: wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment) });
+  } else if (press === 'down') {
+    book.asks.push({ price: ref, size: wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment) });
+  }
+  // 가격 우선순위대로 정렬해 둔다 — 매칭(makerLevels)도 호가창 표시도 이 순서를 그대로 쓴다.
+  book.bids.sort((a, b) => b.price - a.price);
+  book.asks.sort((a, b) => a.price - b.price);
   const next: BotState = { ...step.next, ref };
   return { next, tape, book, bar: { open, high, low, close: ref, volume }, notional: notionalSum, actor };
 }
@@ -1950,6 +2105,11 @@ async function runBotTicks(
   let state = toBotState(row, ref0);
   let tape = parseTape(row?.tape_json);
   const live = parseLive(row?.live_json);
+  // ⚠ 이전 사다리를 읽어 첫 틱에 물려준다(2026-09-08) — 봇 호가는 매 틱 새로 태어나는 게 아니라
+  // **살아남은 주문 위에 새 호가가 얹히기** 때문이다(§ simulateTick keepResting). 이 값에는 그 사이
+  // 유저 체결이 파먹은 자리(bookWriteStmt)가 반영돼 있어서, 시장충격이 호가창에 그대로 남는다.
+  // 추가 읽기는 없다 — `book_json` 은 어차피 이 행에서 같이 읽어온 컬럼이다(§ BOT_STATE_COLS).
+  let carried: BotBook = parseBook(row?.book_json);
   let book: BotBook | null = null;
   let notional = 0;
   const closed: { code: string; bar: LiveBar }[] = [];
@@ -1967,9 +2127,10 @@ async function runBotTicks(
     const ts = Math.max(Date.now(), prevTs + TICK_SPACING_MS);
     prevTs = ts;
     lastTs = ts;
-    const r = simulateTick(state, tape, wallRows, ts);
+    const r = simulateTick(state, tape, carried, wallRows, ts);
     state = r.next;
     tape = r.tape;
+    carried = r.book;
     book = r.book;
     notional += r.notional;
     closed.push(...accrueLive(live, r.bar, ts));

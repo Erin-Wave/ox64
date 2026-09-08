@@ -23,11 +23,25 @@
  *   - 체결 테이프: **틱당 거래량 ~10만**(분포를 바꿔도 총량은 보존한다는 불변식),
  *     **상승틱 매수라벨 70%+ / 하락틱 20% 내외**(라벨과 가격의 인과가 살아있나),
  *     방향 전환율 25~40%(호가 바운스가 한 색 블록으로 뭉치지 않았나)
+ *   - 호가창: **한쪽 레벨 22개**(슬롯 배정이 깨지면 조용히 줄어든다), **호가 지속 25% 안팎**
+ *     (직전 틱과 가격·물량이 그대로인 레벨 — 0 에 가까우면 사다리가 매 틱 통째로 새로 태어나는 것이고,
+ *     너무 높으면 최우선호가가 갱신되지 않는 것이다), **쪼개진 주문 30% 안팎**
+ *     ⚠ **총 유동성·틱당 거래량은 이 시뮬로 판정하지 말 것** — 국면 궤적의 표본오차가 커서 같은 코드로도
+ *     93k~111k 를 왕복한다. 크기 분포·호가 물량을 손봤으면 상태를 하나로 고정하고 `simulateTick` 만
+ *     20만 번 돌려 개편 전 코드와 대조해야 한다(§ CLAUDE.md "평균 보존은 상태를 고정한 A/B 로 잰다").
  *     ⚠ "라벨-가격 불일치"는 0 이 목표가 **아니다** — 2026-09-07 이전엔 라벨을 가격 방향에서
  *     되짚었으니 정의상 0% 였을 뿐이다(동어반복). 지금은 방향이 가격을 만들므로, 시장이 흐름과
  *     반대로 걸어갈 때 생기는 10~20% 는 실제 거래소 데이터의 tick-rule 오분류율과 같은 값이다.
  */
-import { nextMarketState, simulateTick, sessionActivity, GAUGE_FULL, type BotState, type TapeTrade } from '../functions/api/spot';
+import {
+  nextMarketState,
+  simulateTick,
+  sessionActivity,
+  GAUGE_FULL,
+  type BotState,
+  type BotBook,
+  type TapeTrade,
+} from '../functions/api/spot';
 
 const TICKS_PER_MIN = 20; // 접속 중 ~60/분, 유휴(cron) 12/분 사이의 대표값
 const MS_PER_TICK = 60_000 / TICKS_PER_MIN;
@@ -301,6 +315,17 @@ function runOnce(): RunStat {
 function runTape(ticks = 20_000) {
   let s: BotState = { ref: 1, drift: 0, vol: 1, sentiment: 0, anchor: 1, regime: 'calm', regimeTicks: 0, peak: 1, trough: 1 };
   let tape: TapeTrade[] = [];
+  // ⚠ 사다리도 틱 사이로 물려줘야 한다(2026-09-08) — 봇 호가는 매 틱 새로 태어나는 게 아니라 살아남은
+  // 주문 위에 얹히므로(§ simulateTick keepResting), 빈 사다리를 매번 넘기면 지속성 지표가 0 으로 나온다.
+  let book: BotBook = { owner: 'bot-mm-1', bids: [], asks: [] };
+  let bookLevels = 0;   // 한쪽 평균 레벨 수 — BOT_LEVELS_PER_SIDE 를 유지해야 한다
+  let bookLiq = 0;      // 한쪽 총 유동성(총량 보존 불변식 대조용)
+  let bookSpread = 0;   // 최우선호가 스프레드
+  let kept = 0;         // 직전 틱과 (가격·물량)이 **완전히 같은** 레벨 수 = 그 자리에 앉아 있는 주문
+  let keptDen = 0;
+  let sameSize = 0;     // 연속 두 체결이 같은 방향 + 비슷한 수량(= 쪼개진 주문) 인 비율
+  let sizePairs = 0;
+  let prevSize = 0;
   let prints = 0;
   let volume = 0;
   let up = 0;
@@ -319,7 +344,17 @@ function runTape(ticks = 20_000) {
   for (let t = 0; t < ticks; t++) {
     const now = T0 + t * MS_PER_TICK;
     const before = tape.length;
-    const r = simulateTick(s, tape, [], now);
+    const r = simulateTick(s, tape, book, [], now);
+    const prevKeys = new Set(
+      [...book.bids, ...book.asks].map((l) => `${l.price}:${l.size}`),
+    );
+    for (const l of [...r.book.bids, ...r.book.asks]) {
+      keptDen++;
+      if (prevKeys.has(`${l.price}:${l.size}`)) kept++;
+    }
+    bookLevels += (r.book.bids.length + r.book.asks.length) / 2;
+    bookLiq += (r.book.bids.reduce((a, l) => a + l.size, 0) + r.book.asks.reduce((a, l) => a + l.size, 0)) / 2;
+    if (r.book.bids.length && r.book.asks.length) bookSpread += r.book.asks[0].price / r.book.bids[0].price - 1;
     const fresh = r.tape.slice(Math.max(0, r.tape.length - (r.tape.length - before <= 0 ? 0 : r.tape.length - before)));
     let prevPx = s.ref;
     for (const x of fresh) {
@@ -342,7 +377,12 @@ function runTape(ticks = 20_000) {
         }
         curRun = 1;
       }
+      if (prevSide) {
+        sizePairs++;
+        if (prevSide === x.takerSide && Math.abs(x.size / Math.max(1, prevSize) - 1) < 0.25) sameSize++;
+      }
       prevSide = x.takerSide;
+      prevSize = x.size;
       prevPx = x.price;
       const dg = String(Math.round(x.size)).length;
       digits[dg] = (digits[dg] ?? 0) + 1;
@@ -354,6 +394,7 @@ function runTape(ticks = 20_000) {
     if (wick > 0.006) bigWick++;
     s = r.next;
     tape = r.tape;
+    book = r.book;
   }
   const dgTotal = Object.values(digits).reduce((a, b) => a + b, 0);
   return {
@@ -367,6 +408,11 @@ function runTape(ticks = 20_000) {
     runLen: runs ? runLen / runs : 0,
     wick: wickSum / ticks,
     bigWick: bigWick / ticks,
+    bookLevels: bookLevels / ticks,
+    bookLiq: bookLiq / ticks,
+    bookSpread: bookSpread / ticks,
+    restRate: keptDen ? kept / keptDen : 0,
+    sliceShare: sizePairs ? sameSize / sizePairs : 0,
     digits: Object.entries(digits)
       .sort((a, b) => Number(a[0]) - Number(b[0]))
       .map(([k, v]) => `${k}자리 ${((v / dgTotal) * 100).toFixed(0)}%`)
@@ -443,6 +489,12 @@ console.log(
     `방향 전환율(호가 바운스) ${pct(tp.flipRate)}  같은 방향 평균 런 ${tp.runLen.toFixed(2)}건`,
 );
 console.log(`봉 꼬리 평균 ${pct(tp.wick)}  긴 꼬리(0.6%+) 틱 비율 ${pct(tp.bigWick)}`);
+console.log(
+  `쪼개진 주문(연속 같은 방향·비슷한 수량) ${pct(tp.sliceShare)}  ` +
+    `호가 지속(직전 틱과 가격·물량이 그대로인 레벨) ${pct(tp.restRate)}  ` +
+    `한쪽 레벨 ${tp.bookLevels.toFixed(1)}개  한쪽 유동성 ${Math.round(tp.bookLiq).toLocaleString()}  ` +
+    `최우선 스프레드 ${pct(tp.bookSpread)}`,
+);
 console.log(`수량 자릿수: ${tp.digits}`);
 // 하루 리듬을 눈으로 — KST 시각별 활성도
 const byHour: string[] = [];
