@@ -189,7 +189,7 @@ export const useCrateStore = create<Store>((set, get) => ({
   bonusTiers: [],
   milestones: [],
   achievements: [],
-  limits: { maxBuy: 20, maxOpen: 10, dailyCrates: 4, dailyCoins: 200, rescueCrates: 3, rescueCoins: 400, brokeCrates: 3, bulkAt: 10, bulkChance: 0.35 },
+  limits: { maxBuy: 20, maxOpen: 10, dailyCrates: 4, dailyCoins: 200, rescueCrates: 3, rescueCoins: 400, brokeCrates: 3, bulkAt: 10, bulkChance: 0.22, maxMergeTimes: 200 },
   busy: false,
   error: null,
   toast: null,
@@ -276,8 +276,22 @@ export const useCrateStore = create<Store>((set, get) => ({
     try {
       const r = await crateApi.merge(cat, level, times);
       if (r.shardCrates?.length) {
-        const names = r.shardCrates.map((lv) => `Lv${lv}`).join(', ');
-        set({ ...pick(r), toast: { kind: 'good', text: `상자조각이 상자로! (${names})` }, flash: null, achieveQueue: r.achieved ?? [] });
+        // ⚠ 레벨을 그대로 나열하면 200개를 열었을 때 "Lv1, Lv1, Lv1, …" 이 화면을 덮는다.
+        // 서버가 준 레벨별 집계를 쓰고, 없으면(옛 응답) 직접 센다.
+        const byLevel = r.shardSummary?.byLevel ?? r.shardCrates.reduce<Record<string, number>>((m, lv) => {
+          m[lv] = (m[lv] ?? 0) + 1;
+          return m;
+        }, {});
+        const names = Object.entries(byLevel)
+          .sort((a, b) => Number(b[0]) - Number(a[0]))
+          .map(([lv, n]) => `Lv${lv}×${n}`)
+          .join(' · ');
+        set({
+          ...pick(r),
+          toast: { kind: 'good', text: `🧩 조각 ${r.shardCrates.length}회 → ${names}` },
+          flash: null,
+          achieveQueue: r.achieved ?? [],
+        });
       } else if (r.merged) {
         set({ ...pick(r), flash: `${cat}:${r.merged.to}`, toast: null, achieveQueue: r.achieved ?? [] });
         setTimeout(() => set((s) => (s.flash === `${cat}:${r.merged!.to}` ? { flash: null } : s)), 650);

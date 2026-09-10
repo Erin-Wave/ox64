@@ -391,6 +391,7 @@ function statePayload(w: Work) {
       brokeCrates: BROKE_CRATES,
       bulkAt: BULK_BONUS_AT,
       bulkChance: BULK_BONUS_CHANCE,
+      maxMergeTimes: MAX_MERGE_TIMES,
     },
   };
 }
@@ -477,6 +478,8 @@ async function handleGet(request: Request, env: Env): Promise<Response> {
 const RETRY_MSG = '동시에 처리된 요청이 있습니다. 다시 시도해주세요';
 /** 한 요청에 긁을 수 있는 복권 수 — 응답 크기와 연출 길이를 묶어두려는 상한이다. */
 const MAX_SCRATCH_AT_ONCE = 20;
+/** 한 요청에 처리할 머지 횟수 상한(상자조각 일괄 개봉이 여기 걸린다). */
+const MAX_MERGE_TIMES = 200;
 
 async function handlePost(request: Request, env: Env): Promise<Response> {
   const envErr = missingEnv(env);
@@ -574,7 +577,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
   if (action === 'merge') {
     const cat = String(body.cat ?? '') as MatCat;
     const level = Math.round(Number(body.level));
-    const times = Math.max(1, Math.round(Number(body.times ?? 1)));
+    // ⚠ 상한이 없으면 조각 수천 개를 한 요청에 밀어넣을 수 있다. D1 쓰기는 여전히 1행이지만
+    // 응답의 `shardCrates` 배열이 그만큼 길어지고, 클라가 그걸 전부 렌더한다.
+    const times = Math.min(MAX_MERGE_TIMES, Math.max(1, Math.round(Number(body.times ?? 1))));
     if (!isValidMat(cat, level)) return bad('없는 재료입니다');
     const def = CAT_BY_KEY.get(cat)!;
     // ⚠ 골드복권은 레벨이 없어서 합칠 수 없다(maxLevel 1 이라 아래 분기에서도 걸리지만,
@@ -596,7 +601,10 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
       w.merged += times;
       const achieved = grantAchievements(w);
       if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
-      return json({ ...statePayload(w), achieved, shardCrates: gained });
+      // 레벨별로 묶어서 준다 — 200개를 한 번에 열면 배열을 그대로 내려봐야 클라가 읽을 수 없다.
+      const byLevel: Record<string, number> = {};
+      for (const lv of gained) byLevel[lv] = (byLevel[lv] ?? 0) + 1;
+      return json({ ...statePayload(w), achieved, shardCrates: gained, shardSummary: { times, byLevel } });
     }
 
     addMat(w, cat, level, -2 * times);

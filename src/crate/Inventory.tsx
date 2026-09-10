@@ -47,6 +47,7 @@ export default function Inventory() {
   const mergeAll = useCrateStore((s) => s.mergeAll);
   const scratch = useCrateStore((s) => s.scratch);
   const maxScratch = useCrateStore((s) => s.lotto.maxAtOnce);
+  const maxMergeTimes = useCrateStore((s) => s.limits.maxMergeTimes);
 
   const [page, setPage] = useState(0);
   const [sel, setSel] = useState<string | null>(null); // "wood:1#3"
@@ -88,6 +89,15 @@ export default function Inventory() {
     () => cats.some((c) => { for (let lv = 1; lv < c.maxLevel; lv++) if ((inv[`${c.cat}:${lv}`] ?? 0) >= 2) return true; return false; }),
     [inv, cats],
   );
+  /**
+   * 상자조각 최고 레벨은 "합치면 랜덤 상자" 라 `전부 합치기` 에서 일부러 빼놨다(도박이라 유저가 직접
+   * 눌러야 한다). 그런데 그러면 칸을 찾아 선택해야만 열 수 있어서 조각이 쌓이면 번거롭다 —
+   * 헤더에 전용 일괄 버튼을 따로 둔다.
+   */
+  const shardCat = cats.find((c) => c.cat === 'shard');
+  const shardPairsAll = shardCat ? Math.floor((inv[`shard:${shardCat.maxLevel}`] ?? 0) / 2) : 0;
+  // ⚠ 서버가 한 요청에 처리하는 상한을 넘겨 보내면 조용히 잘린다 — 버튼에 실제 처리량을 적는다.
+  const shardPairs = Math.min(shardPairsAll, maxMergeTimes);
 
   const doMerge = (group: string, times = 1) => {
     const [cat, lv] = group.split(':');
@@ -156,6 +166,19 @@ export default function Inventory() {
           </span>
         </div>
         <div className="flex items-center gap-1.5">
+          {shardPairs > 0 && shardCat && (
+            <button
+              onClick={() => merge('shard', shardCat.maxLevel, shardPairs)}
+              disabled={busy}
+              title={
+                `Lv${shardCat.maxLevel} 상자조각 ${shardPairs * 2}개를 2개씩 묶어 상자 ${shardPairs}개로 (등급은 랜덤)` +
+                (shardPairsAll > shardPairs ? ` — 한 번에 ${maxMergeTimes}개까지라 ${shardPairsAll - shardPairs}쌍은 다음에` : '')
+              }
+              className="rounded-md bg-[#fbbf24] px-2.5 py-1 text-[11px] font-extrabold text-black transition hover:brightness-110 disabled:opacity-30"
+            >
+              🧩 조각 → 상자 ×{shardPairs}
+            </button>
+          )}
           <button
             onClick={() => mergeAll()}
             disabled={busy || !mergeableAny}

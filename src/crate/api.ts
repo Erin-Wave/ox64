@@ -148,7 +148,7 @@ export interface CrateState {
   bonusTiers: BonusInfo[];
   milestones: MilestoneInfo[];
   achievements: AchievementInfo[];
-  limits: { maxBuy: number; maxOpen: number; dailyCrates: number; dailyCoins: number; rescueCrates: number; rescueCoins: number; brokeCrates: number; bulkAt: number; bulkChance: number };
+  limits: { maxBuy: number; maxOpen: number; dailyCrates: number; dailyCoins: number; rescueCrates: number; rescueCoins: number; brokeCrates: number; bulkAt: number; bulkChance: number; maxMergeTimes: number };
 }
 
 export interface OpenResult extends CrateState {
@@ -174,6 +174,8 @@ export interface MergeResult extends CrateState {
   achieved?: AchievedNow[];
   merged?: { cat: MatCat; from: number; to: number; times: number };
   shardCrates?: number[];
+  /** 상자조각 일괄 개봉 요약 — {times, byLevel:{"1":3,"2":1}} */
+  shardSummary?: { times: number; byLevel: Record<string, number> };
   mergedAll?: number;
 }
 export interface GrantResult extends CrateState {
