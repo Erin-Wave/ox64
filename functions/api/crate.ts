@@ -4,8 +4,12 @@ import {
   CAT_BY_KEY,
   CRATES,
   CRATE_BY_LEVEL,
-  CRATE_REFILL_AMOUNT,
-  CRATE_REFILL_DAILY_LIMIT,
+  BROKE_CRATES,
+  DAILY_COINS,
+  DAILY_CRATES,
+  RESCUE_COINS,
+  RESCUE_CRATES,
+  RESCUE_DAILY_LIMIT,
   JACKPOTS,
   MAX_OPEN_AT_ONCE,
   MERGE_MULT,
@@ -272,9 +276,15 @@ function statePayload(w: Work) {
       bestCoins: Math.max(w.row.best_coins, w.coins),
       jackpots: w.jackpots,
     },
-    refillsLeft: Math.max(0, CRATE_REFILL_DAILY_LIMIT - usedToday),
-    /** 리필 자격 — 가진 걸 전부 팔아도 가장 싼 상자를 못 사는 상태(진짜 빈털터리)일 때만 준다. */
-    broke: netWorth < cheapest,
+    /** 오늘 일일 지원을 아직 안 받았나 — 조건 없이 누구나 하루 한 번 받는다. */
+    dailyReady: usedToday === 0,
+    /** 남은 파산 구제 횟수(일일 지원과 별개). */
+    rescueLeft: Math.max(0, RESCUE_DAILY_LIMIT - Math.max(0, usedToday - 1)),
+    /**
+     * 파산 판정 — 가진 걸 전부 팔아도 상자를 몇 개도 못 사는 상태. 예전엔 "가장 싼 상자 1개"
+     * (100골드) 였는데, 상자 하나로는 같은 재료가 안 모여 머지가 성립하지 않으므로 회생이 안 된다.
+     */
+    broke: netWorth < cheapest * BROKE_CRATES,
     // ── 클라가 중복 정의하면 안 되는 기준표(서버가 진실원본) ──
     mergeMult: MERGE_MULT,
     cats: CATS.map((c) => ({
@@ -289,7 +299,15 @@ function statePayload(w: Work) {
     shop: shopPayload(),
     shardOdds: SHARD_CRATE_ODDS,
     jackpotTiers: JACKPOTS.map((j) => ({ tier: j.tier, p: j.p, mult: j.mult, label: j.label })),
-    limits: { maxBuy: SHOP_MAX_BUY, maxOpen: MAX_OPEN_AT_ONCE, refillAmount: CRATE_REFILL_AMOUNT },
+    limits: {
+      maxBuy: SHOP_MAX_BUY,
+      maxOpen: MAX_OPEN_AT_ONCE,
+      dailyCrates: DAILY_CRATES,
+      dailyCoins: DAILY_COINS,
+      rescueCrates: RESCUE_CRATES,
+      rescueCoins: RESCUE_COINS,
+      brokeCrates: BROKE_CRATES,
+    },
   };
 }
 
@@ -538,21 +556,42 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     return json({ ...statePayload(w), sold: { cat: null, level: maxLevel, count, gain } });
   }
 
-  // ── 리필(빈털터리 구제) ──────────────────────────────────────────────────────
+  // ── 지원(일일 지원 + 파산 구제) ──────────────────────────────────────────────
   // 트레이딩 refill.ts 와 같은 패턴 — 별도 리셋 cron 없이 "요청 시점에 KST 날짜를 비교"한다.
+  //
+  // ⚠⚠ 지원은 **돈이 아니라 상자로** 준다. 이 게임은 상자만 까면 회수율이 70% 라 흑자를 내려면
+  // 머지를 해야 하는데, 머지에는 같은 재료 2개가 필요하고 그러려면 상자를 여러 개 까야 한다. 즉
+  // 골드를 조금씩 쥐여주면 그 돈으로 상자 한두 개를 까고 재료가 흩어진 채 끝나 **70% 손실만 반복**된다
+  // (실제로 한 명이 전 재산을 잃고 그 상태에서 회복하지 못했다). 상자를 한꺼번에 여러 개 줘야 같은
+  // 재료가 모여 머지가 성립하고, 거기서부터 스스로 굴러간다.
   if (action === 'refill') {
-    const netWorth = w.coins + inventoryValue(w) + crateValue(w);
-    if (netWorth >= CRATES[0].price) return bad('아직 상자를 살 수 있습니다 (재료를 팔아보세요)');
     const today = todayKst();
     const usedToday = w.row.refill_date === today ? w.row.refill_count : 0;
-    if (usedToday >= CRATE_REFILL_DAILY_LIMIT)
-      return bad(`오늘 지원 횟수를 모두 썼습니다 (${CRATE_REFILL_DAILY_LIMIT}/${CRATE_REFILL_DAILY_LIMIT})`);
-    w.coins += CRATE_REFILL_AMOUNT;
+
+    if (usedToday === 0) {
+      // 그날 첫 수령 = 일일 지원. 조건이 없다 — 부자에겐 푼돈이고 빈털터리에겐 생명줄이라
+      // 그 자체로 따라잡기 장치가 된다(하루 400골드 상당이라 상위권 순위엔 영향이 없다).
+      addCrate(w, 1, DAILY_CRATES);
+      w.coins += DAILY_COINS;
+      if (!(await commit(env, w, { refillCount: 1, refillDate: today }))) return bad(RETRY_MSG, 409);
+      w.row.refill_count = 1;
+      w.row.refill_date = today;
+      return json({ ...statePayload(w), granted: { kind: 'daily', crates: DAILY_CRATES, coins: DAILY_COINS } });
+    }
+
+    // 그 뒤로는 파산 구제 — 진짜로 회생이 막혔을 때만
+    const netWorth = w.coins + inventoryValue(w) + crateValue(w);
+    if (netWorth >= CRATES[0].price * BROKE_CRATES)
+      return bad('아직 상자를 살 수 있습니다 (재료를 팔면 골드가 됩니다)');
+    if (usedToday - 1 >= RESCUE_DAILY_LIMIT)
+      return bad(`오늘 구제 횟수를 모두 썼습니다 (${RESCUE_DAILY_LIMIT}/${RESCUE_DAILY_LIMIT}) — 내일 다시 받을 수 있습니다`);
+    addCrate(w, 1, RESCUE_CRATES);
+    w.coins += RESCUE_COINS;
     if (!(await commit(env, w, { refillCount: usedToday + 1, refillDate: today }))) return bad(RETRY_MSG, 409);
-    // commit 에 넘긴 리필 카운트를 응답에도 반영해야 남은 횟수가 즉시 맞다(row 는 읽은 시점 값이다).
+    // commit 에 넘긴 카운트를 응답에도 반영해야 남은 횟수가 즉시 맞다(row 는 읽은 시점 값이다).
     w.row.refill_count = usedToday + 1;
     w.row.refill_date = today;
-    return json({ ...statePayload(w), refilled: CRATE_REFILL_AMOUNT });
+    return json({ ...statePayload(w), granted: { kind: 'rescue', crates: RESCUE_CRATES, coins: RESCUE_COINS } });
   }
 
   return bad('알 수 없는 액션');

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useCrateStore } from './useCrateStore';
-import { countClass, fmtCount, fmtG, tierOf } from './data';
+import { fmtG, tierOf } from './data';
 import type { CatInfo, MatCat } from './api';
 
 /**
@@ -74,19 +74,6 @@ export default function Inventory() {
   }, [page, pages]);
   const start = Math.min(page, pages - 1) * PAGE_SIZE;
   const pageCells = cells.slice(start, start + PAGE_SIZE);
-  /**
-   * 개수 배지를 붙일 칸 — **이 페이지에서 그 재료가 처음 나오는 칸**이다.
-   * ⚠ 그룹 전체의 첫 칸(`idx === 0`)에 붙이면 재료가 48개를 넘는 순간 그 칸이 1페이지에만 있어서
-   * 2페이지부터는 개수가 통째로 안 보인다.
-   */
-  const badgeAt = useMemo(() => {
-    const seen = new Set<string>();
-    return pageCells.map((c) => {
-      const first = !seen.has(c.group);
-      seen.add(c.group);
-      return first;
-    });
-  }, [pageCells]);
 
   // ⚠ 같은 그룹의 아무 칸으로 폴백한다 — "1개 팔기" 로 개수가 줄면 선택했던 인덱스가 사라져서,
   // 정확히 일치하는 칸만 찾으면 아직 재료가 남았는데도 액션 바가 안내 문구로 되돌아간다.
@@ -246,21 +233,10 @@ export default function Inventory() {
                 {cell.level}
               </span>
               {/*
-                개수 — 그 재료가 이 페이지에서 처음 나오는 칸에만 붙인다. 한 칸이 1개라 칸 수가 곧
-                개수지만 서른 칸이 깔리면 세어볼 수가 없고, 그렇다고 모든 칸에 같은 숫자를 박으면
-                화면이 그 숫자로 도배된다.
+                ⚠ 개수 배지는 두지 않는다 — **한 칸이 곧 1개**라 칸 수가 개수인데, 거기에 "2" 를 찍으면
+                스택으로 읽혀서 "2개라면서 옆 칸에 왜 또 있지?" 가 된다(제보). 개수는 액션 바와 툴팁에서
+                숫자로 보여준다.
               */}
-              {badgeAt[i] && cell.count > 1 && (
-                <span
-                  className={
-                    'pointer-events-none absolute -bottom-0.5 right-0.5 font-extrabold leading-tight tabular-nums ' +
-                    countClass(fmtCount(cell.count))
-                  }
-                  style={{ color: tier.color, textShadow: '0 1px 2px rgb(0 0 0 / 0.6)' }}
-                >
-                  {fmtCount(cell.count)}
-                </span>
-              )}
             </button>
           );
         })}

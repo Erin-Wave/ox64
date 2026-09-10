@@ -35,8 +35,9 @@ function CrateGame() {
   const invValue = useCrateStore((s) => s.invValue);
   const stats = useCrateStore((s) => s.stats);
   const broke = useCrateStore((s) => s.broke);
-  const refillsLeft = useCrateStore((s) => s.refillsLeft);
-  const refillAmount = useCrateStore((s) => s.limits.refillAmount);
+  const dailyReady = useCrateStore((s) => s.dailyReady);
+  const rescueLeft = useCrateStore((s) => s.rescueLeft);
+  const limits = useCrateStore((s) => s.limits);
   const busy = useCrateStore((s) => s.busy);
   const error = useCrateStore((s) => s.error);
   const toast = useCrateStore((s) => s.toast);
@@ -95,16 +96,46 @@ function CrateGame() {
       </header>
 
       <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-3 px-3 py-4 sm:px-4">
-        {broke && (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-downDim px-3.5 py-2.5 text-xs text-down">
-            <span>가진 걸 다 팔아도 상자를 살 수 없습니다.</span>
+        {/*
+          회생 안내 — 이 게임은 상자만 까면 회수율이 70% 라 **가난할수록 회복이 구조적으로 어렵다**
+          (머지하려면 같은 재료 2개가 필요한데 상자를 조금밖에 못 까면 재료가 안 모인다). 그래서
+          지원은 골드가 아니라 **상자로** 주고, 파산했을 땐 여러 번 받을 수 있게 한다.
+        */}
+        {dailyReady && (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-accent/10 px-3.5 py-2.5 text-xs ring-1 ring-accent/30">
+            <span>
+              🎁 <b>오늘의 지원</b>이 도착했습니다 — Lv1 상자 {limits.dailyCrates}개 + {limits.dailyCoins.toLocaleString()} G
+              <span className="ml-1.5 text-muted">(매일 한 번, 누구나)</span>
+            </span>
             <button
               onClick={() => refill()}
-              disabled={busy || refillsLeft <= 0}
-              className="rounded-md bg-down/20 px-3 py-1.5 font-bold hover:brightness-110 disabled:opacity-40"
+              disabled={busy}
+              className="rounded-md bg-accent px-3 py-1.5 font-bold text-black transition hover:brightness-110 disabled:opacity-40"
             >
-              지원금 +{refillAmount} G ({refillsLeft}회 남음)
+              받기
             </button>
+          </div>
+        )}
+
+        {broke && !dailyReady && (
+          <div className="rounded-xl bg-downDim px-3.5 py-2.5 text-xs text-down">
+            <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+              <span>
+                <b>재기 불능 상태입니다</b> — 가진 걸 다 팔아도 상자 {limits.brokeCrates}개를 못 삽니다.
+              </span>
+              <button
+                onClick={() => refill()}
+                disabled={busy || rescueLeft <= 0}
+                className="rounded-md bg-down/20 px-3 py-1.5 font-bold hover:brightness-110 disabled:opacity-40"
+              >
+                구제 물자 받기 · 상자 {limits.rescueCrates}개 + {limits.rescueCoins.toLocaleString()} G ({rescueLeft}회 남음)
+              </button>
+            </div>
+            <p className="leading-snug opacity-80">
+              {rescueLeft > 0
+                ? '골드가 아니라 상자로 드립니다 — 한 번에 여러 개를 까야 같은 재료가 모여 합칠 수 있고, 거기서부터 다시 굴러갑니다.'
+                : '오늘 구제를 모두 받았습니다. 내일 다시 받을 수 있고, 지금 가진 상자와 재료로도 이어갈 수 있습니다.'}
+            </p>
           </div>
         )}
 

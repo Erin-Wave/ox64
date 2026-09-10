@@ -216,8 +216,27 @@ export const SHOP_MAX_BUY = 20; // 한 요청에 살 수 있는 상자 수
 export const MAX_OPEN_AT_ONCE = 10; // 한 요청에 깔 수 있는 상자 수
 
 export const START_COINS = 600;
-export const CRATE_REFILL_AMOUNT = 250;
-export const CRATE_REFILL_DAILY_LIMIT = 5;
+
+/**
+ * ⚠⚠ 회생 경로 — 이 게임은 **가난할수록 회복이 구조적으로 어렵다**. 상자만 까면 회수율이 70% 라
+ * 흑자를 내려면 머지를 해야 하는데, 머지에는 같은 재료 2개가 필요하고 그러려면 상자를 여러 개 까야
+ * 한다. 즉 돈이 적으면 머지 기회 자체가 안 생겨 70% 손실이 그대로 굳는다(실제로 한 명이 전 재산을
+ * 잃고 회복하지 못했다). 그래서 구제는 **돈이 아니라 상자로** 준다 — 상자를 여러 개 한꺼번에 줘야
+ * 같은 재료가 모여 머지가 성립하고, 그때부터 스스로 굴러갈 수 있다.
+ *
+ * 지급은 두 단계이고 **컬럼을 더 쓰지 않는다**(`refill_date` + `refill_count` 두 개로 처리 —
+ * 마이그레이션 없이 돌아가야 했다):
+ *   · 그날 **첫 수령**(`refill_count === 0`) = 일일 지원. 조건 없이 누구나. 부자에겐 푼돈이고
+ *     빈털터리에겐 생명줄이라, 따라잡기 장치로도 동작한다.
+ *   · 그 뒤(`refill_count >= 1`) = 파산 구제. **총자산이 상자 3개 값에 못 미칠 때만.**
+ */
+export const DAILY_CRATES = 4; // 일일 지원으로 주는 Lv1 상자 수 — 같은 재료가 모여 머지가 되는 최소선
+export const DAILY_COINS = 200;
+export const RESCUE_CRATES = 3;
+export const RESCUE_COINS = 400;
+export const RESCUE_DAILY_LIMIT = 4; // 일일 지원 1회 + 구제 4회 = 하루 최대 5회 수령
+/** 파산 판정선 — 가진 걸 전부 팔아도 가장 싼 상자를 이만큼도 못 사면 회생 불가로 본다. */
+export const BROKE_CRATES = 3;
 
 // ── 롤(추첨) ────────────────────────────────────────────────────────────────────
 export interface RewardItem {

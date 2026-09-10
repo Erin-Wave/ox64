@@ -56,14 +56,17 @@ export interface CrateState {
   invValue: number;
   netWorth: number;
   stats: { opened: number; merged: number; spent: number; earned: number; bestCoins: number; jackpots: number };
-  refillsLeft: number;
+  /** 오늘 일일 지원을 아직 안 받았나(조건 없이 하루 한 번) */
+  dailyReady: boolean;
+  /** 남은 파산 구제 횟수 */
+  rescueLeft: number;
   broke: boolean;
   mergeMult: number;
   cats: CatInfo[];
   shop: ShopCrate[];
   shardOdds: { level: number; p: number }[];
   jackpotTiers: { tier: JackpotTier; p: number; mult: number; label: string }[];
-  limits: { maxBuy: number; maxOpen: number; refillAmount: number };
+  limits: { maxBuy: number; maxOpen: number; dailyCrates: number; dailyCoins: number; rescueCrates: number; rescueCoins: number; brokeCrates: number };
 }
 
 export interface OpenResult extends CrateState {
@@ -76,6 +79,9 @@ export interface MergeResult extends CrateState {
   merged?: { cat: MatCat; from: number; to: number; times: number };
   shardCrates?: number[];
   mergedAll?: number;
+}
+export interface GrantResult extends CrateState {
+  granted: { kind: 'daily' | 'rescue'; crates: number; coins: number };
 }
 export interface SellResult extends CrateState {
   sold: { cat: MatCat | null; level: number; count: number; gain: number };
@@ -129,5 +135,5 @@ export const crateApi = {
   mergeAll: () => post<MergeResult>({ action: 'mergeAll' }),
   sell: (cat: MatCat, level: number, count?: number) => post<SellResult>({ action: 'sell', cat, level, count }),
   sellAll: (maxLevel: number) => post<SellResult>({ action: 'sellAll', maxLevel }),
-  refill: () => post<CrateState>({ action: 'refill' }),
+  refill: () => post<GrantResult>({ action: 'refill' }),
 };

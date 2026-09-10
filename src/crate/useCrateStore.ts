@@ -64,7 +64,8 @@ interface Store {
   invValue: number;
   netWorth: number;
   stats: CrateState['stats'];
-  refillsLeft: number;
+  dailyReady: boolean;
+  rescueLeft: number;
   broke: boolean;
   mergeMult: number;
   cats: CatInfo[];
@@ -111,7 +112,8 @@ function pick(s: CrateState) {
     invValue: s.invValue,
     netWorth: s.netWorth,
     stats: s.stats,
-    refillsLeft: s.refillsLeft,
+    dailyReady: s.dailyReady,
+    rescueLeft: s.rescueLeft,
     broke: s.broke,
     mergeMult: s.mergeMult,
     cats: s.cats,
@@ -133,14 +135,15 @@ export const useCrateStore = create<Store>((set, get) => ({
   invValue: 0,
   netWorth: 0,
   stats: EMPTY_STATS,
-  refillsLeft: 0,
+  dailyReady: false,
+  rescueLeft: 0,
   broke: false,
   mergeMult: 2.35,
   cats: [],
   shop: [],
   shardOdds: [],
   jackpotTiers: [],
-  limits: { maxBuy: 20, maxOpen: 10, refillAmount: 250 },
+  limits: { maxBuy: 20, maxOpen: 10, dailyCrates: 4, dailyCoins: 200, rescueCrates: 3, rescueCoins: 400, brokeCrates: 3 },
   busy: false,
   error: null,
   toast: null,
@@ -280,7 +283,14 @@ export const useCrateStore = create<Store>((set, get) => ({
     set({ busy: true, error: null });
     try {
       const r = await crateApi.refill();
-      set({ ...pick(r), toast: { kind: 'good', text: '지원금을 받았습니다' } });
+      const g = r.granted;
+      set({
+        ...pick(r),
+        toast: {
+          kind: 'good',
+          text: `${g.kind === 'daily' ? '오늘의 지원' : '구제 물자'} · 상자 ${g.crates}개 + ${g.coins.toLocaleString()} G`,
+        },
+      });
     } catch (e) {
       set({ error: msgOf(e, '지원받지 못했습니다') });
     } finally {

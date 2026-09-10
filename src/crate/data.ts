@@ -55,30 +55,3 @@ export function splitKey(key: string): { cat: string; level: number } {
   const [cat, lv] = key.split(':');
   return { cat, level: Number(lv) };
 }
-
-/**
- * 개수 표기 — 네 자리까지는 그대로, 그 위는 한국식 단위로 줄인다(칸이 50px 남짓이라 "12345" 는
- * 아이콘을 통째로 덮는다).
- */
-export function fmtCount(n: number): string {
-  if (n < 10_000) return String(n);
-  if (n < 100_000_000) {
-    const v = n / 10_000;
-    return `${v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, '')}만`;
-  }
-  const v = n / 100_000_000;
-  return `${v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, '')}억`;
-}
-
-/**
- * 자릿수가 늘수록 글자를 줄인다 — 칸 크기는 고정인데 숫자만 길어지면 배지가 칸을 넘어간다.
- * ⚠ 픽셀 값을 Tailwind 임의 값(text-[13px])으로 쓰면 **클래스명이 런타임에 조립돼 빌드에서 누락**되므로
- * (Tailwind 는 소스를 정적으로 훑는다) 완성된 클래스 문자열을 그대로 돌려준다.
- */
-export function countClass(text: string): string {
-  const n = text.length;
-  if (n <= 2) return 'text-[13px]';
-  if (n === 3) return 'text-[11px]';
-  if (n === 4) return 'text-[10px]';
-  return 'text-[9px]';
-}

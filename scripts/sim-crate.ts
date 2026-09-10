@@ -19,6 +19,12 @@
  *   - 상자조각 경로 수익성 > 1.5배 — Lv4 조각을 파는 것보다 상자로 바꾸는 게 확실히 이득이어야 한다
  */
 import {
+  BROKE_CRATES as BROKE_CRATES_SIM,
+  DAILY_COINS as DAILY_COINS_SIM,
+  DAILY_CRATES as DAILY_CRATES_SIM,
+  RESCUE_COINS as RESCUE_COINS_SIM,
+  RESCUE_CRATES as RESCUE_CRATES_SIM,
+  RESCUE_DAILY_LIMIT as RESCUE_LIMIT_SIM,
   CATS,
   CAT_BY_KEY,
   CRATES,
@@ -116,6 +122,9 @@ function sellOptimal(run: Run): number {
     if (!madeCrate) break;
   }
   coins += sellNaive(run.inv);
+  // ⚠ 판 재료는 반드시 비운다 — 회수율 시뮬은 이 함수를 한 번만 부르지만 회생 시뮬은 날마다 부르므로,
+  // 비우지 않으면 **같은 재료를 매일 다시 판다**(그 버그로 14일 뒤 자산이 650만 G 로 나왔다).
+  run.inv.clear();
   return coins;
 }
 
@@ -193,4 +202,75 @@ console.log('\n── 상자별 드롭 슬롯 수(공시용) ──');
 for (const def of CRATES) console.log(`  ${def.name}: ${slotsOf(def.level).length}개 슬롯(전부 독립시행)`);
 
 console.log(`\n${fail === 0 ? '✔ 전 상자 합격선 통과' : `✘ ${fail}개 상자가 합격선을 벗어남`}\n`);
+
+// ── 파산 회생 시뮬레이션 ────────────────────────────────────────────────────────
+/**
+ * ⚠⚠ **전 재산을 잃은 사람이 실제로 회복할 수 있는가** — 이 게임은 상자만 까면 회수율이 70% 라
+ * 가난할수록 회복이 구조적으로 어렵다(머지하려면 같은 재료 2개가 필요한데 상자를 조금밖에 못 까면
+ * 재료가 흩어진 채 끝난다). 그래서 지원을 **골드가 아니라 상자로** 주는데, 그게 정말로 회생시키는지는
+ * 감이 아니라 여기서 확인한다. 실제로 한 명이 올인 나고 회복하지 못해 추가된 검증이다.
+ *
+ * 합격선: 지원을 받는 플레이어가 **며칠 안에 파산선(상자 3개 값)을 벗어나고, 자산이 우상향**할 것.
+ */
+function simulateRecovery(days: number, opts: { support: boolean }) {
+  const price = CRATES[0].price;
+  const brokeLine = price * BROKE_CRATES_SIM;
+  const run: Run = { coins: 0, inv: new Map(), jackpotCoins: 0, opened: 0 };
+  let brokeUntil = -1;
+  const daily: number[] = [];
+
+  for (let day = 0; day < days; day++) {
+    if (opts.support) {
+      // 일일 지원(조건 없음) + 파산이면 구제 4회
+      run.coins += DAILY_COINS_SIM;
+      openAll(1, DAILY_CRATES_SIM, run);
+      for (let i = 0; i < RESCUE_LIMIT_SIM; i++) {
+        if (run.coins + sellNaive(run.inv) >= brokeLine) break;
+        run.coins += RESCUE_COINS_SIM;
+        openAll(1, RESCUE_CRATES_SIM, run);
+      }
+    }
+    // 하루 플레이: 살 수 있는 만큼 사서 까고, 최고 레벨까지 합쳐서 판다(optimal 정책)
+    const buy = Math.floor(run.coins / price);
+    if (buy > 0) {
+      run.coins -= buy * price;
+      openAll(1, buy, run);
+    }
+    run.coins += sellOptimal(run);
+    const worth = run.coins;
+    daily.push(worth);
+    if (worth >= brokeLine && brokeUntil < 0) brokeUntil = day + 1;
+  }
+  return { final: daily[daily.length - 1], escapedOnDay: brokeUntil, daily };
+}
+
+console.log('── 파산 회생 (골드 0 · 재료 0 에서 시작, 매일 최적 플레이) ──');
+console.log(
+  `지원: 일일 Lv1 상자 ${DAILY_CRATES_SIM}개 + ${num(DAILY_COINS_SIM)} G / ` +
+    `구제 상자 ${RESCUE_CRATES_SIM}개 + ${num(RESCUE_COINS_SIM)} G ×${RESCUE_LIMIT_SIM}회 (파산 중일 때만)`,
+);
+const RECOVERY_RUNS = 60;
+for (const support of [true, false]) {
+  let escaped = 0;
+  let sumDay = 0;
+  let sumFinal = 0;
+  let worstFinal = Infinity;
+  for (let i = 0; i < RECOVERY_RUNS; i++) {
+    const r = simulateRecovery(14, { support });
+    if (r.escapedOnDay > 0) {
+      escaped++;
+      sumDay += r.escapedOnDay;
+    }
+    sumFinal += r.final;
+    worstFinal = Math.min(worstFinal, r.final);
+  }
+  const label = support ? '지원 있음' : '지원 없음(참고)';
+  console.log(
+    `  ${label.padEnd(16)} 파산 탈출 ${escaped}/${RECOVERY_RUNS}회` +
+      (escaped ? ` (평균 ${(sumDay / escaped).toFixed(1)}일)` : '        ') +
+      `  14일 뒤 평균 ${num(sumFinal / RECOVERY_RUNS).padStart(9)} G  최악 ${num(worstFinal).padStart(8)} G` +
+      `  ${support ? (escaped === RECOVERY_RUNS ? '✔' : '✘') : ''}`,
+  );
+}
+console.log();
 process.exit(fail === 0 ? 0 : 1);
