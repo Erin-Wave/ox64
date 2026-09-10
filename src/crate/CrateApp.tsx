@@ -1,10 +1,11 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import Logo from '@/components/Logo';
 import CrateLogin from './CrateLogin';
 import OpenStage from './OpenStage';
 import Shop, { JackpotBanner } from './Shop';
 import Inventory from './Inventory';
 import Collection from './Collection';
+import Leaderboard from './Leaderboard';
 import { useCrateStore } from './useCrateStore';
 import { fmtG } from './data';
 import './crate.css';
@@ -43,6 +44,7 @@ function CrateGame() {
   const logout = useCrateStore((s) => s.logout);
   const dismissToast = useCrateStore((s) => s.dismissToast);
   const clearError = useCrateStore((s) => s.clearError);
+  const [board, setBoard] = useState(false);
 
   useEffect(() => {
     if (!toast) return;
@@ -76,6 +78,13 @@ function CrateGame() {
           >
             총 {fmtG(netWorth)}
           </span>
+          <button
+            onClick={() => setBoard(true)}
+            title="소지 골드 순위 (5초마다 갱신)"
+            className="shrink-0 rounded-md bg-panel2 px-2 py-1 font-bold text-muted ring-1 ring-border transition hover:text-text"
+          >
+            🏆<span className="ml-1 hidden sm:inline">랭킹</span>
+          </button>
           <a href="/" className="shrink-0 text-muted underline decoration-dotted underline-offset-2 hover:text-text">
             트레이딩
           </a>
@@ -129,6 +138,8 @@ function CrateGame() {
           </p>
         </section>
       </main>
+
+      {board && <Leaderboard onClose={() => setBoard(false)} />}
 
       {/* 토스트 — 화면 하단 중앙(모바일에서 헤더를 가리지 않게) */}
       {(toast || error) && (

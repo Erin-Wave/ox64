@@ -293,11 +293,82 @@ function statePayload(w: Work) {
   };
 }
 
+// ── 랭킹 ────────────────────────────────────────────────────────────────────────
+
+interface BoardRow {
+  user_id: string;
+  name: string;
+  coins: number;
+  inv_json: string;
+  crates_json: string;
+  opened: number;
+  merged: number;
+  jackpots: number;
+  best_coins: number;
+}
+
+/** 랭킹에 실어 보낼 한 사람 — 재료·상자는 값으로 환산해 "총자산"까지 같이 준다. */
+export interface BoardEntry {
+  name: string;
+  me: boolean;
+  coins: number;
+  netWorth: number;
+  opened: number;
+  merged: number;
+  jackpots: number;
+  bestCoins: number;
+}
+
+const BOARD_LIMIT = 100;
+
+/**
+ * 소지 골드 순위.
+ *
+ * ⚠ D1 비용(§6): **읽기 한 쿼리, 쓰기 0**. 정렬은 `coins` 컬럼으로 SQL 이 하고 `LIMIT` 으로 자른다 —
+ * 총자산(재료+상자 환산)은 JSON 을 파싱해야 나오는 파생값이라 SQL 로는 못 자르기 때문에, 상위 100명을
+ * 먼저 뽑고 그 안에서만 계산한다. 지금 이 게임의 유저 수는 두 자리라 사실상 전부 들어오지만, 유저가
+ * 늘어도 한 요청이 읽는 행 수가 100 을 안 넘게 묶어두는 게 목적이다.
+ * ⚠ 랭킹은 **열려 있는 동안 5초마다** 폴링되므로(트레이딩 랭킹과 같은 주기) 여기에 쓰기를 추가하면
+ * 그게 곧 "스스로 반복해서 도는 쓰기 경로"가 된다(§6). 읽기 전용으로 유지할 것.
+ */
+async function loadBoard(env: Env, uid: string) {
+  const res = await env.DB.prepare(
+    'SELECT c.user_id, u.name, c.coins, c.inv_json, c.crates_json, c.opened, c.merged, c.jackpots, c.best_coins' +
+      ' FROM crate_stats c JOIN users u ON u.id = c.user_id ORDER BY c.coins DESC LIMIT ?',
+  )
+    .bind(BOARD_LIMIT)
+    .all<BoardRow>();
+
+  const entries: BoardEntry[] = (res.results ?? []).map((r) => {
+    const inv = parseJson<Record<string, number>>(r.inv_json, {});
+    const crates = parseJson<Record<string, number>>(r.crates_json, {});
+    let held = 0;
+    for (const [k, n] of Object.entries(inv)) {
+      const parsed = parseInvKey(k);
+      if (parsed) held += matValue(parsed.cat, parsed.level) * n;
+    }
+    for (const [k, n] of Object.entries(crates)) held += (CRATE_BY_LEVEL.get(Number(k))?.price ?? 0) * n;
+    return {
+      name: r.name,
+      me: r.user_id === uid,
+      coins: r.coins,
+      netWorth: r.coins + held,
+      opened: r.opened,
+      merged: r.merged,
+      jackpots: r.jackpots,
+      bestCoins: r.best_coins,
+    };
+  });
+  return { entries, updatedAt: Date.now() };
+}
+
 async function handleGet(request: Request, env: Env): Promise<Response> {
   const envErr = missingEnv(env);
   if (envErr) return bad(envErr, 500);
   const sess = await getSession(request, env);
   if (!sess) return bad('unauthorized', 401);
+  // ?board=1 이면 랭킹만 — 5초마다 폴링되는 경로라 내 인벤토리·상점표까지 실어 보낼 이유가 없다.
+  if (new URL(request.url).searchParams.get('board') === '1') return json(await loadBoard(env, sess.uid));
   return json(statePayload(toWork(await loadRow(env, sess.uid))));
 }
 

@@ -81,6 +81,22 @@ export interface SellResult extends CrateState {
   sold: { cat: MatCat | null; level: number; count: number; gain: number };
 }
 
+/** 랭킹 한 줄 — 소지 골드와 총자산(재료·상자를 값으로 환산)을 둘 다 준다. */
+export interface BoardEntry {
+  name: string;
+  me: boolean;
+  coins: number;
+  netWorth: number;
+  opened: number;
+  merged: number;
+  jackpots: number;
+  bestCoins: number;
+}
+export interface BoardResult {
+  entries: BoardEntry[];
+  updatedAt: number;
+}
+
 export class CrateApiError extends Error {
   status: number;
   constructor(message: string, status: number) {
@@ -106,6 +122,7 @@ export const crateApi = {
   login: (name: string, passcode: string) => req<{ name: string }>('/login', { method: 'POST', body: JSON.stringify({ name, passcode }) }),
   logout: () => req<{ ok: boolean }>('/logout', { method: 'POST' }),
   state: () => req<CrateState>('/crate'),
+  board: () => req<BoardResult>('/crate?board=1'),
   buy: (level: number, count: number) => post<BuyResult>({ action: 'buy', level, count }),
   open: (level: number, count: number) => post<OpenResult>({ action: 'open', level, count }),
   merge: (cat: MatCat, level: number, times = 1) => post<MergeResult>({ action: 'merge', cat, level, times }),
