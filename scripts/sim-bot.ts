@@ -88,7 +88,36 @@ interface RunStat {
   busyVol: number;    // 활발한 시간대의 평균 거래량 배수
   quietVol: number;   // 한산한 시간대의 평균 거래량 배수
   coilRatio: number;  // 오래 눌린 관망(calm 300틱+)의 |ret| ÷ 갓 시작한 관망(60틱 이하) — 1 보다 작아야 수축이다
+  // ── 2026-09-10 추가: "되돌아옴이 심하다"를 숫자로 잡기 ──
+  // 분산비(variance ratio) = q틱 구간 분산 ÷ (q × 틱 분산). 랜덤워크면 1, 추세면 >1, 되돌리면 <1.
+  // 이 모델은 짧은 구간에서 크게 부풀었다가(추세) 긴 구간에서 꺾여 내려온다(되돌림) — 그 **낙폭**이
+  // 곧 "쌓은 변동 중 몇 %를 되돌려주나"다. 예전엔 61% 를 되돌려줘서 EMA 를 뚫은 봉이 통째로 되감겼다.
+  vr60: number;
+  vr1800: number;
+  giveBack: number;    // 1 - vr1800/vr60 (낮을수록 되돌림이 약하다)
+  emaRun: number;      // EMA20(1분봉) 한쪽에 머무는 봉 수(중앙값)
+  emaWhip: number;     // 2봉 이하로 되돌아 크로스하는 비율(휩쏘)
+  emaExcursion: number;// 크로스 후 EMA 에서 벌어지는 최대 거리(중앙값)
 }
+
+const varOf = (a: number[]): number => {
+  const m = a.reduce((x, y) => x + y, 0) / a.length;
+  return a.reduce((x, y) => x + (y - m) ** 2, 0) / a.length;
+};
+/** q틱 비중첩 블록 합의 분산 ÷ (q × 틱 분산) = 분산비. */
+function varianceRatio(r: number[], q: number): number {
+  const blocks: number[] = [];
+  for (let i = 0; i + q <= r.length; i += q) {
+    let sum = 0;
+    for (let j = i; j < i + q; j++) sum += r[j];
+    blocks.push(sum);
+  }
+  return blocks.length > 1 ? varOf(blocks) / (q * varOf(r)) : NaN;
+}
+const median = (a: number[]): number => {
+  const b = [...a].sort((x, y) => x - y);
+  return b.length ? b[b.length >> 1] : NaN;
+};
 
 function corr(a: number[], b: number[]): number {
   const n = Math.min(a.length, b.length);
@@ -170,6 +199,7 @@ function runOnce(): RunStat {
   let oldCalmN = 0;
   let newCalm = 0;
   let newCalmN = 0;
+  const closes: number[] = []; // 1분봉 종가(EMA 교차 통계용)
 
   for (let t = 0; t < TICKS; t++) {
     const step = nextMarketState(s, T0 + t * MS_PER_TICK);
@@ -257,10 +287,36 @@ function runOnce(): RunStat {
       bars++;
       barHigh = s.ref;
       barLow = s.ref;
+      closes.push(s.ref);
     }
   }
   const shifted = rets.slice(1);
   const abs = rets.map(Math.abs);
+  // EMA20(1분봉) 교차 — 한쪽에 얼마나 머무는가 / 얼마나 벌어졌다 오는가.
+  const P = 20;
+  const k = 2 / (P + 1);
+  let ema = closes[0];
+  let side = 0;
+  let len = 0;
+  let exc = 0;
+  const lens: number[] = [];
+  const excs: number[] = [];
+  for (let i = 1; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+    const d = (closes[i] - ema) / ema;
+    const sg = d > 0 ? 1 : d < 0 ? -1 : side;
+    if (side !== 0 && sg !== side) {
+      lens.push(len);
+      excs.push(exc);
+      len = 0;
+      exc = 0;
+    }
+    side = sg;
+    len++;
+    exc = Math.max(exc, Math.abs(d));
+  }
+  const vr60 = varianceRatio(rets, 60);
+  const vr1800 = varianceRatio(rets, 1800);
   return {
     end: s.ref,
     min,
@@ -300,6 +356,12 @@ function runOnce(): RunStat {
     busyVol: busyN ? busyVolSum / busyN : NaN,
     quietVol: quietN ? quietVolSum / quietN : NaN,
     coilRatio: oldCalmN && newCalmN ? oldCalm / oldCalmN / (newCalm / newCalmN) : NaN,
+    vr60,
+    vr1800,
+    giveBack: 1 - vr1800 / vr60,
+    emaRun: median(lens),
+    emaWhip: lens.filter((x) => x <= 2).length / Math.max(1, lens.length),
+    emaExcursion: median(excs),
   };
 }
 
@@ -456,8 +518,12 @@ console.log(
 );
 console.log(
   // ⚠ 편향은 **로그드리프트**(= 산술평균 − 분산/2)로 본다. 가격은 곱으로 누적되므로 실제 성장률은
-  // 이 값이고, 산술평균만 보면 분산이 큰 모델이 항상 "상승 편향"처럼 보인다. 표본이 수백만이라
-  // SE 가 0.01e-6 수준이어서 종가(log-normal, 8회 평균으로도 2배씩 흔들린다)보다 1000배 정밀하다.
+  // 이 값이고, 산술평균만 보면 분산이 큰 모델이 항상 "상승 편향"처럼 보인다.
+  // ⚠⚠ **표본오차를 얕보지 말 것**(2026-09-10 실측). 예전 주석은 "틱이 수백만이라 SE 0.01e-6" 이라고
+  // 적어뒀는데 그건 틱이 독립일 때 얘기다 — 실제로는 국면이 ~69틱씩 살고 수익률 acf1 이 0.5 라
+  // **유효 표본은 국면 개수**다. 실측 SE 는 7일 1회에 ~4e-6, 8회 평균에 ~1.4e-6, 24회에 ~0.8e-6.
+  // 즉 8회 실행의 -2.6e-6 은 편향이 아니라 노이즈일 수 있다(실제로 그랬다 — 48회로 재니 +0.45e-6).
+  // 파라미터를 손본 뒤 편향을 판정할 땐 `SIM_RUNS=24` 이상으로 다시 돌릴 것.
   `로그드리프트/틱 ${((avg((s) => s.meanRet) - avg((s) => s.tickSd) ** 2 / 2) * 1e6).toFixed(2)}e-6 ` +
     `(편향 지표 — |값| 2 이하 권장, 위험선 28)  ` +
     `기하평균 종가 ${Math.exp(avg((s) => s.logEnd)).toFixed(4)}`,
@@ -467,6 +533,14 @@ console.log(
     `활발한 시간 틱sd ${pct(avg((s) => s.busySd))} vs 한산한 시간 ${pct(avg((s) => s.quietSd))}  ` +
     `거래량 배수 ${avg((s) => s.busyVol).toFixed(2)} vs ${avg((s) => s.quietVol).toFixed(2)}  ` +
     `코일(긴 관망/짧은 관망 변동성) ${avg((s) => s.coilRatio).toFixed(2)}`,
+);
+console.log(
+  // ⚠ "되돌아옴이 심한가" — 분산비가 60틱에서 부풀었다가 1800틱에서 얼마나 꺾이는지가 곧 되돌림이다.
+  // 2026-09-10 개편 전 61% → 후 42%. **다시 55% 위로 올라가면 EMA 를 뚫은 봉이 통째로 되감긴다.**
+  `되돌림: 분산비 60틱 ${avg((s) => s.vr60).toFixed(2)} → 1800틱 ${avg((s) => s.vr1800).toFixed(2)} ` +
+    `= 되돌려주는 몫 ${(100 * avg((s) => s.giveBack)).toFixed(0)}%(55% 미만 유지)  ` +
+    `EMA20 한쪽 ${avg((s) => s.emaRun).toFixed(1)}봉  휩쏘 ${(100 * avg((s) => s.emaWhip)).toFixed(1)}%  ` +
+    `최대이탈 ${pct(avg((s) => s.emaExcursion))}`,
 );
 console.log(
   '국면 점유율: ' +
