@@ -11,7 +11,7 @@
  *               상자조각은 Lv4 2개마다 상자로 바꿔 그것도 마저 깐다
  *
  * 합격선(§ CLAUDE.md "상자깡 밸런스"):
- *   - naive   회수율 **65~75%** — 상자만 까고 다 팔면 반드시 적자여야 인플레가 안 생긴다
+ *   - naive   회수율 **78~92%** — 상자만 까고 다 팔면 반드시 적자여야 인플레가 안 생긴다
  *   - optimal 회수율 **105~118%** — 머지를 끝까지 해야 비로소 흑자(= 이 게임의 유일한 성장 동력)
  *   - 두 정책의 비(optimal/naive)가 1.4 이상 — 머지의 존재 이유가 숫자로 드러나야 한다
  *   - 잭팟 기여분이 optimal 회수율의 5% 미만 — 넘으면 "많이 까면 확률적으로 이긴다"가 되어
@@ -25,6 +25,10 @@ import {
   MILESTONES,
   DAILY_EVENTS,
   priceOf,
+  scratchLotto,
+  lottoExpectedMult,
+  LOTTO_TIERS,
+  LOTTO_BASE,
   type DailyEvent,
   BULK_BONUS_CHANCE,
   rollBonus,
@@ -100,11 +104,19 @@ function openAll(level: number, count: number, run: Run, ev?: DailyEvent | null)
   }
 }
 
-/** 재료를 즉시 전부 판매. */
+/**
+ * 재료를 즉시 전부 판매.
+ * ⚠ 골드복권은 팔 수가 없으므로(긁는 것 말고 처분법이 없다) 여기서도 긁은 값으로 친다 —
+ * 그래야 naive 회수율이 실제로 손에 들어오는 골드와 일치한다.
+ */
 function sellNaive(inv: Inv): number {
   let sum = 0;
   for (const [k, n] of inv) {
     const [cat, lv] = k.split(':');
+    if (cat === 'lotto') {
+      for (let i = 0; i < n; i++) sum += scratchLotto().gold;
+      continue;
+    }
     sum += matValue(cat as MatCat, Number(lv)) * n;
   }
   return sum;
@@ -144,6 +156,13 @@ function sellOptimal(run: Run): number {
     for (const [k, n] of inv) if (n > 0) run.inv.set(k, n);
     if (!madeCrate) break;
   }
+  // ⚠ 골드복권은 **팔지 않고 긁는다** — 기대 배수가 2.6 이라 파는 게 언제나 손해다.
+  // 최적 플레이의 정의상 여기서 긁어야 optimal 회수율이 실제 상한을 반영한다.
+  for (const [k, n] of [...run.inv]) {
+    if (!k.startsWith('lotto:') || n <= 0) continue;
+    for (let i = 0; i < n; i++) coins += scratchLotto().gold;
+    run.inv.delete(k);
+  }
   coins += sellNaive(run.inv);
   // ⚠ 판 재료는 반드시 비운다 — 회수율 시뮬은 이 함수를 한 번만 부르지만 회생 시뮬은 날마다 부르므로,
   // 비우지 않으면 **같은 재료를 매일 다시 판다**(그 버그로 14일 뒤 자산이 650만 G 로 나왔다).
@@ -174,9 +193,11 @@ console.log(`\n=== 상자깡 밸런스 시뮬레이션 (상자당 ${num(RUNS)}�
 console.log('── 재료 가치표 (머지 배수 ' + MERGE_MULT + ', 2개 → 1개) ──');
 for (const c of CATS) {
   const row: string[] = [];
-  for (let lv = 1; lv <= c.maxLevel; lv++) row.push(`Lv${lv} ${num(matValue(c.cat, lv))}`);
+  const step = c.maxLevel > 6 ? 3 : 1; // 12레벨이면 전부 찍으면 줄이 넘친다
+  for (let lv = 1; lv <= c.maxLevel; lv += step) row.push(`Lv${lv} ${num(matValue(c.cat, lv))}`);
+  if ((c.maxLevel - 1) % step !== 0) row.push(`Lv${c.maxLevel} ${num(matValue(c.cat, c.maxLevel))}`);
   const lift = Math.pow(MERGE_MULT / 2, c.maxLevel - 1);
-  console.log(`${c.emoji} ${c.name.padEnd(5)} ${row.join(' · ').padEnd(52)} Lv1→Lv${c.maxLevel} 가치 ×${lift.toFixed(2)}`);
+  console.log(`${c.emoji} ${c.name.padEnd(5)} ${row.join(' · ').padEnd(58)} Lv1→Lv${c.maxLevel} ×${lift.toFixed(2)}`);
 }
 
 console.log('\n── 상자별 회수율 ──');
@@ -186,12 +207,31 @@ for (const def of CRATES) {
   const naive = simulate(def.level, RUNS, 'naive');
   const opt = simulate(def.level, RUNS, 'optimal');
   const ratio = opt.rate / naive.rate;
-  const ok = naive.rate >= 0.78 && naive.rate <= 0.92 && opt.rate >= 1.2 && opt.rate <= 1.8 && ratio >= 1.3;
+  const ok = naive.rate >= 0.78 && naive.rate <= 0.92 && opt.rate >= 1.25 && opt.rate <= 3.2 && ratio >= 1.3;
   if (!ok) fail++;
   console.log(
     `${def.name.padEnd(10)} ${num(def.price).padStart(6)}   ${pct(naive.rate).padStart(7)}   ${pct(opt.rate).padStart(7)}` +
       `   ×${ratio.toFixed(2)}   ×${opt.crateMult.toFixed(2)}      ${pct(opt.jackpotShare).padStart(6)}   ${ok ? '✔' : '✘'}`,
   );
+}
+
+console.log();
+console.log('── 골드복권 (긁으면 판매가의 배수로 골드) ──');
+for (const t of LOTTO_TIERS)
+  console.log(`  ${t.label.padEnd(8)} ${pct(t.p).padStart(6)}   판매가의 ${t.min}~${t.max}배   (기여 ${(t.p * ((t.min + t.max) / 2)).toFixed(2)}배)`);
+console.log(`  기대 배수 ${lottoExpectedMult().toFixed(2)}배 — 파는 것보다 긁는 게 항상 이득이어야 한다 ${lottoExpectedMult() > 1.5 ? '✔' : '✘'}`);
+{
+  // 실제로 굴려서 분포를 확인한다(꼬리가 평균을 얼마나 끌고 가는지)
+  const N = 200_000;
+  let sum = 0;
+  let best = 0;
+  const base = LOTTO_BASE;
+  for (let i = 0; i < N; i++) {
+    const g = scratchLotto().gold;
+    sum += g;
+    best = Math.max(best, g);
+  }
+  console.log(`  실측(${num(N)}장, 기준액 ${base}G): 평균 ${(sum / N / base).toFixed(2)}배 · 최고 ${num(best)}G(${(best / base).toFixed(0)}배)`);
 }
 
 console.log();

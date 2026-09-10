@@ -6,6 +6,10 @@ import {
   CRATE_BY_LEVEL,
   ACHIEVEMENTS,
   DAILY_EVENTS,
+  LOTTO_BASE,
+  LOTTO_TIERS,
+  lottoExpectedMult,
+  scratchLotto,
   eventOfDay,
   priceOf,
   ACH_PREFIX,
@@ -48,6 +52,7 @@ import {
  * POST /api/crate { action: 'open',   level, count }
  * POST /api/crate { action: 'merge',  cat, level, times }   ← shard 최고 레벨이면 랜덤 상자가 나온다
  * POST /api/crate { action: 'mergeAll' }
+ * POST /api/crate { action: 'scratch', level, count }        ← 골드복권 긁기
  * POST /api/crate { action: 'sell',   cat, level, count }    ← count 생략/음수면 전량
  * POST /api/crate { action: 'sellAll', maxLevel }            ← 그 레벨 이하 재료 일괄 판매(상자조각 제외)
  * POST /api/crate { action: 'refill' }
@@ -260,11 +265,18 @@ function grantAchievements(w: Work): { key: string; label: string; desc: string;
 // ── 응답 ────────────────────────────────────────────────────────────────────────
 
 /** 재료 인벤토리를 전부 팔았을 때의 값 — 리필 자격(빈털터리 판정)과 "총자산" 표시에 쓴다. */
+/**
+ * 재료 인벤토리의 값 — 파산 판정과 "총자산" 표시에 쓴다.
+ * ⚠ 골드복권은 팔 수 없으므로 판매가가 아니라 **기대 상금**(기준액 × 2.57)으로 친다. 안 그러면
+ * 복권만 잔뜩 든 사람이 "빈털터리" 로 판정돼 구제를 받으면서 실제로는 부자인 상태가 된다.
+ */
 function inventoryValue(w: Work): number {
   let sum = 0;
+  const lottoValue = LOTTO_BASE * lottoExpectedMult();
   for (const [k, n] of Object.entries(w.inv)) {
     const parsed = parseInvKey(k);
-    if (parsed) sum += matValue(parsed.cat, parsed.level) * n;
+    if (!parsed) continue;
+    sum += (parsed.cat === 'lotto' ? lottoValue : matValue(parsed.cat, parsed.level)) * n;
   }
   return sum;
 }
@@ -341,6 +353,9 @@ function statePayload(w: Work) {
       emoji: c.emoji,
       color: c.color,
       maxLevel: c.maxLevel,
+      // ⚠ 클라가 판매 버튼을 숨기는 근거라 반드시 실어 보낼 것 — 빠뜨리면 팔 수 없는 재료에
+      // 판매 버튼이 그대로 뜨고, 눌러야 서버 거부 메시지를 본다.
+      noSell: c.noSell ?? false,
       desc: c.desc,
       values: Array.from({ length: c.maxLevel }, (_, i) => matValue(c.cat, i + 1)),
     })),
@@ -353,6 +368,7 @@ function statePayload(w: Work) {
      */
     event: { ...eventOfDay(today), today },
     eventWeek: DAILY_EVENTS.map((e) => ({ day: e.day, key: e.key, emoji: e.emoji, label: e.label, desc: e.desc })),
+    lotto: { tiers: LOTTO_TIERS, expected: lottoExpectedMult(), maxAtOnce: MAX_SCRATCH_AT_ONCE },
     bonusTiers: BONUS_TIERS.map((b) => ({ tier: b.tier, p: b.p, mult: b.mult, extra: b.extra, label: b.label, emoji: b.emoji, color: b.color })),
     milestones: MILESTONES.map((m) => ({ every: m.every, level: m.level, count: m.count, label: m.label, progress: w.opened % m.every })),
     achievements: ACHIEVEMENTS.map((a) => ({
@@ -459,6 +475,8 @@ async function handleGet(request: Request, env: Env): Promise<Response> {
 }
 
 const RETRY_MSG = '동시에 처리된 요청이 있습니다. 다시 시도해주세요';
+/** 한 요청에 긁을 수 있는 복권 수 — 응답 크기와 연출 길이를 묶어두려는 상한이다. */
+const MAX_SCRATCH_AT_ONCE = 20;
 
 async function handlePost(request: Request, env: Env): Promise<Response> {
   const envErr = missingEnv(env);
@@ -559,6 +577,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     const times = Math.max(1, Math.round(Number(body.times ?? 1)));
     if (!isValidMat(cat, level)) return bad('없는 재료입니다');
     const def = CAT_BY_KEY.get(cat)!;
+    // ⚠ 골드복권은 레벨이 없어서 합칠 수 없다(maxLevel 1 이라 아래 분기에서도 걸리지만,
+    // "Lv1이 최고 레벨입니다" 는 이유를 설명해주지 못한다).
+    if (cat === 'lotto') return bad('골드복권은 합칠 수 없습니다 — 긁어서 쓰세요');
     const have = invCount(w, cat, level);
     if (have < 2 * times) return bad('재료가 부족합니다 (2개가 필요합니다)');
 
@@ -608,11 +629,38 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     return json({ ...statePayload(w), achieved, mergedAll: total });
   }
 
+  // ── 골드복권 긁기 ────────────────────────────────────────────────────────────
+  // ⚠ 상금은 **서버가 굴린다**(클라는 몇 장 긁을지만 보낸다). 기대 배수가 2.6 이라 파는 것보다
+  // 항상 이득이지만, 절반 이상은 본전도 안 되는 게 이 아이템의 요점이다.
+  if (action === 'scratch') {
+    const level = Math.round(Number(body.level));
+    if (!isValidMat('lotto', level)) return bad('없는 복권입니다');
+    const have = invCount(w, 'lotto', level);
+    if (have <= 0) return bad('보유한 복권이 없습니다');
+    const asked = Math.round(Number(body.count ?? 1));
+    const count = Math.min(Number.isFinite(asked) && asked > 0 ? asked : 1, have, MAX_SCRATCH_AT_ONCE);
+
+    const results: ReturnType<typeof scratchLotto>[] = [];
+    let gold = 0;
+    for (let i = 0; i < count; i++) {
+      const r = scratchLotto(level);
+      results.push(r);
+      gold += r.gold;
+    }
+    addMat(w, 'lotto', level, -count);
+    w.coins += gold;
+    w.earned += gold;
+    const achieved = grantAchievements(w);
+    if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
+    return json({ ...statePayload(w), achieved, scratched: { level, count, gold, results } });
+  }
+
   // ── 판매 ─────────────────────────────────────────────────────────────────────
   if (action === 'sell') {
     const cat = String(body.cat ?? '') as MatCat;
     const level = Math.round(Number(body.level));
     if (!isValidMat(cat, level)) return bad('없는 재료입니다');
+    if (CAT_BY_KEY.get(cat)?.noSell) return bad('골드복권은 팔 수 없습니다 — 긁어서 쓰세요');
     const have = invCount(w, cat, level);
     if (have <= 0) return bad('보유한 재료가 없습니다');
     const asked = Number(body.count);
@@ -635,7 +683,7 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     let gain = 0;
     let count = 0;
     for (const def of CATS) {
-      if (def.cat === 'shard') continue;
+      if (def.cat === 'shard' || def.noSell) continue;
       for (let lv = 1; lv <= Math.min(maxLevel, def.maxLevel); lv++) {
         const have = invCount(w, def.cat, lv);
         if (have <= 0) continue;

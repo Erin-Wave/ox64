@@ -6,7 +6,7 @@
 // 클라에 같은 표를 또 적으면 서버 밸런스를 고칠 때 조용히 어긋나고, 보상은 서버가 주므로 화면만
 // 틀리게 된다(트레이딩의 VIP 등급표와 같은 이유).
 
-export type MatCat = 'wood' | 'ore' | 'gem' | 'essence' | 'shard';
+export type MatCat = 'herb' | 'wood' | 'ore' | 'cloth' | 'gem' | 'essence' | 'lotto' | 'shard';
 export type JackpotTier = 'lucky' | 'mega' | 'legend';
 
 export interface RewardItem {
@@ -19,6 +19,8 @@ export interface RewardItem {
 
 export interface CatInfo {
   cat: MatCat;
+  /** 팔 수 없는 재료(골드복권) */
+  noSell?: boolean;
   name: string;
   emoji: string;
   color: string;
@@ -103,6 +105,19 @@ export interface DailyEventInfo {
   today: string;
 }
 
+/** 골드복권 한 장의 결과 */
+export interface LottoResult {
+  mult: number;
+  gold: number;
+  tier: number;
+  label: string;
+  color: string;
+}
+export interface ScratchResult extends CrateState {
+  scratched: { level: number; count: number; gold: number; results: LottoResult[] };
+  achieved?: AchievedNow[];
+}
+
 export interface CrateState {
   coins: number;
   /** {"wood:1": 37, …} */
@@ -125,6 +140,11 @@ export interface CrateState {
   jackpotTiers: { tier: JackpotTier; p: number; mult: number; label: string }[];
   event: DailyEventInfo;
   eventWeek: { day: number; key: string; emoji: string; label: string; desc: string }[];
+  lotto: {
+    tiers: { p: number; min: number; max: number; label: string; color: string }[];
+    expected: number;
+    maxAtOnce: number;
+  };
   bonusTiers: BonusInfo[];
   milestones: MilestoneInfo[];
   achievements: AchievementInfo[];
@@ -213,5 +233,6 @@ export const crateApi = {
   mergeAll: () => post<MergeResult>({ action: 'mergeAll' }),
   sell: (cat: MatCat, level: number, count?: number) => post<SellResult>({ action: 'sell', cat, level, count }),
   sellAll: (maxLevel: number) => post<SellResult>({ action: 'sellAll', maxLevel }),
+  scratch: (level: number, count: number) => post<ScratchResult>({ action: 'scratch', level, count }),
   refill: () => post<GrantResult>({ action: 'refill' }),
 };

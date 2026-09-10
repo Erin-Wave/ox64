@@ -7,15 +7,20 @@
 
 // ── 재료 ────────────────────────────────────────────────────────────────────────
 // 카테고리는 머지해도 절대 안 바뀌고 레벨만 오른다(요구사항). 같은 카테고리·같은 레벨 2개 → 다음 레벨 1개.
-// 가치는 레벨당 MERGE_MULT 배 — 2개(=2배)를 1개로 합치는데 가치가 2.35배가 되므로 개당 1.175배씩
+// 가치는 레벨당 MERGE_MULT 배 — 2개(=2배)를 1개로 합치는데 가치가 2.25배가 되므로 개당 1.125배씩
 // 이득이다. 이 "머지 프리미엄"이 이 게임의 유일한 성장 동력이고, 상자 기대 회수율을 원가 아래로
 // 잡아둔 이유이기도 하다(상자만 까서 다 팔면 적자, 끝까지 머지해서 팔아야 흑자 = § 밸런스).
-export const MERGE_MULT = 2.35;
+// ⚠⚠ **레벨 상한을 바꾸면 이 값도 같이 재조정해야 한다.** Lv1→최고 레벨의 가치 배율은
+// `(MERGE_MULT/2)^(상한-1)` 라 상한에 지수로 반응한다 — 상한을 6에서 12 로 올렸을 때 2.35 를
+// 그대로 두면 배율이 2.24 → 6.28 로 뛰어 optimal 회수율이 통째로 폭발한다(그래서 2.25 로 내렸다).
+export const MERGE_MULT = 2.25;
 
-export type MatCat = 'wood' | 'ore' | 'gem' | 'essence' | 'shard';
+export type MatCat = 'herb' | 'wood' | 'ore' | 'cloth' | 'gem' | 'essence' | 'lotto' | 'shard';
 
 export interface CatDef {
   cat: MatCat;
+  /** 팔 수 없는 재료(골드복권) — 긁는 것 말고는 쓸 데가 없다 */
+  noSell?: boolean;
   name: string;
   emoji: string;
   color: string;
@@ -29,11 +34,30 @@ export interface CatDef {
 
 // ⚠ 이모지는 **Unicode 11.0 이하**로만 고를 것 — 12.0/13.0 대(🪵 U+1FAB5 등)는 구형 폰트에
 // 글리프가 없어 두부(□)로 뜬다(실제로 목재 아이콘이 그렇게 깨졌다). 새 재료를 추가할 때 반드시 확인.
+/** 일반 재료의 레벨 상한 — 상자조각(4)과 복권(1)만 예외다. */
+export const MAX_MAT_LEVEL = 12;
+/** 골드복권 상금의 기준액 — 상금은 이 값의 0.1~800배다(레벨이 없으므로 고정). */
+export const LOTTO_BASE = 300;
+
 export const CATS: CatDef[] = [
-  { cat: 'wood', name: '목재', emoji: '🌳', color: '#b0803a', base: 6, maxLevel: 6, desc: '가장 흔한 기본 재료' },
-  { cat: 'ore', name: '광석', emoji: '⛏️', color: '#8aa4b8', base: 15, maxLevel: 6, desc: '단단한 중급 재료' },
-  { cat: 'gem', name: '보석', emoji: '💎', color: '#38bdf8', base: 40, maxLevel: 6, desc: '값나가는 고급 재료' },
-  { cat: 'essence', name: '정수', emoji: '🔮', color: '#a78bfa', base: 90, maxLevel: 6, desc: '희귀한 최고급 재료' },
+  { cat: 'herb', name: '약초', emoji: '🌿', color: '#5fbf6a', base: 4, maxLevel: MAX_MAT_LEVEL, desc: '지천에 널린 재료' },
+  { cat: 'wood', name: '목재', emoji: '🌳', color: '#b0803a', base: 6, maxLevel: MAX_MAT_LEVEL, desc: '가장 흔한 기본 재료' },
+  { cat: 'ore', name: '광석', emoji: '⛏️', color: '#8aa4b8', base: 15, maxLevel: MAX_MAT_LEVEL, desc: '단단한 중급 재료' },
+  { cat: 'cloth', name: '섬유', emoji: '🧵', color: '#e08fb0', base: 24, maxLevel: MAX_MAT_LEVEL, desc: '손이 많이 가는 중급 재료' },
+  { cat: 'gem', name: '보석', emoji: '💎', color: '#38bdf8', base: 40, maxLevel: MAX_MAT_LEVEL, desc: '값나가는 고급 재료' },
+  { cat: 'essence', name: '정수', emoji: '🔮', color: '#a78bfa', base: 90, maxLevel: MAX_MAT_LEVEL, desc: '희귀한 최고급 재료' },
+  {
+    cat: 'lotto',
+    name: '골드복권',
+    emoji: '🎫',
+    color: '#ffcc33',
+    base: LOTTO_BASE,
+    // ⚠ 레벨이 없다(상한 1) — 합칠 수도, 팔 수도 없고 **긁는 것만** 가능하다.
+    // 그래서 `base` 는 판매가가 아니라 **상금의 기준액**이고, 상금은 그 0.1~800배다.
+    maxLevel: 1,
+    noSell: true,
+    desc: '긁으면 골드가 나온다 — 최소 30 G, 최대 240,000 G',
+  },
   {
     cat: 'shard',
     name: '상자조각',
@@ -65,6 +89,56 @@ export function parseInvKey(key: string): { cat: MatCat; level: number } | null 
   const level = Number(lv);
   if (!isValidMat(cat, level)) return null;
   return { cat: cat as MatCat, level };
+}
+
+// ── 골드복권 ────────────────────────────────────────────────────────────────────
+/**
+ * 긁으면 `LOTTO_BASE`(300G)의 배수로 골드를 준다. 배수 분포가 이 아이템의 전부다 — 절반 이상은
+ * 기준액도 못 건지고, 아주 가끔 수백 배가 터진다(로그 스케일 꼬리). 실측 최대 240,000골드.
+ *
+ * ⚠ 기대 배수는 `Σ p × (min+max)/2` = **약 2.6배**(= 771골드)다. 복권은 팔 수도 합칠 수도 없으므로
+ * 이 기댓값이 곧 복권의 가치이고, 회수율 계산도 그 값으로 한다.
+ * ⚠ 꼬리를 키울 땐 기대 배수를 반드시 다시 계산할 것 — `p × mult` 가 큰 항이 하나만 있어도 평균이
+ * 통째로 끌려간다(0.1% × 800배 = 0.8배가 평균에 그대로 더해진다).
+ */
+export const LOTTO_TIERS: { p: number; min: number; max: number; label: string; color: string }[] = [
+  { p: 0.55, min: 0.1, max: 0.8, label: '꽝', color: '#8b949e' },
+  { p: 0.31, min: 0.8, max: 2.5, label: '소액', color: '#7ee787' },
+  { p: 0.11, min: 2.5, max: 8, label: '당첨', color: '#4493f8' },
+  { p: 0.025, min: 8, max: 30, label: '고액 당첨', color: '#bc8cff' },
+  { p: 0.004, min: 30, max: 120, label: '대박', color: '#f0883e' },
+  { p: 0.001, min: 120, max: 800, label: '1등', color: '#ff5ea8' },
+];
+
+export interface LottoResult {
+  /** 판매가 대비 배수 */
+  mult: number;
+  /** 실제 지급 골드 */
+  gold: number;
+  tier: number;
+  label: string;
+  color: string;
+}
+
+/** 복권 한 장을 긁는다. */
+export function scratchLotto(_level = 1, rng: Rng = Math.random): LottoResult {
+  const base = LOTTO_BASE;
+  let r = rng();
+  for (let i = 0; i < LOTTO_TIERS.length; i++) {
+    const t = LOTTO_TIERS[i];
+    if (r < t.p) {
+      const mult = t.min + rng() * (t.max - t.min);
+      return { mult, gold: Math.max(1, Math.round(base * mult)), tier: i, label: t.label, color: t.color };
+    }
+    r -= t.p;
+  }
+  const t = LOTTO_TIERS[0];
+  return { mult: t.min, gold: Math.max(1, Math.round(base * t.min)), tier: 0, label: t.label, color: t.color };
+}
+
+/** 복권의 기대 배수 — 시뮬·표시에서 "평균 몇 배" 를 보여줄 때 쓴다. */
+export function lottoExpectedMult(): number {
+  return LOTTO_TIERS.reduce((sum, t) => sum + t.p * ((t.min + t.max) / 2), 0);
 }
 
 // ── 상자 ────────────────────────────────────────────────────────────────────────
@@ -129,15 +203,18 @@ export const CRATES: CrateDef[] = [
     name: 'Lv1 상자',
     emoji: '📦',
     price: 100,
-    desc: '가벼운 나무 상자. 목재와 광석이 주로 나온다.',
+    desc: '가벼운 나무 상자. 약초와 목재가 주로 나온다.',
     slots: [
-      { p: 0.72, drop: coin(25, 48) },
-      { p: 0.85, drop: mat('wood', 1, 1, 2) },
-      { p: 0.45, drop: mat('wood', 2) },
-      { p: 0.28, drop: mat('ore', 1, 1, 2) },
-      { p: 0.26, drop: mat('ore', 2) },
-      { p: 0.06, drop: mat('gem', 1) },
-      { p: 0.02, drop: mat('essence', 1) },
+      { p: 0.72, drop: coin(18, 38) },
+      { p: 0.9, drop: mat('herb', 1, 1, 3) },
+      { p: 0.35, drop: mat('herb', 2) },
+      { p: 0.8, drop: mat('wood', 1) },
+      { p: 0.38, drop: mat('wood', 2) },
+      { p: 0.22, drop: mat('ore', 1) },
+      { p: 0.2, drop: mat('ore', 2) },
+      { p: 0.05, drop: mat('cloth', 1) },
+      { p: 0.04, drop: mat('gem', 1) },
+      { p: 0.008, drop: mat('lotto', 1) },
       { p: 0.2, drop: mat('shard', 1) },
       { p: 0.06, drop: mat('shard', 2) },
       { p: 0.035, drop: crate(1) },
@@ -149,19 +226,21 @@ export const CRATES: CrateDef[] = [
     name: 'Lv2 상자',
     emoji: '🎁',
     price: 450,
-    desc: '단단히 잠긴 철제 상자. 보석과 상자조각이 늘어난다.',
+    desc: '단단히 잠긴 철제 상자. 광석과 섬유가 늘어난다.',
     slots: [
-      { p: 0.7, drop: coin(100, 240) },
-      { p: 0.85, drop: mat('wood', 2, 1, 3) },
+      { p: 0.7, drop: coin(70, 160) },
+      { p: 0.6, drop: mat('herb', 3, 1, 2) },
+      { p: 0.7, drop: mat('wood', 3) },
       { p: 0.6, drop: mat('ore', 2, 1, 2) },
-      { p: 0.3, drop: mat('ore', 3) },
-      { p: 0.55, drop: mat('gem', 1, 1, 2) },
+      { p: 0.28, drop: mat('ore', 3) },
+      { p: 0.4, drop: mat('cloth', 2) },
+      { p: 0.15, drop: mat('cloth', 3) },
       { p: 0.2, drop: mat('gem', 2) },
-      { p: 0.14, drop: mat('essence', 1) },
-      { p: 0.04, drop: mat('essence', 2) },
+      { p: 0.06, drop: mat('essence', 2) },
+      { p: 0.035, drop: mat('lotto', 1) },
       { p: 0.45, drop: mat('shard', 2) },
       { p: 0.2, drop: mat('shard', 1, 1, 2) },
-      { p: 0.22, drop: crate(1) },
+      { p: 0.2, drop: crate(1) },
       { p: 0.03, drop: crate(2) },
       { p: 0.004, drop: crate(3), jackpot: 'lucky' },
     ],
@@ -171,21 +250,67 @@ export const CRATES: CrateDef[] = [
     name: 'Lv3 상자',
     emoji: '🗝️',
     price: 2000,
-    desc: '고대의 금고. 정수와 상위 상자가 쏟아진다.',
+    desc: '고대의 금고. 보석과 정수가 쏟아진다.',
     slots: [
-      { p: 0.75, drop: coin(300, 780) },
-      { p: 0.8, drop: mat('ore', 3, 1, 3) },
-      { p: 0.7, drop: mat('gem', 2, 2, 4) },
-      { p: 0.45, drop: mat('gem', 3) },
-      { p: 0.5, drop: mat('essence', 1, 1, 2) },
-      { p: 0.35, drop: mat('essence', 2, 1, 2) },
-      { p: 0.1, drop: mat('essence', 3) },
-      { p: 0.55, drop: mat('shard', 3, 1, 2) },
-      { p: 0.35, drop: mat('shard', 2, 1, 2) },
-      { p: 0.45, drop: crate(1, 1, 2) },
-      { p: 0.3, drop: crate(2) },
-      { p: 0.05, drop: crate(3) },
-      { p: 0.008, drop: mat('essence', 5), jackpot: 'lucky' },
+      { p: 0.75, drop: coin(195, 510) },
+      { p: 0.6, drop: mat('ore', 4, 1, 2) },
+      { p: 0.5, drop: mat('cloth', 4) },
+      { p: 0.5, drop: mat('gem', 3, 1, 2) },
+      { p: 0.2, drop: mat('gem', 4) },
+      { p: 0.3, drop: mat('essence', 3) },
+      { p: 0.08, drop: mat('essence', 4) },
+      { p: 0.3, drop: mat('wood', 5) },
+      { p: 0.15, drop: mat('lotto', 1, 1, 2) },
+      { p: 0.4, drop: mat('shard', 3, 1, 2) },
+      { p: 0.3, drop: mat('shard', 2, 1, 2) },
+      { p: 0.25, drop: crate(1, 1, 2) },
+      { p: 0.15, drop: crate(2) },
+      { p: 0.035, drop: crate(3) },
+      { p: 0.006, drop: crate(4), jackpot: 'lucky' },
+    ],
+  },
+  {
+    level: 4,
+    name: 'Lv4 상자',
+    emoji: '💼',
+    price: 9000,
+    desc: '봉인된 보물함. 이미 합쳐진 고급 재료가 통째로 들어있다.',
+    slots: [
+      { p: 0.75, drop: coin(880, 2200) },
+      { p: 0.6, drop: mat('gem', 5, 1, 2) },
+      { p: 0.4, drop: mat('essence', 4, 1, 2) },
+      { p: 0.7, drop: mat('cloth', 5, 1, 2) },
+      { p: 0.5, drop: mat('ore', 6, 1, 2) },
+      { p: 0.15, drop: mat('essence', 5) },
+      { p: 0.12, drop: mat('gem', 6) },
+      { p: 0.5, drop: mat('lotto', 1, 1, 3) },
+      { p: 0.5, drop: mat('shard', 4, 1, 2) },
+      { p: 0.25, drop: crate(3) },
+      { p: 0.2, drop: crate(2, 1, 2) },
+      { p: 0.04, drop: crate(4) },
+      { p: 0.006, drop: crate(5), jackpot: 'lucky' },
+    ],
+  },
+  {
+    level: 5,
+    name: 'Lv5 상자',
+    emoji: '👑',
+    price: 40000,
+    desc: '왕가의 보고. 한 번에 인생이 바뀔 수도 있다.',
+    slots: [
+      { p: 0.75, drop: coin(4000, 11000) },
+      { p: 0.6, drop: mat('essence', 6, 1, 2) },
+      { p: 0.55, drop: mat('gem', 7, 1, 2) },
+      { p: 0.5, drop: mat('cloth', 7, 1, 2) },
+      { p: 0.35, drop: mat('ore', 8, 1, 2) },
+      { p: 0.15, drop: mat('essence', 7) },
+      { p: 0.07, drop: mat('gem', 8) },
+      { p: 0.65, drop: mat('lotto', 1, 4, 10) },
+      { p: 0.1, drop: mat('lotto', 1, 5, 12) },
+      { p: 0.8, drop: mat('shard', 4, 2, 4) },
+      { p: 0.22, drop: crate(4) },
+      { p: 0.2, drop: crate(3, 1, 2) },
+      { p: 0.035, drop: crate(5) },
     ],
   },
 ];

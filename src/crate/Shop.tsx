@@ -22,7 +22,7 @@ export default function Shop() {
         <span className="text-[11px] text-muted">한 상자에서 여러 보상이 동시에 나옵니다(각 항목 독립 추첨)</span>
       </div>
 
-      <div className="grid gap-2 sm:grid-cols-3">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
         {shop.map((c) => {
           const affordable = Math.floor(coins / c.price);
           const bulk = Math.min(10, affordable);

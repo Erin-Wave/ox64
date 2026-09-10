@@ -45,6 +45,8 @@ export default function Inventory() {
   const merge = useCrateStore((s) => s.merge);
   const sell = useCrateStore((s) => s.sell);
   const mergeAll = useCrateStore((s) => s.mergeAll);
+  const scratch = useCrateStore((s) => s.scratch);
+  const maxScratch = useCrateStore((s) => s.lotto.maxAtOnce);
 
   const [page, setPage] = useState(0);
   const [sel, setSel] = useState<string | null>(null); // "wood:1#3"
@@ -103,8 +105,9 @@ export default function Inventory() {
   // (액션 바가 영영 안 뜬다). 상위 레벨 재료는 보통 1개뿐이라 사실상 대부분의 칸이 그랬다.
   // 합칠 상대가 없다는 것은 "끌 수 없다"는 뜻이지 "누를 수 없다"는 뜻이 아니다.
   const onDown = (e: React.PointerEvent, cell: Cell) => {
-    down.current = { x: e.clientX, y: e.clientY, group: cell.group, idx: cell.idx, moved: false, draggable: !busy && cell.count >= 2 };
-    if (!busy && cell.count >= 2) (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    const canDrag = !busy && cell.count >= 2 && cell.cat.maxLevel > 1;
+    down.current = { x: e.clientX, y: e.clientY, group: cell.group, idx: cell.idx, moved: false, draggable: canDrag };
+    if (canDrag) (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   };
 
   const onMove = (e: React.PointerEvent, cell: Cell) => {
@@ -220,7 +223,7 @@ export default function Inventory() {
                 (isSrc ? 'crate-dragging ' : '') +
                 (nope === id ? 'crate-nope ' : '') +
                 (flash === cell.group ? 'crate-merged ' : '') +
-                (cell.count >= 2 ? 'cursor-grab active:cursor-grabbing ' : 'cursor-pointer ')
+                (cell.count >= 2 && cell.cat.maxLevel > 1 ? 'cursor-grab active:cursor-grabbing ' : 'cursor-pointer ')
               }
               style={{ borderColor: tier.color + '66', background: tier.color + '14', color: tier.color }}
             >
@@ -246,7 +249,15 @@ export default function Inventory() {
         })}
       </div>
 
-      <ActionBar cell={selCell} busy={busy} onMerge={doMerge} onSell={sell} onClear={() => setSel(null)} />
+      <ActionBar
+        cell={selCell}
+        busy={busy}
+        maxScratch={maxScratch}
+        onMerge={doMerge}
+        onSell={sell}
+        onScratch={(n) => selCell && scratch(selCell.level, n)}
+        onClear={() => setSel(null)}
+      />
 
       {/* 마우스 호버 툴팁 — 터치엔 안 뜬다(탭 선택이 곧 상세 보기다) */}
       {hover && !drag && <Tooltip cell={hover.cell} x={hover.x} y={hover.y} />}
@@ -270,14 +281,18 @@ export default function Inventory() {
 function ActionBar({
   cell,
   busy,
+  maxScratch,
   onMerge,
   onSell,
+  onScratch,
   onClear,
 }: {
   cell: Cell | null;
   busy: boolean;
+  maxScratch: number;
   onMerge: (group: string, times?: number) => void;
   onSell: (cat: MatCat, level: number, count?: number) => void;
+  onScratch: (count: number) => void;
   onClear: () => void;
 }) {
   if (!cell)
@@ -301,15 +316,48 @@ function ActionBar({
       <div className="min-w-0">
         <div className="flex items-baseline gap-1.5">
           <span className="text-xs font-bold" style={{ color: tier.color }}>
-            Lv{level} {cat.name}
+            {cat.maxLevel > 1 ? `Lv${level} ` : ''}
+            {cat.name}
           </span>
-          <span className="text-[10px] text-muted">{tier.name}</span>
+          {cat.maxLevel > 1 && <span className="text-[10px] text-muted">{tier.name}</span>}
         </div>
         <div className="text-[11px] text-muted">
-          개당 {fmtG(value)} G · {count.toLocaleString()}개 · 총 {fmtG(value * count)} G
+          {cat.noSell ? (
+            <>
+              {count.toLocaleString()}장 보유 · 긁으면 평균 {fmtG(value * 2.57)} G (최소 {fmtG(value * 0.1)} · 최대{' '}
+              {fmtG(value * 800)})
+            </>
+          ) : (
+            <>
+              개당 {fmtG(value)} G · {count.toLocaleString()}개 · 총 {fmtG(value * count)} G
+            </>
+          )}
         </div>
       </div>
       <div className="ml-auto flex flex-wrap items-center gap-1">
+        {/* 골드복권 — 합칠 수도 팔 수도 없고 긁는 것만 된다 */}
+        {cat.cat === 'lotto' ? (
+          <>
+            <button
+              onClick={() => onScratch(1)}
+              disabled={busy}
+              title="한 장 긁기"
+              className="rounded bg-[#ffcc33] px-2.5 py-1 text-[11px] font-extrabold text-black transition hover:brightness-110 disabled:opacity-30"
+            >
+              긁기
+            </button>
+            {count > 1 && (
+              <button
+                onClick={() => onScratch(Math.min(count, maxScratch))}
+                disabled={busy}
+                title={`${Math.min(count, maxScratch)}장 한 번에 긁기`}
+                className="rounded bg-panel px-2.5 py-1 text-[11px] font-bold text-muted ring-1 ring-border transition hover:text-text disabled:opacity-30"
+              >
+                ×{Math.min(count, maxScratch)}
+              </button>
+            )}
+          </>
+        ) : null}
         {canMerge && (
           <button
             onClick={() => onMerge(cell.group, pairs)}
@@ -323,22 +371,26 @@ function ActionBar({
             {shardCrate ? `상자로 ×${pairs}` : `합치기 ×${pairs}`}
           </button>
         )}
-        <button
-          onClick={() => onSell(cat.cat, level, 1)}
-          disabled={busy}
-          title={`1개만 팔아 ${fmtG(value)} G 받기`}
-          className="rounded bg-panel px-2.5 py-1 text-[11px] text-muted ring-1 ring-border transition hover:text-text disabled:opacity-30"
-        >
-          1개 팔기
-        </button>
-        <button
-          onClick={() => onSell(cat.cat, level)}
-          disabled={busy}
-          title={`${count.toLocaleString()}개 전부 팔아 ${fmtG(value * count)} G 받기`}
-          className="rounded bg-panel px-2.5 py-1 text-[11px] text-muted ring-1 ring-border transition hover:text-text disabled:opacity-30"
-        >
-          전부 팔기
-        </button>
+        {!cat.noSell && (
+          <>
+            <button
+              onClick={() => onSell(cat.cat, level, 1)}
+              disabled={busy}
+              title={`1개만 팔아 ${fmtG(value)} G 받기`}
+              className="rounded bg-panel px-2.5 py-1 text-[11px] text-muted ring-1 ring-border transition hover:text-text disabled:opacity-30"
+            >
+              1개 팔기
+            </button>
+            <button
+              onClick={() => onSell(cat.cat, level)}
+              disabled={busy}
+              title={`${count.toLocaleString()}개 전부 팔아 ${fmtG(value * count)} G 받기`}
+              className="rounded bg-panel px-2.5 py-1 text-[11px] text-muted ring-1 ring-border transition hover:text-text disabled:opacity-30"
+            >
+              전부 팔기
+            </button>
+          </>
+        )}
         <button onClick={onClear} title="선택 해제" className="px-1 text-[11px] text-muted hover:text-text">
           ✕
         </button>

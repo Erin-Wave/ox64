@@ -20,6 +20,8 @@ export default function OpenStage() {
   const maxOpen = useCrateStore((s) => s.limits.maxOpen);
   const open = useCrateStore((s) => s.open);
   const closeSession = useCrateStore((s) => s.closeSession);
+  const scratchResult = useCrateStore((s) => s.scratchResult);
+  const closeScratch = useCrateStore((s) => s.closeScratch);
 
   const [shaking, setShaking] = useState<number | null>(null);
 
@@ -44,7 +46,7 @@ export default function OpenStage() {
         <span className="text-xs text-muted">{totalOwned === 0 ? '상점에서 상자를 사세요' : `${totalOwned}개 보유`}</span>
       </div>
 
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
         {owned.map((c) => {
           const has = c.count > 0;
           const bulk = Math.min(c.count, maxOpen);
@@ -112,6 +114,39 @@ export default function OpenStage() {
               </span>
             );
           })}
+        </div>
+      )}
+
+      {/* ── 골드복권 결과 ── */}
+      {scratchResult && (
+        <div className="relative z-20 mt-4 rounded-xl border border-[#ffcc33]/50 bg-panel2 p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-xs font-bold">
+              🎫 복권 {scratchResult.count}장 · 합계{' '}
+              <b className="text-[#ffcc33]">{scratchResult.gold.toLocaleString()} G</b>
+            </span>
+            <button onClick={closeScratch} className="text-xs text-muted hover:text-text" title="닫기">
+              ✕
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {scratchResult.results.map((r, i) => (
+              <span
+                key={i}
+                className="crate-pop rounded-md px-2 py-1 text-[11px] font-bold tabular-nums"
+                style={{
+                  animationDelay: `${Math.min(i, 15) * 45}ms`,
+                  background: r.color + '1e',
+                  color: r.color,
+                  border: `1px solid ${r.color}55`,
+                }}
+                title={`${r.label} · 기준액의 ${r.mult.toFixed(1)}배`}
+              >
+                {r.gold.toLocaleString()}
+                {r.mult >= 8 && <span className="ml-1">{r.label}</span>}
+              </span>
+            ))}
+          </div>
         </div>
       )}
 

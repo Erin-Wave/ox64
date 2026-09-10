@@ -8,6 +8,7 @@ import {
   type BonusTier,
   type CatInfo,
   type DailyEventInfo,
+  type LottoResult,
   type MilestoneInfo,
   type CrateState,
   type JackpotTier,
@@ -94,6 +95,7 @@ interface Store {
   jackpotTiers: CrateState['jackpotTiers'];
   event: DailyEventInfo | null;
   eventWeek: CrateState['eventWeek'];
+  lotto: CrateState['lotto'];
   bonusTiers: BonusInfo[];
   milestones: MilestoneInfo[];
   achievements: AchievementInfo[];
@@ -107,6 +109,8 @@ interface Store {
   flash: string | null;
   /** 방금 달성한 업적들 — 한 번에 여러 개가 터질 수 있어 큐로 하나씩 띄운다 */
   achieveQueue: AchievedNow[];
+  /** 방금 긁은 복권 결과 — 무대에 띄웠다가 닫는다 */
+  scratchResult: { count: number; gold: number; results: LottoResult[] } | null;
 
   init: () => Promise<void>;
   login: (name: string, passcode: string) => Promise<void>;
@@ -120,6 +124,8 @@ interface Store {
   refill: () => Promise<void>;
   closeSession: () => void;
   popAchievement: () => void;
+  scratch: (level: number, count: number) => Promise<void>;
+  closeScratch: () => void;
   dismissToast: () => void;
   clearError: () => void;
 }
@@ -150,6 +156,7 @@ function pick(s: CrateState) {
     jackpotTiers: s.jackpotTiers,
     event: s.event,
     eventWeek: s.eventWeek,
+    lotto: s.lotto,
     bonusTiers: s.bonusTiers,
     milestones: s.milestones,
     achievements: s.achievements,
@@ -178,6 +185,7 @@ export const useCrateStore = create<Store>((set, get) => ({
   jackpotTiers: [],
   event: null,
   eventWeek: [],
+  lotto: { tiers: [], expected: 2.57, maxAtOnce: 20 },
   bonusTiers: [],
   milestones: [],
   achievements: [],
@@ -188,6 +196,7 @@ export const useCrateStore = create<Store>((set, get) => ({
   session: null,
   flash: null,
   achieveQueue: [],
+  scratchResult: null,
 
   init: async () => {
     try {
@@ -344,6 +353,27 @@ export const useCrateStore = create<Store>((set, get) => ({
 
   closeSession: () => set({ session: null }),
   popAchievement: () => set((s) => ({ achieveQueue: s.achieveQueue.slice(1) })),
+
+  scratch: async (level, count) => {
+    if (get().busy) return;
+    set({ busy: true, error: null });
+    try {
+      const r = await crateApi.scratch(level, count);
+      const best = r.scratched.results.reduce((m, x) => (x.mult > m.mult ? x : m), r.scratched.results[0]);
+      set({
+        ...pick(r),
+        scratchResult: r.scratched,
+        achieveQueue: r.achieved ?? [],
+        // 큰 게 터졌을 때만 토스트 — 꽝까지 매번 띄우면 시끄럽다
+        toast: best && best.mult >= 8 ? { kind: 'jackpot', text: `🎫 ${best.label}! +${best.gold.toLocaleString()} G` } : null,
+      });
+    } catch (e) {
+      set({ error: msgOf(e, '긁지 못했습니다') });
+    } finally {
+      set({ busy: false });
+    }
+  },
+  closeScratch: () => set({ scratchResult: null }),
   dismissToast: () => set({ toast: null }),
   clearError: () => set({ error: null }),
 }));

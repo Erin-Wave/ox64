@@ -56,7 +56,7 @@ export default function Collection() {
                           : '아직 얻어본 적 없습니다'
                       }
                       className={
-                        'flex h-12 w-12 flex-col items-center justify-center rounded-lg border text-base transition ' +
+                        'flex h-10 w-10 shrink-0 flex-col items-center justify-center rounded-lg border text-sm transition ' +
                         (has ? '' : 'opacity-25 grayscale')
                       }
                       style={{ borderColor: tier.color + '66', background: tier.color + (has ? '18' : '08') }}
@@ -68,6 +68,11 @@ export default function Collection() {
                     </div>
                   );
                 })}
+                {c.cat === 'lotto' && (
+                  <div className="ml-1 flex min-w-0 flex-1 items-center rounded-lg bg-panel2 px-2.5 py-1 text-[11px] leading-snug text-muted">
+                    레벨도 없고 팔 수도 없습니다 — <b className="mx-1 text-text">긁는 것만</b> 가능(평균 2.6배)
+                  </div>
+                )}
                 {c.cat === 'shard' && (
                   <div className="ml-1 flex min-w-0 flex-1 items-center rounded-lg bg-panel2 px-2.5 py-1 text-[11px] leading-snug text-muted">
                     Lv{c.maxLevel} 2개를 합치면 랜덤 상자 —{' '}
@@ -80,7 +85,7 @@ export default function Collection() {
             </div>
           ))}
           <p className="text-[11px] leading-snug text-muted">
-            같은 재료 2개를 합치면 레벨이 하나 오르고 <b className="text-text">가치는 2.35배</b>가 됩니다 — 종류(카테고리)는 절대
+            같은 재료 2개를 합치면 레벨이 하나 오르고 <b className="text-text">가치는 2.25배</b>가 됩니다 — 종류(카테고리)는 절대
             바뀌지 않습니다. 상자만 까서 다 팔면 본전이 안 나오니, 끝까지 합쳐서 파는 게 유일한 흑자 경로입니다.
           </p>
         </div>
