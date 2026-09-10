@@ -93,11 +93,37 @@ function parseJson<T>(s: string, fallback: T): T {
 }
 
 /**
+ * ⚠ `schema.sql` 의 `crate_stats` 정의와 **한 글자도 다르면 안 된다** — 아래 자동 생성이 쓰는 SQL 이다.
+ * 컬럼을 추가할 땐 이 문자열과 schema.sql 을 같이 고칠 것(신규 DB 는 schema.sql, prod 는 이쪽이 만든다).
+ */
+const CREATE_TABLE_SQL =
+  'CREATE TABLE IF NOT EXISTS crate_stats (' +
+  "user_id TEXT PRIMARY KEY, coins REAL NOT NULL DEFAULT 600, inv_json TEXT NOT NULL DEFAULT '{}'," +
+  " crates_json TEXT NOT NULL DEFAULT '{}', seen_json TEXT NOT NULL DEFAULT '[]'," +
+  ' opened INTEGER NOT NULL DEFAULT 0, merged INTEGER NOT NULL DEFAULT 0, spent REAL NOT NULL DEFAULT 0,' +
+  ' earned REAL NOT NULL DEFAULT 0, best_coins REAL NOT NULL DEFAULT 600, jackpots INTEGER NOT NULL DEFAULT 0,' +
+  ' version INTEGER NOT NULL DEFAULT 0, refill_count INTEGER NOT NULL DEFAULT 0, refill_date TEXT,' +
+  ' created_at INTEGER NOT NULL)';
+
+/**
  * 상태 행을 읽는다. 없으면 INSERT 하되 **없을 때만** 쓴다(계정당 평생 1회) — 던전에서 배운 교훈:
  * 매 요청 `INSERT OR IGNORE` 를 때리면 그 자체가 쓰기 비용이 된다(§8).
+ *
+ * ⚠ 테이블 자체가 없으면 **그 자리에서 만든다**. 이 프로젝트의 원칙은 "마이그레이션을 코드 배포보다
+ * 먼저"(§5)지만, 그건 **기존 테이블에 컬럼을 더하는 경우**의 규칙이다(그건 자동화가 위험하다 — 잘못된
+ * 순서로 돌면 이미 도는 거래 batch 가 통째로 롤백된다). 이건 완전히 격리된 신규 테이블이고 `CREATE
+ * TABLE IF NOT EXISTS` 라 멱등하며, 여러 요청이 동시에 들어와도 안전하다. 정상 경로(테이블이 이미
+ * 있는 경우)에서는 catch 가 아예 안 타므로 **쿼리·비용 증가가 0** 이다.
+ * ⚠ 그래도 새 컬럼을 더할 땐 이 자동 생성에 기대지 말 것 — `IF NOT EXISTS` 는 컬럼을 더해주지 않는다.
  */
 async function loadRow(env: Env, uid: string): Promise<CrateRow> {
-  const row = await env.DB.prepare('SELECT * FROM crate_stats WHERE user_id = ?').bind(uid).first<CrateRow>();
+  let row: CrateRow | null = null;
+  try {
+    row = await env.DB.prepare('SELECT * FROM crate_stats WHERE user_id = ?').bind(uid).first<CrateRow>();
+  } catch (e) {
+    if (!/no such table/i.test(String(e))) throw e;
+    await env.DB.prepare(CREATE_TABLE_SQL).run();
+  }
   if (row) return row;
   const now = Date.now();
   await env.DB.prepare('INSERT OR IGNORE INTO crate_stats (user_id, coins, best_coins, created_at) VALUES (?,?,?,?)')
