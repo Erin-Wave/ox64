@@ -109,6 +109,20 @@ export function virtualPrecision(price: number): number {
   return Math.max(0, VIRTUAL_SIG_DIGITS - 1 - virtualExp(p));
 }
 
+// ⚠ 가상 코인 기준가의 절대 한계 — **시세 범위를 정하는 값이 아니라 0·Infinity 만 막는 안전장치**다.
+// 예전엔 하한이 `0.0001` 이었는데(그 위 "소수 4자리 고정" 시절의 틱 최소값이 그대로 남은 것), 틱이
+// 가격 비례가 된 뒤로는 그 자리에 있을 이유가 전혀 없었다 — 실제로 대량 매도로 가격이 내려가면
+// **1e-4 에서 딱 멈춰** 아무리 팔아도 더 안 떨어졌다(제보). 실제 거래소의 저가 코인은 1e-8 대에서도
+// 유효숫자 4자리로 정상 거래된다.
+// 지금은 기준선(1)을 중심으로 **로그상 대칭**인 1e-12 ~ 1e12 이고, 이 범위 안에선 모든 로직이
+// 이미 스케일 무관이다(호가 사다리·격자·자석은 전부 "틱 몇 개"·상대비율, `virtualTick` 은 4자리 유효숫자).
+// ⚠ 하한을 더 내릴 땐 **표시 자릿수**를 같이 볼 것 — `virtualPrecision(1e-12)=15` 이고 `toLocaleString`
+// 의 `maximumFractionDigits` 는 구형 엔진에서 20 이 상한이라, 1e-18 밑으로 내리면 화면이 터진다
+// (`src/format.ts fmtPrice` 가 방어로 20 에서 자르지만 그 아래 자릿수는 어차피 표시되지 않는다).
+// 실사용에선 여기 닿기 한참 전에 `BOT_BASE_PULL`(anchor 를 1 로 당기는 로그거리 제곱 복원력)이 되돌린다.
+export const VIRTUAL_PRICE_MIN = 1e-12;
+export const VIRTUAL_PRICE_MAX = 1e12;
+
 // 캔들 인터벌 코드 → 초 (src/symbols.ts INTERVAL_GROUPS 와 동일한 값을 함수 쪽에 독립 보관).
 const INTERVAL_SEC: Record<string, number> = {
   '1s': 1,

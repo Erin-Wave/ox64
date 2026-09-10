@@ -19,6 +19,8 @@ import {
   sizeEps,
   roundVirtual,
   virtualTick,
+  VIRTUAL_PRICE_MIN,
+  VIRTUAL_PRICE_MAX,
 } from '../_shared';
 import { autoWritesBlocked, meterStmt } from '../_budget';
 
@@ -1572,7 +1574,11 @@ export function nextMarketState(s: BotState, now: number = Date.now()): {
   if (fear > 0.5 && Math.random() < 0.008) ret -= (0.004 + 0.009 * Math.random()) * volEff;
   else if (greed > 0.6 && Math.random() < 0.005) ret += (0.004 + 0.007 * Math.random()) * volEff;
 
-  const ref = roundOx(clamp(s.ref * (1 + ret), 0.0001, 1e6));
+  // ⚠ 다음 기준가. 클램프는 **시세 범위가 아니라 0·Infinity 만 막는 안전장치**다
+  //   (§ _shared.VIRTUAL_PRICE_MIN). 예전 하한 0.0001 은 "소수 4자리 고정" 시절 틱 최소값의
+  //   잔재라, 대량 매도로 가격이 내려가면 거기서 딱 멈춰 아무리 팔아도 더 안 떨어졌다(제보).
+  //   실사용엔 여기 닿기 한참 전에 BOT_BASE_PULL 이 기준선으로 되돌린다.
+  const ref = roundOx(clamp(s.ref * (1 + ret), VIRTUAL_PRICE_MIN, VIRTUAL_PRICE_MAX));
 
   // 8) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증(공포가 거래를 만든다).
   //    ⚠ 탐욕 쪽에도 배수를 준다(2026-08-26) — "급등하면 매수도 많이 붙어야" 급등처럼 보인다. 예전엔
@@ -2614,7 +2620,7 @@ export async function matchMarketOxOrder(
     const synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
     for (let idx = 1; remaining > EPS && idx <= SYNTH_STEPS * 4; idx++) {
       const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
-      const price = roundOx(Math.max(0.0001, synthBase * (1 + openAdverse * impact)));
+      const price = roundOx(Math.max(VIRTUAL_PRICE_MIN, synthBase * (1 + openAdverse * impact)));
       const take = Math.min(remaining, synthChunk);
       planned.push({ level: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], price, size: take });
       remaining -= take;
@@ -2774,7 +2780,7 @@ async function closePositionAgainstBook(
     const synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
     for (let idx = 1; remaining > EPS && idx <= SYNTH_STEPS * 4; idx++) {
       const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
-      const price = roundOx(Math.max(0.0001, synthBase * (1 + adverse * impact)));
+      const price = roundOx(Math.max(VIRTUAL_PRICE_MIN, synthBase * (1 + adverse * impact)));
       const take = Math.min(remaining, synthChunk);
       planned.push({ level: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], price, size: take });
       remaining -= take;

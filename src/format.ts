@@ -37,10 +37,15 @@ export function virtualPrecision(price: number): number {
   return Math.max(0, VIRTUAL_SIG_DIGITS - 1 - virtualExp(p));
 }
 
-/** 심볼 정밀도(prec)에 맞춘 가격 문자열. */
+/** 심볼 정밀도(prec)에 맞춘 가격 문자열.
+ * ⚠ 자릿수는 20 에서 자른다 — 가상 코인은 유효숫자 4자리라 가격이 낮아질수록 자릿수가 늘어나는데
+ * (1e-12 면 15자리), `toLocaleString` 의 maximumFractionDigits 는 구형 엔진에서 20 이 상한이라
+ * 넘기면 RangeError 로 **화면이 통째로 죽는다**. 가격 하한(§ functions/_shared.VIRTUAL_PRICE_MIN)이
+ * 그보다 위라 지금은 걸릴 일이 없지만, 하한을 더 내릴 때 여기서 터지지 않게 하는 방어선이다. */
 export function fmtPrice(v: number | null | undefined, prec: number): string {
   if (v == null || !isFinite(v)) return '—';
-  return v.toLocaleString(undefined, { minimumFractionDigits: prec, maximumFractionDigits: prec });
+  const p = Math.min(20, Math.max(0, Math.round(prec) || 0));
+  return v.toLocaleString(undefined, { minimumFractionDigits: p, maximumFractionDigits: p });
 }
 
 /** 거래량 축약(K/M/B) — 공간이 좁은 차트 우측 축 티커 등 전용. */
