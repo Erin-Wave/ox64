@@ -4,7 +4,15 @@ import {
   CAT_BY_KEY,
   CRATES,
   CRATE_BY_LEVEL,
+  ACHIEVEMENTS,
+  DAILY_EVENTS,
+  eventOfDay,
+  priceOf,
+  ACH_PREFIX,
+  BONUS_TIERS,
   BROKE_CRATES,
+  BULK_BONUS_AT,
+  BULK_BONUS_CHANCE,
   DAILY_COINS,
   DAILY_CRATES,
   RESCUE_COINS,
@@ -16,8 +24,15 @@ import {
   SHARD_CRATE_ODDS,
   SHOP_MAX_BUY,
   START_COINS,
+  MILESTONES,
+  achKey,
   invKey,
   isValidMat,
+  milestonesCrossed,
+  pendingAchievements,
+  rollBonus,
+  rollBulkBonus,
+  rollExtraRewards,
   matValue,
   parseInvKey,
   rollCrate,
@@ -215,6 +230,33 @@ async function commit(env: Env, w: Work, extra?: { refillCount: number; refillDa
   return (res.meta?.changes ?? 0) > 0;
 }
 
+/**
+ * 지금 통계로 달성한 업적을 전부 지급한다(수령 기록은 도감 배열에 `a:<key>` 로 함께 담는다 —
+ * § _crateData.ts, prod 에 컬럼을 못 늘려서 그렇다). 모든 액션 뒤에 부르므로 **한 곳에서만**
+ * 처리된다 — 액션마다 흩뿌리면 새 액션을 추가할 때 빠뜨린다.
+ */
+function grantAchievements(w: Work): { key: string; label: string; desc: string; coins: number; crates?: [number, number] }[] {
+  const seenMats = [...w.seen].filter((k) => !k.startsWith(ACH_PREFIX)).length;
+  const got = pendingAchievements(
+    {
+      opened: w.opened,
+      merged: w.merged,
+      jackpots: w.jackpots,
+      seen: seenMats,
+      bestCoins: Math.max(w.row.best_coins, w.coins),
+      earned: w.earned,
+    },
+    w.seen,
+  );
+  for (const a of got) {
+    w.seen.add(achKey(a.key));
+    w.coins += a.coins;
+    w.earned += a.coins;
+    if (a.crates) addCrate(w, a.crates[0], a.crates[1]);
+  }
+  return got.map((a) => ({ key: a.key, label: a.label, desc: a.desc, coins: a.coins, crates: a.crates }));
+}
+
 // ── 응답 ────────────────────────────────────────────────────────────────────────
 
 /** 재료 인벤토리를 전부 팔았을 때의 값 — 리필 자격(빈털터리 판정)과 "총자산" 표시에 쓴다. */
@@ -236,12 +278,15 @@ function crateValue(w: Work): number {
  * 확률 공시 — 상점에 그대로 표시한다(가챠 확률 공개). 클라에 드롭 테이블을 중복 정의하지 않고
  * 서버 값을 그대로 렌더하게 하는 건 VIP 등급표(loadState.vipTiers)와 같은 패턴이다.
  */
-function shopPayload() {
+function shopPayload(today: string) {
+  const ev = eventOfDay(today);
   return CRATES.map((def) => ({
     level: def.level,
     name: def.name,
     emoji: def.emoji,
-    price: def.price,
+    price: priceOf(def.level, ev),
+    /** 할인 전 원가 — 할인 중이면 클라가 취소선으로 보여준다 */
+    listPrice: def.price,
     desc: def.desc,
     odds: slotsOf(def.level).map((s) => ({
       p: s.p,
@@ -265,7 +310,10 @@ function statePayload(w: Work) {
     coins: w.coins,
     inv: w.inv,
     crates: w.crates,
-    seen: [...w.seen],
+    // ⚠ 도감(seen)에서 업적 수령 기록은 걸러낸다 — 같은 배열에 담겨 있지만 재료가 아니다.
+    // "이미 받았나" 는 아래 achievements[].done 이 알려주므로 키 목록을 따로 내리지 않는다
+    // (액션 응답의 `achieved`(방금 받은 것)와 이름이 겹쳐 서로 덮어썼다).
+    seen: [...w.seen].filter((k) => !k.startsWith(ACH_PREFIX)),
     invValue,
     netWorth,
     stats: {
@@ -296,9 +344,27 @@ function statePayload(w: Work) {
       desc: c.desc,
       values: Array.from({ length: c.maxLevel }, (_, i) => matValue(c.cat, i + 1)),
     })),
-    shop: shopPayload(),
+    shop: shopPayload(today),
     shardOdds: SHARD_CRATE_ODDS,
     jackpotTiers: JACKPOTS.map((j) => ({ tier: j.tier, p: j.p, mult: j.mult, label: j.label })),
+    /**
+     * 오늘의 이벤트 — KST 요일에서 파생하므로 저장할 상태가 없다. 상점 가격도 여기 할인이 반영된
+     * 값(`priceOf`)으로 내려가므로 클라가 따로 계산하지 않는다.
+     */
+    event: { ...eventOfDay(today), today },
+    eventWeek: DAILY_EVENTS.map((e) => ({ day: e.day, key: e.key, emoji: e.emoji, label: e.label, desc: e.desc })),
+    bonusTiers: BONUS_TIERS.map((b) => ({ tier: b.tier, p: b.p, mult: b.mult, extra: b.extra, label: b.label, emoji: b.emoji, color: b.color })),
+    milestones: MILESTONES.map((m) => ({ every: m.every, level: m.level, count: m.count, label: m.label, progress: w.opened % m.every })),
+    achievements: ACHIEVEMENTS.map((a) => ({
+      key: a.key,
+      label: a.label,
+      desc: a.desc,
+      coins: a.coins,
+      crates: a.crates ?? null,
+      stat: a.stat,
+      at: a.at,
+      done: w.seen.has(achKey(a.key)),
+    })),
     limits: {
       maxBuy: SHOP_MAX_BUY,
       maxOpen: MAX_OPEN_AT_ONCE,
@@ -307,6 +373,8 @@ function statePayload(w: Work) {
       rescueCrates: RESCUE_CRATES,
       rescueCoins: RESCUE_COINS,
       brokeCrates: BROKE_CRATES,
+      bulkAt: BULK_BONUS_AT,
+      bulkChance: BULK_BONUS_CHANCE,
     },
   };
 }
@@ -416,7 +484,7 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     const def = CRATE_BY_LEVEL.get(level);
     if (!def) return bad('없는 상자입니다');
     if (!(count >= 1 && count <= SHOP_MAX_BUY)) return bad(`한 번에 1~${SHOP_MAX_BUY}개까지 살 수 있습니다`);
-    const cost = def.price * count;
+    const cost = priceOf(level, eventOfDay(todayKst())) * count; // 할인 이벤트 반영
     if (w.coins < cost) return bad(`골드가 부족합니다 (${cost.toLocaleString()} 필요)`);
     w.coins -= cost;
     w.spent += cost;
@@ -435,11 +503,23 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     if (have < count) return bad('보유한 상자가 부족합니다');
     addCrate(w, level, -count);
 
-    // 상자별 결과를 따로 담는다 — 클라가 한 상자씩 차례로 애니메이션을 재생한다.
+    const ev = eventOfDay(todayKst()); // ⑤ 오늘의 이벤트 — 드롭 수량·보너스 확률·잭팟 확률에 얹힌다
+    // ③ 대량 개봉 보너스 — 한 번에 여러 개를 까면 확률적으로 공짜 상자가 더 나온다
+    const bulk = rollBulkBonus(count, Math.random, ev);
+    const total = count + bulk;
+
     const results: RewardItem[][] = [];
+    const bonuses: (string | null)[] = [];
     let jackpotHit = 0;
-    for (let i = 0; i < count; i++) {
-      const rewards = rollCrate(level);
+    for (let i = 0; i < total; i++) {
+      const rewards = rollCrate(level, Math.random, ev);
+      // ① 개봉 보너스 — 배수와 추가 항목. 잭팟과는 별개로 굴린다(잭팟은 드롭 슬롯 안에 있다).
+      const bonus = rollBonus(Math.random, ev);
+      if (bonus) {
+        if (bonus.mult > 1) for (const r of rewards) r.count *= bonus.mult;
+        if (bonus.extra > 0) rewards.push(...rollExtraRewards(level, bonus.extra, Math.random, ev));
+      }
+      bonuses.push(bonus?.tier ?? null);
       for (const r of rewards) {
         if (r.jackpot) jackpotHit++;
         if (r.kind === 'coin') {
@@ -453,10 +533,21 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
       }
       results.push(rewards);
     }
-    w.opened += count;
+
+    // ② 마일스톤 — 누적 개봉 수가 배수를 넘을 때마다(한 번에 여러 개를 넘길 수도 있다)
+    const before = w.opened;
+    w.opened += total;
     w.jackpots += jackpotHit;
+    const milestones = milestonesCrossed(before, w.opened);
+    for (const m of milestones) addCrate(w, m.level, m.count);
+
+    const achieved = grantAchievements(w);
     if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
-    return json({ ...statePayload(w), opened: { level, count, results } });
+    return json({
+      ...statePayload(w),
+      opened: { level, count, bulk, results, bonuses, milestones, event: ev.key },
+      achieved,
+    });
   }
 
   // ── 머지 ─────────────────────────────────────────────────────────────────────
@@ -482,15 +573,17 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
       }
       addMat(w, cat, level, -2 * times);
       w.merged += times;
+      const achieved = grantAchievements(w);
       if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
-      return json({ ...statePayload(w), shardCrates: gained });
+      return json({ ...statePayload(w), achieved, shardCrates: gained });
     }
 
     addMat(w, cat, level, -2 * times);
     addMat(w, cat, level + 1, times);
     w.merged += times;
+    const achieved = grantAchievements(w);
     if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
-    return json({ ...statePayload(w), merged: { cat, from: level, to: level + 1, times } });
+    return json({ ...statePayload(w), achieved, merged: { cat, from: level, to: level + 1, times } });
   }
 
   // ── 전부 머지 ────────────────────────────────────────────────────────────────
@@ -510,8 +603,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     }
     if (total === 0) return bad('합칠 수 있는 재료가 없습니다');
     w.merged += total;
+    const achieved = grantAchievements(w);
     if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
-    return json({ ...statePayload(w), mergedAll: total });
+    return json({ ...statePayload(w), achieved, mergedAll: total });
   }
 
   // ── 판매 ─────────────────────────────────────────────────────────────────────
@@ -527,8 +621,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     addMat(w, cat, level, -count);
     w.coins += gain;
     w.earned += gain;
+    const achieved = grantAchievements(w);
     if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
-    return json({ ...statePayload(w), sold: { cat, level, count, gain } });
+    return json({ ...statePayload(w), achieved, sold: { cat, level, count, gain } });
   }
 
   // ── 일괄 판매 ────────────────────────────────────────────────────────────────
@@ -552,8 +647,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     if (count === 0) return bad('팔 재료가 없습니다');
     w.coins += gain;
     w.earned += gain;
+    const achieved = grantAchievements(w);
     if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
-    return json({ ...statePayload(w), sold: { cat: null, level: maxLevel, count, gain } });
+    return json({ ...statePayload(w), achieved, sold: { cat: null, level: maxLevel, count, gain } });
   }
 
   // ── 지원(일일 지원 + 파산 구제) ──────────────────────────────────────────────

@@ -41,9 +41,66 @@ export interface ShopCrate {
   level: number;
   name: string;
   emoji: string;
+  /** 오늘 실제로 내는 값(할인 반영) */
   price: number;
+  /** 할인 전 원가 */
+  listPrice: number;
   desc: string;
   odds: OddsRow[];
+}
+
+export type BonusTier = 'mega' | 'triple' | 'double' | 'extra';
+export interface BonusInfo {
+  tier: BonusTier;
+  p: number;
+  mult: number;
+  extra: number;
+  label: string;
+  emoji: string;
+  color: string;
+}
+export interface MilestoneInfo {
+  every: number;
+  level: number;
+  count: number;
+  label: string;
+  /** 다음 보상까지 얼마나 왔는지(누적 개봉 % every) */
+  progress: number;
+}
+export interface AchievementInfo {
+  key: string;
+  label: string;
+  desc: string;
+  coins: number;
+  crates: [number, number] | null;
+  stat: 'opened' | 'merged' | 'jackpots' | 'seen' | 'bestCoins' | 'earned';
+  at: number;
+  done: boolean;
+}
+/** 방금 달성해서 지급된 업적 */
+export interface AchievedNow {
+  key: string;
+  label: string;
+  desc: string;
+  coins: number;
+  crates?: [number, number];
+}
+
+export interface DailyEventInfo {
+  key: string;
+  day: number;
+  label: string;
+  emoji: string;
+  desc: string;
+  coinMult: number;
+  matMult: number;
+  shardMult: number;
+  bonusMult: number;
+  jackpotMult: number;
+  discount: number;
+  bulkAlways: boolean;
+  /** 서버가 판정한 KST 날짜 */
+  today: string;
 }
 
 export interface CrateState {
@@ -66,24 +123,45 @@ export interface CrateState {
   shop: ShopCrate[];
   shardOdds: { level: number; p: number }[];
   jackpotTiers: { tier: JackpotTier; p: number; mult: number; label: string }[];
-  limits: { maxBuy: number; maxOpen: number; dailyCrates: number; dailyCoins: number; rescueCrates: number; rescueCoins: number; brokeCrates: number };
+  event: DailyEventInfo;
+  eventWeek: { day: number; key: string; emoji: string; label: string; desc: string }[];
+  bonusTiers: BonusInfo[];
+  milestones: MilestoneInfo[];
+  achievements: AchievementInfo[];
+  limits: { maxBuy: number; maxOpen: number; dailyCrates: number; dailyCoins: number; rescueCrates: number; rescueCoins: number; brokeCrates: number; bulkAt: number; bulkChance: number };
 }
 
 export interface OpenResult extends CrateState {
-  opened: { level: number; count: number; results: RewardItem[][] };
+  opened: {
+    level: number;
+    count: number;
+    /** 대량 개봉 보너스로 공짜로 더 깐 상자 수 */
+    bulk: number;
+    results: RewardItem[][];
+    /** 상자별로 터진 보너스 등급(없으면 null) */
+    bonuses: (BonusTier | null)[];
+    /** 이번 개봉으로 넘어선 마일스톤들 */
+    milestones: { level: number; count: number; label: string; at: number }[];
+    /** 이 개봉에 적용된 이벤트 키 */
+    event: string;
+  };
+  achieved: AchievedNow[];
 }
 export interface BuyResult extends CrateState {
   bought: { level: number; count: number; cost: number };
 }
 export interface MergeResult extends CrateState {
+  achieved?: AchievedNow[];
   merged?: { cat: MatCat; from: number; to: number; times: number };
   shardCrates?: number[];
   mergedAll?: number;
 }
 export interface GrantResult extends CrateState {
+  achieved?: AchievedNow[];
   granted: { kind: 'daily' | 'rescue'; crates: number; coins: number };
 }
 export interface SellResult extends CrateState {
+  achieved?: AchievedNow[];
   sold: { cat: MatCat | null; level: number; count: number; gain: number };
 }
 

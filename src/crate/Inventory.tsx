@@ -224,11 +224,15 @@ export default function Inventory() {
               }
               style={{ borderColor: tier.color + '66', background: tier.color + '14', color: tier.color }}
             >
-              <span className="pointer-events-none select-none text-xl leading-none sm:text-2xl">{cell.cat.emoji}</span>
-              {/* 레벨 — 좌상단. 아이콘만으로는 Lv1 과 Lv6 이 구분되지 않아 색과 함께 항상 보여준다 */}
+              <span className="pointer-events-none select-none text-lg leading-none sm:text-xl">{cell.cat.emoji}</span>
+              {/*
+                레벨 — 아이콘만으로는 Lv1 과 Lv6 이 구분되지 않으므로 등급색과 함께 크게 박는다.
+                ⚠ 11px 은 칸(50~73px)에 비해 너무 작아 안 읽힌다는 제보가 있었다. 지금은 18px(모바일)
+                /20px(PC) 이고, 이모지 위에 겹치므로 어두운 그림자로 대비를 확보한다.
+              */}
               <span
-                className="pointer-events-none absolute left-0.5 top-0 text-[11px] font-extrabold leading-tight"
-                style={{ color: tier.color }}
+                className="pointer-events-none absolute -top-0.5 left-1 text-[18px] font-extrabold leading-none sm:text-[20px]"
+                style={{ color: tier.color, textShadow: '0 1px 3px rgb(0 0 0 / 0.85), 0 0 2px rgb(0 0 0 / 0.9)' }}
               >
                 {cell.level}
               </span>

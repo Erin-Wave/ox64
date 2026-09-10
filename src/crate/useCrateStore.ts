@@ -2,7 +2,13 @@ import { create } from 'zustand';
 import {
   crateApi,
   CrateApiError,
+  type AchievedNow,
+  type AchievementInfo,
+  type BonusInfo,
+  type BonusTier,
   type CatInfo,
+  type DailyEventInfo,
+  type MilestoneInfo,
   type CrateState,
   type JackpotTier,
   type MatCat,
@@ -24,11 +30,25 @@ export interface Toast {
 export interface OpenSession {
   level: number;
   count: number;
+  /** 대량 개봉 보너스로 공짜로 더 깐 상자 수 */
+  bulk: number;
+  /** 이번 개봉에서 터진 보너스 등급들(같은 등급은 묶어 개수로) */
+  bonusCounts: { tier: BonusTier; n: number }[];
+  /** 넘어선 마일스톤 */
+  milestones: { level: number; count: number; label: string; at: number }[];
   /** 같은 (종류·재료·레벨)끼리 합산한 결과 — 화면에 뜨는 카드 목록 */
   items: RewardItem[];
   jackpot: JackpotTier | null;
   /** 이번 개봉으로 새로 도감에 등록된 재료 키 */
   discovered: string[];
+}
+
+/** 터진 보너스를 등급별로 센다 — 10연에서 "✨×3 🔥×1" 처럼 한 줄로 보여주기 위해. */
+function countBonuses(list: (BonusTier | null)[]): { tier: BonusTier; n: number }[] {
+  const order: BonusTier[] = ['mega', 'triple', 'double', 'extra'];
+  const map = new Map<BonusTier, number>();
+  for (const t of list) if (t) map.set(t, (map.get(t) ?? 0) + 1);
+  return order.filter((t) => map.has(t)).map((t) => ({ tier: t, n: map.get(t)! }));
 }
 
 /** 상자별 결과를 카드 목록으로 합산 — 10연에서 카드 40장이 쏟아지는 걸 막는다. */
@@ -72,6 +92,11 @@ interface Store {
   shop: ShopCrate[];
   shardOdds: { level: number; p: number }[];
   jackpotTiers: CrateState['jackpotTiers'];
+  event: DailyEventInfo | null;
+  eventWeek: CrateState['eventWeek'];
+  bonusTiers: BonusInfo[];
+  milestones: MilestoneInfo[];
+  achievements: AchievementInfo[];
   limits: CrateState['limits'];
 
   busy: boolean;
@@ -80,6 +105,8 @@ interface Store {
   session: OpenSession | null;
   /** 머지 애니메이션 대상 키("wood:2") — 잠깐 반짝였다 꺼진다 */
   flash: string | null;
+  /** 방금 달성한 업적들 — 한 번에 여러 개가 터질 수 있어 큐로 하나씩 띄운다 */
+  achieveQueue: AchievedNow[];
 
   init: () => Promise<void>;
   login: (name: string, passcode: string) => Promise<void>;
@@ -92,6 +119,7 @@ interface Store {
   sellAll: (maxLevel: number) => Promise<void>;
   refill: () => Promise<void>;
   closeSession: () => void;
+  popAchievement: () => void;
   dismissToast: () => void;
   clearError: () => void;
 }
@@ -120,6 +148,11 @@ function pick(s: CrateState) {
     shop: s.shop,
     shardOdds: s.shardOdds,
     jackpotTiers: s.jackpotTiers,
+    event: s.event,
+    eventWeek: s.eventWeek,
+    bonusTiers: s.bonusTiers,
+    milestones: s.milestones,
+    achievements: s.achievements,
     limits: s.limits,
   };
 }
@@ -143,12 +176,18 @@ export const useCrateStore = create<Store>((set, get) => ({
   shop: [],
   shardOdds: [],
   jackpotTiers: [],
-  limits: { maxBuy: 20, maxOpen: 10, dailyCrates: 4, dailyCoins: 200, rescueCrates: 3, rescueCoins: 400, brokeCrates: 3 },
+  event: null,
+  eventWeek: [],
+  bonusTiers: [],
+  milestones: [],
+  achievements: [],
+  limits: { maxBuy: 20, maxOpen: 10, dailyCrates: 4, dailyCoins: 200, rescueCrates: 3, rescueCoins: 400, brokeCrates: 3, bulkAt: 10, bulkChance: 0.35 },
   busy: false,
   error: null,
   toast: null,
   session: null,
   flash: null,
+  achieveQueue: [],
 
   init: async () => {
     try {
@@ -205,11 +244,15 @@ export const useCrateStore = create<Store>((set, get) => ({
         session: {
           level,
           count,
+          bulk: r.opened.bulk,
+          bonusCounts: countBonuses(r.opened.bonuses),
+          milestones: r.opened.milestones,
           items: aggregate(r.opened.results),
           jackpot: best,
           discovered: r.seen.filter((k) => !before.has(k)),
         },
         toast: best ? { kind: 'jackpot', text: '잭팟!' } : null,
+        achieveQueue: r.achieved ?? [],
       });
     } catch (e) {
       set({ error: msgOf(e, '열지 못했습니다') });
@@ -225,9 +268,9 @@ export const useCrateStore = create<Store>((set, get) => ({
       const r = await crateApi.merge(cat, level, times);
       if (r.shardCrates?.length) {
         const names = r.shardCrates.map((lv) => `Lv${lv}`).join(', ');
-        set({ ...pick(r), toast: { kind: 'good', text: `상자조각이 상자로! (${names})` }, flash: null });
+        set({ ...pick(r), toast: { kind: 'good', text: `상자조각이 상자로! (${names})` }, flash: null, achieveQueue: r.achieved ?? [] });
       } else if (r.merged) {
-        set({ ...pick(r), flash: `${cat}:${r.merged.to}`, toast: null });
+        set({ ...pick(r), flash: `${cat}:${r.merged.to}`, toast: null, achieveQueue: r.achieved ?? [] });
         setTimeout(() => set((s) => (s.flash === `${cat}:${r.merged!.to}` ? { flash: null } : s)), 650);
       } else {
         set({ ...pick(r) });
@@ -244,7 +287,7 @@ export const useCrateStore = create<Store>((set, get) => ({
     set({ busy: true, error: null });
     try {
       const r = await crateApi.mergeAll();
-      set({ ...pick(r), toast: { kind: 'good', text: `${r.mergedAll}번 합쳤습니다` } });
+      set({ ...pick(r), toast: { kind: 'good', text: `${r.mergedAll}번 합쳤습니다` } , achieveQueue: r.achieved ?? [] });
     } catch (e) {
       set({ error: msgOf(e, '합치지 못했습니다') });
     } finally {
@@ -257,7 +300,7 @@ export const useCrateStore = create<Store>((set, get) => ({
     set({ busy: true, error: null });
     try {
       const r = await crateApi.sell(cat, level, count);
-      set({ ...pick(r), toast: { kind: 'good', text: `+${r.sold.gain.toLocaleString()} G` } });
+      set({ ...pick(r), toast: { kind: 'good', text: `+${r.sold.gain.toLocaleString()} G` } , achieveQueue: r.achieved ?? [] });
     } catch (e) {
       set({ error: msgOf(e, '팔지 못했습니다') });
     } finally {
@@ -270,7 +313,7 @@ export const useCrateStore = create<Store>((set, get) => ({
     set({ busy: true, error: null });
     try {
       const r = await crateApi.sellAll(maxLevel);
-      set({ ...pick(r), toast: { kind: 'good', text: `${r.sold.count}개 판매 · +${r.sold.gain.toLocaleString()} G` } });
+      set({ ...pick(r), toast: { kind: 'good', text: `${r.sold.count}개 판매 · +${r.sold.gain.toLocaleString()} G` } , achieveQueue: r.achieved ?? [] });
     } catch (e) {
       set({ error: msgOf(e, '팔지 못했습니다') });
     } finally {
@@ -290,6 +333,7 @@ export const useCrateStore = create<Store>((set, get) => ({
           kind: 'good',
           text: `${g.kind === 'daily' ? '오늘의 지원' : '구제 물자'} · 상자 ${g.crates}개 + ${g.coins.toLocaleString()} G`,
         },
+        achieveQueue: r.achieved ?? [],
       });
     } catch (e) {
       set({ error: msgOf(e, '지원받지 못했습니다') });
@@ -299,6 +343,7 @@ export const useCrateStore = create<Store>((set, get) => ({
   },
 
   closeSession: () => set({ session: null }),
+  popAchievement: () => set((s) => ({ achieveQueue: s.achieveQueue.slice(1) })),
   dismissToast: () => set({ toast: null }),
   clearError: () => set({ error: null }),
 }));

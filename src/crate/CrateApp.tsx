@@ -6,6 +6,7 @@ import Shop, { JackpotBanner } from './Shop';
 import Inventory from './Inventory';
 import Collection from './Collection';
 import Leaderboard from './Leaderboard';
+import Achievements, { AchievementToast } from './Achievements';
 import { useCrateStore } from './useCrateStore';
 import { fmtG } from './data';
 import './crate.css';
@@ -45,7 +46,13 @@ function CrateGame() {
   const logout = useCrateStore((s) => s.logout);
   const dismissToast = useCrateStore((s) => s.dismissToast);
   const clearError = useCrateStore((s) => s.clearError);
+  const achieveQueue = useCrateStore((s) => s.achieveQueue);
+  const popAchievement = useCrateStore((s) => s.popAchievement);
   const [board, setBoard] = useState(false);
+  const [achv, setAchv] = useState(false);
+  const event = useCrateStore((s) => s.event);
+  const eventWeek = useCrateStore((s) => s.eventWeek);
+  const [weekOpen, setWeekOpen] = useState(false);
 
   useEffect(() => {
     if (!toast) return;
@@ -58,6 +65,13 @@ function CrateGame() {
     const t = setTimeout(clearError, 3200);
     return () => clearTimeout(t);
   }, [error, clearError]);
+
+  // 업적 팝업은 큐라 하나씩 자동으로 넘어간다(누르면 즉시 다음으로)
+  useEffect(() => {
+    if (achieveQueue.length === 0) return;
+    const t = setTimeout(popAchievement, 2800);
+    return () => clearTimeout(t);
+  }, [achieveQueue, popAchievement]);
 
   return (
     <div className="flex min-h-screen flex-col bg-bg text-text">
@@ -79,6 +93,13 @@ function CrateGame() {
           >
             총 {fmtG(netWorth)}
           </span>
+          <button
+            onClick={() => setAchv(true)}
+            title="업적 — 조건을 채우면 자동 지급"
+            className="shrink-0 rounded-md bg-panel2 px-2 py-1 font-bold text-muted ring-1 ring-border transition hover:text-text"
+          >
+            🏅<span className="ml-1 hidden sm:inline">업적</span>
+          </button>
           <button
             onClick={() => setBoard(true)}
             title="소지 골드 순위 (5초마다 갱신)"
@@ -139,6 +160,39 @@ function CrateGame() {
           </div>
         )}
 
+        {/*
+          오늘의 이벤트 — KST 요일에서 파생하므로 저장 상태도 스케줄러도 없다(§10).
+          효과는 서버가 드롭·가격에 이미 적용해서 내려주고 여기는 무엇이 걸렸는지만 보여준다.
+        */}
+        {event && (
+          <div className="rounded-xl border border-accent/40 bg-accent/10 px-3.5 py-2.5">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+              <span className="text-lg leading-none">{event.emoji}</span>
+              <b className="text-accent">오늘은 {event.label}</b>
+              <span className="text-muted">{event.desc}</span>
+              <button
+                onClick={() => setWeekOpen(!weekOpen)}
+                className="ml-auto shrink-0 text-[11px] text-muted underline decoration-dotted underline-offset-2 hover:text-text"
+              >
+                {weekOpen ? '요일표 접기' : '요일표'}
+              </button>
+            </div>
+            {weekOpen && (
+              <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 border-t border-accent/20 pt-2 text-[11px] sm:grid-cols-4">
+                {eventWeek.map((e) => (
+                  <span
+                    key={e.key}
+                    className={'truncate ' + (e.key === event.key ? 'font-bold text-accent' : 'text-muted')}
+                    title={e.desc}
+                  >
+                    {['일', '월', '화', '수', '목', '금', '토'][e.day]} {e.emoji} {e.label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         <OpenStage />
 
         <div className="grid gap-3 lg:grid-cols-2">
@@ -167,10 +221,19 @@ function CrateGame() {
             <b className="text-text">상자만 까서 다 팔면 본전이 안 나옵니다</b> — 끝까지 합쳐서 파는 게 이 게임의 유일한 흑자
             경로입니다. 상자조각은 Lv4까지 합친 뒤 2개를 더 합치면 상자가 되고, 운이 좋으면 더 비싼 상자가 나옵니다.
           </p>
+          <p className="mt-1.5 leading-relaxed">
+            <b className="text-text">보상</b> — 개봉마다 <b className="text-accent">✨보너스</b>(항목 추가)·
+            <b className="text-accent">🔥더블</b>·<b className="text-accent">⚡트리플</b>·<b className="text-accent">💥메가</b>가 터질 수
+            있고, <b className="text-text">{limits.bulkAt}개 이상 한 번에</b> 까면 {Math.round(limits.bulkChance * 100)}% 확률로 공짜
+            상자가 하나 더 나옵니다. 누적 개봉 수가 쌓이면 <b className="text-text">마일스톤 상자</b>를, 조건을 채우면{' '}
+            <b className="text-text">업적 보상</b>을 자동으로 받습니다.
+          </p>
         </section>
       </main>
 
       {board && <Leaderboard onClose={() => setBoard(false)} />}
+      {achv && <Achievements onClose={() => setAchv(false)} />}
+      <AchievementToast />
 
       {/* 토스트 — 화면 하단 중앙(모바일에서 헤더를 가리지 않게) */}
       {(toast || error) && (

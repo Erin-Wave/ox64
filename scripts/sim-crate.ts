@@ -19,6 +19,17 @@
  *   - 상자조각 경로 수익성 > 1.5배 — Lv4 조각을 파는 것보다 상자로 바꾸는 게 확실히 이득이어야 한다
  */
 import {
+  BONUS_TIERS,
+  BULK_BONUS_AT,
+  rollBulkBonus,
+  MILESTONES,
+  DAILY_EVENTS,
+  priceOf,
+  type DailyEvent,
+  BULK_BONUS_CHANCE,
+  rollBonus,
+  rollExtraRewards,
+  milestonesCrossed,
   BROKE_CRATES as BROKE_CRATES_SIM,
   DAILY_COINS as DAILY_COINS_SIM,
   DAILY_CRATES as DAILY_CRATES_SIM,
@@ -57,13 +68,25 @@ interface Run {
  * 상자 `count` 개를 깐다. 나온 상자는 큐에 넣어 **재귀적으로 끝까지** 깐다(그게 실제 회수액이다 —
  * 나온 상자를 "가격"으로 환산하면 상자에서 상자가 나오는 경로가 통째로 과대평가된다).
  */
-function openAll(level: number, count: number, run: Run) {
+function openAll(level: number, count: number, run: Run, ev?: DailyEvent | null) {
   const queue: number[] = [];
-  for (let i = 0; i < count; i++) queue.push(level);
+  // ③ 대량 개봉 보너스 — 한 번에 여러 개를 까면 확률적으로 공짜 상자가 더 나온다
+  const bulk = rollBulkBonus(count, Math.random, ev);
+  for (let i = 0; i < count + bulk; i++) queue.push(level);
   while (queue.length) {
     const lv = queue.pop()!;
+    const before = run.opened;
     run.opened++;
-    for (const r of rollCrate(lv) as RewardItem[]) {
+    // ② 마일스톤 — 누적 개봉 수가 배수를 넘을 때마다 상자를 준다(그 상자도 큐에 들어가 마저 깐다)
+    for (const m of milestonesCrossed(before, run.opened)) for (let i = 0; i < m.count; i++) queue.push(m.level);
+    // ① 개봉 보너스 — 배수 / 추가 항목
+    const rewards = rollCrate(lv, Math.random, ev) as RewardItem[];
+    const bonus = rollBonus(Math.random, ev);
+    if (bonus) {
+      if (bonus.mult > 1) for (const r of rewards) r.count *= bonus.mult;
+      if (bonus.extra > 0) rewards.push(...(rollExtraRewards(lv, bonus.extra, Math.random, ev) as RewardItem[]));
+    }
+    for (const r of rewards) {
       if (r.kind === 'coin') {
         run.coins += r.count;
         if (r.jackpot) run.jackpotCoins += r.count;
@@ -128,14 +151,16 @@ function sellOptimal(run: Run): number {
   return coins;
 }
 
-function simulate(level: number, runs: number, policy: 'naive' | 'optimal') {
-  const price = CRATES.find((c) => c.level === level)!.price;
+function simulate(level: number, runs: number, policy: 'naive' | 'optimal', ev?: DailyEvent | null) {
+  const price = priceOf(level, ev); // 할인 이벤트는 원가가 내려가므로 회수율 분모가 달라진다
   const run: Run = { coins: 0, inv: new Map(), jackpotCoins: 0, opened: 0 };
-  openAll(level, runs, run);
+  // ⚠ 한 번에 runs 개를 까면 안 된다 — 대량 개봉 보너스가 그 호출 전체에 1회만 붙어 실제 플레이보다
+  // 훨씬 적게 계산된다. 사람이 하듯 최대 묶음(10개)씩 나눠 깐다.
+  for (let left = runs; left > 0; left -= BULK_BONUS_AT) openAll(level, Math.min(BULK_BONUS_AT, left), run, ev);
   const matCoins = policy === 'naive' ? sellNaive(run.inv) : sellOptimal(run);
   const total = run.coins + matCoins;
   return {
-    rate: total / (runs * price),
+    rate: total / (runs * price), // 분모는 **산 상자 수** — 보너스로 더 깐 건 이득이지 비용이 아니다
     jackpotShare: run.jackpotCoins / total,
     crateMult: run.opened / runs, // 산 상자 1개당 실제로 깐 상자 수(재귀 배율)
   };
@@ -161,7 +186,7 @@ for (const def of CRATES) {
   const naive = simulate(def.level, RUNS, 'naive');
   const opt = simulate(def.level, RUNS, 'optimal');
   const ratio = opt.rate / naive.rate;
-  const ok = naive.rate >= 0.62 && naive.rate <= 0.78 && opt.rate >= 1.0 && opt.rate <= 1.2 && ratio >= 1.35;
+  const ok = naive.rate >= 0.78 && naive.rate <= 0.92 && opt.rate >= 1.2 && opt.rate <= 1.8 && ratio >= 1.3;
   if (!ok) fail++;
   console.log(
     `${def.name.padEnd(10)} ${num(def.price).padStart(6)}   ${pct(naive.rate).padStart(7)}   ${pct(opt.rate).padStart(7)}` +
@@ -169,21 +194,48 @@ for (const def of CRATES) {
   );
 }
 
-console.log('\n── 극한 확률 잭팟 (모든 상자 공통, 배수는 그 상자 가격 기준) ──');
-let jackpotEv = 0;
-for (const j of JACKPOTS) {
-  jackpotEv += j.p * j.mult;
-  console.log(
-    `${j.label.padEnd(10)} 1/${num(1 / j.p).padStart(9)}   ×${String(j.mult).padStart(5)}   ` +
-      `기대기여 ${pct(j.p * j.mult).padStart(6)}   (Lv1 상자 기준 ${num(100 * j.mult)}골드)`,
-  );
+console.log();
+console.log('── 날짜 한정 이벤트 (KST 요일, 저장 상태 0) ──');
+console.log('요일  이벤트              Lv1 naive  Lv1 optimal   효과');
+const DAY_KO = ['일', '월', '화', '수', '목', '금', '토'];
+const EV_RUNS = Math.max(20000, Math.floor(RUNS / 4));
+let naiveSum = 0;
+let optSum = 0;
+for (const ev of DAILY_EVENTS) {
+  const n = simulate(1, EV_RUNS, 'naive', ev);
+  const o = simulate(1, EV_RUNS, 'optimal', ev);
+  naiveSum += n.rate;
+  optSum += o.rate;
+  const fx = [
+    ev.coinMult !== 1 ? `골드×${ev.coinMult}` : '',
+    ev.matMult !== 1 ? `재료×${ev.matMult}` : '',
+    ev.shardMult !== 1 ? `조각×${ev.shardMult}` : '',
+    ev.bonusMult !== 1 ? `보너스×${ev.bonusMult}` : '',
+    ev.jackpotMult !== 1 ? `잭팟×${ev.jackpotMult}` : '',
+    ev.discount ? `${Math.round(ev.discount * 100)}% 할인` : '',
+    ev.bulkAlways ? '대량확정' : '',
+  ].filter(Boolean).join(' ');
+  console.log(`${DAY_KO[ev.day]}    ${ev.emoji} ${ev.label.padEnd(12)} ${pct(n.rate).padStart(8)}   ${pct(o.rate).padStart(8)}     ${fx}`);
 }
-const matJp = MAT_JACKPOT.drop as { kind: 'mat'; cat: MatCat; level: number };
+const naiveAvg = naiveSum / DAILY_EVENTS.length;
+const optAvg = optSum / DAILY_EVENTS.length;
+const evOk = naiveAvg < 1.0;
 console.log(
-  `${'정수 Lv6'.padEnd(10)} 1/${num(1 / MAT_JACKPOT.p).padStart(9)}   ` +
-    `        가치 ${num(matValue(matJp.cat, matJp.level))}골드`,
+  `      7일 평균${' '.repeat(9)} ${pct(naiveAvg).padStart(8)}   ${pct(optAvg).padStart(8)}     ` +
+    `${evOk ? '✔ 평균이 100% 미만' : '✘ 평균이 100% 이상 — 상자만 까도 골드가 불어난다'}`,
 );
-console.log(`잭팟 기대기여 합계: ${pct(jackpotEv)} (가격 대비 — 5% 넘으면 밸런스의 주인이 바뀐다)`);
+if (!evOk) fail++;
+
+console.log();
+console.log('── 개봉 보너스 (매 개봉마다, 위에서부터 하나만 적용) ──');
+for (const b of BONUS_TIERS)
+  console.log(
+    `${b.emoji} ${b.label.padEnd(9)} ${pct(b.p).padStart(6)}   ` +
+      (b.mult > 1 ? `보상 ×${b.mult}` : '') +
+      (b.extra > 0 ? `${b.mult > 1 ? ' + ' : ''}항목 ${b.extra}개 추가` : ''),
+  );
+console.log(`   대량 개봉: ${BULK_BONUS_AT}개 이상 한 번에 까면 ${Math.round(BULK_BONUS_CHANCE * 100)}% 확률로 무료 1개 추가`);
+console.log('   마일스톤: ' + MILESTONES.map((m) => `${m.every}회마다 Lv${m.level} 상자 ${m.count}개`).join(' · '));
 
 console.log('\n── 상자조각 경로 (Lv4 2개 → 랜덤 상자) ──');
 const shardTopValue = matValue('shard', 4);

@@ -27,8 +27,10 @@ export interface CatDef {
   desc: string;
 }
 
+// ⚠ 이모지는 **Unicode 11.0 이하**로만 고를 것 — 12.0/13.0 대(🪵 U+1FAB5 등)는 구형 폰트에
+// 글리프가 없어 두부(□)로 뜬다(실제로 목재 아이콘이 그렇게 깨졌다). 새 재료를 추가할 때 반드시 확인.
 export const CATS: CatDef[] = [
-  { cat: 'wood', name: '목재', emoji: '🪵', color: '#b0803a', base: 6, maxLevel: 6, desc: '가장 흔한 기본 재료' },
+  { cat: 'wood', name: '목재', emoji: '🌳', color: '#b0803a', base: 6, maxLevel: 6, desc: '가장 흔한 기본 재료' },
   { cat: 'ore', name: '광석', emoji: '⛏️', color: '#8aa4b8', base: 15, maxLevel: 6, desc: '단단한 중급 재료' },
   { cat: 'gem', name: '보석', emoji: '💎', color: '#38bdf8', base: 40, maxLevel: 6, desc: '값나가는 고급 재료' },
   { cat: 'essence', name: '정수', emoji: '🔮', color: '#a78bfa', base: 90, maxLevel: 6, desc: '희귀한 최고급 재료' },
@@ -215,6 +217,113 @@ export const SHARD_CRATE_ODDS: { level: number; p: number }[] = [
 export const SHOP_MAX_BUY = 20; // 한 요청에 살 수 있는 상자 수
 export const MAX_OPEN_AT_ONCE = 10; // 한 요청에 깔 수 있는 상자 수
 
+// ── 보상을 퍼주는 장치 셋 ───────────────────────────────────────────────────────
+// 초기 밸런스(naive 70%)는 "대충 하면 계속 깎인다"가 너무 세게 체감됐다. 회수율 숫자를 그냥 올리는
+// 대신 **눈에 보이는 사건**으로 얹는다 — 같은 +15% 라도 "확률표가 좋아졌다"는 안 느껴지지만
+// "✨ 보너스! 2개 더" 는 매번 보인다. 셋 다 `npm run sim:crate` 가 회수율에 미치는 영향을 실측한다.
+
+/**
+ * ① 개봉 보너스 — 상자를 깔 때마다 굴린다. 위에서부터 판정해 **하나만** 적용된다.
+ * `mult` 는 그 상자의 모든 보상 수량에 곱하고, `extra` 는 보상 항목을 그만큼 더 얹는다
+ * (추가 항목은 그 상자의 드롭 분포를 따르되 잭팟은 제외 — 잭팟은 잭팟 확률로만 나와야 한다).
+ */
+export type BonusTier = 'mega' | 'triple' | 'double' | 'extra';
+export const BONUS_TIERS: { tier: BonusTier; p: number; mult: number; extra: number; label: string; emoji: string; color: string }[] = [
+  { tier: 'mega', p: 0.002, mult: 5, extra: 2, label: '메가 잭팟', emoji: '💥', color: '#ff5ea8' },
+  { tier: 'triple', p: 0.010, mult: 3, extra: 0, label: '트리플', emoji: '⚡', color: '#ff8f3f' },
+  { tier: 'double', p: 0.038, mult: 2, extra: 0, label: '더블', emoji: '🔥', color: '#ffcc33' },
+  { tier: 'extra', p: 0.10, mult: 1, extra: 2, label: '보너스', emoji: '✨', color: '#7ee787' },
+];
+
+/**
+ * ② 개봉 마일스톤 — 누적 개봉 수(`crate_stats.opened`)가 배수를 넘을 때마다 상자를 준다.
+ * ⚠ **컬럼을 추가하지 않으려고 `opened` 를 그대로 게이지로 쓴다**(prod 에 ALTER 를 돌릴 수 없다).
+ * 진행도 표시도 `opened % every` 로 파생되므로 저장할 상태가 없다.
+ * 저가 상자를 많이 까는 사람일수록 가격 대비 이득이 커서(Lv1 기준 +9%, Lv3 기준 +0.4%) 따라잡기
+ * 장치로도 동작한다.
+ */
+export const MILESTONES: { every: number; level: number; count: number; label: string }[] = [
+  { every: 60, level: 1, count: 1, label: '60회 개봉' },
+  { every: 300, level: 2, count: 1, label: '300회 개봉' },
+  { every: 1500, level: 3, count: 1, label: '1,500회 개봉' },
+];
+
+/**
+ * ③ 대량 개봉 보너스 — 한 번에 이만큼 이상 까면 **확률적으로** 공짜 상자가 더 나온다.
+ * ⚠ 확정 지급(10개마다 1개)으로 두면 그것만으로 회수율이 +10%p 올라 밸런스의 주인이 된다.
+ * 확률로 두면 기여는 +3.5%p 로 줄면서 "가끔 하나 더 나오는" 재미는 남는다.
+ */
+export const BULK_BONUS_AT = 10;
+export const BULK_BONUS_CRATES = 1;
+export const BULK_BONUS_CHANCE = 0.22;
+export function rollBulkBonus(count: number, rng: Rng = Math.random, ev?: DailyEvent | null): number {
+  if (count < BULK_BONUS_AT) return 0;
+  return ev?.bulkAlways || rng() < BULK_BONUS_CHANCE ? BULK_BONUS_CRATES : 0;
+}
+
+/**
+ * ④ 업적 — "돈 벌 방법이 상자밖에 없다" 를 푸는 장치. 누적 통계가 기준선을 넘으면 한 번씩 지급한다.
+ *
+ * ⚠⚠ **수령 여부를 `seen_json`(도감) 배열에 `a:<key>` 로 같이 담는다** — prod 에 ALTER 를 돌릴 수
+ * 없어서 컬럼을 못 늘리기 때문이다. `parseInvKey('a:open10')` 은 `null` 을 돌려주고 도감 화면은
+ * `CATS` 기준으로만 그리므로 재료 쪽에 섞여 보이지 않는다. 재료 카테고리에 `a` 를 절대 쓰지 말 것.
+ * ⚠ 보상 총량은 유한하다(전부 합쳐 약 6만 골드 상당) — 일회성이라 인플레 경로가 아니고, 초중반에
+ * 크게 체감되다가 후반엔 무의미해진다(따라잡기 장치).
+ */
+export type AchStat = 'opened' | 'merged' | 'jackpots' | 'seen' | 'bestCoins' | 'earned';
+export interface Achievement {
+  key: string;
+  stat: AchStat;
+  at: number;
+  label: string;
+  desc: string;
+  coins: number;
+  /** [상자 레벨, 개수] */
+  crates?: [number, number];
+}
+
+export const ACHIEVEMENTS: Achievement[] = [
+  // 개봉
+  { key: 'open1', stat: 'opened', at: 1, label: '첫 개봉', desc: '상자를 처음 열었다', coins: 300 },
+  { key: 'open25', stat: 'opened', at: 25, label: '상자 애호가', desc: '상자 25개 개봉', coins: 600, crates: [1, 2] },
+  { key: 'open100', stat: 'opened', at: 100, label: '개봉 장인', desc: '상자 100개 개봉', coins: 1500, crates: [2, 1] },
+  { key: 'open500', stat: 'opened', at: 500, label: '상자 중독', desc: '상자 500개 개봉', coins: 4000, crates: [2, 3] },
+  { key: 'open2000', stat: 'opened', at: 2000, label: '개봉의 신', desc: '상자 2,000개 개봉', coins: 12000, crates: [3, 2] },
+  // 머지
+  { key: 'merge1', stat: 'merged', at: 1, label: '첫 합성', desc: '재료를 처음 합쳤다', coins: 300 },
+  { key: 'merge25', stat: 'merged', at: 25, label: '합성 견습', desc: '25번 합성', coins: 800, crates: [1, 3] },
+  { key: 'merge100', stat: 'merged', at: 100, label: '합성 숙련', desc: '100번 합성', coins: 2000, crates: [2, 2] },
+  { key: 'merge500', stat: 'merged', at: 500, label: '합성 대가', desc: '500번 합성', coins: 6000, crates: [3, 1] },
+  { key: 'merge2000', stat: 'merged', at: 2000, label: '연금술사', desc: '2,000번 합성', coins: 15000, crates: [3, 3] },
+  // 도감
+  { key: 'seen8', stat: 'seen', at: 8, label: '수집가 입문', desc: '재료 8종 발견', coins: 800 },
+  { key: 'seen16', stat: 'seen', at: 16, label: '수집가', desc: '재료 16종 발견', coins: 2500, crates: [2, 2] },
+  { key: 'seen24', stat: 'seen', at: 24, label: '박물학자', desc: '재료 24종 발견', coins: 6000, crates: [3, 1] },
+  { key: 'seenAll', stat: 'seen', at: 28, label: '도감 완성', desc: '모든 재료 발견', coins: 20000, crates: [3, 3] },
+  // 잭팟
+  { key: 'jack1', stat: 'jackpots', at: 1, label: '행운아', desc: '극한 확률 잭팟 적중', coins: 2000, crates: [2, 2] },
+  { key: 'jack5', stat: 'jackpots', at: 5, label: '운명의 총아', desc: '잭팟 5회 적중', coins: 10000, crates: [3, 2] },
+  // 자산
+  { key: 'rich10k', stat: 'bestCoins', at: 10_000, label: '첫 만 골드', desc: '골드 10,000 보유', coins: 1500 },
+  { key: 'rich100k', stat: 'bestCoins', at: 100_000, label: '부자', desc: '골드 100,000 보유', coins: 8000, crates: [3, 1] },
+  { key: 'rich1m', stat: 'bestCoins', at: 1_000_000, label: '백만장자', desc: '골드 1,000,000 보유', coins: 40000, crates: [3, 5] },
+  // 누적 수입
+  { key: 'earn50k', stat: 'earned', at: 50_000, label: '장사꾼', desc: '누적 수입 50,000 골드', coins: 3000, crates: [2, 2] },
+  { key: 'earn500k', stat: 'earned', at: 500_000, label: '거상', desc: '누적 수입 500,000 골드', coins: 20000, crates: [3, 3] },
+];
+
+/** 업적 수령 기록은 도감 배열에 이 접두사로 함께 담긴다. */
+export const ACH_PREFIX = 'a:';
+export const achKey = (key: string) => ACH_PREFIX + key;
+
+/** 지금 통계로 새로 달성한(아직 안 받은) 업적들. */
+export function pendingAchievements(
+  stats: { opened: number; merged: number; jackpots: number; seen: number; bestCoins: number; earned: number },
+  claimed: Set<string>,
+): Achievement[] {
+  return ACHIEVEMENTS.filter((a) => !claimed.has(achKey(a.key)) && stats[a.stat] >= a.at);
+}
+
 export const START_COINS = 600;
 
 /**
@@ -238,6 +347,85 @@ export const RESCUE_DAILY_LIMIT = 4; // 일일 지원 1회 + 구제 4회 = 하�
 /** 파산 판정선 — 가진 걸 전부 팔아도 가장 싼 상자를 이만큼도 못 사면 회생 불가로 본다. */
 export const BROKE_CRATES = 3;
 
+// ── 날짜 한정 이벤트 ────────────────────────────────────────────────────────────
+/**
+ * ⑤ 요일마다 도는 이벤트 — **KST 날짜에서 파생하므로 저장할 상태가 0** 이다(스케줄러도, 컬럼도,
+ * cron 도 필요 없다. 트레이딩 리필의 "요청 시점에 KST 날짜를 계산" 패턴과 같은 사상).
+ *
+ * ⚠⚠ 효과는 전부 **회수율에 직접 얹힌다**. 이벤트가 하루씩 도니 평균 기여 = 각 효과의 1/7 합이고,
+ * 그래서 `npm run sim:crate` 가 **요일별 회수율과 7일 평균**을 따로 찍는다. 평균이 100% 를 넘으면
+ * 상자만 까도 골드가 불어나므로(§ 밸런스) 이벤트를 세게 만들려면 **평상시 드롭을 같이 낮춰야 한다**.
+ * 지금은 "이벤트 날은 본전 이상, 평균은 그 아래" 를 노린다 — 그래야 그날 몰아 하는 재미가 생긴다.
+ */
+export interface DailyEvent {
+  key: string;
+  day: number; // 0=일 … 6=토 (KST)
+  label: string;
+  emoji: string;
+  desc: string;
+  /** 코인 드롭 수량 배수 */
+  coinMult: number;
+  /** 재료 드롭 수량 배수 */
+  matMult: number;
+  /** 상자조각 드롭 수량 배수(재료 배수와 곱해진다) */
+  shardMult: number;
+  /** 개봉 보너스(BONUS_TIERS) 확률 배수 */
+  bonusMult: number;
+  /** 극한 확률 잭팟 확률 배수 */
+  jackpotMult: number;
+  /** 상점 할인율(0.1 = 10% 싸게) */
+  discount: number;
+  /** 대량 개봉 보너스를 확정으로 */
+  bulkAlways: boolean;
+}
+
+const EV = (
+  day: number,
+  key: string,
+  emoji: string,
+  label: string,
+  desc: string,
+  o: Partial<Omit<DailyEvent, 'key' | 'day' | 'label' | 'emoji' | 'desc'>>,
+): DailyEvent => ({
+  key,
+  day,
+  label,
+  emoji,
+  desc,
+  coinMult: 1,
+  matMult: 1,
+  shardMult: 1,
+  bonusMult: 1,
+  jackpotMult: 1,
+  discount: 0,
+  bulkAlways: false,
+  ...o,
+});
+
+export const DAILY_EVENTS: DailyEvent[] = [
+  EV(0, 'gift', '🎁', '선물의 날', '개봉 보너스가 훨씬 자주 터집니다', { bonusMult: 1.6 }),
+  EV(1, 'miner', '⛏️', '광부의 날', '재료가 더 많이 나옵니다', { matMult: 1.25 }),
+  EV(2, 'gold', '💰', '황금의 날', '골드 드롭이 크게 늘어납니다', { coinMult: 1.35 }),
+  EV(3, 'shard', '🧩', '조각의 날', '상자조각이 두 배로 나옵니다', { shardMult: 2 }),
+  EV(4, 'sale', '📦', '창고 대방출', '상점 상자를 10% 싸게 삽니다', { discount: 0.1 }),
+  EV(5, 'luck', '🍀', '행운의 날', '극한 확률 잭팟이 세 배로 잘 터집니다', { jackpotMult: 3 }),
+  EV(6, 'festa', '🎉', '축제의 날', '대량 개봉 공짜 상자가 확정이고 보너스도 잘 터집니다', { bonusMult: 1.3, bulkAlways: true }),
+];
+
+/** `todayKst()` 가 준 'YYYY-MM-DD' 의 요일 이벤트. */
+export function eventOfDay(dateKst: string): DailyEvent {
+  const [y, m, d] = dateKst.split('-').map(Number);
+  // UTC 로 만들어 요일만 뽑는다(이미 KST 로 환산된 날짜라 시간대를 또 적용하면 안 된다)
+  const day = new Date(Date.UTC(y, (m || 1) - 1, d || 1)).getUTCDay();
+  return DAILY_EVENTS.find((e) => e.day === day) ?? DAILY_EVENTS[0];
+}
+
+/** 이벤트가 적용된 상자 가격(할인). */
+export function priceOf(level: number, ev?: DailyEvent | null): number {
+  const base = CRATE_BY_LEVEL.get(level)?.price ?? 0;
+  return ev && ev.discount > 0 ? Math.max(1, Math.round(base * (1 - ev.discount))) : base;
+}
+
 // ── 롤(추첨) ────────────────────────────────────────────────────────────────────
 export interface RewardItem {
   kind: 'coin' | 'mat' | 'crate';
@@ -258,14 +446,20 @@ function randInt(rng: Rng, min: number, max: number): number {
  * ⚠ 상자에서 상자가 나오는 재귀는 여기서 풀지 않는다 — 나온 상자는 인벤토리에 들어가고 유저가
  * 직접 깐다(자동으로 풀면 "10개 깠는데 결과가 40줄"이 되어 응답·애니메이션이 폭주한다).
  */
-export function rollCrate(level: number, rng: Rng = Math.random): RewardItem[] {
+export function rollCrate(level: number, rng: Rng = Math.random, ev?: DailyEvent | null): RewardItem[] {
   const slots = slotsOf(level);
   if (slots.length === 0) return [];
   const out: RewardItem[] = [];
   for (const slot of slots) {
-    if (rng() >= slot.p) continue;
+    // 잭팟 슬롯만 잭팟 배수를 받는다(평범한 슬롯까지 배수를 먹이면 그게 곧 회수율 폭증이다)
+    const p = slot.jackpot && ev ? slot.p * ev.jackpotMult : slot.p;
+    if (rng() >= p) continue;
     const d = slot.drop;
-    const count = randInt(rng, d.min, d.max);
+    let count = randInt(rng, d.min, d.max);
+    if (ev) {
+      if (d.kind === 'coin') count = Math.round(count * ev.coinMult);
+      else if (d.kind === 'mat') count = Math.round(count * ev.matMult * (d.cat === 'shard' ? ev.shardMult : 1));
+    }
     if (count <= 0) continue;
     if (d.kind === 'coin') out.push({ kind: 'coin', level: 0, count, jackpot: slot.jackpot });
     else if (d.kind === 'mat') out.push({ kind: 'mat', cat: d.cat, level: d.level, count, jackpot: slot.jackpot });
@@ -273,6 +467,61 @@ export function rollCrate(level: number, rng: Rng = Math.random): RewardItem[] {
   }
   // 전부 꽝이면 최소 보상 하나는 준다 — "아무것도 안 나옴"은 재미가 아니라 그냥 고장처럼 보인다.
   if (out.length === 0) out.push({ kind: 'mat', cat: 'wood', level: 1, count: 1 });
+  return out;
+}
+
+/**
+ * 개봉 보너스를 굴린다 — 확률이 높은 순이 아니라 **등급이 높은 순**으로 판정해 하나만 적용한다
+ * (메가가 떴는데 더블로 덮이면 안 된다).
+ */
+export function rollBonus(rng: Rng = Math.random, ev?: DailyEvent | null): (typeof BONUS_TIERS)[number] | null {
+  const mult = ev?.bonusMult ?? 1;
+  for (const b of BONUS_TIERS) if (rng() < b.p * mult) return b;
+  return null;
+}
+
+/**
+ * 보너스로 얹어주는 추가 보상 — 그 상자의 드롭 분포를 따르되 **잭팟 슬롯은 제외**한다
+ * (잭팟은 잭팟 확률로만 나와야 한다). 슬롯을 확률 가중으로 골라서, 얹어주는 것도 흔한 건 흔하게
+ * 귀한 건 귀하게 나온다.
+ */
+export function rollExtraRewards(level: number, n: number, rng: Rng = Math.random, ev?: DailyEvent | null): RewardItem[] {
+  const slots = slotsOf(level).filter((s) => !s.jackpot);
+  const total = slots.reduce((sum, s) => sum + s.p, 0);
+  if (total <= 0) return [];
+  const out: RewardItem[] = [];
+  for (let i = 0; i < n; i++) {
+    let r = rng() * total;
+    let picked = slots[slots.length - 1];
+    for (const s of slots) {
+      r -= s.p;
+      if (r <= 0) {
+        picked = s;
+        break;
+      }
+    }
+    const d = picked.drop;
+    let count = randInt(rng, d.min, d.max);
+    if (ev) {
+      if (d.kind === 'coin') count = Math.round(count * ev.coinMult);
+      else if (d.kind === 'mat') count = Math.round(count * ev.matMult * (d.cat === 'shard' ? ev.shardMult : 1));
+    }
+    if (count <= 0) continue;
+    if (d.kind === 'coin') out.push({ kind: 'coin', level: 0, count });
+    else if (d.kind === 'mat') out.push({ kind: 'mat', cat: d.cat, level: d.level, count });
+    else out.push({ kind: 'crate', level: d.level, count });
+  }
+  return out;
+}
+
+/** 누적 개봉 수가 `before` → `after` 로 늘 때 넘어선 마일스톤들. */
+export function milestonesCrossed(before: number, after: number) {
+  const out: { level: number; count: number; label: string; at: number }[] = [];
+  for (const m of MILESTONES) {
+    const from = Math.floor(before / m.every);
+    const to = Math.floor(after / m.every);
+    for (let k = from + 1; k <= to; k++) out.push({ level: m.level, count: m.count, label: m.label, at: k * m.every });
+  }
   return out;
 }
 

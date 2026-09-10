@@ -32,7 +32,14 @@ export default function Shop() {
                 <span className="text-2xl leading-none">{c.emoji}</span>
                 <div className="min-w-0">
                   <div className="truncate text-xs font-bold">{c.name}</div>
-                  <div className="text-[11px] font-bold text-accent">{c.price.toLocaleString()} G</div>
+                  <div className="flex items-baseline gap-1 text-[11px] font-bold text-accent">
+                    {c.price.toLocaleString()} G
+                    {c.listPrice > c.price && (
+                      <span className="font-normal text-muted line-through" title="오늘 할인 이벤트 중입니다">
+                        {c.listPrice.toLocaleString()}
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
               <p className="mb-2 text-[11px] leading-snug text-muted">{c.desc}</p>
