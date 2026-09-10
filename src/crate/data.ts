@@ -55,6 +55,3 @@ export function splitKey(key: string): { cat: string; level: number } {
   const [cat, lv] = key.split(':');
   return { cat, level: Number(lv) };
 }
-
-/** 한 그룹(같은 재료·같은 레벨)에서 화면에 실제로 펼칠 칸 수 — 수백 개가 쌓여도 렌더가 안 터지게 */
-export const MAX_SLOTS_PER_GROUP = 36;
