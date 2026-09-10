@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useCrateStore } from './useCrateStore';
-import { fmtG, tierOf } from './data';
+import { countClass, fmtCount, fmtG, tierOf } from './data';
 import type { CatInfo, MatCat } from './api';
 
 /**
@@ -53,7 +53,7 @@ export default function Inventory() {
   // 고스트는 ref 로 직접 움직이고, 리렌더는 "드롭 대상이 바뀌었을 때"만 일어난다.
   const [drag, setDrag] = useState<{ group: string; emoji: string; over: string | null } | null>(null);
   const [nope, setNope] = useState<string | null>(null);
-  const down = useRef<{ x: number; y: number; group: string; idx: number; moved: boolean } | null>(null);
+  const down = useRef<{ x: number; y: number; group: string; idx: number; moved: boolean; draggable: boolean } | null>(null);
   const ghost = useRef<HTMLDivElement | null>(null);
 
   /** 재료를 칸 단위로 펼친다 — 카테고리 순서 → 레벨 오름차순(합칠 것이 앞 페이지에 모이게). */
@@ -74,6 +74,19 @@ export default function Inventory() {
   }, [page, pages]);
   const start = Math.min(page, pages - 1) * PAGE_SIZE;
   const pageCells = cells.slice(start, start + PAGE_SIZE);
+  /**
+   * 개수 배지를 붙일 칸 — **이 페이지에서 그 재료가 처음 나오는 칸**이다.
+   * ⚠ 그룹 전체의 첫 칸(`idx === 0`)에 붙이면 재료가 48개를 넘는 순간 그 칸이 1페이지에만 있어서
+   * 2페이지부터는 개수가 통째로 안 보인다.
+   */
+  const badgeAt = useMemo(() => {
+    const seen = new Set<string>();
+    return pageCells.map((c) => {
+      const first = !seen.has(c.group);
+      seen.add(c.group);
+      return first;
+    });
+  }, [pageCells]);
 
   // ⚠ 같은 그룹의 아무 칸으로 폴백한다 — "1개 팔기" 로 개수가 줄면 선택했던 인덱스가 사라져서,
   // 정확히 일치하는 칸만 찾으면 아직 재료가 남았는데도 액션 바가 안내 문구로 되돌아간다.
@@ -98,15 +111,18 @@ export default function Inventory() {
     setTimeout(() => setNope((v) => (v === slotId ? null : v)), 280);
   };
 
+  // ⚠⚠ 드래그를 시작할 수 없는 칸이어도 `down` 은 반드시 기록한다. 예전엔 `count < 2` 면 여기서
+  // 곧장 return 했는데, 그러면 onUp 의 `if (!d) return` 에 걸려 **그 칸은 눌러도 선택 자체가 안 됐다**
+  // (액션 바가 영영 안 뜬다). 상위 레벨 재료는 보통 1개뿐이라 사실상 대부분의 칸이 그랬다.
+  // 합칠 상대가 없다는 것은 "끌 수 없다"는 뜻이지 "누를 수 없다"는 뜻이 아니다.
   const onDown = (e: React.PointerEvent, cell: Cell) => {
-    if (busy || cell.count < 2) return; // 1개뿐이면 합칠 상대가 없다 — 드래그를 시작하지 않는다
-    down.current = { x: e.clientX, y: e.clientY, group: cell.group, idx: cell.idx, moved: false };
-    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    down.current = { x: e.clientX, y: e.clientY, group: cell.group, idx: cell.idx, moved: false, draggable: !busy && cell.count >= 2 };
+    if (!busy && cell.count >= 2) (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   };
 
   const onMove = (e: React.PointerEvent, cell: Cell) => {
     const d = down.current;
-    if (!d) return;
+    if (!d || !d.draggable) return;
     if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 6) return;
     const first = !d.moved;
     d.moved = true;
@@ -124,9 +140,8 @@ export default function Inventory() {
     const d = down.current;
     down.current = null;
     setDrag(null);
-    if (!d) return;
 
-    if (d.moved) {
+    if (d?.moved) {
       const el = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest('[data-slot]') as HTMLElement | null;
       const target = el?.dataset.slot ?? '';
       const [tGroup, tIdx] = target.split('#');
@@ -134,7 +149,8 @@ export default function Inventory() {
       else if (target) reject(target); // 다른 재료 위에 놓았다 — 흔들어서 안 된다고 알린다
       return;
     }
-    // 움직이지 않았으면 탭 — 같은 종류의 다른 칸을 이미 골라뒀으면 합치고, 아니면 선택만 한다
+    // 여기까지 왔으면 탭이다 — `d` 가 없어도(드래그를 시작조차 못 한 칸) 선택은 반드시 되어야 한다.
+    // 같은 종류의 다른 칸을 이미 골라뒀으면 합치고, 아니면 선택만 한다
     const id = `${cell.group}#${cell.idx}`;
     if (sel && sel !== id && sel.split('#')[0] === cell.group) doMerge(cell.group);
     else setSel(sel === id ? null : id);
@@ -221,13 +237,30 @@ export default function Inventory() {
               }
               style={{ borderColor: tier.color + '66', background: tier.color + '14', color: tier.color }}
             >
-              <span className="pointer-events-none select-none">{cell.cat.emoji}</span>
+              <span className="pointer-events-none select-none text-xl leading-none sm:text-2xl">{cell.cat.emoji}</span>
+              {/* 레벨 — 좌상단. 아이콘만으로는 Lv1 과 Lv6 이 구분되지 않아 색과 함께 항상 보여준다 */}
               <span
-                className="pointer-events-none absolute bottom-0 right-0.5 text-[9px] font-extrabold leading-tight"
+                className="pointer-events-none absolute left-0.5 top-0 text-[11px] font-extrabold leading-tight"
                 style={{ color: tier.color }}
               >
                 {cell.level}
               </span>
+              {/*
+                개수 — 그 재료가 이 페이지에서 처음 나오는 칸에만 붙인다. 한 칸이 1개라 칸 수가 곧
+                개수지만 서른 칸이 깔리면 세어볼 수가 없고, 그렇다고 모든 칸에 같은 숫자를 박으면
+                화면이 그 숫자로 도배된다.
+              */}
+              {badgeAt[i] && cell.count > 1 && (
+                <span
+                  className={
+                    'pointer-events-none absolute -bottom-0.5 right-0.5 font-extrabold leading-tight tabular-nums ' +
+                    countClass(fmtCount(cell.count))
+                  }
+                  style={{ color: tier.color, textShadow: '0 1px 2px rgb(0 0 0 / 0.6)' }}
+                >
+                  {fmtCount(cell.count)}
+                </span>
+              )}
             </button>
           );
         })}
