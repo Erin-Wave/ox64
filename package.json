@@ -11,7 +11,8 @@
     "lint": "tsc -b --noEmit",
     "d1:budget": "node scripts/d1-budget.mjs",
     "sim:bot": "esbuild scripts/sim-bot.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/ox64-sim.mjs --log-level=warning && node node_modules/.cache/ox64-sim.mjs",
-    "d1:check": "npx wrangler d1 insights ox64 --sort-by writes --count 5 --timePeriod 1d --json"
+    "d1:check": "npx wrangler d1 insights ox64 --sort-by writes --count 5 --timePeriod 1d --json",
+    "sim:crate": "esbuild scripts/sim-crate.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/ox64-sim-crate.mjs --log-level=warning && node node_modules/.cache/ox64-sim-crate.mjs"
   },
   "dependencies": {
     "lightweight-charts": "^4.2.3",

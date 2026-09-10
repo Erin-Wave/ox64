@@ -10,7 +10,7 @@
 > 규칙(돈이 걸린 부분) · §5 = 배포·마이그레이션 절차 · **§6 = D1 예산과 함정(새 기능을 얹기 전에 반드시
 > 볼 것)** · §7~§9 = 트레이딩과 완전히 분리된 독립 게임 셋.
 > **⚠ 표시는 "여기서 실제로 사고가 났다"는 뜻**이다 — 그 규칙을 되돌리기 전에 문단을 끝까지 읽을 것.
-> 완료된 작업의 이력·실측치는 [docs/HISTORY.md](docs/HISTORY.md) 로 분리했다(§10).
+> 완료된 작업의 이력·실측치는 [docs/HISTORY.md](docs/HISTORY.md) 로 분리했다(§11).
 > `AGENTS.md` 는 이 파일을 가리키는 포인터이므로 내용은 **여기에만** 쓴다.
 
 ## 1. 기술 스택 (선정 이유 = 성능 + 무결성)
@@ -35,8 +35,8 @@ ox64/
 ├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드 + **구글 애드센스 스니펫**(pagead2 async, client=ca-pub-6831535776648677 — 광고 단위는 아직 없고 자동 광고/사이트 인증용 로더만)
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
 ├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산, +last_fill_at=부분 재체결 간격 하한]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들 +open_at/close_at=시가·종가 체결 시각]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks/peak/trough=봇 심리상태(고점·저점 기억 포함), +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼, +live_json=진행 중 캔들 버킷, +pend_notional/pend_rows/pend_ticks=봇 수수료·계량기 누적]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
-├── docs/HISTORY.md         완료된 작업의 배경·수정 내용·검증 기록(§10 에서 분리 — 규칙의 진실원본은 언제나 이 문서 본문)
-├── scripts/                운영 스크립트 — d1-budget.mjs(D1 쓰기 예산 점검, §6) · sim-bot.ts(봇 심리 모델 장기 시뮬레이션 + **체결 미세구조·호가창 지속성 검증**, `npm run sim:bot` — 심리 파라미터를 바꿨으면 반드시 돌릴 것. 기본 7일=정확히 한 주여야 세션 활성도 평균이 1 로 나온다. 편향은 종가가 아니라 **로그드리프트/틱**(산술평균−분산/2, |값| 2e-6 이하)으로 본다)
+├── docs/HISTORY.md         완료된 작업의 배경·수정 내용·검증 기록(§11 에서 분리 — 규칙의 진실원본은 언제나 이 문서 본문)
+├── scripts/                운영 스크립트 — d1-budget.mjs(D1 쓰기 예산 점검, §6) · **sim-crate.ts(상자깡 밸런스 시뮬레이션, `npm run sim:crate` — 드롭 확률·가격·재료 가치를 바꿨으면 반드시 돌릴 것. 상자만 까서 다 팔면 적자(~70%)·끝까지 머지하면 흑자(~110%)라는 불변식을 지킨다, §10)** · sim-bot.ts(봇 심리 모델 장기 시뮬레이션 + **체결 미세구조·호가창 지속성 검증**, `npm run sim:bot` — 심리 파라미터를 바꿨으면 반드시 돌릴 것. 기본 7일=정확히 한 주여야 세션 활성도 평균이 1 로 나온다. 편향은 종가가 아니라 **로그드리프트/틱**(산술평균−분산/2, |값| 2e-6 이하)으로 본다)
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조(rgb(var(--color-x) / <alpha-value>)) — 실제 값은 src/index.css 테마 블록
 ├── cron/                   ── 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker (메인 Pages 프로젝트와 별도 배포) ──
@@ -47,6 +47,7 @@ ox64/
 │   ├── _shared.ts          인증(HMAC 토큰/PBKDF2)·바이낸스 서버측 시세·D1 타입·loadState(positions/orders/pendingOrders)
 │   ├── _budget.ts          **D1 쓰기 예산 계량기 + 자동 쓰기 차단(서킷 브레이커)** — Cloudflare 엔 D1 지출 상한 기능이 없어서(예산 알림은 사후 통보) "포함분을 넘기면 멈춘다"를 코드로 만든 것. 스스로 반복해서 도는 경로(봇 틱·repeating 조건부)만 `usage_meter` 에 누적하고, 이번 달 누적이 `BLOCK_AT_ROWS`(포함분 5,000만의 90%)를 넘으면 그 경로들이 조용히 물러난다(수동 거래·트리거 sweep 은 계속 동작). 계량 문장은 **이미 도는 batch 에 얹어** 계량기 자체가 비용이 되지 않게 하고, 조회도 **오늘 한 행만**(PK) 읽는다 — 예전엔 `day LIKE '이번달%'` 로 달 전체를 SUM 해서 조회 하나가 날짜 수만큼 행을 읽었다(§6)
 │   ├── _trading.ts         runTriggers(...) — 강제청산→지정가→SL/TP→조건부 평가 본체(순수 로직 분리 패턴) / checkTriggers(env,uid) — 접속(폴링) 시 그 유저 1인분 / sweepTriggers(env) — cron 이 접속 여부 무관하게 호출하는 전 유저 sweep(**같은 본체를 공유**해서 "접속 중에만 되는 기능"이 갈라지지 않게)
+│   ├── _crateData.ts       "상자깡"(§10) 콘텐츠 정의 + 순수 로직(D1 I/O 없음) — 재료 5종(목재/광석/보석/정수 Lv1~6, 상자조각 Lv1~4)·가치 공식(base × MERGE_MULT^(lv-1))·상자 3종 드롭 테이블(슬롯마다 독립시행)·극한 확률 잭팟(JACKPOTS)·추첨(rollCrate/rollShardCrate). **밸런스의 진실원본이라 여기만 고치면 되고, 고쳤으면 `npm run sim:crate` 를 돌린다**(_dungeonData/_dungeonEngine 과 같은 "데이터·로직은 순수 함수로 분리" 패턴 — 그래서 시뮬레이터가 이 파일만 import 한다)
 │   ├── _dungeonData.ts     "5분 던전"(§8) 콘텐츠 정의 — 아이콘 5종/영웅 6종 덱 구성표(HEROES/heroDeckSpec), 몬스터 24·함정 6·포션 4·보스 4 풀, 던전 4개(DUNGEONS, 난이도별 구성), 인원수 난이도 스케일(partyScale). 서버 권위 콘텐츠(원작 카드 텍스트를 그대로 베끼지 않은 오리지널 구성)
 │   ├── _dungeonEngine.ts   "5분 던전" 순수 게임 로직(D1 I/O 없음) — 셔플/덱빌드(buildDungeonDeck)/드로우(drawUpTo)/요구치 판정(isReqMet)/함정 자동발동(applyTrap, ward 무효화 포함)/파티 커버 아이콘 보정(adaptReq). _trading.ts 와 같은 "로직은 순수 함수로 분리" 패턴
 │   └── api/
@@ -58,6 +59,7 @@ ox64/
 │       ├── spot.ts         GET /api/spot (OX/USDT 호가창·체결내역 "표시용" 시장 데이터, ?candles=1 로 캔들도) + runMarketMaker() (봇이 심리 모델(nextMarketState: 추세/변동성 클러스터링/과열회귀/탐욕-공포 국면)로 기준가를 옮기고 그 주변에 호가 사다리를 깔아 만드는 합성 시세·호가·체결 — **틱은 순수 계산(simulateTick)이고 N틱을 메모리에서 돌린 뒤 커밋 1회 = 상태 행 1행만 쓴다(runBotTicks)** — 사다리(`book_json`)·체결 테이프(`tape_json`)·진행 중 캔들(`live_json`)이 전부 그 한 행이라, 틱을 몇 개 돌리든 D1 왕복·쓰기가 안 늘어난다 — **사다리는 매 틱 새로 태어나지 않고 이전 틱의 살아있는 주문을 물려받는다**(§4 호가창 지속), 봇 호가는 잔고 에스크로 안 함(무한 유동성 풀 — 단 체결된 뒤의 재고/현금은 `botFillStmts` 가 정산). OX 는 레버리지 롱/숏도 order.ts 로 실제 코인과 동일하게 거래됨, 체결가만 여기서 옴)
 │       ├── leaderboard.ts  GET  /api/leaderboard (친구 자산 순위=잔고+미실현PnL, 서버 시세)
 │       ├── puzzle.ts       GET/POST /api/puzzle — "스핑크스 보석찾기" 퍼즐게임(§7, ox64.app/b). 트레이딩과 별도 재화(puzzle_stats), 보드 정답(puzzle_games.board)은 서버만 알고 클라 응답엔 "이미 연 칸"만 내려줌
+│       ├── crate.ts        GET/POST /api/crate — "상자깡"(§10, ox64.app/c) 상자 구매/개봉/머지/판매/지원금. 트레이딩과 별도 재화(crate_stats.coins)이고 드롭 추첨은 서버만 굴린다. ⚠ **한 요청이 읽기 1행 + 쓰기 1행**(유저의 모든 상태가 crate_stats 한 행의 JSON 칸들이다) — 아이템을 행으로 쪼개면 개봉 한 번이 수십 행이 된다
 │       └── dungeon.ts      GET/POST /api/dungeon — "5분 던전"(§8, ox64.app/5m) 방 생성/참가/던전선택/영웅선택/시작/카드플레이(여러 장 동시)/휴식/특수카드/나가기. GET 폴링(진행 중 0.5초)이 곧 동기화 수단(Durable Objects/WebSocket 없이 D1만으로) — ⚠ **GET 은 D1 왕복 2회·쓰기 0회**로 유지할 것(§8)
 ├── public/
 │   ├── favicon.png         아이콘(원본 src/resources/images/icon2_256.png)
@@ -66,7 +68,7 @@ ox64/
 │   └── fonts/              ProximaNova-{Light,Regular,Semibold,Extrabold}.ttf
 └── src/                    ── 프론트 ──
     ├── App.tsx             세션확인→Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달
-    ├── main.tsx            location.pathname 으로 트레이딩(App)·퍼즐게임(puzzle/PuzzleApp, /b)·5분 던전(dungeon/DungeonApp, /5m)·미니 RTS(sc/ScApp, /s1) 를 분기(라우터 없음, 동적 import 로 서로의 번들이 안 섞이게). useSettingsStore 를 먼저 import(저장된 테마 즉시 적용, FOUC 방지). ⚠ /s1 만 StrictMode 를 안 씌운다 — 개발 모드의 이펙트 2회 실행이 rAF 루프와 Game 인스턴스를 두 벌 만들어 시뮬이 2배속으로 도는 것처럼 보인다
+    ├── main.tsx            location.pathname 으로 트레이딩(App)·퍼즐게임(puzzle/PuzzleApp, /b)·5분 던전(dungeon/DungeonApp, /5m)·미니 RTS(sc/ScApp, /s1)·상자깡(crate/CrateApp, /c) 를 분기(라우터 없음, 동적 import 로 서로의 번들이 안 섞이게). useSettingsStore 를 먼저 import(저장된 테마 즉시 적용, FOUC 방지). ⚠ /s1 만 StrictMode 를 안 씌운다 — 개발 모드의 이펙트 2회 실행이 rAF 루프와 Game 인스턴스를 두 벌 만들어 시뮬이 2배속으로 도는 것처럼 보인다
     ├── index.css           Tailwind + 테마 CSS 변수(:root/[data-theme=light|high-contrast]) + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position[stopLoss/takeProfit]/PendingOrder/Side)
     ├── symbols.ts          거래 심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS(OXUSDT·EWUSDT)/isVirtualSymbol(체결가 소스만 다르다는 표시, 거래 로직은 동일) + 타임프레임 그룹(분/시간/일+) + KST_OFFSET(+9h 고정)
@@ -133,6 +135,16 @@ ox64/
         ├── GameBoard.tsx       진행 중/종료 화면 — 던전 진행도 막대, 파티 체력·방벽, 타이머 막대, 현재 카드 요구치(항목별 진행 막대+보스 2페이즈 예고), 내 손패(낼 수 있는 카드만 강조)·전부 내기·휴식·특수, 파티원 공개 손패, 종료 시 기여도 통계
         ├── Card.tsx            카드 1장 시각 컴포넌트(아이콘 이모지+기여값+속성 이름, sm/md 크기)
         └── DungeonApp.tsx      진입 컴포넌트 — 로그인 게이트 → 로비 or 게임보드
+    └── crate/                  ── "상자깡"(/c, §10) — 트레이딩·퍼즐·던전 어느 쪽과도 분리된 독립 진입점 ──
+        ├── api.ts              /api/crate 전용 클라이언트(별도 번들). ⚠ 확률·가격·재료 가치는 **서버 응답을 그대로 쓴다**(클라에 표를 또 적으면 서버 밸런스를 고칠 때 화면만 조용히 틀려진다)
+        ├── data.ts             표시 전용 메타뿐 — 레벨 등급색(일반~신화, 테마 무관 고정색)·골드 축약(fmtG)·확률 표기(fmtP, 0.1% 미만이면 1/N 분모로)
+        ├── crate.css           개봉/머지 애니메이션(전부 0.2~0.7초 — 요구사항이 "아주 살짝만")
+        ├── useCrateStore.ts    zustand: coins/inv/crates/seen/stats + buy/open/merge/mergeAll/sell/sellAll/refill. 개봉 결과는 같은 보상끼리 **합산**해서 한 번에 띄운다(aggregate — 10연차를 상자별로 재생하면 고문이 된다)
+        ├── CrateLogin.tsx      이름+패스코드 로그인(트레이딩과 같은 계정/세션 쿠키 재사용)
+        ├── OpenStage.tsx       개봉 무대 — 보유 상자 + 열기(1개/최대 10개) + 결과 카드. 잭팟이면 무대 전체가 한 번 번쩍인다
+        ├── Shop.tsx            상자 3종 구매 + **확률 공시**(서버 odds 를 그대로 렌더) + 극한 확률 안내 배너
+        ├── Inventory.tsx       재료 그리드 + **드래그 머지**(같은 재료 2개를 끌어다 놓거나 탭 두 번). ⚠ 포인터 좌표를 리렌더에 안 태운다(칸이 수백 개까지 간다)
+        └── Collection.tsx      도감 — 한 번이라도 얻어본 재료를 종류·레벨별로 기록(안 얻은 칸은 실루엣)
 ```
 
 ## 3. 데이터 흐름
@@ -807,6 +819,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
     그리고 **인덱스 교체**(쓰기 비용 증가 0, 읽기 96% 감소): `CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at)` + `DROP INDEX IF EXISTS idx_orders_user` + `DROP INDEX IF EXISTS idx_fee_ledger_time`(읽는 코드가 없는데 체결마다 1행씩 비용만 냈다).
     **⚠ `usage_meter` 의 오늘 행은 전환 시 한 번 리셋해야 한다** — 예전 단가(틱당 7행)로 쌓인 값이라 새 임계값(§6, 일 8만)에서 즉시 차단이 걸린다. `DELETE FROM usage_meter WHERE day = <오늘 KST>`.
   - **⚠ `spot_candles.open_at`/`close_at`(캔들 시가 오염 수정, 2026-09-02)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE spot_candles ADD COLUMN open_at INTEGER NOT NULL DEFAULT 0"` 및 동일 형식으로 `close_at INTEGER NOT NULL DEFAULT 0`. **코드 배포 전에 먼저 적용돼야 한다** — 모든 체결의 캔들 upsert 와 봇의 캔들 flush 가 이 컬럼을 쓰므로 없으면 체결 batch 가 통째로 롤백된다(= 거래가 멈춘다). prod·로컬 적용 완료. 기존 행은 0(=가장 이른 시각)이라 시가가 예전 값 그대로 유지되고, 배포 시점에 진행 중이던 버킷 하나만 해당된다.
+  - **⚠ `crate_stats`(상자깡, §10, 2026-09-10)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/crate` 코드가 이 테이블을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩·퍼즐·던전 라우트와 완전히 분리돼 있어 없어도 그쪽엔 영향 없고 `/api/crate` 만 500 이 된다.
   - **⚠ `dungeon_stats`/`dungeon_rooms`/`dungeon_players`(5분 던전, §8, 2026-07-27)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/dungeon` 코드가 이 테이블들을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩·퍼즐 라우트와 완전히 분리돼 있어 없어도 그쪽엔 영향 없고 `/api/dungeon` 만 500 이 된다(방어적 try/catch 없음 — 격리돼 있어 불필요 판단).
 - **Secret**: `SESSION_SECRET` = `wrangler pages secret put SESSION_SECRET --project-name ox64` 로 production 에 설정됨(랜덤 32B hex). wrangler.toml 엔 두지 않음.
 - 재적용 명령: 스키마 `npx wrangler d1 execute ox64 --remote --file=./schema.sql` / 시크릿 `echo <값> | npx wrangler pages secret put SESSION_SECRET --project-name ox64`.
@@ -1037,6 +1050,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
     | `useDungeonStore` → `/api/dungeon` GET | 0.5~4s | **0** (§8 — 계정당 평생 1회 stats INSERT 제외) |
     | `useMarkPrices` → OKX | 1.2s | **0** (외부 API, D1 미접촉) |
     | 퍼즐 | 폴링 없음 | 클릭당 2~3행 |
+    | 상자깡(§10) | **폴링 없음** | 액션당 **1행**(유저의 모든 상태가 crate_stats 한 행이라 개봉 10연도 1행) |
 
   - **⚠⚠ 가상 코인 폴링을 0.2초로 당길 수 없는 이유(2026-08-19 검토)** — "체결·호가가 1초마다 갱신되니
     0.2초로 해달라"는 요청에 대한 결론은 **불가**이고, 막는 건 D1 행 수가 아니라 **요청 수와 쓰기**다.
@@ -1299,7 +1313,66 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   ⚠ 같은 코드끼리 붙이면 P0 가 7~8할 이긴다 — 한 틱 안에서 엔티티 순서대로 처리해 먼저 생성된 쪽이
   먼저 쏘기 때문(순차 시뮬의 구조적 특성). 사람이 P0 라 이 미세한 이점은 플레이어 쪽으로 간다.
 
-## 10. 백로그 (열린 항목)
+## 10. 상자깡 (ox64.app/c, `functions/api/crate.ts` + `functions/_crateData.ts` + `src/crate/`)
+
+> 상자를 까서 재료·돈을 얻고, **같은 재료 2개를 합쳐(merge) 레벨을 올려 값을 불리는** 미니게임.
+> 트레이딩·퍼즐·던전 어느 쪽과도 완전히 무관 — 같은 계정(이름+패스코드, 세션 쿠키)을 그대로 쓰지만
+> 재화(`crate_stats.coins`, "골드")는 `users.balance`(USDT)와 전혀 다른 별도 컬럼이다.
+> 폴링이 없다(싱글플레이라 남의 상태를 볼 이유가 없다).
+
+- **⚠⚠ 한 유저의 모든 상태가 `crate_stats` 한 행이다** — 인벤토리(`inv_json`)·보유 상자(`crates_json`)·
+  도감(`seen_json`)이 전부 JSON 칸 하나씩이라 **상자를 10개 까든 재료가 30종이든 D1 쓰기가 1행**이다
+  (§6 "매 틱 통째로 교체되는 스냅샷은 행으로 쪼개지 말고 이미 UPDATE 하는 행의 JSON 칸에 담는다" —
+  봇 호가 사다리 `book_json` 과 같은 사상). **아이템을 행으로 쪼개는 설계로 절대 되돌리지 말 것** —
+  개봉 한 번이 수십 행이 되어 무료 플랜 일일 쓰기(10만)를 그 기능 하나로 태운다. 한 요청은 항상
+  **읽기 1행 + 쓰기 1행**(신규 유저만 INSERT 1회 추가)이라 invocation당 쿼리 한도(50)와도 무관하다.
+- **⚠ 밸런스의 진실원본은 `functions/_crateData.ts` 하나이고, 확률·가격·가치를 건드렸으면 반드시
+  `npm run sim:crate` 를 돌릴 것**(`scripts/sim-crate.ts` — 드롭 테이블이 순수 함수라 상자당 20만 회
+  개봉을 몇 초에 굴린다). 합격선:
+  | 지표 | 목표 | 실측(2026-09-10) |
+  | --- | --- | --- |
+  | naive 회수율(머지 없이 다 팔기) | 65~75% | Lv1 69.6 / Lv2 72.0 / Lv3 70.7% |
+  | optimal 회수율(끝까지 머지 후 판매) | 105~118% | Lv1 115.6 / Lv2 114.5 / Lv3 107.0% |
+  | 두 정책의 비 | 1.4 이상 | ×1.66 / ×1.59 / ×1.51 |
+  | 잭팟이 optimal 에서 차지하는 몫 | 5% 미만 | 3.2 / 2.3 / 3.6% |
+  **핵심 불변식: 상자만 까서 다 팔면 반드시 적자여야 한다.** 돈을 버는 건 상자가 아니라 머지다 —
+  이게 깨지면(naive 가 100% 를 넘으면) 상자를 무한히 까는 것만으로 골드가 불어나는 인플레 경로가 된다.
+  회수율은 **나온 상자를 재귀적으로 끝까지 깐 값**으로 재야 한다(상자 드롭을 "가격"으로 환산하면
+  상자에서 상자가 나오는 경로가 통째로 과대평가된다).
+- **머지 규칙** — 같은 카테고리·같은 레벨 **2개 → 다음 레벨 1개**, 가치는 `MERGE_MULT`(2.35)배.
+  즉 개당 1.175배씩 이득이고, 이 "머지 프리미엄"이 이 게임의 유일한 성장 동력이다.
+  **⚠ 카테고리는 절대 안 바뀌고 레벨만 오른다.** 상자는 머지 대상이 아니다(재료만 합쳐진다).
+  카테고리는 5종(목재/광석/보석/정수 Lv1~6, 상자조각 Lv1~4)이고 base 가격만 다르다.
+- **⚠ 상자조각은 유일한 예외** — 최고 레벨(Lv4) 2개를 합치면 다음 레벨 대신 **랜덤 상자**가 나온다
+  (`SHARD_CRATE_ODDS`, 확률적으로 더 비싼 상자). 기댓값(444골드)이 Lv4 조각 2개 판매가(260골드)보다
+  **확실히 높아야**(현재 ×1.71) "조각은 팔지 말고 합쳐라"가 성립한다. 그래서 `sellAll` 은 상자조각을
+  제외하고, `mergeAll` 도 상자조각 최고 레벨은 건드리지 않는다(그건 도박이라 유저가 직접 눌러야 한다).
+- **⚠ 극한 확률 잭팟(`JACKPOTS`)의 상한 규칙** — 모든 상자에 공통으로 붙는 1/2,000 · 1/25,000 ·
+  1/250,000 짜리 슬롯이고 보상은 **그 상자 가격의 배수**(×25 · ×150 · ×1,500)다. 확률이 자릿수로 낮아
+  기대 회수율 기여는 2.5% 뿐이면서 도박성만 얹는 게 목적이다. **`Σ(p × mult)` 가 0.05(가격의 5%)를
+  넘지 않게 할 것** — 넘으면 밸런스의 주인이 머지가 아니라 잭팟이 되어 "많이 까는 사람이 확률적으로
+  무조건 이기는" 인플레 경로가 된다.
+- **⚠ 서버 권위** — 드롭 추첨(`rollCrate`)·머지·판매·잔고를 전부 서버가 계산한다. 클라가 보내는 건
+  "무엇을 몇 개" 뿐이다(트레이딩의 "체결가는 서버가 fetch" 와 같은 사상). 확률표·가격·재료 가치는
+  서버가 `GET /api/crate` 응답(`cats`/`shop`/`shardOdds`)으로 내려주고 클라는 그대로 렌더한다 —
+  **클라에 같은 표를 또 적지 말 것**(VIP 등급표와 같은 이유: 서버 밸런스를 고칠 때 화면만 조용히 틀려진다).
+- **⚠ 모든 액션이 read-modify-write 라 `version` 가드가 필수다** — 인벤토리가 JSON 한 칸이라 두 요청이
+  겹치면 뒤에 쓴 쪽이 상대의 보상을 통째로 지운다(더블클릭 한 번이면 재현된다). `commit()` 이
+  `WHERE user_id=? AND version=?` 로 원자적으로 막고 0행이면 재시도를 돌려준다(`dungeon_rooms.version`
+  과 같은 관용구). **새 액션을 추가할 때 `commit()` 을 우회해 직접 UPDATE 하지 말 것.**
+- **애니메이션은 "아주 살짝만"**(`src/crate/crate.css`, 전부 0.2~0.7초) — 상자가 0.42초 흔들린 뒤 결과
+  카드가 40ms 간격으로 튀어나온다. ⚠ 여러 개를 깔 때 **상자별로 차례로 보여주면 10연차가 고문**이
+  되므로 같은 보상끼리 합산해(`aggregate`) 한 번에 띄운다. 서버 응답이 애니메이션보다 빨리 와도
+  흔들림은 끝까지 재생한다(`Promise.all` 로 최소 시간 보장 — 안 그러면 결과만 툭 튀어나온다).
+- **⚠ 인벤토리 드래그는 포인터 좌표를 리렌더에 태우지 않는다**(`Inventory.tsx`) — 칸이 수백 개까지
+  가므로 매 `pointermove` 마다 `setState` 하면 그 전부가 다시 그려진다. 고스트는 `ref` 로 DOM 을 직접
+  움직이고 리렌더는 **드롭 대상이 바뀔 때만** 일어난다. 고스트는 조건부로 마운트하면 안 되고
+  (첫 프레임에 (0,0) 에서 튄다) `pointer-events: none` 이어야 한다(`elementFromPoint` 가 아래 칸을
+  못 찾는다). 끌어 놓기와 **탭 두 번**을 같은 이벤트로 처리한다(모바일엔 우클릭도 hover 도 없다).
+- 파산 구제: 가진 걸 전부 팔아도 가장 싼 상자를 못 사면(`broke`) 지원금 250골드를 1일 5회까지
+  (KST 날짜 기준 — 트레이딩 `refill.ts` 와 같은 "요청 시점에 계산" 패턴, 별도 cron 불필요).
+
+## 11. 백로그 (열린 항목)
 
 > 완료된 작업 78건의 배경·수정 내용·검증 기록은 **[docs/HISTORY.md](docs/HISTORY.md)** 로 옮겼다.
 > 규칙·불변식의 진실원본은 언제나 이 문서 본문(§2·§4·§6)이고, 이력은 "왜 그렇게 됐는지"를 되짚을 때만 연다.
@@ -1308,5 +1381,6 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 
 - [ ] 가상 코인 3종 이상 추가 — 페어 파라미터화·봇 재고 분리는 끝났고(`VIRTUAL_PAIRS`/`bot_inventory`) `VIRTUAL_SYMBOLS`+`spot_bot_state` 시작가 행만 추가하면 된다. 틱 예산은 코인 수로 나눠 쓰므로 비용은 안 늘지만 코인당 움직임이 성겨진다
 - [ ] 미니 RTS 확장(종족 추가, 유닛 다양화, 난이도 선택, 리플레이)
+- [ ] 상자깡(§10) 확장 — 재료 카테고리 추가, 상자 Lv4 이상, 도감 완성 보상. ⚠ 무엇을 얹든 `npm run sim:crate` 로 naive 70%/optimal 110% 를 다시 맞출 것
 - [ ] 펀딩비 반영
 - [ ] 랭킹 새로고침 최적화(현재 5초 폴링 → 서버 캐시/집계)

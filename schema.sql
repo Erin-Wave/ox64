@@ -547,3 +547,37 @@ CREATE INDEX IF NOT EXISTS idx_dungeon_players_room ON dungeon_players(room_code
 -- (배포 시점에 진행 중이던 버킷 하나만 해당 — 다음 버킷부터는 정상).
 -- ALTER TABLE spot_candles ADD COLUMN open_at INTEGER NOT NULL DEFAULT 0;
 -- ALTER TABLE spot_candles ADD COLUMN close_at INTEGER NOT NULL DEFAULT 0;
+
+-- ── 상자깡(ox64.app/c) — 상자를 까서 재료·돈을 얻고, 재료를 합쳐 값을 올리는 미니게임 ────────────
+-- 트레이딩·퍼즐·던전 어느 쪽과도 완전히 분리된 별도 재화(coins)다. 계정만 기존 users 테이블
+-- (이름+패스코드, 세션 쿠키)을 그대로 재사용한다.
+-- ⚠⚠ **한 유저의 모든 상태가 이 한 행에 들어간다** — 인벤토리도 보유 상자도 도감도 전부 JSON 칸
+-- 하나씩이라, 상자를 몇 개 까든 재료가 몇 종이든 **D1 쓰기가 항상 1행**이다(§6 "매 틱 통째로 교체되는
+-- 스냅샷은 행으로 쪼개지 말고 이미 UPDATE 하는 행의 JSON 칸에 담는다" — 봇 호가 사다리(book_json)와
+-- 같은 사상). 아이템을 행으로 쪼개면 개봉 한 번이 수십 행이 되어 무료 플랜 일일 쓰기를 태운다.
+-- 서버 권위: 드롭 추첨(rollCrate)·머지·판매는 전부 서버가 계산하고, 클라는 결과를 받아 그리기만 한다.
+CREATE TABLE IF NOT EXISTS crate_stats (
+  user_id      TEXT PRIMARY KEY,
+  coins        REAL NOT NULL DEFAULT 600,    -- 이 게임 전용 재화(골드). users.balance(USDT)와 무관
+  inv_json     TEXT NOT NULL DEFAULT '{}',   -- JSON: {"wood:1": 37, "shard:4": 2, …} 재료 인벤토리
+  crates_json  TEXT NOT NULL DEFAULT '{}',   -- JSON: {"1": 3, "2": 0, "3": 1} 아직 안 깐 보유 상자
+  seen_json    TEXT NOT NULL DEFAULT '[]',   -- JSON: 한 번이라도 얻어본 재료 키 목록(도감)
+  opened       INTEGER NOT NULL DEFAULT 0,   -- 누적 개봉 수
+  merged       INTEGER NOT NULL DEFAULT 0,   -- 누적 머지 횟수
+  spent        REAL NOT NULL DEFAULT 0,      -- 상자 구매에 쓴 골드 누계
+  earned       REAL NOT NULL DEFAULT 0,      -- 드롭+판매로 번 골드 누계
+  best_coins   REAL NOT NULL DEFAULT 600,    -- 최고 보유 골드(기록용)
+  jackpots     INTEGER NOT NULL DEFAULT 0,   -- 극한 확률 잭팟이 터진 횟수
+  version      INTEGER NOT NULL DEFAULT 0,   -- 낙관적 동시성 카운터 — 인벤토리가 JSON 한 칸이라 모든
+                                             -- 액션이 read-modify-write 다. 더블클릭·중복 요청이 서로의
+                                             -- 결과를 덮어쓰지 않게 `WHERE version=?` 로 원자적으로 막는다
+                                             -- (0행이면 재시도 — dungeon_rooms.version 과 같은 관용구).
+  refill_count INTEGER NOT NULL DEFAULT 0,   -- 오늘(refill_date) 사용한 리필 횟수(빈털터리일 때만 가능)
+  refill_date  TEXT,
+  created_at   INTEGER NOT NULL
+);
+
+-- ⚠ 일회성 마이그레이션 (2026-09-10 추가, 상자깡): 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` 다.
+-- `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 생성된다(ALTER 불필요).
+-- **`/api/crate` 코드가 이 테이블을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩·
+-- 퍼즐·던전 라우트와 완전히 분리돼 있어 없어도 그쪽엔 영향이 없고 `/api/crate` 만 500 이 된다.

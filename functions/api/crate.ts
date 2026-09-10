@@ -1,0 +1,462 @@
+import { type Ctx, type Env, bad, json, safe, missingEnv, getSession, todayKst } from '../_shared';
+import {
+  CATS,
+  CAT_BY_KEY,
+  CRATES,
+  CRATE_BY_LEVEL,
+  CRATE_REFILL_AMOUNT,
+  CRATE_REFILL_DAILY_LIMIT,
+  JACKPOTS,
+  MAX_OPEN_AT_ONCE,
+  MERGE_MULT,
+  SHARD_CRATE_ODDS,
+  SHOP_MAX_BUY,
+  START_COINS,
+  invKey,
+  isValidMat,
+  matValue,
+  parseInvKey,
+  rollCrate,
+  rollShardCrate,
+  slotsOf,
+  type MatCat,
+  type RewardItem,
+} from '../_crateData';
+
+/**
+ * GET  /api/crate
+ * POST /api/crate { action: 'buy',    level, count }
+ * POST /api/crate { action: 'open',   level, count }
+ * POST /api/crate { action: 'merge',  cat, level, times }   ← shard 최고 레벨이면 랜덤 상자가 나온다
+ * POST /api/crate { action: 'mergeAll' }
+ * POST /api/crate { action: 'sell',   cat, level, count }    ← count 생략/음수면 전량
+ * POST /api/crate { action: 'sellAll', maxLevel }            ← 그 레벨 이하 재료 일괄 판매(상자조각 제외)
+ * POST /api/crate { action: 'refill' }
+ *
+ * "상자깡"(ox64.app/c) — 상자를 까서 재료·돈을 얻고, 같은 재료 2개를 합쳐(merge) 레벨을 올려 값을
+ * 불리는 미니게임. 코인 트레이딩·퍼즐·던전과 완전히 분리된 별도 재화(crate_stats.coins)이고 계정만
+ * 공유한다(세션 쿠키).
+ *
+ * ⚠ 서버 권위: 드롭 추첨(rollCrate)·머지·판매·잔고를 전부 서버가 계산한다. 클라가 보내는 건
+ * "무엇을 몇 개" 뿐이고 결과값은 절대 신뢰하지 않는다(트레이딩의 "체결가는 서버가 fetch" 와 같은 사상).
+ *
+ * ⚠ D1 비용(§6): 한 요청이 **읽기 1행 + 쓰기 1행**이다. 유저의 모든 상태(코인·인벤토리·보유 상자·
+ * 도감·통계)가 crate_stats 한 행에 JSON 칸으로 들어있어서, 상자를 10개 까든 재료가 30종이든 쓰기가
+ * 늘지 않는다. **아이템을 행으로 쪼개는 설계로 되돌리지 말 것** — 개봉 한 번이 수십 행이 된다.
+ * 폴링도 없다(싱글플레이라 남의 상태를 볼 이유가 없다).
+ */
+export function onRequestGet({ request, env }: Ctx): Promise<Response> {
+  return safe(() => handleGet(request, env));
+}
+export function onRequestPost({ request, env }: Ctx): Promise<Response> {
+  return safe(() => handlePost(request, env));
+}
+
+interface CrateRow {
+  user_id: string;
+  coins: number;
+  inv_json: string;
+  crates_json: string;
+  seen_json: string;
+  opened: number;
+  merged: number;
+  spent: number;
+  earned: number;
+  best_coins: number;
+  jackpots: number;
+  version: number;
+  refill_count: number;
+  refill_date: string | null;
+}
+
+/** 메모리에서 굴리는 작업 상태 — 계산이 끝나면 통째로 한 문장에 커밋한다. */
+interface Work {
+  row: CrateRow;
+  inv: Record<string, number>;
+  crates: Record<string, number>;
+  seen: Set<string>;
+  coins: number;
+  opened: number;
+  merged: number;
+  spent: number;
+  earned: number;
+  jackpots: number;
+}
+
+function parseJson<T>(s: string, fallback: T): T {
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === 'object' ? (v as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * 상태 행을 읽는다. 없으면 INSERT 하되 **없을 때만** 쓴다(계정당 평생 1회) — 던전에서 배운 교훈:
+ * 매 요청 `INSERT OR IGNORE` 를 때리면 그 자체가 쓰기 비용이 된다(§8).
+ */
+async function loadRow(env: Env, uid: string): Promise<CrateRow> {
+  const row = await env.DB.prepare('SELECT * FROM crate_stats WHERE user_id = ?').bind(uid).first<CrateRow>();
+  if (row) return row;
+  const now = Date.now();
+  await env.DB.prepare('INSERT OR IGNORE INTO crate_stats (user_id, coins, best_coins, created_at) VALUES (?,?,?,?)')
+    .bind(uid, START_COINS, START_COINS, now)
+    .run();
+  return {
+    user_id: uid,
+    coins: START_COINS,
+    inv_json: '{}',
+    crates_json: '{}',
+    seen_json: '[]',
+    opened: 0,
+    merged: 0,
+    spent: 0,
+    earned: 0,
+    best_coins: START_COINS,
+    jackpots: 0,
+    version: 0,
+    refill_count: 0,
+    refill_date: null,
+  };
+}
+
+function toWork(row: CrateRow): Work {
+  const inv = parseJson<Record<string, number>>(row.inv_json, {});
+  const crates = parseJson<Record<string, number>>(row.crates_json, {});
+  const seenArr = parseJson<string[]>(row.seen_json, []) as string[];
+  return {
+    row,
+    inv,
+    crates,
+    seen: new Set(Array.isArray(seenArr) ? seenArr : []),
+    coins: row.coins,
+    opened: row.opened,
+    merged: row.merged,
+    spent: row.spent,
+    earned: row.earned,
+    jackpots: row.jackpots,
+  };
+}
+
+const invCount = (w: Work, cat: MatCat, level: number) => w.inv[invKey(cat, level)] ?? 0;
+function addMat(w: Work, cat: MatCat, level: number, n: number) {
+  const k = invKey(cat, level);
+  const next = (w.inv[k] ?? 0) + n;
+  if (next <= 0) delete w.inv[k];
+  else w.inv[k] = next;
+  if (n > 0) w.seen.add(k);
+}
+function addCrate(w: Work, level: number, n: number) {
+  const k = String(level);
+  const next = (w.crates[k] ?? 0) + n;
+  if (next <= 0) delete w.crates[k];
+  else w.crates[k] = next;
+}
+
+/**
+ * 계산 결과를 한 문장으로 커밋한다. `WHERE version = ?` 가드가 read-modify-write 의 lost update 를
+ * 막는다 — 인벤토리 전체가 JSON 한 칸이라 두 요청이 겹치면 뒤에 쓴 쪽이 상대의 보상을 통째로
+ * 지워버릴 수 있다(더블클릭 한 번이면 재현된다). 0행이면 호출자가 "다시 시도"를 돌려준다.
+ */
+async function commit(env: Env, w: Work, extra?: { refillCount: number; refillDate: string }): Promise<boolean> {
+  const bestCoins = Math.max(w.row.best_coins, w.coins);
+  const res = await env.DB.prepare(
+    'UPDATE crate_stats SET coins=?, inv_json=?, crates_json=?, seen_json=?, opened=?, merged=?, spent=?, earned=?,' +
+      ' best_coins=?, jackpots=?, refill_count=?, refill_date=?, version=version+1 WHERE user_id=? AND version=?',
+  )
+    .bind(
+      w.coins,
+      JSON.stringify(w.inv),
+      JSON.stringify(w.crates),
+      JSON.stringify([...w.seen]),
+      w.opened,
+      w.merged,
+      w.spent,
+      w.earned,
+      bestCoins,
+      w.jackpots,
+      extra ? extra.refillCount : w.row.refill_count,
+      extra ? extra.refillDate : w.row.refill_date,
+      w.row.user_id,
+      w.row.version,
+    )
+    .run();
+  return (res.meta?.changes ?? 0) > 0;
+}
+
+// ── 응답 ────────────────────────────────────────────────────────────────────────
+
+/** 재료 인벤토리를 전부 팔았을 때의 값 — 리필 자격(빈털터리 판정)과 "총자산" 표시에 쓴다. */
+function inventoryValue(w: Work): number {
+  let sum = 0;
+  for (const [k, n] of Object.entries(w.inv)) {
+    const parsed = parseInvKey(k);
+    if (parsed) sum += matValue(parsed.cat, parsed.level) * n;
+  }
+  return sum;
+}
+function crateValue(w: Work): number {
+  let sum = 0;
+  for (const [k, n] of Object.entries(w.crates)) sum += (CRATE_BY_LEVEL.get(Number(k))?.price ?? 0) * n;
+  return sum;
+}
+
+/**
+ * 확률 공시 — 상점에 그대로 표시한다(가챠 확률 공개). 클라에 드롭 테이블을 중복 정의하지 않고
+ * 서버 값을 그대로 렌더하게 하는 건 VIP 등급표(loadState.vipTiers)와 같은 패턴이다.
+ */
+function shopPayload() {
+  return CRATES.map((def) => ({
+    level: def.level,
+    name: def.name,
+    emoji: def.emoji,
+    price: def.price,
+    desc: def.desc,
+    odds: slotsOf(def.level).map((s) => ({
+      p: s.p,
+      jackpot: s.jackpot ?? null,
+      kind: s.drop.kind,
+      cat: s.drop.kind === 'mat' ? s.drop.cat : null,
+      level: s.drop.kind === 'coin' ? 0 : s.drop.level,
+      min: s.drop.min,
+      max: s.drop.max,
+    })),
+  }));
+}
+
+function statePayload(w: Work) {
+  const today = todayKst();
+  const usedToday = w.row.refill_date === today ? w.row.refill_count : 0;
+  const invValue = inventoryValue(w);
+  const netWorth = w.coins + invValue + crateValue(w);
+  const cheapest = CRATES[0].price;
+  return {
+    coins: w.coins,
+    inv: w.inv,
+    crates: w.crates,
+    seen: [...w.seen],
+    invValue,
+    netWorth,
+    stats: {
+      opened: w.opened,
+      merged: w.merged,
+      spent: w.spent,
+      earned: w.earned,
+      bestCoins: Math.max(w.row.best_coins, w.coins),
+      jackpots: w.jackpots,
+    },
+    refillsLeft: Math.max(0, CRATE_REFILL_DAILY_LIMIT - usedToday),
+    /** 리필 자격 — 가진 걸 전부 팔아도 가장 싼 상자를 못 사는 상태(진짜 빈털터리)일 때만 준다. */
+    broke: netWorth < cheapest,
+    // ── 클라가 중복 정의하면 안 되는 기준표(서버가 진실원본) ──
+    mergeMult: MERGE_MULT,
+    cats: CATS.map((c) => ({
+      cat: c.cat,
+      name: c.name,
+      emoji: c.emoji,
+      color: c.color,
+      maxLevel: c.maxLevel,
+      desc: c.desc,
+      values: Array.from({ length: c.maxLevel }, (_, i) => matValue(c.cat, i + 1)),
+    })),
+    shop: shopPayload(),
+    shardOdds: SHARD_CRATE_ODDS,
+    jackpotTiers: JACKPOTS.map((j) => ({ tier: j.tier, p: j.p, mult: j.mult, label: j.label })),
+    limits: { maxBuy: SHOP_MAX_BUY, maxOpen: MAX_OPEN_AT_ONCE, refillAmount: CRATE_REFILL_AMOUNT },
+  };
+}
+
+async function handleGet(request: Request, env: Env): Promise<Response> {
+  const envErr = missingEnv(env);
+  if (envErr) return bad(envErr, 500);
+  const sess = await getSession(request, env);
+  if (!sess) return bad('unauthorized', 401);
+  return json(statePayload(toWork(await loadRow(env, sess.uid))));
+}
+
+const RETRY_MSG = '동시에 처리된 요청이 있습니다. 다시 시도해주세요';
+
+async function handlePost(request: Request, env: Env): Promise<Response> {
+  const envErr = missingEnv(env);
+  if (envErr) return bad(envErr, 500);
+  const sess = await getSession(request, env);
+  if (!sess) return bad('unauthorized', 401);
+  const uid = sess.uid;
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return bad('invalid json');
+  }
+
+  const w = toWork(await loadRow(env, uid));
+  const action = String(body.action ?? '');
+
+  // ── 상자 구매 ────────────────────────────────────────────────────────────────
+  if (action === 'buy') {
+    const level = Math.round(Number(body.level));
+    const count = Math.round(Number(body.count ?? 1));
+    const def = CRATE_BY_LEVEL.get(level);
+    if (!def) return bad('없는 상자입니다');
+    if (!(count >= 1 && count <= SHOP_MAX_BUY)) return bad(`한 번에 1~${SHOP_MAX_BUY}개까지 살 수 있습니다`);
+    const cost = def.price * count;
+    if (w.coins < cost) return bad(`골드가 부족합니다 (${cost.toLocaleString()} 필요)`);
+    w.coins -= cost;
+    w.spent += cost;
+    addCrate(w, level, count);
+    if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
+    return json({ ...statePayload(w), bought: { level, count, cost } });
+  }
+
+  // ── 상자 개봉 ────────────────────────────────────────────────────────────────
+  if (action === 'open') {
+    const level = Math.round(Number(body.level));
+    const count = Math.round(Number(body.count ?? 1));
+    if (!CRATE_BY_LEVEL.has(level)) return bad('없는 상자입니다');
+    if (!(count >= 1 && count <= MAX_OPEN_AT_ONCE)) return bad(`한 번에 1~${MAX_OPEN_AT_ONCE}개까지 깔 수 있습니다`);
+    const have = w.crates[String(level)] ?? 0;
+    if (have < count) return bad('보유한 상자가 부족합니다');
+    addCrate(w, level, -count);
+
+    // 상자별 결과를 따로 담는다 — 클라가 한 상자씩 차례로 애니메이션을 재생한다.
+    const results: RewardItem[][] = [];
+    let jackpotHit = 0;
+    for (let i = 0; i < count; i++) {
+      const rewards = rollCrate(level);
+      for (const r of rewards) {
+        if (r.jackpot) jackpotHit++;
+        if (r.kind === 'coin') {
+          w.coins += r.count;
+          w.earned += r.count;
+        } else if (r.kind === 'mat' && r.cat) {
+          addMat(w, r.cat, r.level, r.count);
+        } else if (r.kind === 'crate') {
+          addCrate(w, r.level, r.count);
+        }
+      }
+      results.push(rewards);
+    }
+    w.opened += count;
+    w.jackpots += jackpotHit;
+    if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
+    return json({ ...statePayload(w), opened: { level, count, results } });
+  }
+
+  // ── 머지 ─────────────────────────────────────────────────────────────────────
+  // 같은 카테고리·같은 레벨 2개 → 다음 레벨 1개. 카테고리는 절대 안 바뀐다.
+  // 상자조각만 예외: 최고 레벨(Lv4) 2개는 다음 레벨이 없으므로 **랜덤 상자**가 된다.
+  if (action === 'merge') {
+    const cat = String(body.cat ?? '') as MatCat;
+    const level = Math.round(Number(body.level));
+    const times = Math.max(1, Math.round(Number(body.times ?? 1)));
+    if (!isValidMat(cat, level)) return bad('없는 재료입니다');
+    const def = CAT_BY_KEY.get(cat)!;
+    const have = invCount(w, cat, level);
+    if (have < 2 * times) return bad('재료가 부족합니다 (2개가 필요합니다)');
+
+    if (level >= def.maxLevel) {
+      if (cat !== 'shard') return bad(`${def.name}은(는) Lv${def.maxLevel}이 최고 레벨입니다`);
+      // 상자조각 Lv4 2개 → 랜덤 상자 1개(확률적으로 더 높은 레벨이 나온다)
+      const gained: number[] = [];
+      for (let i = 0; i < times; i++) {
+        const lv = rollShardCrate();
+        addCrate(w, lv, 1);
+        gained.push(lv);
+      }
+      addMat(w, cat, level, -2 * times);
+      w.merged += times;
+      if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
+      return json({ ...statePayload(w), shardCrates: gained });
+    }
+
+    addMat(w, cat, level, -2 * times);
+    addMat(w, cat, level + 1, times);
+    w.merged += times;
+    if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
+    return json({ ...statePayload(w), merged: { cat, from: level, to: level + 1, times } });
+  }
+
+  // ── 전부 머지 ────────────────────────────────────────────────────────────────
+  // 낮은 레벨부터 올려서 연쇄시킨다(Lv1 4개 → Lv2 2개 → Lv3 1개가 한 번에 된다).
+  // ⚠ 상자조각 최고 레벨은 **건드리지 않는다** — 그건 상자를 뽑는 도박이라 유저가 직접 눌러야 한다.
+  if (action === 'mergeAll') {
+    let total = 0;
+    for (const def of CATS) {
+      for (let lv = 1; lv < def.maxLevel; lv++) {
+        const have = invCount(w, def.cat, lv);
+        const pairs = Math.floor(have / 2);
+        if (pairs <= 0) continue;
+        addMat(w, def.cat, lv, -2 * pairs);
+        addMat(w, def.cat, lv + 1, pairs);
+        total += pairs;
+      }
+    }
+    if (total === 0) return bad('합칠 수 있는 재료가 없습니다');
+    w.merged += total;
+    if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
+    return json({ ...statePayload(w), mergedAll: total });
+  }
+
+  // ── 판매 ─────────────────────────────────────────────────────────────────────
+  if (action === 'sell') {
+    const cat = String(body.cat ?? '') as MatCat;
+    const level = Math.round(Number(body.level));
+    if (!isValidMat(cat, level)) return bad('없는 재료입니다');
+    const have = invCount(w, cat, level);
+    if (have <= 0) return bad('보유한 재료가 없습니다');
+    const asked = Number(body.count);
+    const count = Number.isFinite(asked) && asked > 0 ? Math.min(Math.floor(asked), have) : have;
+    const gain = matValue(cat, level) * count;
+    addMat(w, cat, level, -count);
+    w.coins += gain;
+    w.earned += gain;
+    if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
+    return json({ ...statePayload(w), sold: { cat, level, count, gain } });
+  }
+
+  // ── 일괄 판매 ────────────────────────────────────────────────────────────────
+  // "Lv2 이하 전부 팔기" 처럼 자잘한 재료를 한 번에 정리하는 편의 기능.
+  // ⚠ 상자조각은 제외한다 — 팔면 손해인 재료라(상자로 바꾸는 게 1.7배) 실수로 날리면 뼈아프다.
+  if (action === 'sellAll') {
+    const maxLevel = Math.round(Number(body.maxLevel ?? 1));
+    if (!(maxLevel >= 1 && maxLevel <= 6)) return bad('잘못된 레벨입니다');
+    let gain = 0;
+    let count = 0;
+    for (const def of CATS) {
+      if (def.cat === 'shard') continue;
+      for (let lv = 1; lv <= Math.min(maxLevel, def.maxLevel); lv++) {
+        const have = invCount(w, def.cat, lv);
+        if (have <= 0) continue;
+        gain += matValue(def.cat, lv) * have;
+        count += have;
+        addMat(w, def.cat, lv, -have);
+      }
+    }
+    if (count === 0) return bad('팔 재료가 없습니다');
+    w.coins += gain;
+    w.earned += gain;
+    if (!(await commit(env, w))) return bad(RETRY_MSG, 409);
+    return json({ ...statePayload(w), sold: { cat: null, level: maxLevel, count, gain } });
+  }
+
+  // ── 리필(빈털터리 구제) ──────────────────────────────────────────────────────
+  // 트레이딩 refill.ts 와 같은 패턴 — 별도 리셋 cron 없이 "요청 시점에 KST 날짜를 비교"한다.
+  if (action === 'refill') {
+    const netWorth = w.coins + inventoryValue(w) + crateValue(w);
+    if (netWorth >= CRATES[0].price) return bad('아직 상자를 살 수 있습니다 (재료를 팔아보세요)');
+    const today = todayKst();
+    const usedToday = w.row.refill_date === today ? w.row.refill_count : 0;
+    if (usedToday >= CRATE_REFILL_DAILY_LIMIT)
+      return bad(`오늘 지원 횟수를 모두 썼습니다 (${CRATE_REFILL_DAILY_LIMIT}/${CRATE_REFILL_DAILY_LIMIT})`);
+    w.coins += CRATE_REFILL_AMOUNT;
+    if (!(await commit(env, w, { refillCount: usedToday + 1, refillDate: today }))) return bad(RETRY_MSG, 409);
+    // commit 에 넘긴 리필 카운트를 응답에도 반영해야 남은 횟수가 즉시 맞다(row 는 읽은 시점 값이다).
+    w.row.refill_count = usedToday + 1;
+    w.row.refill_date = today;
+    return json({ ...statePayload(w), refilled: CRATE_REFILL_AMOUNT });
+  }
+
+  return bad('알 수 없는 액션');
+}
