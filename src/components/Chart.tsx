@@ -10,16 +10,26 @@ import {
   type CandlestickData,
   type HistogramData,
   type LineData,
+  type WhitespaceData,
   type SeriesMarker,
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
 import { fetchKlines, fetchPricePrecision } from '@/services/binanceRest';
 import { klineStream } from '@/services/binanceWs';
-import { ema, bollinger, rsi } from '@/services/indicators';
+import type { Series } from '@/services/indicators';
+import {
+  INDICATOR_DEFS,
+  OVERLAY_TYPES,
+  OSCILLATOR_TYPES,
+  indicatorTitle,
+  type IndicatorFormat,
+  type IndicatorType,
+  type LineStyleName,
+} from '@/services/indicatorDefs';
 import { api } from '@/services/api';
 import { useMarketStore } from '@/store/useMarketStore';
-import { useChartStore, type IndicatorConfig, type IndicatorType, type ChartColorScheme } from '@/store/useChartStore';
+import { useChartStore, type IndicatorConfig, type ChartColorScheme } from '@/store/useChartStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol } from '@/symbols';
@@ -27,7 +37,6 @@ import { fmtPrice, fmtPriceShort, fmtQtyShort, virtualPrecision } from '@/format
 import Clock from '@/components/Clock';
 import type { Candle } from '@/types';
 
-const IND_LABEL: Record<IndicatorType, string> = { ema: 'EMA', bb: 'Bollinger', rsi: 'RSI' };
 const IND_COLORS = ['#f0b90b', '#4a90e2', '#c77dff', '#00c076', '#ff6b6b', '#3bb2d0', '#e08fd6'];
 
 // 차트 캔버스 색(배경/격자/축 텍스트/캔들) — UI 크롬은 index.css 의 CSS 변수로,
@@ -61,9 +70,11 @@ function volColors(c: ChartColors): { up: string; down: string } {
   return { up: withAlpha(c.up, VOL_ALPHA), down: withAlpha(c.down, VOL_ALPHA) };
 }
 
-type BbSeries = { upper: ISeriesApi<'Line'>; basis: ISeriesApi<'Line'>; lower: ISeriesApi<'Line'> };
-type BbValues = { upper: number; basis: number; lower: number };
-type IndLegendValue = number | BbValues;
+type IndSeries = ISeriesApi<'Line'> | ISeriesApi<'Histogram'>;
+/** 인디케이터 인스턴스 하나 = 선 키 → 시리즈 (indicatorDefs 의 lines 와 1:1) */
+type IndSeriesMap = Map<string, IndSeries>;
+/** 레전드 값: 선 키 → 그 시점 값 */
+type IndLegendValue = Record<string, number>;
 
 const toChart = (t: number) => (t + KST_OFFSET) as UTCTimestamp;
 const fmtKst = (realSec: number, withSeconds = false) => {
@@ -72,11 +83,33 @@ const fmtKst = (realSec: number, withSeconds = false) => {
   const base = `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
   return withSeconds ? `${base}:${p(d.getUTCSeconds())}` : base;
 };
-const line = (arr: (number | null)[], times: number[]): LineData[] => {
-  const out: LineData[] = [];
-  for (let i = 0; i < arr.length; i++) if (arr[i] != null) out.push({ time: toChart(times[i]), value: arr[i]! });
+// ⚠ null 은 건너뛰지 않고 whitespace(`{time}` 만)로 넣는다 — **그 자리에서 선이 끊겨야** 하는 지표가 있다
+// (SuperTrend 국면 전환, Ichimoku 후행스팬 끝, 워밍업). 건너뛰면 LWC 가 앞뒤 점을 이어 있지도 않은 선을 그린다.
+const line = (arr: Series, times: number[]): (LineData | WhitespaceData)[] =>
+  arr.map((v, i) => (v == null ? { time: toChart(times[i]) } : { time: toChart(times[i]), value: v }));
+const histData = (arr: Series, times: number[], up: string, down: string): (HistogramData | WhitespaceData)[] =>
+  arr.map((v, i) => (v == null ? { time: toChart(times[i]) } : { time: toChart(times[i]), value: v, color: v >= 0 ? up : down }));
+/** 선 길이가 봉 수를 넘으면(Ichimoku 선행스팬 = n+kijun) 마지막 봉 뒤로 인터벌만큼 시간을 늘려 붙인다. */
+const extendTimes = (times: number[], extra: number, stepSec: number): number[] => {
+  const out = times.slice();
+  let last = times.length ? times[times.length - 1] : 0;
+  for (let i = 0; i < extra; i++) out.push((last += stepSec));
   return out;
 };
+const LWC_STYLE: Record<LineStyleName, LineStyle> = { solid: LineStyle.Solid, dotted: LineStyle.Dotted, dashed: LineStyle.Dashed };
+const fmtIndValue = (fmt: IndicatorFormat, v: number, prec: number): string =>
+  fmt === 'price' ? fmtPriceShort(v, prec, 9) : fmt === 'fixed1' ? v.toFixed(1) : fmt === 'fixed2' ? v.toFixed(2) : fmtQtyShort(v, 9);
+
+/** 인디케이터 표시/숨김 아이콘(눈 / 빗금 친 눈). 이모지는 폰트에 따라 깨져서 인라인 SVG 로. */
+function EyeIcon({ off }: { off: boolean }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
+      <circle cx="12" cy="12" r="3" />
+      {off && <path d="M3 3l18 18" />}
+    </svg>
+  );
+}
 
 export default function Chart() {
   const symbol = useMarketStore((s) => s.symbol);
@@ -100,12 +133,10 @@ export default function Chart() {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
-  const indSeriesRef = useRef<Map<string, ISeriesApi<'Line'> | BbSeries>>(new Map());
-  // syncIndicators() 가 candlesRef 와 나란한 인덱스로 채워두는 원본 계산값 —
+  const indSeriesRef = useRef<Map<string, IndSeriesMap>>(new Map());
+  // syncIndicators() 가 candlesRef 와 나란한 인덱스로 채워두는 원본 계산값(선 키별) —
   // 크로스헤어가 벗어났을 때(마지막 값) 또는 hover 시점 조회에 사용.
-  const indValuesRef = useRef<
-    Map<string, (number | null)[] | { upper: (number | null)[]; basis: (number | null)[]; lower: (number | null)[] }>
-  >(new Map());
+  const indValuesRef = useRef<Map<string, Record<string, Series>>>(new Map());
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const volMap = useRef<Map<number, number>>(new Map());
@@ -140,16 +171,20 @@ export default function Chart() {
   // indValuesRef 는 그냥 ref 라 여기서 최신값을 읽어도 클로저 staleness 문제가 없다.
   const lastIndLegend = (): Record<string, IndLegendValue> => {
     const out: Record<string, IndLegendValue> = {};
-    for (const [id, arr] of indValuesRef.current) {
-      if (Array.isArray(arr)) {
-        const v = arr.at(-1);
-        if (v != null) out[id] = v;
-      } else {
-        const u = arr.upper.at(-1);
-        const b = arr.basis.at(-1);
-        const l = arr.lower.at(-1);
-        if (u != null && b != null && l != null) out[id] = { upper: u, basis: b, lower: l };
+    const n = candlesRef.current.length;
+    if (n === 0) return out;
+    for (const [id, vals] of indValuesRef.current) {
+      const rec: IndLegendValue = {};
+      let any = false;
+      for (const [key, arr] of Object.entries(vals)) {
+        // 선행스팬처럼 봉 수보다 긴 선도 "현재 봉" 자리(n-1)의 값을 보여준다
+        const v = arr[n - 1];
+        if (v != null) {
+          rec[key] = v;
+          any = true;
+        }
       }
+      if (any) out[id] = rec;
     }
     return out;
   };
@@ -285,17 +320,19 @@ export default function Chart() {
       setLegend({ time: real, open: d.open, high: d.high, low: d.low, close: d.close, volume: volMap.current.get(real) });
 
       // 인디케이터 값 — 각 시리즈에 그 시점 데이터가 있으면 param.seriesData 에서 바로 조회.
+      // whitespace 점(값 없음 = 선이 끊긴 자리)은 건너뛴다.
       const nextInd: Record<string, IndLegendValue> = {};
-      for (const [id, s] of indSeriesRef.current) {
-        if ('upper' in s) {
-          const u = param.seriesData.get(s.upper) as LineData | undefined;
-          const b = param.seriesData.get(s.basis) as LineData | undefined;
-          const lo = param.seriesData.get(s.lower) as LineData | undefined;
-          if (u && b && lo) nextInd[id] = { upper: u.value, basis: b.value, lower: lo.value };
-        } else {
-          const v = param.seriesData.get(s) as LineData | undefined;
-          if (v) nextInd[id] = v.value;
+      for (const [id, m] of indSeriesRef.current) {
+        const rec: IndLegendValue = {};
+        let any = false;
+        for (const [key, s] of m) {
+          const v = param.seriesData.get(s) as { value?: number } | undefined;
+          if (v && typeof v.value === 'number') {
+            rec[key] = v.value;
+            any = true;
+          }
         }
+        if (any) nextInd[id] = rec;
       }
       setIndLegend(nextInd);
     });
@@ -352,62 +389,72 @@ export default function Chart() {
     const candles = candlesRef.current;
     if (!chart || candles.length === 0) return;
     const o = optsRef.current;
-    const closes = candles.map((c) => c.close);
     const times = candles.map((c) => c.time);
 
     // 더 이상 존재하지 않는 인디케이터 인스턴스의 시리즈 제거
     const activeIds = new Set(o.indicators.map((i) => i.id));
-    for (const [id, ref] of indSeriesRef.current) {
+    for (const [id, m] of indSeriesRef.current) {
       if (activeIds.has(id)) continue;
-      if ('upper' in ref) {
-        chart.removeSeries(ref.upper);
-        chart.removeSeries(ref.basis);
-        chart.removeSeries(ref.lower);
-      } else {
-        chart.removeSeries(ref);
-      }
+      for (const s of m.values()) chart.removeSeries(s);
       indSeriesRef.current.delete(id);
       indValuesRef.current.delete(id);
     }
 
+    // 레지스트리(indicatorDefs) 기반 — 여기엔 지표 타입 분기가 없다. 선 하나 = 시리즈 하나,
+    // own 패널 지표는 priceScaleId = 지표 id 로 자기 축을 갖는다(아래 스택 배치).
+    const themeColors = chartColors(useSettingsStore.getState().theme, o.colorScheme);
+    const histUp = withAlpha(themeColors.up, 0.6);
+    const histDown = withAlpha(themeColors.down, 0.6);
+    const stepSec = intervalSec(interval);
     o.indicators.forEach((ind: IndicatorConfig, idx: number) => {
-      const color = IND_COLORS[idx % IND_COLORS.length];
-      if (ind.type === 'ema') {
-        let s = indSeriesRef.current.get(ind.id) as ISeriesApi<'Line'> | undefined;
-        if (!s) {
-          s = chart.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
-          indSeriesRef.current.set(ind.id, s);
-        }
-        const vals = ema(closes, ind.period);
-        s.setData(line(vals, times));
-        indValuesRef.current.set(ind.id, vals);
-      } else if (ind.type === 'bb') {
-        let s = indSeriesRef.current.get(ind.id) as BbSeries | undefined;
-        if (!s) {
-          s = {
-            upper: chart.addLineSeries({ color, lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false }),
-            basis: chart.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false }),
-            lower: chart.addLineSeries({ color, lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false }),
-          };
-          indSeriesRef.current.set(ind.id, s);
-        }
-        const bands = bollinger(closes, ind.period, ind.mult ?? 2);
-        s.upper.setData(line(bands.upper, times));
-        s.basis.setData(line(bands.basis, times));
-        s.lower.setData(line(bands.lower, times));
-        indValuesRef.current.set(ind.id, bands);
-      } else if (ind.type === 'rsi') {
-        let s = indSeriesRef.current.get(ind.id) as ISeriesApi<'Line'> | undefined;
-        if (!s) {
-          s = chart.addLineSeries({ color, lineWidth: 1, priceScaleId: 'rsi', priceLineVisible: false, lastValueVisible: false });
-          s.createPriceLine({ price: 70, color: '#f6465d40', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
-          s.createPriceLine({ price: 30, color: '#00c07640', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
-          indSeriesRef.current.set(ind.id, s);
-        }
-        const vals = rsi(closes, ind.period);
-        s.setData(line(vals, times));
-        indValuesRef.current.set(ind.id, vals);
+      const def = INDICATOR_DEFS[ind.type];
+      const base = IND_COLORS[idx % IND_COLORS.length];
+      let found = indSeriesRef.current.get(ind.id);
+      if (!found) {
+        found = new Map<string, IndSeries>();
+        indSeriesRef.current.set(ind.id, found);
       }
+      const series = found;
+      const scaleId = def.pane === 'own' ? ind.id : 'right';
+      const vals = def.compute(candles, ind.params);
+      indValuesRef.current.set(ind.id, vals);
+      def.lines.forEach((ln, li) => {
+        const color = ln.color ?? base;
+        let s = series.get(ln.key);
+        if (!s) {
+          if (ln.kind === 'hist') {
+            s = chart.addHistogramSeries({ priceScaleId: scaleId, base: 0, priceLineVisible: false, lastValueVisible: false });
+          } else {
+            s = chart.addLineSeries({
+              color,
+              lineWidth: ln.width ?? 1,
+              lineStyle: LWC_STYLE[ln.style ?? 'solid'],
+              priceScaleId: scaleId,
+              priceLineVisible: false,
+              lastValueVisible: false,
+              // 점 표시(Parabolic SAR): 선은 숨기고 점만 찍는다
+              ...(ln.kind === 'dots' ? { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 2, crosshairMarkerVisible: false } : {}),
+            });
+          }
+          if (li === 0 && def.levels) {
+            for (const lv of def.levels) {
+              s.createPriceLine({ price: lv.value, color: lv.color ?? '#88888855', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' });
+            }
+          }
+          series.set(ln.key, s);
+        }
+        const arr = vals[ln.key] ?? [];
+        const t = arr.length > times.length ? extendTimes(times, arr.length - times.length, stepSec) : times;
+        if (ln.kind === 'hist') {
+          (s as ISeriesApi<'Histogram'>).setData(histData(arr, t, histUp, histDown));
+        } else {
+          (s as ISeriesApi<'Line'>).setData(line(arr, t));
+          // 앞의 지표가 지워지면 배정색(idx)이 바뀌므로 매번 맞춘다 — 레전드 점 색과 어긋나지 않게
+          (s as ISeriesApi<'Line'>).applyOptions({ color });
+        }
+        // 숨김 ≠ 삭제. 시리즈·설정은 그대로 두고 visible 만 끈다(다시 켤 때 재생성 비용 0).
+        s.applyOptions({ visible: ind.visible });
+      });
     });
 
     // 거래량 히스토그램 — 최하단
@@ -429,12 +476,18 @@ export default function Chart() {
       volRef.current = null;
     }
 
-    // 하단 영역 스택 배치: [캔들] / [RSI] / [거래량]
-    const hasRsi = o.indicators.some((i) => i.type === 'rsi');
+    // 하단 영역 스택 배치: [캔들] / [own 패널 지표들 — 보이는 것만] / [거래량]. 패널이 늘면 높이를 나눠 쓴다
+    // (숨긴 지표는 자리를 차지하지 않는다).
+    const panes = o.indicators.filter((i) => i.visible && INDICATOR_DEFS[i.type].pane === 'own');
     const volH = o.volume ? 0.15 : 0;
-    const rsiH = hasRsi ? 0.16 : 0;
-    chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.06, bottom: Math.max(0.04, volH + rsiH + 0.02) } });
-    if (hasRsi) chart.priceScale('rsi').applyOptions({ scaleMargins: { top: 1 - volH - rsiH, bottom: volH } });
+    const paneH = panes.length ? Math.min(0.16, 0.55 / panes.length) : 0;
+    const total = volH + paneH * panes.length;
+    chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.06, bottom: Math.max(0.04, total + 0.02) } });
+    panes.forEach((ind, i) => {
+      chart.priceScale(ind.id).applyOptions({
+        scaleMargins: { top: 1 - volH - (panes.length - i) * paneH, bottom: volH + (panes.length - i - 1) * paneH },
+      });
+    });
     if (o.volume) chart.priceScale('vol').applyOptions({ scaleMargins: { top: 1 - volH, bottom: 0 } });
   };
   syncIndicatorsRef.current = syncIndicators;
@@ -931,7 +984,7 @@ export default function Chart() {
           {showOpts && (
             <>
               <div className="fixed inset-0 z-20" onClick={() => setShowOpts(false)} />
-              <div className="absolute left-0 top-full z-30 mt-1 w-64 rounded-lg border border-border bg-panel p-1.5 shadow-2xl">
+              <div className="absolute left-0 top-full z-30 mt-1 w-80 rounded-lg border border-border bg-panel p-1.5 shadow-2xl">
                 {(
                   [
                     ['volume', '거래량'],
@@ -958,60 +1011,77 @@ export default function Chart() {
                 {opts.indicators.length === 0 && (
                   <div className="px-2 py-1.5 text-[11px] text-muted">추가된 인디케이터 없음</div>
                 )}
-                {opts.indicators.map((ind, idx) => (
-                  <div key={ind.id} className="flex items-center gap-1.5 rounded px-2 py-1 text-xs text-text hover:bg-panel2">
-                    <span
-                      className="h-2 w-2 shrink-0 rounded-full"
-                      style={{ backgroundColor: IND_COLORS[idx % IND_COLORS.length] }}
-                    />
-                    <span className="w-16 shrink-0">{IND_LABEL[ind.type]}</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={500}
-                      value={ind.period}
-                      onChange={(e) => {
-                        const v = Math.max(1, Math.min(500, Number(e.target.value) || 1));
-                        opts.updateIndicator(ind.id, { period: v });
-                      }}
-                      className="w-14 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
-                    />
-                    {ind.type === 'bb' && (
-                      <input
-                        type="number"
-                        min={0.5}
-                        max={5}
-                        step={0.5}
-                        value={ind.mult ?? 2}
-                        onChange={(e) => {
-                          const v = Math.max(0.5, Math.min(5, Number(e.target.value) || 2));
-                          opts.updateIndicator(ind.id, { mult: v });
-                        }}
-                        className="w-12 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
-                        title="표준편차 배수"
-                      />
-                    )}
-                    <button
-                      onClick={() => opts.removeIndicator(ind.id)}
-                      className="ml-auto shrink-0 rounded px-1.5 text-muted hover:bg-elevated hover:text-down"
-                      title="삭제"
+                {opts.indicators.map((ind, idx) => {
+                  const def = INDICATOR_DEFS[ind.type];
+                  return (
+                    <div
+                      key={ind.id}
+                      className={`flex items-center gap-1 rounded px-2 py-1 text-xs text-text hover:bg-panel2 ${ind.visible ? '' : 'opacity-50'}`}
                     >
-                      ✕
-                    </button>
-                  </div>
-                ))}
+                      <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: IND_COLORS[idx % IND_COLORS.length] }} />
+                      <span className="w-[4.6rem] shrink-0 truncate" title={`${def.name}${def.pane === 'own' ? ' · 별도 패널' : ''}`}>
+                        {def.label}
+                      </span>
+                      <span className="flex flex-1 items-center justify-end gap-1">
+                        {def.params.map((p) => (
+                          <input
+                            key={p.key}
+                            type="number"
+                            min={p.min}
+                            max={p.max}
+                            step={p.step ?? 1}
+                            value={ind.params[p.key] ?? p.def}
+                            onChange={(e) => opts.updateIndicator(ind.id, { [p.key]: Number(e.target.value) })}
+                            className="w-12 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
+                            title={p.label}
+                          />
+                        ))}
+                      </span>
+                      {/* 숨김/표시 — 삭제와 별개. 설정을 지우지 않고 잠시 끈다(시리즈 visible 만 토글) */}
+                      <button
+                        onClick={() => opts.toggleIndicator(ind.id)}
+                        className={`shrink-0 rounded p-0.5 hover:bg-elevated ${ind.visible ? 'text-text' : 'text-muted'}`}
+                        title={ind.visible ? '숨기기' : '보이기'}
+                        aria-pressed={ind.visible}
+                      >
+                        <EyeIcon off={!ind.visible} />
+                      </button>
+                      <button
+                        onClick={() => opts.removeIndicator(ind.id)}
+                        className="shrink-0 rounded px-1 text-muted hover:bg-elevated hover:text-down"
+                        title="삭제"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  );
+                })}
 
-                <div className="mt-1 flex gap-1 px-1">
-                  {(['ema', 'bb', 'rsi'] as const).map((t) => (
-                    <button
-                      key={t}
-                      onClick={() => opts.addIndicator(t)}
-                      className="flex-1 rounded bg-panel2 px-1.5 py-1 text-[11px] font-semibold text-text ring-1 ring-border transition hover:bg-elevated"
-                    >
-                      + {IND_LABEL[t]}
-                    </button>
-                  ))}
-                </div>
+                {/* 추가 — 오버레이(캔들 위) / 오실레이터(별도 패널) 그룹. 값은 항상 '' 로 되돌려 같은 지표를 또 고를 수 있게 */}
+                <select
+                  value=""
+                  onChange={(e) => {
+                    const t = e.target.value as IndicatorType | '';
+                    if (t) opts.addIndicator(t);
+                  }}
+                  className="mt-1 w-full cursor-pointer rounded bg-panel2 px-2 py-1 text-[11px] font-semibold text-text outline-none ring-1 ring-border"
+                >
+                  <option value="">+ 인디케이터 추가…</option>
+                  <optgroup label="오버레이 (캔들 위)">
+                    {OVERLAY_TYPES.map((t) => (
+                      <option key={t} value={t}>
+                        {INDICATOR_DEFS[t].label} — {INDICATOR_DEFS[t].name}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="오실레이터 (별도 패널)">
+                    {OSCILLATOR_TYPES.map((t) => (
+                      <option key={t} value={t}>
+                        {INDICATOR_DEFS[t].label} — {INDICATOR_DEFS[t].name}
+                      </option>
+                    ))}
+                  </optgroup>
+                </select>
               </div>
             </>
           )}
@@ -1041,20 +1111,21 @@ export default function Chart() {
             </span>
             <span className="text-muted">거래량 <span className="text-text">{fmtQtyShort(legend.volume, 9)}</span></span>
             {opts.indicators.map((ind, idx) => {
+              if (!ind.visible) return null;
               const val = indLegend[ind.id];
-              if (val == null) return null;
-              const color = IND_COLORS[idx % IND_COLORS.length];
+              if (!val) return null;
+              const def = INDICATOR_DEFS[ind.type];
+              const parts: string[] = [];
+              for (const ln of def.lines) {
+                const v = val[ln.key];
+                if (v == null) continue;
+                const txt = fmtIndValue(def.format, v, prec);
+                parts.push(ln.label ? `${ln.label} ${txt}` : txt);
+              }
+              if (parts.length === 0) return null;
               return (
-                <span key={ind.id} style={{ color }}>
-                  {IND_LABEL[ind.type]}({ind.period})
-                  {typeof val === 'number' ? (
-                    <> {ind.type === 'rsi' ? val.toFixed(1) : fmtPrice(val, prec)}</>
-                  ) : (
-                    <>
-                      {' '}
-                      U {fmtPrice(val.upper, prec)} B {fmtPrice(val.basis, prec)} L {fmtPrice(val.lower, prec)}
-                    </>
-                  )}
+                <span key={ind.id} style={{ color: IND_COLORS[idx % IND_COLORS.length] }}>
+                  {indicatorTitle(ind.type, ind.params)} {parts.join(' ')}
                 </span>
               );
             })}

@@ -1,17 +1,15 @@
 # ox64 — Mock Trading Platform
 
-> 지인들끼리 수익률을 겨루는 모의 선물 트레이딩 플랫폼.
-> 실시간 시세(바이낸스) 기반 롱/숏 진입·청산 연습 + **친구 랭킹**.
-> **서버 권위 구조**: 잔고·포지션·주문·손익은 전부 서버(Cloudflare D1)가 계산·보관하고,
-> 체결가는 서버가 외부 거래소(OKX→Coinbase 폴백, §3)에서 직접 받아 쓴다 → 클라이언트가 가격/잔고를 조작해도 무의미.
+> 지인들끼리 수익률을 겨루는 모의 선물 트레이딩 플랫폼. 실시간 시세(바이낸스) 기반 롱/숏 진입·청산 연습 + **친구 랭킹**.
+> **서버 권위 구조**: 잔고·포지션·주문·손익은 전부 서버(Cloudflare D1)가 계산·보관하고, 체결가는 서버가 외부
+> 거래소(OKX→Coinbase 폴백, §3)에서 직접 받아 쓴다 → 클라이언트가 가격/잔고를 조작해도 무의미.
 > 프론트(정적 SPA) + 백엔드(Cloudflare Pages Functions) 를 **한 레포·한 배포**로 운영.
 
-> **이 문서 읽는 법** — §1~§3 = 구조(무엇이 어디에 있고 데이터가 어떻게 흐르는가) · §4 = 체결·정산
-> 규칙(돈이 걸린 부분) · §5 = 배포·마이그레이션 절차 · **§6 = D1 예산과 함정(새 기능을 얹기 전에 반드시
-> 볼 것)** · §7~§9 = 트레이딩과 완전히 분리된 독립 게임 셋.
+> **이 문서 읽는 법** — §1~§3 = 구조 · §4 = 체결·정산 규칙(돈이 걸린 부분) · §5 = 배포·마이그레이션 ·
+> **§6 = D1 예산과 함정(새 기능을 얹기 전에 반드시 볼 것)** · §7~§10 = 트레이딩과 분리된 독립 게임 셋 · §11 = 백로그.
 > **⚠ 표시는 "여기서 실제로 사고가 났다"는 뜻**이다 — 그 규칙을 되돌리기 전에 문단을 끝까지 읽을 것.
-> 완료된 작업의 이력·실측치는 [docs/HISTORY.md](docs/HISTORY.md) 로 분리했다(§11).
-> `AGENTS.md` 는 이 파일을 가리키는 포인터이므로 내용은 **여기에만** 쓴다.
+> 완료된 작업의 이력·실측치는 [docs/HISTORY.md](docs/HISTORY.md) 에 있다(§11). `AGENTS.md` 는 이 파일을 가리키는
+> 포인터이므로 내용은 **여기에만** 쓴다.
 
 ## 1. 기술 스택 (선정 이유 = 성능 + 무결성)
 
@@ -19,132 +17,93 @@
 | --- | --- | --- |
 | 프레임워크 | **Vite + React (TS)** | 순수 SPA, Pages 배포 최적화 |
 | 차트 | **TradingView Lightweight Charts v4** | Canvas 초경량, 실시간 60fps |
-| 실시간 시세 | **RxJS + Native WebSocket** | 초당 수십 틱 스트림, 렌더 병목 방지 (표시 전용) |
+| 실시간 시세 | **RxJS + Native WebSocket** | 초당 수십 틱 스트림(표시 전용) |
 | 상태/UI | **Zustand + Tailwind CSS** | selector 구독으로 리렌더 차단 |
 | **백엔드** | **Cloudflare Pages Functions** (`functions/`) | 프론트와 같은 레포·배포. `/api/*` 라우트 |
-| **DB** | **Cloudflare D1 (SQLite)** | 서버 권위 저장소(users/positions/orders) |
-| **인증** | HMAC 서명 세션 쿠키 + PBKDF2 패스코드 | DB 세션테이블 불필요. 이름+패스코드 로그인. 쿠키 30일 지속(자동로그인) — 클라 `init/refresh` 는 **401 일 때만** 로그아웃하고 일시적 네트워크/5xx 오류엔 세션을 유지(폴링 실패로 튕기던 문제 방지, `api.ts ApiError`) |
+| **DB** | **Cloudflare D1 (SQLite)** | 서버 권위 저장소 |
+| **인증** | HMAC 서명 세션 쿠키 + PBKDF2 패스코드 | 세션테이블 불필요. 쿠키 30일. 클라 `init/refresh` 는 **401 일 때만** 로그아웃(일시적 네트워크/5xx 엔 세션 유지, `api.ts ApiError`) |
 
-> **왜 서버 권위인가**: 클라이언트(IndexedDB/localStorage)에 둔 값은 콘솔로 100% 변조 가능
-> → 랭킹 경쟁이 무의미해짐. 그래서 진실원본을 서버로 옮김. (구 IndexedDB/Dexie 구조는 제거됨.)
+> **왜 서버 권위인가**: 클라 값은 콘솔로 100% 변조 가능 → 랭킹이 무의미. 진실원본을 서버로 옮김.
 
 ## 2. 폴더 구조 (역할 한 줄)
 
 ```
 ox64/
-├── index.html              SPA 진입(다크). favicon(/favicon.png) + Proxima Nova 로드 + **구글 애드센스 스니펫**(pagead2 async, client=ca-pub-6831535776648677 — 광고 단위는 아직 없고 자동 광고/사이트 인증용 로더만)
-├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB, database_id 박음) 코드 관리 → Git 배포가 읽음
-├── schema.sql              D1 스키마(users[+refill_count/refill_date/ox_balance]/positions/orders/pending_orders[+reduce_only=지정가 청산, +last_fill_at=부분 재체결 간격 하한]/conditional_orders[조건부/스탑 주문 +repeating/armed/rearm_price/fill_count/max_fills=무한 반복]/spot_orders/spot_trades/spot_candles[OX 영속 캔들 +open_at/close_at=시가·종가 체결 시각]/spot_bot_state[+drift/vol/sentiment/anchor/regime/regime_ticks/peak/trough=봇 심리상태(고점·저점 기억 포함), +book_json=호가 사다리, +tape_json=체결 테이프 링 버퍼, +live_json=진행 중 캔들 버킷, +pend_notional/pend_rows/pend_ticks=봇 수수료·계량기 누적]/usage_meter[D1 쓰기 예산 계량기, §6]/puzzle_stats/puzzle_games[퍼즐게임, §7]/dungeon_stats/dungeon_rooms/dungeon_players[5분 던전, §8]) — wrangler d1 execute 또는 D1 Console 로 적용
-├── docs/HISTORY.md         완료된 작업의 배경·수정 내용·검증 기록(§11 에서 분리 — 규칙의 진실원본은 언제나 이 문서 본문)
-├── scripts/                운영 스크립트 — d1-budget.mjs(D1 쓰기 예산 점검, §6) · **sim-crate.ts(상자깡 밸런스 시뮬레이션, `npm run sim:crate` — 드롭 확률·가격·재료 가치를 바꿨으면 반드시 돌릴 것. 상자만 까서 다 팔면 적자(~70%)·끝까지 머지하면 흑자(~110%)라는 불변식을 지킨다, §10)** · sim-bot.ts(봇 심리 모델 장기 시뮬레이션 + **체결 미세구조·호가창 지속성 검증**, `npm run sim:bot` — 심리 파라미터를 바꿨으면 반드시 돌릴 것. 기본 7일=정확히 한 주여야 세션 활성도 평균이 1 로 나온다. 편향은 종가가 아니라 **로그드리프트/틱**(산술평균−분산/2, |값| 2e-6 이하)으로 본다)
+├── index.html              SPA 진입(다크). favicon + Proxima Nova + 구글 애드센스 로더(ca-pub-6831535776648677, 광고 단위 없음)
+├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB) 코드 관리 → Git 배포가 읽음
+├── schema.sql              D1 스키마(users/positions/orders/pending_orders/conditional_orders/spot_orders(폐기)/spot_trades/spot_candles/spot_bot_state/usage_meter/puzzle_*/dungeon_*/crate_stats). wrangler d1 execute 로 적용
+├── docs/HISTORY.md         완료된 작업의 배경·수정·검증 기록(규칙의 진실원본은 이 문서 본문)
+├── scripts/                d1-budget.mjs(D1 예산 점검, §6) · sim-crate.ts(`npm run sim:crate` — 드롭 확률·가격·가치를 바꿨으면 반드시, §10) · sim-bot.ts(`npm run sim:bot` — 봇 심리 파라미터를 바꿨으면 반드시. 기본 7일=한 주여야 세션 활성도 평균 1. 편향은 **로그드리프트/틱**(|값| 2e-6 이하)으로 본다)
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
-├── tailwind.config.js       색상 토큰이 CSS 변수 참조(rgb(var(--color-x) / <alpha-value>)) — 실제 값은 src/index.css 테마 블록
-├── cron/                   ── 접속자 없이도 돌아가야 하는 백그라운드 작업 전용 Cron Worker (메인 Pages 프로젝트와 별도 배포) ──
-│   ├── wrangler.toml       name="ox64-liquidation-cron", 같은 D1(ox64) 바인딩, [triggers] crons=["* * * * *"](매 1분)
-│   └── index.ts            scheduled() 가 매 1분 "페어별 봇 버스트(runMarketMakerBurst) → 트리거 평가(sweepTriggers) **1회**"를 호출. ⚠ 예전엔 이걸 4라운드 번갈아 돌려 가격 경로를 4번 샘플링했는데, sweep 한 번이 D1 쿼리 ~18개라 **무료 플랜의 invocation당 한도(50)** 를 넘겼다 → 지금은 버스트가 **지나온 기준가 경로**를 돌려주고(rangeOfPath) 그 최저/최고로 한 번에 판정한다(4점 샘플링보다 정확 — 그 구간의 딥/스파이크를 하나도 안 놓친다, § _trading.ts runTriggers ranges). fetch() 는 CRON_SECRET 헤더로 보호된 수동 트리거(테스트/즉시 재실행용)
+├── tailwind.config.js       색상 토큰이 CSS 변수 참조 — 실제 값은 src/index.css 테마 블록
+├── cron/                   ── 접속자 없이도 돌아야 하는 백그라운드 전용 Cron Worker(메인 Pages 와 별도 배포) ──
+│   ├── wrangler.toml       name="ox64-liquidation-cron", 같은 D1 바인딩, crons=["* * * * *"]
+│   └── index.ts            매 1분 "페어별 봇 버스트(runMarketMakerBurst) → sweepTriggers **1회**". ⚠ 4라운드 반복은 invocation당 쿼리 한도(50)를 넘겼다 → 버스트의 **기준가 경로**(rangeOfPath) 최저/최고로 한 번에 판정. fetch() 는 CRON_SECRET 수동 트리거
 ├── functions/              ── 백엔드 (Cloudflare Pages Functions, /api/*) ──
-│   ├── _middleware.ts      전역 미들웨어 — Host 가 ox64.app/localhost 가 아니면(*.pages.dev 포함) ox64.app 으로 301 리다이렉트(Pages 는 pages.dev 서브도메인을 끄는 대시보드 옵션이 없어서 미들웨어로 처리)
-│   ├── _shared.ts          인증(HMAC 토큰/PBKDF2)·바이낸스 서버측 시세·D1 타입·loadState(positions/orders/pendingOrders)
-│   ├── _budget.ts          **D1 쓰기 예산 계량기 + 자동 쓰기 차단(서킷 브레이커)** — Cloudflare 엔 D1 지출 상한 기능이 없어서(예산 알림은 사후 통보) "포함분을 넘기면 멈춘다"를 코드로 만든 것. 스스로 반복해서 도는 경로(봇 틱·repeating 조건부)만 `usage_meter` 에 누적하고, 이번 달 누적이 `BLOCK_AT_ROWS`(포함분 5,000만의 90%)를 넘으면 그 경로들이 조용히 물러난다(수동 거래·트리거 sweep 은 계속 동작). 계량 문장은 **이미 도는 batch 에 얹어** 계량기 자체가 비용이 되지 않게 하고, 조회도 **오늘 한 행만**(PK) 읽는다 — 예전엔 `day LIKE '이번달%'` 로 달 전체를 SUM 해서 조회 하나가 날짜 수만큼 행을 읽었다(§6)
-│   ├── _trading.ts         runTriggers(...) — 강제청산→지정가→SL/TP→조건부 평가 본체(순수 로직 분리 패턴) / checkTriggers(env,uid) — 접속(폴링) 시 그 유저 1인분 / sweepTriggers(env) — cron 이 접속 여부 무관하게 호출하는 전 유저 sweep(**같은 본체를 공유**해서 "접속 중에만 되는 기능"이 갈라지지 않게)
-│   ├── _crateData.ts       "상자깡"(§10) 콘텐츠 정의 + 순수 로직(D1 I/O 없음) — 재료 5종(목재/광석/보석/정수 Lv1~6, 상자조각 Lv1~4)·가치 공식(base × MERGE_MULT^(lv-1))·상자 3종 드롭 테이블(슬롯마다 독립시행)·극한 확률 잭팟(JACKPOTS)·추첨(rollCrate/rollShardCrate). **밸런스의 진실원본이라 여기만 고치면 되고, 고쳤으면 `npm run sim:crate` 를 돌린다**(_dungeonData/_dungeonEngine 과 같은 "데이터·로직은 순수 함수로 분리" 패턴 — 그래서 시뮬레이터가 이 파일만 import 한다)
-│   ├── _dungeonData.ts     "5분 던전"(§8) 콘텐츠 정의 — 아이콘 5종/영웅 6종 덱 구성표(HEROES/heroDeckSpec), 몬스터 24·함정 6·포션 4·보스 4 풀, 던전 4개(DUNGEONS, 난이도별 구성), 인원수 난이도 스케일(partyScale). 서버 권위 콘텐츠(원작 카드 텍스트를 그대로 베끼지 않은 오리지널 구성)
-│   ├── _dungeonEngine.ts   "5분 던전" 순수 게임 로직(D1 I/O 없음) — 셔플/덱빌드(buildDungeonDeck)/드로우(drawUpTo)/요구치 판정(isReqMet)/함정 자동발동(applyTrap, ward 무효화 포함)/파티 커버 아이콘 보정(adaptReq). _trading.ts 와 같은 "로직은 순수 함수로 분리" 패턴
+│   ├── _middleware.ts      Host 가 ox64.app/localhost 가 아니면(*.pages.dev 포함) ox64.app 으로 301
+│   ├── _shared.ts          인증(HMAC/PBKDF2)·서버측 시세·D1 타입·loadState
+│   ├── _budget.ts          **D1 쓰기 예산 계량기 + 서킷 브레이커**(§6) — 스스로 반복 도는 경로(봇 틱·repeating 조건부·큰 지정가 재체결)만 `usage_meter` 에 누적, 선을 넘으면 그 경로만 물러남. 계량 문장은 **이미 도는 batch 에 얹고**, 조회는 **오늘 한 행만**(PK)
+│   ├── _trading.ts         runTriggers = 강제청산→지정가→SL/TP→조건부 평가 본체 / checkTriggers(env,uid) = 접속 폴링 1인분 / sweepTriggers(env) = cron 전 유저(**같은 본체 공유** — "접속 중에만 되는 기능"이 갈라지지 않게)
+│   ├── _crateData.ts       상자깡(§10) 콘텐츠 + 순수 로직(D1 없음). **밸런스 진실원본, 고쳤으면 `npm run sim:crate`**
+│   ├── _dungeonData.ts     5분 던전(§8) 콘텐츠 — 아이콘 5/영웅 6/몬스터 24/함정 6/포션 4/보스 4/던전 4, partyScale
+│   ├── _dungeonEngine.ts   5분 던전 순수 게임 로직(D1 없음) — 셔플/덱빌드/드로우/요구치/함정/adaptReq
 │   └── api/
-│       ├── login.ts        POST /api/login  (없는 이름=가입, 있으면 패스코드 검증→세션쿠키 30일 Max-Age=자동로그인)
-│       ├── logout.ts       POST /api/logout (쿠키 제거)
-│       ├── state.ts        GET  /api/state  (checkTriggers 호출 후 잔고+refillsLeft+포지션+주문+미체결주문, 인증필요). **`?tick=<pair>` 통합 폴링 모드** — 호가·체결·캔들(+`&state=1` 이면 계정 상태까지)을 한 요청으로. OX 화면의 폴링 3개를 합쳐 요청을 1/2.4 로 줄인 것(§6). ⚠ 이 파일이 `api/spot.ts` 를 import 하는 방향이어야 한다(반대로 하면 `_trading → api/spot` 과 순환)
-│       ├── order.ts        POST /api/order  (open/close/limitClose/limitOpen/cancelLimit/editLimit/setSlTp/conditionalOpen/cancelConditional — 서버가 체결가 fetch·손익 계산·D1 원자 갱신. 응답은 `loadState(…, body.ordersSince)` 로 **주문내역을 증분**으로 싣는다(§6 — 액션마다 주문 50행을 다시 읽던 낭비 제거). close 는 OX 면 봇 호가창 walking 청산, limitClose 는 지정가 청산=reduce-only, editLimit 는 미체결 주문의 지정가·수량 수정, conditionalOpen 은 조건부/스탑 주문 예약)
-│       ├── refill.ts       POST /api/refill (강제청산 안전망 — 1일 최대 3회, 1회 +10,000 USDT)
-│       ├── spot.ts         GET /api/spot (OX/USDT 호가창·체결내역 "표시용" 시장 데이터, ?candles=1 로 캔들도) + runMarketMaker() (봇이 심리 모델(nextMarketState: 추세/변동성 클러스터링/과열회귀/탐욕-공포 국면)로 기준가를 옮기고 그 주변에 호가 사다리를 깔아 만드는 합성 시세·호가·체결 — **틱은 순수 계산(simulateTick)이고 N틱을 메모리에서 돌린 뒤 커밋 1회 = 상태 행 1행만 쓴다(runBotTicks)** — 사다리(`book_json`)·체결 테이프(`tape_json`)·진행 중 캔들(`live_json`)이 전부 그 한 행이라, 틱을 몇 개 돌리든 D1 왕복·쓰기가 안 늘어난다 — **사다리는 매 틱 새로 태어나지 않고 이전 틱의 살아있는 주문을 물려받는다**(§4 호가창 지속), 봇 호가는 잔고 에스크로 안 함(무한 유동성 풀 — 단 체결된 뒤의 재고/현금은 `botFillStmts` 가 정산). OX 는 레버리지 롱/숏도 order.ts 로 실제 코인과 동일하게 거래됨, 체결가만 여기서 옴)
-│       ├── leaderboard.ts  GET  /api/leaderboard (친구 자산 순위=잔고+미실현PnL, 서버 시세)
-│       ├── puzzle.ts       GET/POST /api/puzzle — "스핑크스 보석찾기" 퍼즐게임(§7, ox64.app/b). 트레이딩과 별도 재화(puzzle_stats), 보드 정답(puzzle_games.board)은 서버만 알고 클라 응답엔 "이미 연 칸"만 내려줌
-│       ├── crate.ts        GET/POST /api/crate — "상자깡"(§10, ox64.app/c) 상자 구매/개봉/머지/판매/지원금. 트레이딩과 별도 재화(crate_stats.coins)이고 드롭 추첨은 서버만 굴린다. ⚠ **한 요청이 읽기 1행 + 쓰기 1행**(유저의 모든 상태가 crate_stats 한 행의 JSON 칸들이다) — 아이템을 행으로 쪼개면 개봉 한 번이 수십 행이 된다
-│       └── dungeon.ts      GET/POST /api/dungeon — "5분 던전"(§8, ox64.app/5m) 방 생성/참가/던전선택/영웅선택/시작/카드플레이(여러 장 동시)/휴식/특수카드/나가기. GET 폴링(진행 중 0.5초)이 곧 동기화 수단(Durable Objects/WebSocket 없이 D1만으로) — ⚠ **GET 은 D1 왕복 2회·쓰기 0회**로 유지할 것(§8)
+│       ├── login.ts        POST (없는 이름=가입, 있으면 패스코드 검증 → 쿠키 30일) · logout.ts POST
+│       ├── state.ts        GET (checkTriggers 후 계정 상태). **`?tick=<pair>` 통합 폴링** — 호가·체결·캔들(+`&state=1` 계정)을 한 요청으로(§6). ⚠ 이 파일이 `api/spot.ts` 를 import 하는 방향이어야 한다(반대면 순환)
+│       ├── order.ts        POST (open/close/limitClose/limitOpen/cancelLimit/editLimit/setSlTp/conditionalOpen/cancelConditional). 응답은 `loadState(…, body.ordersSince)` 로 **주문내역 증분**(§6)
+│       ├── refill.ts       POST (파산 안전망 — 1일 3회, +10,000 USDT)
+│       ├── spot.ts         GET (OX 호가창·체결 표시용, ?candles=1) + runMarketMaker() — 봇 심리 모델(nextMarketState)이 기준가를 옮기고 사다리를 깐다. **틱은 순수 계산(simulateTick), N틱 메모리 → 커밋 1회 = 1행**(runBotTicks) — 사다리(`book_json`)·테이프(`tape_json`)·진행 중 캔들(`live_json`)이 그 한 행. 봇 호가는 에스크로 없음, 체결 뒤 정산은 `botFillStmts`
+│       ├── leaderboard.ts  GET (자산=잔고+미실현PnL 순위)
+│       ├── puzzle.ts       GET/POST — 퍼즐게임(§7). 별도 재화, 보드 정답은 서버만
+│       ├── crate.ts        GET/POST — 상자깡(§10). ⚠ **한 요청 = 읽기 1행 + 쓰기 1행**(유저 상태 전부가 한 행의 JSON) — 아이템을 행으로 쪼개지 말 것
+│       └── dungeon.ts      GET/POST — 5분 던전(§8). GET 폴링이 곧 동기화 — ⚠ **GET 은 D1 왕복 2회·쓰기 0회** 유지
 ├── public/
-│   ├── favicon.png         아이콘(원본 src/resources/images/icon2_256.png)
-│   ├── _redirects          `/* /index.html 200` — SPA 폴백(Functions/정적파일이 먼저 매칭되므로 /api/* 는 영향 없음). /b, /5m, /s1 로 직접 진입/새로고침해도 index.html 이 서빙되게 함
-│   ├── ads.txt             애드센스 판매자 선언(`google.com, pub-6831535776648677, DIRECT, f08c47fec0942fa0`) — 없으면 AdSense 가 "수익 손실 위험"으로 경고한다. 정적 파일이 `_redirects` 보다 먼저 매칭되므로 /ads.txt 로 그대로 서빙됨
-│   └── fonts/              ProximaNova-{Light,Regular,Semibold,Extrabold}.ttf
+│   ├── favicon.png · fonts/  아이콘(원본 src/resources/images/icon2_256.png) · ProximaNova ttf 4종
+│   ├── _redirects          `/* /index.html 200` — SPA 폴백(/api/* 는 Functions 가 먼저). /b,/5m,/s1,/c 직접 진입용
+│   └── ads.txt             애드센스 판매자 선언(없으면 경고). 정적 파일이 `_redirects` 보다 먼저 매칭
 └── src/                    ── 프론트 ──
-    ├── App.tsx             세션확인→Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달
-    ├── main.tsx            location.pathname 으로 트레이딩(App)·퍼즐게임(puzzle/PuzzleApp, /b)·5분 던전(dungeon/DungeonApp, /5m)·미니 RTS(sc/ScApp, /s1)·상자깡(crate/CrateApp, /c) 를 분기(라우터 없음, 동적 import 로 서로의 번들이 안 섞이게). useSettingsStore 를 먼저 import(저장된 테마 즉시 적용, FOUC 방지). ⚠ /s1 만 StrictMode 를 안 씌운다 — 개발 모드의 이펙트 2회 실행이 rAF 루프와 Game 인스턴스를 두 벌 만들어 시뮬이 2배속으로 도는 것처럼 보인다
-    ├── index.css           Tailwind + 테마 CSS 변수(:root/[data-theme=light|high-contrast]) + @font-face + tabular-nums
-    ├── types.ts            도메인 타입(Candle/Order/Position[stopLoss/takeProfit]/PendingOrder/Side)
-    ├── symbols.ts          거래 심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS(OXUSDT·EWUSDT)/isVirtualSymbol(체결가 소스만 다르다는 표시, 거래 로직은 동일) + 타임프레임 그룹(분/시간/일+) + KST_OFFSET(+9h 고정)
-    ├── format.ts           fmtPrice(심볼 정밀도)/fmtVol(K·M·B)/precisionFromTick
+    ├── App.tsx             세션확인 → Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달
+    ├── main.tsx            pathname 으로 트레이딩·퍼즐(/b)·던전(/5m)·RTS(/s1)·상자깡(/c) 분기(라우터 없음, 동적 import). useSettingsStore 먼저 import(FOUC 방지). ⚠ /s1 만 StrictMode 안 씌움(이펙트 2회 실행이 rAF 루프를 두 벌 만든다)
+    ├── index.css           Tailwind + 테마 CSS 변수 + @font-face + tabular-nums
+    ├── types.ts            도메인 타입(Candle/Order/Position/PendingOrder/Side)
+    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + INTERVAL_GROUPS + KST_OFFSET(+9h)
+    ├── format.ts           fmtPrice/fmtVol/precisionFromTick + 축약 헬퍼(§6)
     ├── services/
-    │   ├── binanceRest.ts  초기 과거봉(스팟 REST) — 차트 표시용
-    │   ├── binanceWs.ts    실시간 kline(스팟 WS) — 차트/현재가 표시용 + orderbookStream(부분 호가 스트림 `@depth<N>@100ms` 를 `BOOK_THROTTLE_MS`(200ms)로 솎아 내려줌, 호가창용) + aggTradeStream(체결, 발생 즉시 push). ⚠ 이 셋은 **브라우저↔바이낸스 직결**이라 Cloudflare 요청·D1 을 안 쓴다 — 실제 코인 호가/체결 갱신 주기는 예산과 무관하게 당길 수 있다(가상 코인은 서버 폴링이라 반대다, §6)
-    │   ├── indicators.ts   EMA / Bollinger / RSI 계산
-    │   └── api.ts          백엔드 클라이언트(/api/*, credentials 포함) — limitOpen/cancelLimit/setSlTp 포함
+    │   ├── binanceRest.ts  초기 과거봉(스팟 REST)
+    │   ├── binanceWs.ts    kline + orderbookStream(`@depth<N>@100ms` 를 `BOOK_THROTTLE_MS`=200ms 로 솎음) + aggTradeStream. ⚠ **브라우저↔바이낸스 직결**이라 요청·D1 을 안 쓴다 — 갱신 주기를 예산과 무관하게 당길 수 있다(가상 코인은 반대, §6)
+    │   ├── okxRest.ts      OKX 시세(실제 코인 mark — 서버 체결가와 같은 소스)
+    │   ├── indicators.ts   차트 보조지표 순수 계산 15종(EMA/SMA/BB/RSI/VWAP(롤링)/MACD/Stochastic/ATR/ADX(+DI/−DI)/CCI/OBV/Williams %R/Ichimoku/Parabolic SAR/SuperTrend). 입력=Candle[] 시간 오름차순, 출력=같은 인덱스 정렬(워밍업 null). Ichimoku 선행스팬은 길이가 n+kijun 이라 Chart 가 시간을 연장해 그린다
+    │   ├── indicatorDefs.ts 인디케이터 레지스트리(`INDICATOR_DEFS`): 타입별 라벨·패널(overlay=캔들 위 / own=하단 별도 패널)·파라미터 정의(key/label/기본값/범위)·선 스펙(kind line/hist/dots, 스타일, 고정색)·기준선(RSI 70/30 등)·값 포맷·compute. **Chart 는 이 표만 보고 그리므로 지표 추가 = 여기 한 항목 + indicators.ts 계산 함수**(Chart/스토어에 타입 분기를 새로 넣지 말 것)
+    │   └── api.ts          백엔드 클라이언트(/api/*, credentials 포함)
     ├── hooks/
-    │   ├── useMarkPrices.ts   현재+포지션 심볼 가격 1.2초 폴링(다른 심볼 PnL 갱신 + 현재 심볼 mark). **가격 소스=OKX(services/okxRest, 서버 체결가와 동일 소스)**, 실패 시 바이낸스 폴백. isVirtualSymbol 은 제외(OX 는 서버 ref/spotCandles 로 옴). 실제 코인 mark 를 OKX 로 통일한 이유는 §시세 참고(바이낸스 mark 였을 때 고배율 진입 즉시 손익 튐)
-    │   ├── useTriggerPoll.ts  로그인 시 **항상 2.5초마다** /api/state 재조회 → 서버 checkTriggers 를 실질적으로 구동시키는 폴링(=OX 안 볼 때 지정가/SL·TP 체결 지연 + 내 잔고/PnL 갱신 주기). in-flight 가드로 중첩 방지. ⚠ 예전엔 연속 무한 조건부가 있으면 1초로 당기는 적응형이었는데, 그 모드에 재실행 간격 하한 5초가 생겨(§4) 2.5초로 충분해져 분기를 없앴다
-    │   ├── useTradeTape.ts    현재 심볼 체결 테이프 → useMarketStore.recentTrades. ⚠ 가상 코인은 `setRecentTrades`(교체)가 아니라 **`mergeTrades`(새 것만 얹기)** 다 — 서버가 매 폴링 최근 50건만 주는데 통째로 갈아끼우면 버퍼가 영영 50건이라 체결 필터를 켰을 때 화면이 계속 빈다(`MAX_TRADES`=400 은 순수 클라 메모리라 요청·D1 비용 0)
-    │   ├── useEquity.ts       평가자산(= 여유잔고 + Σ(잠긴 증거금 + 미실현손익))과 파산 여부 — 서버의 강제청산·리필 판정과 **같은 식**을 클라 한 곳에만 둔다(Header 리필 버튼 · RefillModal 이 공유)
-    │   └── useSpotPoll.ts     현재 심볼이 가상(OXUSDT)일 때만 1초마다 **통합 폴링**(`GET /api/state?tick=<pair>` — 호가·체결·캔들을 한 요청으로, 3틱에 한 번은 `&state=1` 로 계정 상태까지) → useTradingStore 의 spotBook/spotTrades(호가창·체결내역 표시용, 유저 개인 데이터 아님) 갱신. 이 폴링이 곧 봇 마켓메이커 클럭이라 짧게 잡아 체결 딜레이를 줄임. **탭이 백그라운드면 정지**(§6 — 안 보이는 화면에 봇 틱과 요청을 쓰는 건 순수 낭비)
+    │   ├── useMarkPrices.ts   현재+포지션 심볼 가격 1.2초 폴링. **소스=OKX**(서버 체결가와 동일), 실패 시 바이낸스 폴백. 가상 심볼 제외. 보유·미체결·현재 심볼의 precision 도 없으면 1회 조회(가상 심볼은 가격에서 파생)
+    │   ├── useTriggerPoll.ts  로그인 시 **항상 2.5초** /api/state 재조회 = 서버 checkTriggers 클럭. in-flight 가드
+    │   ├── useTradeTape.ts    체결 테이프 → recentTrades. ⚠ 가상 코인은 교체 아닌 **`mergeTrades`**(서버가 최근 50건만 주므로 통째로 갈아끼우면 버퍼가 영영 50건). `MAX_TRADES`=400 은 클라 메모리(비용 0)
+    │   ├── useEquity.ts       평가자산(= 여유잔고 + Σ(증거금 + 미실현)) + 파산 여부 — 서버와 **같은 식**을 클라 한 곳에만(Header·RefillModal 공유)
+    │   └── useSpotPoll.ts     현재 심볼이 가상일 때만 1초 **통합 폴링**(`?tick=`, 3틱에 한 번 `&state=1`). 이 폴링이 곧 봇 클럭. **탭 백그라운드면 정지**(§6)
     ├── store/
-    │   ├── useMarketStore.ts   symbol/interval(둘 다 localStorage 영속)/prices(심볼별 가격맵)/precisions(심볼별 소수자릿수)/connected/chartClickPrice+chartClickNonce(차트·호가창 클릭→지정가 입력 신호)+priceTarget(그 신호를 받을 칸: ''=주문패널 지정가, 'close:<positionId>'=그 포지션의 청산 지정가) + selectLastPrice/precisionOf
-    │   ├── useChartStore.ts    차트 옵션(indicators: 기간/개수 자유 설정 가능한 EMA/BB/RSI 배열, visibleBars: 마지막 확대/축소 봉수, 카운트다운·거래량·매매마커·평단선·SL/TP선·지정가주문선, bookRows: 호가·체결 한 화면 표시 행수 5~50/기본 10 + BOOK_ROWS_MIN·MAX·DEFAULT·clampRows, **tradeFilterOn/tradeFilterBasis('qty'|'notional')/tradeFilterMin/tradeFilterMax = 체결 목록 필터(전 심볼 공통·표시 전용, min/max 는 null=제한없음, cleanLimit 이 0/음수/NaN 을 null 로)**, **tradeStrength = 체결 강세·약세 "레벨" 배경 바**) localStorage 영속
-    │   ├── useSettingsStore.ts 테마(dark/light/high-contrast)+거래모드(easy/standard) localStorage 영속, setTheme 이 document.documentElement.dataset.theme 도 갱신
-    │   └── useTradingStore.ts  서버 상태 캐시(positions/orders/pendingOrders/refillsLeft) + init/login/logout/openMarket/closePosition/limitOpen/cancelLimit/setSlTp/refill(OXUSDT 도 이 경로 그대로 탐) + spotBook/spotTrades/spotRefresh(OX 호가창·체결내역 "표시용" 시장 데이터, 유저 개인 잔고 아님). **체결 목록은 `dripTrades` 가 0.1~0.25초 간격으로 한 건씩 흘려보낸다**(§6 — 봇 틱 하나가 한 번에 2~40건(평균 ~12)을 찍어서 목록이 1초에 한 번 덜컥 갱신되던 것을, 이미 받은 데이터를 시간순으로 내보내 실제 테이프처럼 흐르게 한 것 — 요청·D1 증가 0). ⚠ 간격을 더 줄여도 소용없다 — **해상도 상한은 타이머가 아니라 "그 초에 존재하는 체결 건수"**(틱당 평균 ~12건 → 초당 7회 × 2건 공개)이고, 더 잘게 쪼개면 빈 스텝만 늘어 리렌더만 낭비된다. ⚠ 새 체결 식별은 **`createdAt`** 으로 한다 — 봇 테이프가 링 버퍼라 `id`(`t<시각>-<인덱스>`)가 폴링마다 바뀐다. 코인 전환 시 `spotClear` 가 남은 슬라이스 타이머를 반드시 지울 것
+    │   ├── useMarketStore.ts   symbol/interval/prices/precisions/connected/chartClickPrice+Nonce+priceTarget(클릭 가격을 받을 칸: ''=주문패널, 'close:<positionId>')
+    │   ├── useChartStore.ts    차트 옵션(localStorage) — visibleBars, 토글류, bookRows(5~50/기본 10, `clampRows`), bookTogether, 체결 필터(`cleanLimit` 이 0/음수/NaN→null), tradeStrength. `indicators: IndicatorConfig[]`(`{id,type,params:Record<string,number>,visible}`) — 예전 `{period,mult}` 저장값은 load 시 params 로 마이그레이션. `addIndicator/removeIndicator/updateIndicator(id, params 패치)/toggleIndicator(id)`(visibility on/off — 삭제와 별개)
+    │   ├── useSettingsStore.ts 테마+거래모드(easy/standard), setTheme 이 `dataset.theme` 도 갱신
+    │   └── useTradingStore.ts  서버 상태 캐시 + 액션 + spotBook/spotTrades(표시용). **체결 목록은 `dripTrades` 가 0.1~0.25초 간격으로 한 건씩** 흘려보낸다(§6, 비용 0). ⚠ 새 체결 식별은 **`createdAt`**(테이프 `id` 는 폴링마다 바뀜). 코인 전환 시 `spotClear` 가 타이머를 지울 것
     └── components/
-        ├── RefillModal.tsx      파산 팝업 — 평가자산이 0 이하가 되면 자동으로 뜬다(하루 3회 무료 리필 안내 + 그 자리에서 리필). 판정은 `useEquity` 하나만 쓴다(헤더 리필 버튼과 같은 식이어야 "버튼은 활성인데 팝업은 안 뜨는" 어긋남이 안 생긴다). 닫으면 **평가자산이 0 을 벗어날 때까지** 다시 안 뜬다(2.5초 폴링마다 다시 뜨면 아무것도 못 한다)
-        ├── VipModal.tsx        VIP 진행도 모달(뱃지 클릭) — 다음 등급까지 진행 막대·남은 거래대금·등급표. 기준표는 서버(loadState.vipTiers)에서 받음
-        ├── VipBadge.tsx        VIP 등급 뱃지(등급 높을수록 진해짐, title 에 요율·다음 등급까지 남은 거래대금)
-        ├── Logo.tsx            ox64 워드마크 — 15×3 픽셀아트를 옮긴 인라인 SVG(보간 없음, currentColor 로 테마 대응). 높이는 3의 배수로 주고 폭은 w-auto
+        ├── RefillModal.tsx      파산 팝업 — 평가자산 ≤0 이면 자동. 판정은 `useEquity` 하나만. 닫으면 **0 을 벗어날 때까지** 다시 안 뜸
+        ├── VipModal.tsx · VipBadge.tsx  VIP 진행도·뱃지 — 기준표는 서버(loadState.vipTiers)
+        ├── Logo.tsx            워드마크 — 15×3 픽셀아트 인라인 SVG(currentColor). 높이 3의 배수, 폭 w-auto(§6)
         ├── Login.tsx           이름+패스코드 로그인/가입
-        ├── Header.tsx          심볼(38+가상 1종, 공용목록, 정렬 가능)/현재가/연결/평가자산(잔고+미실현손익, 현금잔고 아님)/리필버튼(평가자산<=0 일 때만 활성화, N/3)/랭킹버튼/설정버튼/로그아웃. 모바일은 로고 숨김·아이콘만·"⋯" 더보기 드롭다운(랭킹/설정/유저/로그아웃)으로 한 줄에 수렴, `sm:` 이상은 기존 개별 버튼 레이아웃
-        ├── SymbolSelect.tsx    심볼 드롭다운 — 실제 38종(바이낸스 ticker/24hr 폴링) + 가상 OX/USDT(뱃지) 를 **같은 목록·같은 정렬(심볼/가격/24h변동, 컬럼 헤더 클릭)에 통합**. OX 가격=`/api/spot` 최근체결가, OX 24h변동률=`/api/spot?candles=1&interval=1h&limit=24` 로 24h 전 시가 대비 계산(데이터 24h 미만이면 최초 시점 대비). `statOf(sym)` 이 심볼 종류에 따라 stat 소스만 분기해 정렬은 동일하게 처리
-        ├── OrderBook.tsx       호가(매수 좌열·매도 우열, 각 최우선호가가 맨 위) / 체결(내부 탭으로 전환). **내 미체결 주문이 있는 가격대는 accent 링+점+굵은 수량으로 강조**(서버가 가격대별 `mine` 을 따로 합산해 내려줌) — 체결 행은 가격과 **수량 모두** 테이커 방향 색(매수 up / 매도 down) — 가격만 칠하면 목록을 훑을 때 매수·매도 흐름이 안 읽힌다. 실제 심볼=바이낸스 depth WS(100ms 스냅샷을 200ms 로 솎음)/aggTrade WS, 가상 심볼=useTradingStore.spotBook·spotTrades(useSpotPoll 1초 통합 폴링). Standard 모드 + 옵션(useChartStore.orderBook) 둘 다 켜져 있을 때만 표시. **PC(md=768px 이상)에서는 `useChartStore.bookTogether` 를 켜면 탭 없이 호가(위)·체결(아래)을 같이** 본다(`useIsDesktop` 이 App.tsx 의 2열 분기와 **같은 경계**를 봐야 한다 — 모바일은 폭이 좁아 항상 탭이고, 사이드바가 18rem 이라 좌우 3열로 쪼개면 숫자가 뭉개져서 세로로 쌓는다). ⚠ 훅 호출을 `옵션 && useIsDesktop()` 처럼 단축 평가 뒤에 두면 렌더마다 훅 개수가 바뀌어 터진다. **한 화면에 보이는 행 수는 설정(useChartStore.bookRows, 5~50)** — 각 열/체결 목록의 높이를 `rows × ROW_PX(16)` 로 잡아 딱 그만큼만 보이게 한다. ⚠ **maxHeight 가 아니라 height(고정)** 여야 한다 — 내용이 적으면 줄어드는 maxHeight 로 두면 체결이 한 건씩 흘러들어올 때마다(dripTrades)·호가 단계 수가 바뀔 때마다 패널 높이가 오르내려 아래 컴포넌트가 통째로 밀린다("height 가 와리가리" 제보). **체결 목록 필터(useChartStore.tradeFilter*)와 강세·약세 레벨(tradeStrength)도 여기서 적용**. ⚠ **레벨은 틱 방향(직전 체결 대비 상승·하락)이 아니다** — 그건 행 색(테이커 방향)과 거의 같은 정보라 새로 알려주는 게 없다. 보려는 건 **"지금 이 가격이 싼가/비싼가"** 이므로 `strengthAt` 이 그 체결 **직전 최근 120건의 중앙값**과 비교해 **0~±50 레벨**을 매기고, 가격 칸 배경에 **왼쪽에서 자라는** 바로 은은하게 깐다(길이 = 레벨/50 · 농도 6~22% — 숫자가 오른쪽 정렬이라 오른쪽에 붙이면 글자를 가리고, 시작점이 제각각이면 길이 비교가 안 된다)(+=중심보다 비싸게=강세, −=싸게=약세). 함정이 넷이다:
-    ①기준은 **trailing**(행마다 자기 시점) — 목록 전체에 "지금의 중심" 하나를 쓰면 추세가 나올 때 옛 행들이 통째로 한쪽 색으로 **리페인트**된다.
-    ②중심·산포는 평균이 아니라 **중앙값 / 중앙절대편차(robust)** — 예전엔 평균/평균절대편차였는데, 대량 시장가가 호가를 훑으며 찍는 프린트들이 **자기들끼리 잣대를 부풀려** 뒤로 갈수록 z 가 오히려 작아졌다("대량 매수했는데 가격은 오르는데 바 길이가 다 똑같다" 제보 → 실측 그 스윕 8건이 전부 50레벨). 중앙값은 창의 소수를 차지하는 그 프린트들에 안 끌려간다. 덤으로 평균+제곱(표준편차)의 자릿수 상쇄 문제도 없다(BTC 10만 대에서 `E[x²]−E[x]²` 는 분산이 통째로 날아간다).
-    ③z→레벨은 **꺾은선**이다 — 평상시 틱 노이즈(z≈1~3)와 대량 체결(z 수십~수백)은 자릿수가 100배 차이라 한 눈금으로 못 담는다. 선형이면 스윕이 전부 최대 레벨에 박히고(실제로 그랬다), 스윕에 맞춰 눈금을 늘리면 평상시 바가 사라진다 → **무릎(z=2.5)까지 선형(레벨 30)** + 그 위는 **로그 압축(z=600 에서 50)**. 실측(6,000틱 시뮬): 평상시 평균 18.3레벨·포화 0%, 4.66→4.76 스윕 8건 38→45 단조 증가, 2배 스윕은 1.1 부터 포화.
-    ④계산은 **표시할 행에 대해서만**(창 120건 + 정렬 2회라 버퍼 400건 전부에 돌리면 폴링마다 수십만 연산) 하되 창은 **필터 이전 원본 테이프**에서 — 고래만 보기 필터를 켜면 고래끼리의 중심이 되어 전혀 다른 잣대가 된다. ⚠ 3단계였을 땐 "조금 싼가 많이 싼가"가 세 칸으로 뭉개져 미세한 차이가 안 보였다. 필터가 켜져 있으면 체결 탭에 뱃지를 띄워 "왜 목록이 비었는지"를 보여주고 누르면 즉시 해제된다(행 마크업이 `leading-[14px]`+`py-px` 라 폰트 크기와 무관하게 16px 고정 — 행 높이를 바꾸면 ROW_PX 도 같이)
-        ├── Settings.tsx        테마 3선택 + 차트 색상 3선택 + **호가·체결 표시 개수(슬라이더 5~50 + 5/10/20/30/50 프리셋) + "PC 에서 호가·체결 같이 보기" 토글** + **체결 목록 필터(켬·끔 / 기준 거래대금·수량 / 이상·이하 입력)** + **강세·약세 레벨 배경 토글** + 거래모드(Easy/Standard) 2선택 + 폰트 크기 3선택 모달. 섹션이 늘어 작은 화면에서 넘칠 수 있어 모달 자체가 `max-h-[90dvh] overflow-y-auto`
-        ├── Clock.tsx           우측 구석 실시간 시계(KST, 시:분:초). 1초마다 자체 상태만 갱신하는 독립 컴포넌트(부모 리렌더 안 유발). Chart 툴바 우측에 마운트
-        ├── Chart.tsx           **⚠ 캔들을 직접 폴링하지 않는다** — 통합 폴링(useSpotPoll→spotTick)이 스토어에 넣은 봉을 구독만 한다(과거봉 lazy 로드만 자기 요청). 연결 표시는 fetch 실패가 아니라 **신선도**(마지막 갱신 8초 경과)로 판정. Lightweight Charts: 타임프레임 그룹셀렉트(초봉 포함)·KST+9·OHLCV+인디케이터값 레전드(hover/터치, 종가 옆에 그 봉의 변동률 (종가-시가)/시가 % 표시)·툴바 우측 실시간 시계(Clock)·다음봉 카운트다운(트레이딩뷰처럼 우측 가격축의 현재가 티커=마지막 봉 종가 라벨 바로 아래에 붙임 — `priceToCoordinate`+`priceScale('right').width()` 로 위치 계산, WS 틱·폴링·팬/줌·1초 틱마다 갱신)·인디케이터(추가/삭제/기간편집)·매매 B/S/L 마커·포지션 평단선+청산가선(추정, 평단선 옵션에 묶임)·SL/TP 수평선·미체결 지정가 주문선(가격+수량, 매수녹색/매도적색)·조건부(스탑) 주문 수평선(트리거가에 앰버 점선 "조건부 롱/숏 ≥/≤ 수량", 취소 X 버튼은 `cancelConditional` 로 라우팅 — 지정가/조건부 모두 `pendingLine` 옵션에 묶임)·차트 클릭→지정가 입력·테마 반응형 캔버스 재도색. 가상 심볼은 바이낸스 REST/WS 대신 api.spotCandles(1초 폴링)로 분기하되 표시범위는 최초 로드 때만 설정(매 폴링마다 재설정하면 줌이 리셋되는 버그가 있었음). **⚠ 폴링은 최초 1회만 500봉을 받고 이후엔 "마지막 로드 이후 흐른 시간 ÷ 인터벌 + 2"봉만 받는다**(§6 — 예전엔 1초마다 500봉을 통째로 다시 받아 하루 1,050만 행을 읽었다. 서버 롤업까지 겹쳐 요청 하나가 500×배수 행이었다). **탭이 백그라운드면 폴링 정지**, 돌아오면 쉰 시간만큼 봉을 더 받아 구멍을 메운다
-        ├── OrderPanel.tsx      Easy=슬라이더로 비중만 정해 롱/숏 버튼 / Standard=시장가+지정가+조건부 탭·SL·TP 입력·수량 텍스트입력+단위(코인/USDT) 전환 (레버리지는 공통, 체결가는 서버가 fetch). **⚠ 수량 입력의 진실원본은 입력칸 문자열(`amtInput`, 현재 unit 기준)이고 코인 수량은 `sizeCoin` 으로 파생** — 예전엔 코인 수량을 상태로 두고 USDT 표시를 coin×가격으로 매 렌더 재계산했는데, 그 왕복에서 정밀도가 깨져(coin toFixed(6)) USDT 로 입력하면 타이핑이 엉뚱한 값으로 튀었다(BTC 에 "1 USDT" → 0.98). 단위 전환·슬라이더는 현재 unit 값으로 입력칸을 1회 채운다. **OXUSDT 도 이 컴포넌트 하나로 처리**(가상 전용 분기 없음 — 실제 코인과 완전히 동일한 레버리지 거래)
-        ├── PositionsPanel.tsx  탭: 포지션(청산가 표시[⚠ 값이 커지면 `fmtPriceShort` 로 축약]·(Standard 전용) 부분청산 수량 입력 **+ 그 아래 청산 비중 슬라이더(진실원본은 입력칸 문자열이고 슬라이더 위치는 `closePctOf` 로 거기서 파생 — 별도 상태를 두면 둘이 어긋난다. 빈칸=전량이라 100% 로 보이고, 100 으로 끌면 다시 빈칸)** + **지정가 청산 입력(비우면 시장가, 칸을 포커스하면 차트·호가창 클릭 가격이 여기로 들어옴 — accent 링으로 표시)**·SL/TP 인라인 편집, 청산 실행 후에도 수량·지정가 입력값 유지, Easy 는 전량 시장가청산 버튼만) / (Standard) 미체결 지정가(reduce-only 는 "롱/숏 청산" 뱃지) / 주문내역(전체 체결 이력, 강제청산 하이라이트). **OXUSDT 도 이 컴포넌트 하나로 처리**(가상 전용 분기 없음)
-        └── Leaderboard.tsx     친구 자산 순위 모달(5초 폴링) + 상단에 거래소 수수료 수익(유저분/봇분/누적 거래대금)
-    └── puzzle/                 ── 퍼즐게임(/b, §7) — App.tsx/useTradingStore 와 완전히 분리된 독립 진입점 ──
-        ├── api.ts              /api/puzzle 전용 클라이언트(src/services/api.ts 재사용 안 함 — 별도 번들 유지)
-        ├── usePuzzleStore.ts   zustand: currency/activeGame/levels + init/login/logout/start/open/abandon/refill. open() 은 서버 activeGame(= status active 인 판만 반환)에 의존하지 않고 로컬 보드에 이번 칸 결과만 이어붙임(승/패로 막 끝난 판도 화면에서 안 사라지게)
-        ├── PuzzleLogin.tsx     이름+패스코드 로그인(트레이딩과 같은 계정/세션 쿠키 재사용)
-        ├── Board.tsx           보드 격자 렌더링 — 서버가 내려준 "이미 연 칸"만 그리고, 안 연 칸은 전부 빈 버튼(정답 없음)
-        └── PuzzleApp.tsx       진입 컴포넌트 — 로그인 게이트 → 레벨 선택(1~10) or 보드+HUD(재화/보석 진행도/포기·클리어·게임오버)
-    └── sc/                     ── "미니 RTS"(/s1, §9) — **서버·로그인 없이 전부 클라이언트에서 도는 유일한 게임** ──
-        ├── types.ts            도메인 타입 + 상수(타일 24px, 맵 64×64, 고정 틱 30Hz, 자원량/채집 시간)
-        ├── data.ts             테란 유닛 4종(일꾼/마린/파이어뱃/시즈탱크)·건물 5종(커맨드/디팟/배럭/리파이너리/팩토리) 스펙. 밸런스는 여기만 고치면 됨
-        ├── map.ts              맵 생성(180° 회전 대칭·본진 연결성 보장) + 통행 격자(rebuildBlocked) + 전장의 안개(explored/visible)
-        ├── pathfind.ts         그리드 A*(최소 힙, 대각선 모서리 관통 금지, 경로 평활화). 유닛은 장애물로 넣지 않는다
-        ├── game.ts             시뮬레이션 코어 — 고정 틱, 명령(이동/공격/공격이동/사수/채집/건설), 유닛 분리력, 타겟 획득·사격·스플래시, 채집 왕복, 건설 진행, 생산 큐, 인구, 승패
-        ├── ai.ts               컴퓨터 상대 — 0.5초마다 판단(일꾼→인구→배럭→가스→팩토리→병력→타이밍 공격). owner 를 생성자로 받아 AI 대 AI 헤드리스 검증이 가능
-        ├── render.ts           Canvas 렌더 — 지형/자원/건물/유닛/궤적/안개(가로 런 병합)/미니맵. 스프라이트 없이 전부 도형
-        ├── Hud.tsx             자원·인구·시계, 미니맵, 선택 정보, 커맨드 카드(건설/생산/명령 버튼)
-        └── ScApp.tsx           메뉴 + 대전 화면 — rAF 루프, 드래그 선택·우클릭 명령·건물 배치·부대 지정, HUD 스냅샷 8Hz
-    └── dungeon/                ── "5분 던전"(/5m, §8) — 트레이딩·퍼즐 어느 쪽과도 완전히 분리된 독립 진입점 ──
-        ├── api.ts              /api/dungeon 전용 클라이언트(별도 번들 유지). playCards 는 여러 장을 한 요청에 보낸다
-        ├── data.ts             표시 전용 메타(아이콘 이모지/색/난이도 라벨) + planAutoPlay("전부 내기" 배치 계산)·remainingReq·fmtClock — 실제 덱 구성·판정은 서버(functions/_dungeonData.ts)가 유일한 진실원본
-        ├── useDungeonStore.ts  zustand: room/players/heroes/dungeons/stats + create/join/chooseDungeon/chooseHero/start/playCard/autoPlay/rest/useSpecial/leave + **적응형 폴링**(delayFor: 진행 중 0.5s / 로비 1s / 종료 2s / 방 없음 4s, setInterval 이 아니라 자기 자신을 다시 예약하는 setTimeout 루프) + 직전 응답과 같으면 setState 스킵(리렌더 억제)
-        ├── DungeonLogin.tsx    이름+패스코드 로그인(트레이딩과 같은 계정/세션 쿠키 재사용)
-        ├── Rules.tsx           게임 규칙 설명 패널(로비에 기본 펼침) + IconLegend(아이콘 범례, 게임 화면에서도 재사용)
-        ├── EventLog.tsx        던전 기록 — 서버가 방에 남긴 이벤트(함정 발동/격파/페이즈/특수)를 흘려보여준다. 폴링이라 놓친 사건을 따라잡는 용도
-        ├── Lobby.tsx           방 없음(생성/코드 참가+규칙 설명) 또는 로비(던전 선택[방장]·영웅 선택·파티원 목록·시작)
-        ├── GameBoard.tsx       진행 중/종료 화면 — 던전 진행도 막대, 파티 체력·방벽, 타이머 막대, 현재 카드 요구치(항목별 진행 막대+보스 2페이즈 예고), 내 손패(낼 수 있는 카드만 강조)·전부 내기·휴식·특수, 파티원 공개 손패, 종료 시 기여도 통계
-        ├── Card.tsx            카드 1장 시각 컴포넌트(아이콘 이모지+기여값+속성 이름, sm/md 크기)
-        └── DungeonApp.tsx      진입 컴포넌트 — 로그인 게이트 → 로비 or 게임보드
-    └── crate/                  ── "상자깡"(/c, §10) — 트레이딩·퍼즐·던전 어느 쪽과도 분리된 독립 진입점 ──
-        ├── api.ts              /api/crate 전용 클라이언트(별도 번들). ⚠ 확률·가격·재료 가치는 **서버 응답을 그대로 쓴다**(클라에 표를 또 적으면 서버 밸런스를 고칠 때 화면만 조용히 틀려진다)
-        ├── data.ts             표시 전용 메타뿐 — 레벨 등급색(일반~신화, 테마 무관 고정색)·골드 축약(fmtG)·확률 표기(fmtP, 0.1% 미만이면 1/N 분모로)
-        ├── crate.css           개봉/머지 애니메이션(전부 0.2~0.7초 — 요구사항이 "아주 살짝만")
-        ├── useCrateStore.ts    zustand: coins/inv/crates/seen/stats + buy/open/merge/mergeAll/sell/sellAll/refill. 개봉 결과는 같은 보상끼리 **합산**해서 한 번에 띄운다(aggregate — 10연차를 상자별로 재생하면 고문이 된다)
-        ├── CrateLogin.tsx      이름+패스코드 로그인(트레이딩과 같은 계정/세션 쿠키 재사용)
-        ├── OpenStage.tsx       개봉 무대 — 보유 상자 + 열기(1개/최대 10개) + 결과 카드. 잭팟이면 무대 전체가 한 번 번쩍인다
-        ├── Shop.tsx            상자 3종 구매 + **확률 공시**(서버 odds 를 그대로 렌더) + 극한 확률 안내 배너
-        ├── Inventory.tsx       재료 그리드 + **드래그 머지**(같은 재료 2개를 끌어다 놓거나 탭 두 번). ⚠ 포인터 좌표를 리렌더에 안 태운다(칸이 수백 개까지 간다)
-        └── Collection.tsx      도감 — 한 번이라도 얻어본 재료를 종류·레벨별로 기록(안 얻은 칸은 실루엣)
+        ├── Header.tsx          심볼/현재가/평가자산/리필(평가자산≤0 일 때만)/랭킹/설정/로그아웃. 모바일은 "⋯" 더보기
+        ├── SymbolSelect.tsx    실제 38종 + 가상 코인을 **같은 목록·같은 정렬**로. OX 가격=`/api/spot`, 24h변동=`?candles=1&interval=1h&limit=24`. `statOf(sym)` 이 소스만 분기
+        ├── OrderBook.tsx       호가(매수 좌·매도 우)/체결 탭. 내 미체결 가격대 강조(서버 `mine`). 체결 행은 가격·수량 모두 테이커 방향 색. Standard+옵션(orderBook) 둘 다 켜야 표시. PC(md≥768)에서 `bookTogether` 면 호가·체결 상하 함께 — `useIsDesktop` 은 App.tsx 2열 분기와 **같은 경계**. ⚠ 훅을 `옵션 && useIsDesktop()` 처럼 단축 평가 뒤에 두면 훅 개수가 바뀌어 터진다. 높이=`bookRows × ROW_PX(16)` — ⚠ **maxHeight 가 아니라 height 고정**(체결이 흘러들 때 패널이 오르내림; 행 높이를 바꾸면 ROW_PX 도 같이). 강세/약세 레벨(tradeStrength): ⚠ 틱 방향이 아니라 **"이 가격이 싼가/비싼가"** — `strengthAt` 이 그 체결 **직전 120건의 중앙값/MAD(robust)** 대비 z(평균은 스윕 프린트가 잣대를 부풀림), z→레벨은 **꺾은선**(z=2.5 까지 선형 30, 위는 로그 압축으로 z=600 에서 50), 가격 칸 배경에 **왼쪽에서 자라는** 바. 기준은 **trailing**(행마다 자기 시점), **표시할 행에 대해서만**, 창은 **필터 이전 원본 테이프**에서
+        ├── Settings.tsx        테마·차트 색·호가/체결 행 수·PC 함께 보기·체결 필터·강세/약세·거래모드·폰트 모달(`max-h-[90dvh] overflow-y-auto`)
+        ├── Clock.tsx           KST 시계(자체 상태만 갱신). Chart 툴바 우측
+        ├── Chart.tsx           **⚠ 캔들을 직접 폴링하지 않는다** — 통합 폴링이 스토어에 넣은 봉을 구독만(과거봉 lazy 로드만 자기 요청). 연결 표시는 **신선도**(8초). LWC v4: KST+9·OHLCV 레전드·카운트다운(우측 가격축 현재가 라벨 아래, `priceToCoordinate`+`priceScale('right').width()`)·B/S/L 마커·평단선+청산가선·SL/TP선·지정가/조건부 주문선(X 버튼)·차트 클릭→지정가·테마 재도색. 인디케이터는 레지스트리(indicatorDefs) 기반 — 선마다 시리즈 1개(`Map<id, Map<lineKey, series>>`), own 패널 지표는 `priceScaleId=ind.id` 로 하단에 자동 스택([캔들]/[패널들]/[거래량], 높이는 개수로 나눔), 숨김은 `series.applyOptions({visible:false})`(삭제 아님, 레전드·패널 배치에서도 제외). null 은 whitespace 로 넣어 선이 끊긴다(SuperTrend 국면 전환·워밍업). 옵션 패널: 지표 행마다 👁 토글·파라미터 입력(def.params 자동 생성)·삭제, 추가는 오버레이/오실레이터 optgroup 셀렉트. 가상 심볼 표시범위는 최초 로드 때만(매 폴링 재설정하면 줌 리셋)
+        ├── OrderPanel.tsx      Easy=슬라이더+롱/숏 / Standard=시장가·지정가·조건부 탭+SL/TP+수량(코인/USDT). **⚠ 수량 진실원본은 입력칸 문자열(`amtInput`)이고 코인 수량은 `sizeCoin` 파생**(반대로 두면 왕복 정밀도가 깨져 USDT 입력이 튄다). OXUSDT 도 같은 컴포넌트
+        ├── PositionsPanel.tsx  포지션(청산가 `fmtPriceShort`·부분청산 입력+비중 슬라이더(진실원본은 입력칸, 슬라이더는 `closePctOf` 파생; 빈칸=전량)·지정가 청산 입력(비우면 시장가, 포커스 시 차트 클릭 가격 수신)·SL/TP 편집) / 미체결(reduce-only 뱃지) / 조건부 / 주문내역
+        └── Leaderboard.tsx     자산 순위 모달(5초 폴링) + 거래소 수수료 수익(유저분/봇분)
+    └── puzzle/                 ── 퍼즐게임(/b, §7) ── api.ts(별도 번들) · usePuzzleStore.ts(open() 은 로컬 보드에 결과만 이어붙임 — 끝난 판이 안 사라지게) · PuzzleLogin · Board(연 칸만 그림) · PuzzleApp
+    └── sc/                     ── 미니 RTS(/s1, §9) — **서버·로그인 없이 전부 클라이언트** ── types(타일 24px·맵 64×64·틱 30Hz) · data(유닛 4·건물 5, 밸런스는 여기만) · map(180° 대칭·연결성 보장·안개) · pathfind(A*, 유닛은 장애물 아님) · game · ai(0.5초 판단, owner 인자로 AI 대 AI) · render(전부 도형) · Hud · ScApp(rAF 루프, HUD 8Hz)
+    └── dungeon/                ── 5분 던전(/5m, §8) ── api(playCards 여러 장 한 요청) · data(표시 메타 + planAutoPlay — 덱·판정은 서버) · useDungeonStore(**적응형 폴링** 진행 0.5s/로비 1s/종료 2s/방 없음 4s, 같은 응답이면 setState 스킵) · Login · Rules(+IconLegend) · EventLog · Lobby · GameBoard · Card · DungeonApp
+    └── crate/                  ── 상자깡(/c, §10) ── api(⚠ 확률·가격·가치는 **서버 응답 그대로**) · data(등급색·fmtG·fmtP) · crate.css(0.2~0.7초) · useCrateStore(개봉 결과는 같은 보상끼리 **합산**) · Login · OpenStage · Shop(확률 공시) · Inventory(드래그 머지, ⚠ 포인터 좌표를 리렌더에 안 태움) · Collection
 ```
 
 ## 3. 데이터 흐름
@@ -152,102 +111,78 @@ ox64/
 ```
 시세(표시 전용):
   바이낸스 스팟 REST ─(초기 500봉)─► Chart.setData()
-  바이낸스 스팟 WS   ─(RxJS kline$)─► Chart.update() + useMarketStore.lastPrice
+  바이낸스 스팟 WS   ─(RxJS kline$)─► Chart.update()
+  OKX REST(1.2s)     ─(useMarkPrices)─► useMarketStore.prices (현재가/PnL mark)
 
 거래(서버 권위):
   Login ──POST /api/login──► [세션쿠키]
   OrderPanel ──POST /api/order {symbol,side,size,leverage}──► functions/api/order.ts
-                                                                │ 서버가 바이낸스서 체결가 fetch
+                                                                │ 서버가 OKX 서 체결가 fetch
                                                                 │ 증거금/손익 계산·검증
                                                                 ▼
                                                             D1 (users/positions/orders) 원자 갱신
                                                                 │
-  useTradingStore ◄──(갱신된 전체 state 응답)──────────────────┘
+  useTradingStore ◄──(갱신된 state 응답)────────────────────────┘
   Leaderboard ──GET /api/leaderboard──► 전 유저 equity(잔고+미실현) 순위
 ```
 
-- **시세 소스 = 바이낸스 스팟**(REST `api.binance.com/api/v3/klines`, WS `stream.binance.com:9443`).
-  선물(fapi/fstream)은 지역/IP 에 따라 WS 스트리밍이 막힘(소켓 OPEN 되나 데이터 0). 스팟은 전역 접근 가능 + 주요 종목 가격 사실상 동일 + 메시지 포맷 동일.
-- **클라 시세는 표시 전용**. 체결가는 서버(`functions/_shared.fetchPrice`)가 별도로 받는다 → 클라가 lastPrice 를 조작해도 체결/손익은 서버가 받은 진짜 가격으로 계산됨.
-- **⚠ 서버 시세 소스 = OKX → Coinbase → 바이낸스미러 폴백** (바이낸스 아님): **바이낸스는 Cloudflare Worker egress IP 를 전 호스트(api.binance.com·data-api.binance.vision)에서 403 차단**한다(브라우저는 되지만 서버 fetch 는 안 됨 → "price fetch 403"). 그래서 서버는 OKX(`www.okx.com`, USDT 페어 정확 일치) 우선, Coinbase(`api.exchange.coinbase.com`, USD≈USDT), 바이낸스미러 순으로 폴백. 클라 차트는 여전히 바이낸스 스팟(브라우저라 OK). 새 심볼 추가 시 OKX instId(`BASE-USDT`)·Coinbase product(`BASE-USD`) 매핑 확인.
-- **⚠ 실제 코인 mark(현재가/PnL) 소스 = OKX (차트 캔들만 바이낸스, 2026-07-24)**: 서버는 실제 코인 체결가를 **OKX** 에서 받는데(바이낸스는 Worker egress 403), 예전엔 클라 mark(현재가·PnL 기준)가 **바이낸스**(차트 WS + useMarkPrices)라 둘이 코인별 0.005~0.3% 어긋났다. **고배율에선 이게 크게 증폭**돼(200배면 0.05% 괴리도 10% ROE, PEPE 는 진입 즉시 -57%) "평단가가 차트에 없던 값에 체결된 것처럼" 보이고 진입 즉시 손익이 튀었다("사기?" 제보). 수정: `useMarkPrices` 와 `useMarketStore.prices` 를 **OKX(`services/okxRest.fetchOkxPrices`)** 로 채워 체결가=mark 로 통일 → 진입 손익 ~0 에서 시작(open 응답의 `markPrices[symbol]=체결가` 시드로 진입 순간엔 정확히 0). **차트 WS(binanceWs.klineStream)는 캔들만 그리고 더 이상 `setPrice` 하지 않는다**(실제 코인 분기 — OX 스폿캔들 경로 489줄의 setPrice 는 OX ref=체결소스라 유지). OKX 가 지역 차단이면 useMarkPrices 가 바이낸스로 폴백(그 유저만 예전 괴리로 degrade, 무회귀). 차트 캔들은 바이낸스 유지(전역 접근·전 인터벌 — OKX 는 8h 미지원). 실제 코인 현재가는 이제 WS 가 아니라 1.2초 OKX 폴링으로 갱신(캔들은 여전히 WS 로 부드럽게 애니메이션).
-- **PnL 표시 divergence(잔존)**: 실현 손익·랭킹은 서버 OKX 시세, 클라 mark 도 이제 OKX 라 예전보다 훨씬 작지만, 폴링 타이밍(체결 시각 vs 폴링 시각) 차이로 미세한 차이 가능(정상). 차트 캔들(바이낸스)과 포지션 현재가(OKX)는 괴리 큰 코인에서 소수점 몇 자리 다를 수 있으나 진입 손익 튐은 없다.
-- **전 심볼 PnL 갱신**: `useMarketStore.prices`(심볼별 가격맵)를 `useMarkPrices`(현재+보유 포지션 심볼, OKX, 1.2초)로 채운다. 예전엔 차트 WS(현재 심볼, 바이낸스)도 채웠으나 위 이유로 실제 코인 mark 는 OKX 폴링만 쓴다. PositionsPanel 은 `prices[p.symbol]` 로 각 포지션 PnL 계산.
-- **가격 정밀도(심볼별)**: 소수점 2자리 고정은 버그(예 0.0002345→0.00). `binanceRest.fetchPricePrecision` 이 exchangeInfo `PRICE_FILTER.tickSize` 로 심볼별 자릿수를 구해 (a)차트 series `priceFormat`(우측축·크로스헤어) 적용 + (b)`useMarketStore.precisions[symbol]` 저장 → Header 현재가·PositionsPanel 현재가/진입가/청산가·차트 레전드가 `fmtPrice(v, precisionOf(...))` 로 표기. 거래량은 `fmtVol`(K/M/B). (BTC/SOL=2, ALLO=4, PEPE=8.) **⚠ precision 은 예전엔 차트가 "현재 보는 심볼"만 채워서, 다른 심볼 포지션의 가격이 소수 2자리(precisionOf 폴백)로 나오던 버그가 있었다 → `useMarkPrices` 가 보유 포지션·미체결·현재 심볼 전부의 precision 을 없으면 1회 조회해 채운다(⚠ **가상 심볼은 조회 대상이 아니라 가격에서 파생** — 유효숫자 4자리라 자릿수가 가격대에 따라 바뀌므로 `useMarketStore.setPrice` 가 매 갱신마다 계산한다, § 가격 정밀도).** PositionsPanel 포지션 탭은 현재가 컬럼(진입가 좌측)·수량 아래 증거금(USDT) 표기.
-- **⚠ 거래량 히스토그램 색은 캔들 색에서 파생**(`volColors`/`withAlpha`, alpha 0.45): 차트 하단 오버레이, `useChartStore.volume`(기본 ON) 토글. 예전엔 `rgba(0,192,118,0.45)` 처럼 **하드코딩**돼서 테마/프리셋(라이트·고대비·바이낸스·OKX·트레이딩뷰)을 바꿔도 거래량만 옛 배색으로 남아 캔들과 따로 놀았다(어떤 테마의 캔들색과도 일치하지 않는 값이었다). 새 색을 직접 쓰지 말고 항상 `volColors(chartColors(...))` 를 거칠 것. **⚠ 히스토그램은 색이 각 데이터 포인트에 박혀 있어 `applyOptions` 로 안 바뀐다** — 테마 변경 이펙트가 `syncIndicators()` 를 다시 불러 전체를 새 색으로 그린다. 우측 축에 최신 거래량 티커(`lastValueVisible`, 1.23M 형식). RSI/거래량 동시 표시 시 하단을 [캔들]/[RSI]/[거래량] 으로 스택.
-- **⚠ 과거봉 lazy 로드는 실제 심볼·OX 양쪽 모두** — OX 분기가 예전엔 `subscribeVisibleLogicalRangeChange` 설정 **전에 곧장 return** 해버려서 가상코인만 과거 조회가 통째로 없었다(맨 왼쪽까지 스크롤해도 아무 일도 안 일어남). 지금은 OX 도 같은 패턴으로 `api.spotCandles(interval, 500, oldest*1000)` 를 호출해 이어 받는다(서버 `loadSpotCandles` 가 `endTime` 파라미터로 `bucket < ?` 페이지네이션). **1s 등 <60s 는 영속 캔들이 없어 과거 페이지가 존재하지 않으므로 `endTime` 이 오면 빈 배열을 반환**해 클라가 "더 없음"으로 확정하게 한다(최신 구간을 다시 주면 같은 구간을 무한히 덧붙인다). **⚠ 1초 폴링이 과거봉을 덮어쓰지 않게 병합**한다 — 폴링 결과로 배열을 통째로 갈아끼우면 왼쪽 스크롤로 붙여둔 과거봉이 매번 날아가 사실상 과거 조회가 불가능하다(최신 구간만 교체하고 그보다 앞선 구간은 보존). **기본 표시 봉수 + 과거봉 lazy 로드**: 초기 로드 후 `fitContent` 대신 `setVisibleLogicalRange` 로 **최근 ~38봉만** 표시(모바일 가독성). 왼쪽으로 스크롤해 보이는 논리범위 `from<10` 이면 `fetchKlines(.., endTimeMs=oldest-1)` 로 과거 500봉 prepend(`subscribeVisibleLogicalRangeChange`). prepend 시 인덱스가 밀리므로 `getVisibleLogicalRange`+오프셋으로 뷰 위치 보존. `loadingMore`/`noMore`(fresh<450=끝) 가드. symbol/interval 변경 시 리셋.
-- **차트(Chart.tsx)**: 시간축은 **KST(+9h) 고정** — 차트에 넣는 모든 시간값에 `KST_OFFSET` 을 더해 라벨을 한국시간으로(LWC v4 는 UTC 라벨이라 오프셋 방식). 타임프레임=`symbols.ts INTERVAL_GROUPS`(분/시간/일+, `<optgroup>`). 인디케이터=`services/indicators.ts`(EMA20/BB20·2/RSI14, RSI 는 하단 별도 priceScale). 매매마커=orders 필터(long=B 그린 arrowUp, short=S 레드 arrowDown, close=C). 평단선=현재 심볼 포지션 가중평균 `createPriceLine`. 옵션 토글은 `useChartStore`(localStorage). **바이낸스는 1년봉 미지원 → 최대 1개월봉**(1y 요청은 데이터소스 한계로 제외).
+- **차트 시세 = 바이낸스 스팟**(REST `api.binance.com/api/v3/klines`, WS `stream.binance.com:9443`; 선물 WS 는 지역에 따라 막힘). **클라 시세는 표시 전용** — 체결가는 서버(`_shared.fetchPrice`)가 따로 받는다.
+- **⚠ 서버 시세 = OKX → Coinbase → 바이낸스미러 폴백**(바이낸스는 Worker egress IP 를 403 차단). OKX(`BASE-USDT`) 우선, Coinbase(`BASE-USD`, USD≈USDT) — 새 심볼 추가 시 두 매핑 확인. `timedFetch`(2.5s) 로 느린 소스는 즉시 다음 폴백.
+- **⚠ 실제 코인 mark(현재가/PnL) = OKX, 차트 캔들만 바이낸스**: 서버 체결가가 OKX 인데 클라 mark 가 바이낸스면 코인별 0.005~0.3% 어긋나 고배율에서 진입 즉시 손익이 튄다(200배면 0.05% 도 10% ROE). `useMarkPrices` 가 OKX 로 채우고 open 응답의 `markPrices[symbol]=체결가` 로 시드. **차트 WS(klineStream)는 캔들만 그리고 `setPrice` 하지 않는다**(OX 스폿캔들 경로의 setPrice 는 ref=체결소스라 유지). 캔들은 바이낸스 유지(전 인터벌 — OKX 는 8h 미지원).
+- **가격 정밀도(심볼별)**: `binanceRest.fetchPricePrecision`(`PRICE_FILTER.tickSize`) → 차트 `priceFormat` + `useMarketStore.precisions[symbol]` → 모든 가격 표기는 `fmtPrice(v, precisionOf(...))`. ⚠ 차트가 "현재 심볼"만 채우면 다른 심볼 포지션이 소수 2자리 폴백 → `useMarkPrices` 가 보유·미체결·현재 심볼 전부 채운다(**가상 심볼은 가격에서 파생** — 유효숫자 4자리라 `setPrice` 가 매 갱신 계산, §4).
+- **⚠ 거래량 히스토그램 색은 캔들 색에서 파생**(`volColors`/`withAlpha`, alpha 0.45) — 하드코딩하면 테마를 바꿔도 거래량만 옛 배색. **⚠ 색이 데이터 포인트에 박혀 `applyOptions` 로 안 바뀐다** — 테마 변경 이펙트가 `syncIndicators()` 를 다시 불러 전체를 새로 그린다.
+- **⚠ 과거봉 lazy 로드는 실제 심볼·OX 양쪽 모두**. OX 는 `api.spotCandles(interval, 500, oldest*1000)`(서버 `loadSpotCandles` 가 `endTime` 으로 `bucket < ?` 페이지네이션). **<60s 는 영속 캔들이 없어 `endTime` 이 오면 빈 배열**(최신 구간을 다시 주면 무한히 덧붙인다). **⚠ 폴링이 과거봉을 덮어쓰지 않게 병합**(최신 구간만 교체). 초기 로드 후 `setVisibleLogicalRange` 로 **최근 ~38봉**(visibleBars), `from<10` 이면 과거 500봉 prepend + 오프셋으로 뷰 보존, `loadingMore`/`noMore`(fresh<450=끝) 가드.
+- **차트 시간축은 KST(+9h) 고정** — 모든 시간값에 `KST_OFFSET` 을 더한다(LWC v4 는 UTC 라벨). 매매마커=orders(long=B arrowUp, short=S arrowDown, close=C, liquidation=L). 평단선=심볼 포지션 가중평균 `createPriceLine`. **바이낸스는 1년봉 미지원 → 최대 1개월봉**.
 
 ## 4. 모의 체결 로직 (서버 = `functions/api/order.ts`)
 
-- **진입(open)**: 서버가 `fetchPrice(env, symbol)` → 증거금 `price*size/leverage` 를 잔고에서 **조건부 UPDATE**(`balance >= margin`)로 원자 차감. 부족하면 거부. 포지션+주문 INSERT 를 `DB.batch`(트랜잭션)로. `fetchPrice` 는 `isVirtualSymbol(symbol)`(OXUSDT) 이면 OKX/Coinbase 대신 봇이 만드는 내부가격(`spot_bot_state.ref_price`)을 반환 — **OX 도 다른 38종과 완전히 동일한 이 코드로 거래되며, 체결가 소스만 다르다.**
-  **⚠ 같은 심볼·같은 방향 물타기 = 포지션 병합(중복 생성 버그 수정)**: 이미 보유 중인 포지션이 있으면
-  새 행을 또 만들지 않고 그 포지션에 합친다(평단가 재계산, 거래소들의 "원웨이 모드"와 동일). 레버리지는
-  **최초 진입 때 값으로 고정**(포지션 하나에 레버리지가 섞이면 증거금 계산 불가) — 클라에서 보낸 레버리지는
-  기존 포지션이 있으면 무시하고 `existing.leverage` 를 그대로 씀. `limitOpen` 체결(`_trading.ts`)도 동일한
-  병합 로직을 탄다(`posBySymbolSide` 맵으로 같은 폴링 라운드 안의 연속 체결까지 올바르게 병합).
-- **미실현 PnL**: `(mark-entry)*size*dir`. 랭킹/표시에서 계산(저장 안 함).
-- **마진 모드 = 크로스(Cross) 고정**: 모든 포지션이 계좌 전체(여유잔고+전 포지션 증거금)를 공유 담보로 쓰고, 강제청산은 **계좌 평가자산이 0 이하일 때 전 포지션 동시**로만 일어난다(개별 포지션이 자기 증거금만 소진했다고 청산되는 아이솔레이티드가 아님). 청산가도 계좌 전체가 뒷받침한다는 전제로 계산된다(아래 산식). 아이솔레이티드 옵션은 없음. UI 는 OrderPanel 레버리지 뱃지·PositionsPanel 포지션/미체결 뱃지에 "크로스"를 명시.
-- **⚠ 크로스 가용 증거금 = 여유잔고 + 전 포지션 미실현손익** (`= 평가자산 − 사용중 증거금`, `_shared.unrealizedTotal`): 신규 주문(open/limitOpen)이 쓸 수 있는 증거금은 여유 현금뿐 아니라 **보유 포지션의 미실현이익까지 포함**한다 — 예전엔 여유 현금(balance)만 봐서 "평가자산 10만인데 슬라이더 100%가 2만밖에 안 잡히던" 버그가 있었다(이익 중인 포지션의 미실현이익이 새 주문에 안 잡힘 = 사실상 아이솔레이티드처럼 동작). 이익을 담보로 열면 여유잔고(`users.balance`)가 **음수까지 허용**되며(미실현이익이 상쇄), 잔고 차감 가드는 `balance − margin >= −uPnL`(⟺ `가용 >= margin`)로 원자적으로 막는다. 손실 중이면 가용이 여유잔고보다 작아진다(정상). 클라(OrderPanel 슬라이더·"가용(크로스)" 표시)도 서버 `markPrices` 기준으로 동일 계산해 어긋나지 않게 한다. OX 시장가도 `matchMarketOxOrder(…, floorPnL)` 로 동일 적용.
-- **⚠ 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익)** — 진입 시 증거금은 잔고(`users.balance`)에서 이미 빠져나가지만(그게 곧 담보), 청산 시 `balance += margin + pnl` 로 되돌아오므로 **증거금은 순자산의 일부다**. 강제청산(`_trading.ts liquidateIfBankrupt`)·리필(`refill.ts`)·랭킹(`leaderboard.ts`)·클라 표시(Header/PositionsPanel/Chart 청산가)가 전부 이 식을 쓴다. 예전엔 증거금 항을 빠뜨리고 `잔고+미실현`으로만 계산해서, 증거금 비중을 크게 잡으면(슬라이더 100% 등) **진입 즉시 강제청산**되고 랭킹 자산도 증거금만큼 깎여 보이던 치명적 버그가 있었음(수정됨).
-- **청산(close)**: **실제 코인 38종**은 서버가 청산가 fetch → `pnl` 계산 → 잔고에 `margin+pnl` 반환, 포지션 DELETE, close 주문 기록(pnl 포함). 전부 batch. `size` 를 지정하면 **부분 청산**(보유수량보다 작을 때) — 증거금/포지션 수량을 비율만큼만 줄이고 포지션은 유지, 생략/전량이면 DELETE(로컬 호가창이 없어 외부시세 mark 정산이 표준, 유동성 사실상 무한).
-  - **⚠ 시장가 매칭 = 스냅샷 기반(2026-07-24 재설계 — "대량 매수가 느리고 조금씩·급락·멈춤" 심각 버그 수정)**: 예전엔 `matchMarketOxOrder`/`closePositionAgainstBook` 이 봇 호가를 **청크마다** (포지션 SELECT + 15개 인터벌 캔들 upsert 포함 batch + 리쿼트와 경합하는 조건부 claim)로 **remote D1 를 왕복**하며 walking 했다. 대량 주문이면 수십~수백 왕복이 나고, 접속 폴링(useSpotPoll/useTriggerPoll)이 유발하는 봇 리쿼트가 walking 도중 봇 호가를 취소해 **claim 실패→refund→continue 스핀**으로 진행이 막혀, 체결이 조금씩·느리게 되고 심하면 몇 분간 멈췄다. 지금은 봇 호가를 **스냅샷 1회**로 읽어 **메모리에서 walking**(실사다리 소진 후 합성 흡수까지 전부 메모리)하고 결과를 **단일 batch**로 적용한다 → 왕복이 주문 크기와 무관하게 상수(수 read + charge + batch 1회), claim 경합 스핀 없음(소비한 실호가는 best-effort UPDATE — 리쿼트가 이미 취소했어도 봇은 무한 유동성이라 체결은 그대로 성립). 합성 흡수는 여전히 `SYNTH_STEPS`=24 균등 분할 + `SYNTH_MAX_IMPACT`=3% 상한(슬리피지 완만). 지정가(reduce-only 청산·limitOpen marketable)는 합성 안 함 — 크로스 호가 없으면 잔량 대기. 체결 테이프는 **walking 한 가격대별로 여러 줄**(아래 § 유저 체결 프린트 분해)로 기록하고 ref_price 를 최종 체결가로 갱신한다. **실측(로컬 D1): 1천만개 매수/청산이 단일 요청에 전량 즉시 체결, 매수→ref +3%·매도→-3%.**
-  - **⚠⚠ 유저 체결은 "한 줄"이 아니라 walking 한 만큼 여러 줄로 찍는다(`splitPrints`/`userTradeStmts`, 2026-09-03)**: 예전엔 시장가 한 방을 **1건으로 집계**해 찍어서 체결창에 "3,000,000개" 한 줄이 통째로 떴다("내 시장가가 합쳐서 나온다" 제보). 실제 거래소는 maker 주문 하나하나가 별도 체결로 인쇄되므로 사다리를 훑으면 그 단계 수만큼 줄이 생긴다. **집계했던 이유는 순전히 D1 비용**이다 — `spot_trades` INSERT 는 1건이 **3 rows written**(행 1 + 암묵 PK + 인덱스, §6)이라 실사다리 22단계 + 합성 24스텝을 전부 찍으면 체결 하나가 138행이 된다. 그렇다고 봇처럼 `tape_json` 링 버퍼에 얹으면 공짜지만 그 칸은 봇이 매 틱 통째로 덮어써서 **유저 체결이 몇 %는 사라진다**(자기 매매가 체결창에 안 보이는 건 "표시용 손실"로 넘길 수 없다). 그래서 **행으로 찍되 줄 수를 `USER_PRINT_MAX` 로 묶는다** — 같은 가격은 한 줄로 합치고(사다리 한 단계 = 한 체결), 그래도 넘치면 **연속 구간**을 가중평균가로 묶어 가격이 걸어간 순서를 유지한다. 시각은 1ms 씩 벌려 찍는다(마지막이 정확히 `now`) — 같은 ms 에 몰면 정렬이 불안정하고, 클라가 새 체결을 **시각**으로 식별하므로(`dripTrades`) 한 건만 새 것으로 보고 나머지를 안 흘려보낸다. 적용 경로는 시장가 진입/청산·지정가 체결 셋이고, `recordVirtualFill`(SL/TP 등 mark 정산)은 walking 이 아니라 1건 그대로다.
-    **⚠⚠ 줄 상한 6 → 20(2026-09-07)**: 6줄은 최대 46개 가격대(사다리 22 + 합성 24)를 8개씩 묶어 버려서, 대량 시장가의 체결창이 "가격이 걸어간 모습"이 아니라 뭉개진 6칸이었다("대량매매했을 때 6개까지밖에 안 뜬다" 제보). 20줄이면 3개씩 묶는 정도라 sweep 모양이 그대로 남는다. **계량은 flat 단가를 올리는 게 아니라 실제 줄 수를 넘긴다** — `feeAccrualStmts(…, prints.length)` → `_budget.rowsForFill(prints)`. flat 단가를 20줄 기준(60행)으로 올리면 프린트가 1~3줄뿐인 **대다수의 평범한 체결까지 3배로 과대 계상**돼 차단선이 이유 없이 먼저 걸린다(§6). ⚠ 새 체결 경로가 프린트를 여러 줄 찍으면 그 줄 수를 반드시 넘길 것(누락 = 과소계상 = 다음 청구서).
-    **⚠ 묶기는 "구간 크기"가 아니라 "정확히 max 칸"으로 나눈다** — `per = ceil(n/max)` 로 크기를 먼저 정하면 줄 수가 `ceil(n/per)` 로 떨어져 **상한의 절반 언저리**가 된다(46개 가격대 → 16줄, 21개 → 11줄). 상한을 20 으로 올려놓고 실제로는 16줄만 나오던 게 이것이다(prod 실측 33건 중 31건이 정확히 16줄). 인덱스를 균등 분할하면 구간 크기만 1 차이로 섞이고 줄 수는 항상 max 다.
-    **⚠⚠ 프린트 한 줄 = INSERT 한 문장이면 안 된다(`TRADE_INSERT_ROWS`, 2026-09-08)** — 무료 플랜은 **invocation 하나당 D1 쿼리 50개**가 상한이고 `DB.batch` 는 문장 하나하나가 그 1개로 잡힌다(§6). 줄 상한을 6→20 으로 올린 순간 시장가 한 방이 47~51 쿼리가 되어 **주문 크기·보유 심볼 수에 따라 어떤 건 넘고 어떤 건 안 넘는** 상태가 됐다(= "시장가가 가끔 씹힌다" 제보). 넘기면 batch 가 통째로 던져지는데 **잔고 차감(charge)은 그 앞에서 이미 확정**되므로 증거금만 나가고 포지션은 안 생긴다 — 표시 문제가 아니라 돈 문제다. 그래서 프린트는 **다중행 INSERT**(`VALUES (…),(…),…`)로 묶는다: 행 수·과금은 그대로고 문장만 12줄당 1개가 된다(20줄 = 2문장, 같은 요청이 ~30쿼리). ⚠ 묶음 크기 12 는 **D1 바운드 파라미터 상한 100**에서 온다(8컬럼 × 12행 = 96) — 컬럼을 늘리면 이 값을 같이 내릴 것.
-  - **⚠ 합성 흡수(synth) 램프의 기준은 "사다리를 다 먹은 지점"이다(2026-09-03 수정)**: 예전엔 `est`(주문 전 기준가)에서 다시 시작해서, 사다리 위쪽(예 1.156)까지 먹고도 합성 첫 스텝이 1.130 으로 **되돌아갔다**. 체결을 1건으로 집계해 찍던 시절엔 안 보였지만 위 프린트 분해로 그대로 드러난다 — 실제 거래소의 한 번의 sweep 은 절대 가격이 되돌아가지 않는다. `synthBase = planned[마지막].price ?? est` 로 바꿔 진입·청산 양쪽 모두 단조(매수는 오름, 매도는 내림)가 된다. 결과적으로 대량 주문의 슬리피지가 "책을 다 먹은 자리 + 최대 3%"로 커진다(예전엔 사다리를 먹은 사실이 합성 가격에 반영되지 않았다).
-  - **⚠ 유저 체결이 적정가(anchor)를 끌어당긴다(`ANCHOR_TRADE_PULL`=0.5) — "매수했는데 오히려 급락" 수정**: 예전엔 유저 시장가 체결이 `ref` 만 밀고 `anchor` 는 그대로라, 다음 봇 틱의 평균회귀(적정가 대비 과열도로 되돌림)가 그 움직임을 통째로 되돌려 매수 직후 되레 급락하는 것처럼 보였다(특히 옛 코드에선 체결이 조금씩이라 시장 노이즈에 파묻혔다). 실제 시장에서 대량 주문은 정보/수요라 적정가 자체를 옮긴다 — `matchMarketOxOrder`/`closePositionAgainstBook` 이 체결 후 `anchor` 를 체결가 방향으로 절반쯤 당겨(`newAnchor = anchor + (newRef−anchor)×0.5`) 시장충격이 "굳게" 한다(나머지 절반만 서서히 되돌아옴 = 현실적 임팩트 감쇠). **봇 전용 시뮬레이션엔 이 경로가 없어 장기 안정성 불변**(`BOT_BASE_PULL` 이 anchor 를 기준선 1 로 약하게 tether). 봇↔봇 합성체결엔 적용 안 함.
-  - **⚠ 시장가 진입은 목표 수량을 "감당 가능한 만큼" 먼저 클램프**(부풀린 평단→즉시 강제청산 버그): `affordableUnits = (balance + floorPnL) × 0.999 / (est/lev + est×feeRate)` 로 목표를 줄인 뒤 스냅샷 walking 한다. ⚠ 메모리 정산 시 감당분을 `avail` 딱 100% 가 아니라 `avail×(1−1e-6)`(budget)로 잘라야 한다 — 정확히 avail 에 맞추면 최종 잔고 차감(charge)의 원자 가드가 부동소수 오차로 실패해 체결이 통째로 0 이 된다. 청산(`closePositionAgainstBook`)은 잔고를 환급하므로 감당 클램프가 없다(포지션 전량이 목표).
-  - **⚠ OX/USDT 시장가 청산 = 봇 호가창 walking(있는 물량만큼만 청산)**: 예전엔 OX 청산이 호가창을 무시하고 `fetchPrice`(봇 ref) 한 값에 **전량** 정산돼, **호가창에 매물이 없어도(얇아도) 전 물량이 즉시 청산**되던 버그가 있었다. 이제 진입(`matchMarketOxOrder`)과 대칭으로 `spot.ts closePositionAgainstBook` 이 봇 호가를 가격-시간 우선순위로 walking 하며 **있는 물량만** 실제 호가 가격에 청산하고, 매물이 부족하면 **그만큼만(부분) 청산하고 나머지는 포지션에 남긴다**(호가가 아예 없으면 "청산할 수 있는 호가 물량이 없습니다"). PnL·증거금 환급은 실제 체결가(가중평균) 기준(슬리피지 반영). `order.ts close` 액션이 OX 면 `marketCloseOxPosition` 으로 분기.
-- **⚠ 미체결 주문 수정(editLimit)**: 미체결 지정가 주문의 **지정가·수량을 취소 없이 수정**한다. 진입 지정가는 새 값으로 증거금을 재계산해 델타(신규−기존)만큼 잔고를 조정 — **잔고 차감을 먼저 원자 가드(`balance − delta >= −uPnL`)로 확정하고 성공했을 때만 pending 을 UPDATE 한다**(⚠ batch 로 묶으면 잔고 가드가 0행이어도 pending UPDATE 가 그대로 커밋돼 "증거금 없이 주문만 커지는" 상태가 된다 — D1 batch 는 조건부 UPDATE 0행을 실패로 안 봄). reduce-only(지정가 청산)는 증거금이 없어 값만 갱신. 수정 후 OX 는 새 가격으로 즉시 재매칭(marketable 이면 바로 체결). UI 는 `PositionsPanel` 미체결 탭의 "수정" 버튼(지정가/수량 인라인 편집) + 차트 주문선 옆 취소(X) 버튼.
-- **⚠ 지정가 청산(limitClose, reduce-only)**: 포지션을 특정 가격에 청산 예약하는 기능(수량뿐 아니라 지정가로도 청산). `pending_orders.reduce_only=1` 로 쌓되 **증거금은 새로 안 잠근다(청산이므로, margin=0)**. 주문 방향(side)은 포지션 반대(롱 청산=`short`=매도, 숏 청산=`long`=매수). 체결 시 새 포지션을 열지 않고 대상 포지션(반대 side)을 그 수량만큼 줄인다. **OX** 는 제출 즉시 + 재호가 sweep + `checkTriggers` 가 `matchReduceOnlyOxPending`(위 `closePositionAgainstBook` 를 limitPrice 로 walking)로 봇 호가창에 매칭. **실제 코인** 은 `_trading.ts settleReduceOnlyClose` 가 mark 가 지정가를 크로스하면(매도청산 `mark>=limit`, 매수청산 `mark<=limit`) 그 지정가에 정산. 대상 포지션이 이미 없으면(전량청산·강제청산됨) 고아 pending 은 자동 삭제. 취소는 `cancelLimit`(margin=0 이라 환불 0). **⚠ 청산 가능 수량 검증(2026-07-24)**: 지정가 청산 수량은 `보유수량 − 이미 걸어둔 reduce-only 청산 합`(원웨이 모드라 symbol+closeSide 의 reduce_only 는 전부 이 포지션 대상) 이내여야 한다 — 예전엔 `size > pos.size` 로만 봐서 100 짜리에 청산 예약 100 을 여러 번 쌓아 **보유량을 초과하는 청산 주문**을 걸 수 있었다(체결 땐 `min(pending, pos)` 로 캡되지만 예약 자체가 유령). `limitClose`·`editLimit`(reduce-only) 둘 다 예약 합을 빼고 검증. 클라(`PositionsPanel`)도 청산 수량 placeholder 를 `청산 가능(=보유−예약)` 으로 표시하고, 지정가 청산 시 수량 비우면 전량 대신 청산 가능분을 기본값으로 보낸다. UI 는 `PositionsPanel` 청산 셀의 "지정가(비우면 시장가)" 입력 + 미체결 탭 "롱/숏 청산" 뱃지 + 차트 "청산 매수/매도" 주문선. **⚠ SL/TP 루프는 이제 포지션을 스냅샷이 아니라 최신 상태로 다시 읽는다** — reduce-only 청산이 같은 폴링에서 이미 줄이거나 없앤 포지션을 SL/TP 가 이중 청산(사라진 포지션에 잔고 재환급)하지 않게 하는 방어.
-- **입력 검증**: 심볼 형식(USDT 페어), side∈long/short, 레버리지 1~250(⚠ 서버 `order.ts` 4곳과 클라 `OrderPanel.MAX_LEVERAGE` 가 **같은 값**이어야 한다 — 한쪽만 올리면 슬라이더가 서버에 거부당하거나 화면에서 못 고른다), `badSize(size)`(=`size>0 && isFinite` — **상한은 여기서 안 본다**, 아래), leverage 1~250.
-  - **⚠⚠ 수량 상한 초과는 "거부"가 아니라 "클램프"다(`_shared.clampOrderSize`, 2026-08-20)** — 상한은 부동소수 폭주만 막는 계산 안전장치이고 실제 한도는 `증거금+수수료 <= 크로스 가용` 가드가 잡는다. 그런데 예전엔 `badSize` 가 `size > MAX_ORDER_SIZE` 를 **그대로 "수량 오류"로 반환**해서, 캡을 올려도 유저가 자릿수를 더 길게 넣으면 같은 버그가 다시 났다(히스토리 = `1e6` PEPE 수십억 개에서 터짐 → `1e15` 2026-07-30 에 또 터짐 → `1e30` 2026-08-20 에 또 터짐: 입력칸에 `888…888`(39자리)을 넣으면 그게 곧 "수량 오류"라 **주문 자체가 안 되는 것처럼 보였다**). 지금은 **캡을 숫자로 노출하지 않는다** — 파싱 지점(`open`/`limitOpen`/`editLimit`/`conditionalOpen`/`editConditional`)에서 `clampOrderSize` 로 잘라 넘기고, 그 뒤는 증거금 가드가 판정한다: 실제 코인은 **"증거금이 부족합니다 (최대 약 N 개)"**(`noMarginMsg` — 왜 막혔고 얼마면 되는지까지, 식은 클라 슬라이더와 동일), OX/EW 는 **감당 가능 수량으로 클램프해 부분 체결**. `1e999`(JSON 이 Infinity 로 파싱하는 값)도 `> MAX` 가 참이라 같이 흡수되고, `NaN`/0/음수만 "수량 오류"로 남는다. 캡 자체는 `1e60` 으로 올렸다(BTC 최고가를 곱해도 1e65 라 double 한참 아래, 그만큼 사려면 잔고 1e56 이 필요해 정상 거래로는 안 닿는다 — **잘리는 일 자체가 없게** 하는 게 목적). ⚠ 새 주문 경로를 추가할 때 `Number(body.size)` 를 그냥 쓰지 말고 반드시 `clampOrderSize` 를 거칠 것(안 거치면 1e300 같은 값이 명목금액 곱셈에서 `Infinity`→`NaN` 이 되어 잔고를 오염시킬 수 있다). 청산 수량(`close`/`limitClose`)은 상한이 "보유·청산 가능 수량"이라 그쪽 검증 문구가 그대로 뜬다(`보유 수량보다 많습니다` — 이미 사유가 명확).
-  - **⚠ 잔여/전량 판정 오차는 고정값이 아니라 `_shared.sizeEps(size)=max(1e-9, size*1e-12)`** — double 유효자리가 ~16자리뿐이라 1e15 개를 여러 청크로 walking 체결하면 합산 오차가 0.1~1 단위로 나온다. 고정 `1e-9` 로 비교하면 그 먼지가 "미체결 잔량"으로 남아 **전량 청산해도 포지션이 안 지워지고**(청산 버튼을 눌러도 수량이 0 이 안 됨) 미체결/조건부도 영원히 남는다. 적용 지점: `spot.ts` 청산 `fullyClosed`·pending 소진, `_trading.ts` reduce-only `fullyClosed`·조건부 잔량, `order.ts` 보유수량 초과/부분청산/청산가능수량 검증. **전량 판정이 참이면 증거금은 비율 계산이 아니라 잠긴 전액(`pos.margin`)을 환급**한다(반올림 손실이 잔고에 남지 않게).
-- **⚠ 진입 지연 감소**: 실제 코인 `open` 은 `checkTriggers`(보유 심볼 시세 fetch)와 체결가 `fetchPrice(symbol)` 를 `Promise.all` 로 **병렬** 실행한다(둘 다 끝난 뒤에만 잔고/기존포지션을 읽으므로 원자성 안전) — 예전엔 순차라 외부 시세를 두 번 왕복했다. 아울러 서버 시세 소스 fetch 에 `timedFetch`(2.5s AbortController) 를 걸어, 한 소스가 느리면 즉시 다음 폴백으로 넘어가 롱/숏 버튼 체감 지연의 tail 을 줄였다.
-- **지정가(limitOpen)**: `pending_orders` 에 생성 시점 `limit_price` 기준 증거금을 즉시 잠금(조건부 UPDATE 동일 패턴). **실제 코인 38종**은 체결가를 재계산 없이 `limit_price` 그대로 사용(델타 정산 불필요, `checkTriggers` 가 `mark` 이 `limit_price` 를 크로스하면 체결). **OX/USDT 는 예외** — 봇 호가창을 실제로 walking 매칭한다(§ OX/USDT "실제 호가창 매칭 엔진", `spot.ts matchLimitPendingAgainstBook`): 있는 물량만 실제 호가 가격에 체결, 잔량은 대기. `cancelLimit` 은 잠근(잔량분) 증거금을 그대로 환불.
-- **SL/TP(setSlTp)**: `positions.stop_loss`/`take_profit` (포지션당 각 1개). 값은 항상 포지션 방향 기준으로 검증(롱: `stopLoss<entry<takeProfit`, 숏은 반대) — `validSlTp()`.
-- **⚠ 조건부(스탑) 주문(conditionalOpen/cancelConditional)**: 지정가와 별개의 주문 타입. `conditional_orders` 테이블에 `trigger_price`+`trigger_dir`('above'=이상/'below'=이하)+진입 방향(long/short)+수량+레버리지를 저장하되 **증거금은 미리 잠그지 않는다**(스탑 주문 관행 — 트리거 전엔 예약일 뿐). `checkTriggers` 의 `settleConditionalOrder(_trading.ts)` 가 매 폴링에서 `mark` 이 트리거를 넘어섰는지 보고(above=`mark>=trigger`, below=`mark<=trigger`), 넘었으면 **그 자리에서 시장가로 남은 수량만큼 진입**한다. **OX** 는 `matchMarketOxOrder`(봇 호가창 walking — 있는 물량만 실제 호가 가격에, 잔량은 조건 유지), **실제 코인**은 `mark` 가에 즉시 체결하되 **가용 증거금(크로스=여유잔고+미실현손익)만큼만** 체결하고 못 채운 잔량은 조건을 살려둔다 → **"예약 수량이 다 안 채워지면 계속 조건이 살아있음"**(부분 체결마다 `conditional_orders.size` 를 줄이고, 0 이 되면 삭제). ⚠ 실제 코인 경로는 **잔고 차감을 먼저 원자 가드로 확정한 뒤에만** 포지션/원장 batch 를 커밋한다(editLimit 과 동일 — batch 안에 조건부 UPDATE 를 넣으면 0행이어도 나머지가 커밋돼 "증거금 없이 포지션만 생기는" 함정). 물타기 시 기존 포지션 레버리지로 고정·평단 재계산(원웨이 모드). SL/TP 는 지원 안 함(진입만 예약). `conditionalOpen` 은 INSERT 직후 `checkTriggers` 를 한 번 돌려 **이미 트리거된 스탑은 즉시 체결**시킨다(거래소 동일). 취소(`cancelConditional`)는 잠근 증거금이 없어 환불 0. UI 는 `OrderPanel` 세 번째 주문 타입 탭("조건부", 이상/이하 토글+트리거가) + `PositionsPanel` "조건부" 탭(방향/트리거조건/수량/반복/취소).
-- **⚠ 무한(반복) 조건부(`repeating`, 2026-07-28)**: "1.5 이하로 떨어질 때마다 시장가 123개 매수"처럼 **체결돼도 주문이 사라지지 않고** 계속 일하는 모드. `repeating=1` 이면 `size` 는 남은 목표가 아니라 **1회 실행 수량(차감 안 함)** 이고, 체결 후 행을 지우는 대신 `fill_count+1`·`last_fill_at` 을 갱신한다. 반복 방식(`repeat_mode`)이 두 가지다:
-  - **`continuous`(기본)** — 조건이 참인 **동안 계속** 실행한다(체결 후에도 `armed=1` 유지 → 다음 폴링에서 또 진입). "떨어져 있는 동안 계속 사 모으는" 물타기/DCA 용도이며 유저가 명시적으로 요청한 기본 동작이다.
-    **⚠⚠ 재실행 간격 하한 = 5초**(`_shared.ts MIN_CONTINUOUS_COOLDOWN_MS`, 2026-08-01). 예전엔 `cooldown_ms=0`(=평가마다 ≈1초)이 기본이자 허용값이었는데, 그러면 **주문 하나가 하루 8.6만 번 체결되고 체결 1건이 D1 에 ~18행을 쓰므로 하루 155만 행 = 월 4,650만 행** — 월 rows written 포함분(5,000만)을 그 주문 하나로 거의 다 먹는다. 실제로 이것과 봇 쓰기가 겹쳐 **7월분 $47 이 청구됐다**(§6). 5초면 같은 주문이 월 930만 행이 되어 봇(600만)과 합쳐도 3배 여유가 남고, 가격이 조건 아래에 머무는 시간은 보통 분 단위라 DCA 체감은 거의 같다.
-    **⚠ 판정은 저장값이 아니라 `effectiveCooldownMs(c.cooldown_ms)` 로 한다** — 하한 도입 전에 만들어진 주문들이 DB 에 `cooldown_ms=0` 으로 남아 있어서, 생성 시 검증만 고치면 그 주문들은 계속 1초 간격으로 돌아 예산을 태운다. `order.ts` 는 저장값도 하한으로 올려(UI 표시와 실제 동작이 어긋나지 않게) 이중으로 막는다.
-    **⚠ 그래도 스스로 멈추지는 않는다** — 브레이크는 `cooldown_ms`(≥5초)와 `max_fills`(최대 실행 횟수)뿐이고, `max_fills` 를 안 걸면 조건이 참인 동안 잔고가 바닥날 때까지 진입한다(그 뒤엔 가용 부족으로 체결 0 → 강제청산). 이건 버그가 아니라 선택된 동작이므로 UI 에 경고 문구를 붙였다. 특히 **트리거가 현재가에서 아주 먼 값이면 조건이 영구히 참**이라(예: OX 시세 1.0 에 "1.8 이하 매수") 사실상 무한 매수기가 된다.
-    **⚠ 이 사이트에서 유일하게 "스스로 무한히 D1 쓰기를 만드는" 유저 경로**라, `settleConditionalOrder` 는 체결 전에 `autoWritesBlocked(env)`(§6, `_budget.ts`)를 물어보고 이번 달 예산을 넘겼으면 조용히 물러난다. 1회성 조건부는 총량이 유한해서 막지 않는다(막으면 걸어둔 스탑이 안 걸리는 게 더 큰 사고다).
-  - **`rearm`** — 한 번 실행되면 `armed=0` 이 되고, 가격이 **트리거 반대편**(`rearm_price`, 미설정이면 `trigger_price`)으로 돌아왔을 때만 `armed=1` 로 복구된다(below 면 `mark >= rearm`, above 면 `mark <= rearm`) → "내려갈 때마다 한 번씩". `settleConditionalOrder` 는 재무장 대기 중이면 **재무장 판정만 하고 즉시 return**(그 폴링에선 절대 체결 안 함)한다. `rearm_price` 는 방향 검증을 받는다(below 는 `rearm >= trigger`, above 는 `rearm <= trigger` — 반대편이 아니면 재무장이 성립하지 않는다).
-  - `max_fills`(1~100,000, NULL=무제한)에 도달하면 그 체결 batch 안에서 주문을 **삭제**한다. `fill_count` 는 표시용 겸 상한 판정용.
-  - 체결 후 행 처리는 OX/실제코인 양쪽이 `conditionalAfterFillStmt()` 하나를 공유한다(1회성=잔량 차감/삭제, 무한=횟수+1·`continuous` 는 무장 유지·`rearm` 은 armed=0·상한 도달 시 삭제). OX 는 `filled > EPS` 일 때만 부르고(유동성 부족으로 0 체결이면 상태 그대로 유지 → 다음 폴링 재시도), 실제 코인은 잔고 차감 가드를 통과한 뒤 같은 batch 에 얹는다.
-  - **⚠ `useTriggerPoll` 은 항상 2.5초다(적응형 폐기, 2026-08-01)** — 예전엔 `continuous` 무한 조건부가 하나라도 있으면 폴링을 2.5초 → 1초로 당겼다(그 모드가 "폴링마다 1회"라 폴링 주기가 곧 매수 간격이었다). 지금은 그 모드에 **재실행 간격 하한 5초**가 있어 2.5초 폴링으로 하한을 충분히 따라잡으므로 분기를 없앴다. 폴링을 더 당기려면 §6 D1 예산을 먼저 계산할 것.
-  - **⚠ 반복 실행은 앱을 닫아둬도 계속된다(2026-07-29부터)** — cron 워커가 매 1분 `sweepTriggers` 로 전 유저를 훑기 때문(아래 §"접속 여부와 무관하게 매 1분 자동 실행"). 예전엔 `checkTriggers`(유저 요청 시점)만이 클럭이라 앱을 닫으면 반복이 멈췄다. 대신 **주기가 달라진다**: 접속 중 ~1초마다 / 접속 없으면 1분마다 4회 몰아서 → `cooldown_ms`/`max_fills` 를 안 걸었으면 **앱을 끄고 자는 동안에도 잔고가 계속 나간다**(브레이크는 여전히 그 둘뿐).
-  - **⚠ 신규 컬럼은 마이그레이션 전 DB 에서 `undefined` 로 온다** — 읽는 쪽은 전부 `?? 기본값`(`repeatModeOf()` 포함)으로 방어하지만 `conditionalOpen` 의 INSERT 는 컬럼이 없으면 실패하므로 **코드 배포 전에 ALTER 를 먼저 적용**할 것(§5).
-  - UI: `OrderPanel` 조건부 탭의 "무한 반복" 체크박스(켜면 반복 방식 토글 + `continuous` 는 재실행 간격(초) / `rearm` 은 재무장 가격 + 최대 실행 횟수, 그리고 모드별 동작·위험 설명), `PositionsPanel` 조건부 탭의 "반복" 컬럼(`계속 ∞`/`되돌아올 때 ∞`, 실행 횟수·간격·무장 상태), `Chart` 주문선 라벨 `조건부∞`(재무장 대기면 재무장 가격에 흐린 점선을 하나 더 그려 "왜 지금은 안 걸리는지"를 보여준다).
-- **⚠ 조건부 주문 수정(`editConditional`, 2026-07-28)**: 트리거가·수량·조건(이상/이하)·레버리지 + 반복 설정(방식/간격/재무장가/최대횟수)을 취소 없이 바꾼다. **`editLimit` 과 달리 잔고 정산이 전혀 없다** — 조건부는 증거금을 미리 잠그지 않으므로 단순 UPDATE 한 방이면 된다(그래서 "잔고 차감 먼저 확정" 같은 순서 함정도 없다). 안 보낸 필드는 기존 값 유지, `null`/`''` 로 보내면 해제(`parseRepeatOpts(body, …, prev)` 가 `undefined`=유지 / `null`=해제를 구분). 검증은 `conditionalOpen` 과 같은 함수를 공유하고, `max_fills` 는 **이미 실행한 횟수보다 커야** 한다(작게 넣으면 저장 즉시 사라지는 주문이 된다). 수정 후 **`armed=1` 로 되살리고** `checkTriggers` 를 한 번 돌린다 — 재무장 대기 중에 조건을 고쳤는데 계속 잠들어 있으면 "수정했는데 안 걸린다"가 되고, 새 조건을 이미 만족하면 거래소처럼 즉시 체결돼야 한다. UI 는 `PositionsPanel` 조건부 탭의 "수정" 버튼(인라인 편집: ≥/≤ 토글·트리거가·수량·반복 설정).
-- **강제청산(계좌 파산)**: `checkTriggers` 맨 앞에서 평가자산(위 정의: `balance + Σ(margin + 미실현손익)`)이 0 미만이면 **전 포지션 강제청산 + 미체결 지정가 전부 취소 + 잔고 0 으로 리셋**, 각 포지션은 `kind='liquidation'` 주문으로 기록(청산가=그 시점 서버 시세). 심볼 가격을 하나라도 못 받아온 라운드는 건너뜀(불완전한 데이터로 오청산 방지, 다음 폴링에 재평가). 트리거되면 그 라운드의 지정가/SL·TP 평가는 스킵(이미 다 정리됐으므로).
-- **청산가 표시(추정치)**: `PositionsPanel`/`Chart` 가 클라에서 `entry - (balance + Σ전체margin + 다른 포지션들 미실현손익) / (size*dir)` 로 "이 포지션 가격이 얼마가 되면 계좌가 파산하는지" 를 계산해 보여준다 — 위 강제청산 조건과 동일한 식(증거금 항 포함)이지만 어디까지나 클라 추정(실제 체결은 서버가 다음 폴링에서 판단).
-- **⚠ markPrices(청산가 즉시·일관 표시)**: 청산가/평가자산은 보유 심볼의 **현재가**가 있어야 계산되는데, 예전엔 클라가 그 값을 (a)차트 WS(현재 심볼만) (b)`useMarkPrices` 바이낸스 폴링(가상심볼 제외)으로만 채워서, **OX 를 안 보고 있으면 OX 포지션 현재가가 안 들어와 전 포지션 청산가가 통째로 안 나오고**, 진입 직후엔 폴링 전까지 청산가가 비어 있었다. 수정: `checkTriggers` 가 자기가 fetch 한 시세 맵을 반환하고, `loadState(env,uid,marks)` 가 이를 `markPrices` 로 응답에 실어보내면 클라 `useTradingStore.apply` 가 `useMarketStore.prices` 에 시드한다 → 서버 강제청산과 **똑같은 시세**로, 폴링을 기다리지 않고 즉시 계산(OX 미열람·진입 직후 포함). `open` 은 방금 체결가를, `close` 는 청산가를 marks 에 추가해 새 심볼도 바로 반영.
-- **리필(`functions/api/refill.ts`)**: 강제청산으로 자산이 0이 됐을 때를 위한 안전망. **평가자산(잔고+전 포지션 미실현손익 합)이 0 이하일 때만 지급** — 포지션이 있으면 서버가 그 심볼들 시세를 fetch 해 판정(가격 하나라도 못 받아오면 거부, 오판정 방지). 자산이 남아있으면 거부. 통과하면 `users.refill_count`/`refill_date`(KST 날짜)로 **1일 최대 3회, 1회 +10,000 USDT**. 날짜가 바뀌면 `refill_date !== 오늘` 이라 카운트를 0으로 취급(별도 리셋 cron 불필요 — `checkTriggers` 와 같은 "폴링 시점에 계산" 패턴). `loadState` 가 `refillsLeft` 를 계산해 응답에 포함. `Header.tsx` 도 동일한 식으로 클라 추정해 버튼을 미리 비활성화(실제 판정은 서버).
-  **⚠ 자산이 0 이 되면 팝업이 자동으로 뜬다(`RefillModal.tsx`, 2026-09-02)** — 리필이 헤더 구석의 작은
-  버튼뿐이라, 강제청산으로 자산이 0 이 된 사람에겐 **게임이 끝난 것처럼** 보였다(하루 3회 무료로 다시
-  시작할 수 있다는 걸 알 방법이 없었다). 평가자산·남은 횟수·자정 초기화를 안내하고 그 자리에서 리필을
-  받는다. 닫으면 **평가자산이 0 을 벗어날 때까지** 다시 안 뜬다(폴링마다 다시 뜨면 아무것도 못 한다 —
-  리필에 성공하면 자동으로 초기화되고 다음에 또 파산하면 다시 뜬다). 스토어의 `error` 는 공용이라
-  **이 팝업에서 실제로 눌러본 뒤에만** 보여준다(직전에 실패한 주문 메시지가 리필 팝업에 뜨면 오해한다).
-- **체결 체크 = 접속 폴링(빠른 경로) + cron sweep(접속 무관, 느린 경로)**: Cloudflare Pages Functions 는 정기 실행을 지원하지 않는다. 그래서 `functions/_trading.ts checkTriggers(env,uid)` 를 `state.ts`(GET, 클라가 `useTriggerPoll` 로 항상 2.5초마다 호출)와 `order.ts`(POST 액션 진입 직후, 수동 조작과의 레이스 방지)에서 호출해 **그 유저의 요청이 들어올 때** 강제청산/지정가/SL·TP/조건부를 평가·체결한다(체결가는 지정가/SL/TP 값 그대로, 슬리피지 모델링 없음). 그리고 **아무도 접속하지 않아도** 같은 평가가 돌도록 `cron/` 워커가 매 1분 `sweepTriggers(env)` 로 전 유저를 훑는다(아래) → **주기만 다르고 기능 차이는 없다**.
-- **⚠ 접속 여부와 무관하게 매 1분 자동 실행 = `sweepTriggers`(2026-07-29, 예전엔 강제청산만)**: `cron/`(별도 배포되는 작은 Worker, Pages 는 Cron Trigger 미지원이라 분리) 가 매 1분 `sweepTriggers(env)`(`functions/_trading.ts`) 를 호출해 **포지션·미체결·조건부가 있는 전 유저**를 훑어 강제청산·지정가·SL/TP·조건부(무한 반복 포함)를 전부 평가·체결한다. 같은 D1 을 바인딩하므로 별도 동기화 불필요. 배포·시크릿 설정은 §5 참고(⚠ cron 워커는 수동 재배포).
-  - **예전엔 이 sweep 이 `sweepForcedLiquidations`(강제청산만)** 이라, 무한 조건부를 걸어둬도 **앱(차트 화면)을 닫으면 반복 매수가 멈췄다**("차트 켜놨을 때만 조건부가 작동함" 제보). 근본 원인은 조건부/지정가/SL·TP 평가가 `checkTriggers` 안에만 있어서 = **유저 요청이 유일한 클럭**이었던 것. 수정: 평가 본체를 `runTriggers(env,uid,pendings,positions,conditionals,prices)` 로 추출해 `checkTriggers`(1인분)와 `sweepTriggers`(전 유저)가 **공유**한다 → 새 트리거 기능을 추가해도 자동으로 양쪽에서 돈다(한쪽에만 추가되는 실수 방지).
-  - **⚠ 마켓메이커 틱 예산은 총량 고정, 코인들이 나눠 쓴다**(`cron/index.ts` `MM_TICK_BUDGET`=24, `MM_BUDGET_PER_PAIR = MM_TICK_BUDGET / VIRTUAL_PAIRS.length`): 현재 2코인 × 12틱. **⚠ 이 값을 정하는 기준이 바뀌었다(2026-08-14)** — 예전엔 틱 하나가 D1 왕복 ~14쿼리라 쿼리 한도가 상한을 정했지만, 지금은 틱이 순수 계산이고 커밋이 페어당 1회라 **틱 수가 쿼리 수도 쓰기도 거의 안 늘린다**(§ spot.ts runBotTicks). 이제 상한을 정하는 건 **CPU(무료 10ms/invocation)** 다 — 실측 24틱 ≈ 3.5ms. 코인을 늘릴 때도 총량을 그대로 두면 코인당 틱만 줄어(움직임이 성겨짐) 비용은 불변이다.
-  - **⚠ 유저가 보고 있으면 cron 은 물러난다**(`marketMakerTickBudget`, `POLL_ACTIVE_MS`=20s, `BURST_MIN_TICKS`=4): `/api/spot` 폴링(1초)이 이미 초당 한 번씩 재호가를 돌리는데 cron 이 12틱을 더 얹는 건 순수 중복이라, 쓰기만 배로 나가고 차트가 더 살아나지도 않는다. `last_run` 이 방금 전이면 폴링이 클럭 역할 중이라는 뜻이므로 최소치만 돌린다(cron 이 직접 찍은 `last_run` 은 다음 실행 때 60초 전이라 두 경우가 안 섞인다).
-    **⚠⚠ 이 판정은 라운드 루프 밖에서 실행당 한 번만 한다** — `runMarketMakerBurst` 는 끝날 때 `last_run` 을 찍으므로, 안에서 라운드마다 판정하면 **다음 라운드가 직전 라운드의 자기 발자국을 보고 "누가 폴링 중"이라 오판**해 아무도 없는데도 cron 이 스스로 물러난다(실측: 분당 12틱이어야 할 것이 4틱). 라운드 간격이 밀리초라 시각만으로는 cron 자신과 유저 폴링을 구분할 수 없다.
-  - **⚠ 트리거는 "현재가 한 점"이 아니라 "지나온 가격 범위"로 판정한다**(`_trading.ts` `PriceRanges`/`rangeOfPath`, 2026-08-14): OX 가격은 벽시계가 아니라 **봇 틱이 돌 때만** 움직이는데 cron 은 1분치 틱을 한 번에 몰아 돌린다 — 끝난 뒤 현재가 한 점만 보면 그 사이 지나간 딥/스파이크를 통째로 놓친다(예: "1.0 이하로 내려가면 매수"인데 8번째 틱에서만 1.0 을 찍고 되돌아온 경우). 예전엔 이걸 "sweep 을 4라운드 반복"으로 때웠으나 sweep 한 번이 D1 쿼리 ~18개라 무료 한도(50)를 넘겼다. 지금은 버스트가 돌려준 경로의 **최저/최고**로 한 번에 판정한다 — 실제 거래소가 구간 고가/저가로 스탑을 판정하는 방식과 같고, 4점 샘플링보다 오히려 정확하다. 적용 대상은 조건부(발동·재무장)·SL/TP·지정가 크로스이고, **강제청산만은 현재가로 본다**(스쳐간 저가로 계좌를 파산시키면 되돌릴 수 없다).
-  - **⚠ 한 invocation 에서 훑는 유저 수 상한 `MAX_SWEEP_USERS`(8)**: 유저가 늘어도 invocation 쿼리 수가 늘지 않게 분 단위로 회전하며 나눠 훑는다(무료 한도 50 방어). 접속 중인 유저는 자기 폴링(2.5초)이 즉시 처리하므로 늦어지는 건 앱을 닫아둔 유저뿐이고, 그마저 몇 분 안에 차례가 온다. 현재 대상 유저는 4명이라 회전이 아예 일어나지 않는다.
-  - **⚠ 실제 코인 시세는 한 cron 안에서 재사용, OX 는 매 라운드 새로 읽는다**(`sweepTriggers(env, cachedPrices?)` → 반환한 `prices` 를 다음 라운드에 넘김): 실제 코인은 외부 거래소 fetch(비싸고 라운드마다 거의 같은 값), OX 는 `spot_bot_state.ref_price`(D1 read, 라운드마다 실제로 바뀜).
-  - **체감 주기**: 접속 중이면 폴링(2.5초) / 접속을 끊으면 1분마다 1회. 단 `continuous` 무한 조건부의 실제 실행 간격은 **재실행 간격 하한 5초**가 상한을 잡으므로 접속 중엔 분당 최대 12회, 앱을 닫으면 분당 1회다. 더 촘촘하게 하려면 cron 주기(1분이 Cloudflare 최소)를 줄여야 하는데 그게 최소값이고, **D1 쓰기가 계속 나가는 기능**이라 §6 예산을 먼저 계산할 것.
-  - 한 유저의 평가가 예외로 터져도 나머지 유저는 계속 평가한다(try/catch + `console.error`, 다음 라운드/다음 cron 에서 재시도).
-  - 로컬 검증(`cd cron && npx wrangler dev` → `curl .../cdn-cgi/handler/scheduled`, **유저 요청 0회**): OX 무한 `continuous` 가 4라운드에 정확히 4회 체결(fill_count=4, 무장 유지), `cooldown_ms`=60s 는 1회로 제한, 1회성 조건부(실제 코인 BTCUSDT)는 체결 후 행 삭제, 실제 코인 지정가 pending 체결, SL 히트로 포지션 청산까지 전부 확인.
-- **⚠ 거래 수수료 + VIP 등급(2026-07-20)**: 모든 체결에 `수수료 = 명목금액(체결가×수량) × VIP 요율` 이 붙는다.
-  - **등급 = 누적 거래대금(`users.total_volume`)** 으로 결정. 증거금이 아니라 **명목금액(레버리지 포함)** 이라 고배율일수록 빨리 오른다. 진입·청산 각각 그 체결의 명목금액만큼 누적.
-  - **⚠⚠ 등급은 표가 아니라 공식이고 상한이 없다(2026-08-09, 무한 레벨)**: 예전엔 `VIP_TIERS` 13행 상수표(VIP0~12, 1단계당 100배)였다 — (a)VIP12 에서 끝나 그 위로는 아무리 거래해도 변화가 없고 (b)한 칸이 100배라 RPG 로 치면 "레벨이 12개뿐이고 다음 레벨까지 경험치 100배"였다. 지금은 등비수열 두 개로 무한히 이어진다(`_shared.ts`):
+- **진입(open)**: 서버가 `fetchPrice(env, symbol)` → 증거금 `price*size/leverage` 를 잔고에서 **조건부 UPDATE**(`balance >= margin`)로 원자 차감, 부족하면 거부. 포지션+주문 INSERT 는 `DB.batch`. `fetchPrice` 는 `isVirtualSymbol(symbol)` 이면 OKX/Coinbase 대신 봇 내부가격(`spot_bot_state.ref_price`) — **OX 도 이 코드 그대로 거래되고 체결가 소스만 다르다.**
+  **⚠ 같은 심볼·같은 방향 물타기 = 포지션 병합**(원웨이 모드): 새 행을 만들지 않고 그 포지션에 합쳐 평단가 재계산. 레버리지는 **최초 진입 값으로 고정**(한 포지션에 레버리지가 섞이면 증거금 계산 불가) — 클라 값은 기존 포지션이 있으면 무시하고 `existing.leverage`. `limitOpen` 체결(`_trading.ts`)도 같은 병합(`posBySymbolSide` 맵으로 같은 라운드 안의 연속 체결까지).
+- **미실현 PnL** `(mark-entry)*size*dir` — 저장 안 하고 랭킹/표시에서 계산.
+- **마진 모드 = 크로스 고정**: 전 포지션이 계좌 전체(여유잔고+전 증거금)를 공유 담보로 쓰고, 강제청산은 **평가자산 ≤ 0 일 때 전 포지션 동시**로만. 아이솔레이티드 옵션 없음(OrderPanel 레버리지 뱃지·PositionsPanel 뱃지에 "크로스" 명시).
+- **⚠ 크로스 가용 증거금 = 여유잔고 + 전 포지션 미실현손익**(`_shared.unrealizedTotal`, = 평가자산 − 사용중 증거금): 신규 주문(open/limitOpen)은 보유 포지션의 미실현이익까지 담보로 쓴다(여유 현금만 보면 이익 중 포지션이 새 주문에 안 잡혀 사실상 아이솔레이티드). 그래서 `users.balance` 는 **음수까지 허용**되고 가드는 `balance − margin >= −uPnL`(⟺ `가용 >= margin`) 원자 UPDATE. 클라(OrderPanel 슬라이더·"가용(크로스)")도 서버 `markPrices` 로 같은 식. OX 시장가도 `matchMarketOxOrder(…, floorPnL)`.
+- **⚠ 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익)** — 증거금은 진입 때 잔고에서 빠지지만 청산 때 `balance += margin + pnl` 로 돌아오는 **순자산의 일부**다. 강제청산(`_trading.ts liquidateIfBankrupt`)·리필(`refill.ts`)·랭킹(`leaderboard.ts`)·클라 표시(Header/PositionsPanel/Chart 청산가, `useEquity`)가 전부 이 식(증거금 항을 빠뜨리면 슬라이더 100% 진입이 즉시 강제청산되고 랭킹 자산이 증거금만큼 깎여 보인다).
+- **청산(close)**: 실제 코인 38종은 청산가 fetch → `pnl` → 잔고에 `margin+pnl` 반환, 포지션 DELETE, close 주문 기록(pnl 포함, 전부 batch). `size` 지정 시 **부분 청산**(증거금·수량을 비율만큼 축소), 생략/전량이면 DELETE(외부시세 mark 정산이 표준).
+  - **⚠ OX 시장가 매칭 = 스냅샷 기반**: 봇 호가를 **1회 읽어 메모리에서 walking**(실사다리 소진 후 합성 흡수까지) → 결과를 **단일 batch** 로. 왕복이 주문 크기와 무관하게 상수(수 read + charge + batch 1회), claim 경합 스핀 없음(소비한 실호가는 best-effort UPDATE — 리쿼트가 이미 지웠어도 봇은 무한 유동성이라 체결 성립). 합성 흡수는 `SYNTH_STEPS`=24 균등 분할 + `SYNTH_MAX_IMPACT`=3% 상한. 지정가(reduce-only 청산·marketable limitOpen)는 합성 안 함 — 크로스 호가 없으면 잔량 대기. ⚠ 청크마다 D1 을 왕복하던 예전 방식(대량 주문이 느리고·조금씩·급락·멈춤)으로 돌아가지 말 것.
+  - **⚠⚠ 유저 체결은 "한 줄"이 아니라 walking 한 가격대별로 여러 줄**(`splitPrints`/`userTradeStmts`): 같은 가격은 한 줄(사다리 한 단계 = 한 체결), 줄 수는 `USER_PRINT_MAX`(20)로 묶되 **인덱스를 정확히 max 칸으로 균등 분할**한다(`per=ceil(n/max)` 로 크기를 먼저 정하면 줄 수가 `ceil(n/per)` 로 떨어져 상한의 절반쯤만 나온다), 연속 구간은 가중평균가로 순서 유지. 시각은 1ms 씩 벌려 마지막이 정확히 `now`(같은 ms 면 정렬 불안정 + 클라 `dripTrades` 가 시각으로 새 체결을 식별해 한 건만 흘린다). 봇처럼 `tape_json` 에 얹지 않는 이유: 봇이 매 틱 덮어써 유저 체결이 사라진다. **계량은 flat 단가가 아니라 실제 줄 수**(`feeAccrualStmts(…, prints.length)` → `_budget.rowsForFill`) — flat 을 20줄 기준으로 올리면 1~3줄짜리 평범한 체결까지 3배 과대 계상된다. ⚠ 새 체결 경로가 여러 줄을 찍으면 반드시 줄 수를 넘길 것(누락=과소계상=다음 청구서). 적용: 시장가 진입/청산·지정가 체결. `recordVirtualFill`(SL/TP 등 mark 정산)은 1건 그대로.
+    **⚠⚠ 프린트 한 줄 = INSERT 한 문장이면 안 된다(`TRADE_INSERT_ROWS`=12)** — 무료 플랜은 invocation당 D1 쿼리 50 이고 `DB.batch` 문장 하나가 1쿼리다(§6). 20줄이면 시장가 한 방이 47~51 쿼리라 주문 크기·보유 심볼 수에 따라 "가끔" 넘고, 넘기면 batch 가 통째로 던져지는데 **잔고 차감(charge)은 그 앞에서 이미 확정**돼 증거금만 빠지고 포지션이 안 생긴다. 그래서 다중행 INSERT(`VALUES (…),(…)`)로 12줄당 1문장(20줄 = 2문장, ~30쿼리). 12 는 **D1 바운드 파라미터 상한 100 ÷ 8컬럼** — 컬럼을 늘리면 같이 내릴 것.
+  - **⚠ 합성 흡수(synth) 램프의 기준은 "사다리를 다 먹은 지점"**(`synthBase = planned[마지막].price ?? est`) — `est`(주문 전 기준가)에서 다시 시작하면 사다리 위쪽까지 먹고도 합성 첫 스텝이 아래로 되돌아간다. 진입·청산 모두 단조(매수 오름/매도 내림), 대량 슬리피지는 "책을 다 먹은 자리 + 최대 3%".
+  - **⚠ 유저 체결이 적정가(anchor)를 끌어당긴다(`ANCHOR_TRADE_PULL`=0.5)**: `matchMarketOxOrder`/`closePositionAgainstBook` 이 체결 후 `newAnchor = anchor + (newRef−anchor)×0.5`. 안 하면 다음 봇 틱의 평균회귀가 움직임을 통째로 되돌려 "매수했는데 급락"이 된다(대량 주문은 정보/수요라 적정가 자체를 옮긴다). 봇↔봇 합성체결·봇 전용 sim 에는 적용 안 함(장기 안정성 불변).
+  - **⚠ 시장가 진입은 목표 수량을 감당 가능한 만큼 먼저 클램프**: `affordableUnits = (balance + floorPnL) × 0.999 / (est/lev + est×feeRate)` 로 줄인 뒤 walking(안 하면 부풀린 평단→즉시 강제청산). ⚠ 메모리 정산 시 감당분은 `avail×(1−1e-6)`(budget)로 잘라야 한다 — 정확히 avail 이면 charge 의 원자 가드가 부동소수로 실패해 체결이 통째로 0. 청산(`closePositionAgainstBook`)은 환급이라 클램프 없음.
+  - **⚠ OX 시장가 청산 = 봇 호가창 walking**(`spot.ts closePositionAgainstBook`, 진입과 대칭): 있는 물량만 실제 호가 가격에, 부족하면 **그만큼만 부분 청산하고 나머지는 포지션에 남긴다**(호가가 없으면 "청산할 수 있는 호가 물량이 없습니다"). PnL·환급은 가중평균 체결가 기준. `order.ts close` 가 OX 면 `marketCloseOxPosition`. ⚠ 호가창을 무시하고 `fetchPrice` 한 값에 전량 정산하던 예전 방식 금지.
+- **⚠ 미체결 주문 수정(editLimit)**: 지정가·수량을 취소 없이 수정. 진입 지정가는 새 증거금 델타만큼 잔고 조정 — **잔고 차감을 먼저 원자 가드(`balance − delta >= −uPnL`)로 확정하고 성공했을 때만 pending UPDATE**. **⚠⚠ D1 batch 는 조건부 UPDATE 가 0행이어도 실패로 안 본다** — 잔고 가드와 후속 쓰기를 한 batch 에 넣으면 "증거금 없이 주문만 커지는/포지션만 생기는" 상태가 된다(conditionalOpen 실제코인 경로·던전 §8 도 같은 규칙). reduce-only 는 증거금이 없어 값만 갱신. OX 는 수정 후 즉시 재매칭. UI: `PositionsPanel` 미체결 탭 "수정" + 차트 주문선 옆 취소(X).
+- **⚠ 지정가 청산(limitClose, reduce-only)**: `pending_orders.reduce_only=1`, **증거금은 안 잠근다(margin=0)**, side 는 포지션 반대(롱 청산=`short`). 체결 시 새 포지션을 열지 않고 대상 포지션(반대 side)을 그 수량만큼 줄인다. **OX** 는 제출 즉시 + 재호가 sweep + `checkTriggers` 가 `matchReduceOnlyOxPending`(`closePositionAgainstBook` 을 limitPrice 로 walking)으로 매칭, **실제 코인**은 `_trading.ts settleReduceOnlyClose` 가 mark 크로스(매도청산 `mark>=limit`/매수청산 `mark<=limit`) 시 지정가에 정산. 대상 포지션이 없으면 고아 pending 자동 삭제. `cancelLimit` 환불 0. **⚠ 청산 예약 수량 ≤ 보유 − 이미 걸어둔 reduce-only 합**(원웨이라 symbol+closeSide 의 reduce_only 는 전부 이 포지션 대상; `limitClose`·`editLimit` 둘 다 검증. 클라 placeholder 도 "청산 가능"=보유−예약, 지정가 청산 시 비우면 그 값을 보낸다). **⚠ SL/TP 루프는 포지션을 스냅샷이 아니라 최신 상태로 다시 읽는다**(같은 폴링의 reduce-only 청산이 줄인 포지션을 이중 청산하지 않게).
+- **입력 검증**: USDT 페어 형식·side∈long/short·레버리지 1~250(⚠ 서버 `order.ts` 4곳과 클라 `OrderPanel.MAX_LEVERAGE` 가 **같은 값**이어야 한다)·`badSize(size)`(=`size>0 && isFinite` — **상한은 여기서 안 본다**).
+  - **⚠⚠ 수량 상한 초과는 "거부"가 아니라 "클램프"(`_shared.clampOrderSize`, 캡 `1e60`)** — 상한은 부동소수 폭주만 막는 안전장치고 실제 한도는 `증거금+수수료 <= 가용` 가드다. 캡을 숫자로 거부하면 유저가 자릿수를 더 넣는 순간 같은 버그가 재발한다(1e6→1e15→1e30 으로 세 번 터졌다 — "수량 오류"라 주문 자체가 안 되는 것처럼 보였다). 파싱 지점(`open`/`limitOpen`/`editLimit`/`conditionalOpen`/`editConditional`) 전부 `clampOrderSize` 를 거치고, 그 뒤는 증거금 가드가 판정: 실제 코인은 `noMarginMsg`("증거금이 부족합니다 (최대 약 N 개)", 식은 클라 슬라이더와 동일), OX/EW 는 감당 가능 수량으로 클램프해 부분 체결. `1e999`(Infinity)도 `> MAX` 로 흡수, `NaN`/0/음수만 "수량 오류". 캡 1e60 은 잘리는 일 자체가 없게 하는 값(BTC 최고가를 곱해도 double 한참 아래). ⚠ 새 주문 경로에서 `Number(body.size)` 를 그냥 쓰지 말 것(1e300 이 명목금액 곱셈에서 Infinity→NaN 이 되어 잔고 오염). 청산 수량(`close`/`limitClose`)은 상한이 보유·청산 가능 수량이라 "보유 수량보다 많습니다" 그대로.
+  - **⚠ 잔여/전량 판정 오차 = `_shared.sizeEps(size)=max(1e-9, size*1e-12)`** — double 유효자리가 ~16자리라 1e15 개를 여러 청크로 체결하면 합산 오차가 0.1~1 이고, 고정 1e-9 로 비교하면 그 먼지가 "미체결 잔량"으로 남아 전량 청산해도 포지션이 안 지워진다. 적용: `spot.ts` 청산 `fullyClosed`·pending 소진, `_trading.ts` reduce-only `fullyClosed`·조건부 잔량, `order.ts` 보유수량/부분청산/청산가능 검증. **전량이면 증거금은 비율이 아니라 잠긴 전액(`pos.margin`) 환급**(반올림 손실이 잔고에 남지 않게).
+- **⚠ 진입 지연 감소**: 실제 코인 `open` 은 `checkTriggers`(보유 심볼 시세)와 `fetchPrice(symbol)` 를 `Promise.all` **병렬**(둘 다 끝난 뒤 잔고/포지션을 읽으므로 원자성 안전). 시세 소스 fetch 는 `timedFetch`(2.5s AbortController)로 느린 소스를 즉시 다음 폴백으로.
+- **지정가(limitOpen)**: `pending_orders` 에 `limit_price` 기준 증거금 즉시 잠금(조건부 UPDATE). 실제 코인은 `checkTriggers` 가 mark 크로스 시 `limit_price` 그대로 체결(델타 정산 없음). **OX 는 봇 호가창을 walking 매칭**(`spot.ts matchLimitPendingAgainstBook`, 있는 물량만 실제 호가 가격에·잔량 대기). `cancelLimit` 은 잔량분 증거금 환불.
+- **SL/TP(setSlTp)**: `positions.stop_loss`/`take_profit` 포지션당 각 1개, 항상 포지션 방향 기준 검증(`validSlTp()`: 롱 `stopLoss<entry<takeProfit`, 숏 반대).
+- **⚠ 조건부(스탑) 주문(conditionalOpen/cancelConditional)**: 지정가와 별개 타입. `conditional_orders`(`trigger_price`+`trigger_dir` 'above'/'below'+side+size+leverage), **증거금은 미리 안 잠근다**(스탑 관행). `settleConditionalOrder`(`_trading.ts`) 가 매 평가에서 above=`mark>=trigger`/below=`mark<=trigger` 면 **그 자리에서 시장가로 남은 수량만큼 진입**: OX 는 `matchMarketOxOrder`(있는 물량만, 잔량은 조건 유지), 실제 코인은 mark 에 **가용 증거금(크로스)만큼만** 체결하고 못 채운 잔량은 조건을 살려둔다(부분 체결마다 `size` 차감, 0 이면 삭제 = "다 안 채워지면 계속 살아있음"). ⚠ 실제 코인 경로도 **잔고 차감을 먼저 원자 가드로 확정한 뒤에만** 포지션/원장 batch(위 editLimit 함정). 물타기는 기존 레버리지 고정·평단 재계산. SL/TP 미지원(진입만). INSERT 직후 `checkTriggers` 1회로 **이미 트리거된 스탑은 즉시 체결**. 취소 환불 0. UI: `OrderPanel` 세 번째 탭 "조건부"(이상/이하 토글+트리거가) + `PositionsPanel` "조건부" 탭.
+- **⚠ 무한(반복) 조건부(`repeating=1`)**: 체결돼도 주문이 남는다. `size` 는 **1회 실행 수량(차감 안 함)**, 체결 후 `fill_count+1`·`last_fill_at`. `repeat_mode` 두 가지:
+  - **`continuous`(기본)** — 조건이 참인 **동안 계속**(체결 후 `armed=1` 유지 → 다음 폴링에서 또 진입, DCA 용도). **⚠⚠ 재실행 간격 하한 5초**(`_shared.ts MIN_CONTINUOUS_COOLDOWN_MS`) — `cooldown_ms=0`(≈1초)이면 주문 하나가 하루 8.6만 체결 × ~18행 = 월 4,650만 행으로 D1 포함분을 혼자 먹는다(실제 7월 $47 청구의 원인 중 하나, §6). 5초면 월 930만 행. **⚠ 판정은 저장값이 아니라 `effectiveCooldownMs(c.cooldown_ms)`** (하한 도입 전에 만들어진 `cooldown_ms=0` 행 방어) 이고 `order.ts` 는 저장값도 하한으로 올린다(UI 표시와 실제 동작 일치). **⚠ 스스로 멈추지 않는다** — 브레이크는 `cooldown_ms`(≥5초)와 `max_fills` 뿐이고, 트리거가 현재가에서 아주 멀면(OX 1.0 에 "1.8 이하 매수") 조건이 영구 참이라 잔고가 바닥날 때까지 진입한다(선택된 동작, UI 경고 문구). **이 사이트에서 유일하게 스스로 무한히 D1 쓰기를 만드는 유저 경로**라 `settleConditionalOrder` 는 체결 전 `autoWritesBlocked(env)`(§6 `_budget.ts`)를 확인하고 예산 초과면 조용히 물러난다(1회성은 막지 않는다 — 걸어둔 스탑이 안 걸리는 게 더 큰 사고).
+  - **`rearm`** — 한 번 실행되면 `armed=0`, 가격이 **트리거 반대편**(`rearm_price`, 미설정이면 `trigger_price`)으로 돌아왔을 때만(below `mark >= rearm`/above `mark <= rearm`) `armed=1`("내려갈 때마다 한 번씩"). 재무장 대기 중엔 **재무장 판정만 하고 즉시 return**(그 폴링엔 절대 체결 없음). `rearm_price` 는 방향 검증(below 는 `rearm >= trigger`, above 는 `rearm <= trigger`).
+  - `max_fills`(1~100,000, NULL=무제한) 도달 시 그 체결 batch 에서 삭제. 체결 후 행 처리는 OX/실제 양쪽이 `conditionalAfterFillStmt()` 하나를 공유(1회성=차감/삭제, 무한=횟수+1, continuous 무장 유지·rearm armed=0·상한 도달 삭제). OX 는 `filled > EPS` 일 때만 호출(0 체결이면 다음 폴링 재시도).
+  - **⚠ `useTriggerPoll` 은 항상 2.5초**(하한 5초를 충분히 따라잡아 옛 1초 적응형은 폐기 — 더 당기려면 §6 예산 먼저). **⚠ 반복은 앱을 닫아둬도 계속된다**(cron `sweepTriggers`, 접속 중 ~2.5초 / 미접속 1분 주기) — `cooldown_ms`/`max_fills` 를 안 걸면 **자는 동안에도 잔고가 나간다**.
+  - **⚠ 신규 컬럼은 마이그레이션 전 DB 에서 `undefined`** — 읽기는 전부 `?? 기본값`(`repeatModeOf()` 포함)으로 방어하지만 `conditionalOpen` 의 INSERT 는 실패하므로 **코드 배포 전에 ALTER 먼저**(§5).
+  - UI: `OrderPanel` 조건부 탭 "무한 반복" 체크(반복 방식 토글 + continuous 는 간격(초) / rearm 은 재무장 가격 + 최대 실행 횟수 + 모드별 위험 설명), `PositionsPanel` 조건부 탭 "반복" 컬럼(`계속 ∞`/`되돌아올 때 ∞`, 횟수·간격·무장 상태), `Chart` 주문선 `조건부∞`(재무장 대기면 재무장 가격에 흐린 점선을 하나 더).
+- **⚠ 조건부 주문 수정(`editConditional`)**: 트리거가·수량·조건·레버리지 + 반복 설정을 취소 없이 변경. **`editLimit` 과 달리 잔고 정산이 전혀 없다**(증거금을 안 잠그므로 UPDATE 한 방, 순서 함정 없음). 안 보낸 필드는 유지, `null`/`''` 는 해제(`parseRepeatOpts(body, …, prev)` 가 `undefined`=유지 / `null`=해제 구분). 검증은 `conditionalOpen` 과 공유, `max_fills` 는 **이미 실행한 횟수보다 커야** 한다(작으면 저장 즉시 사라진다). 수정 후 **`armed=1` 로 되살리고** `checkTriggers` 1회(재무장 대기 중 고쳤는데 계속 잠들어 있으면 "수정했는데 안 걸린다"). UI: `PositionsPanel` 조건부 탭 "수정"(인라인 편집).
+- **강제청산(계좌 파산)**: `checkTriggers` 맨 앞에서 평가자산 < 0 이면 **전 포지션 강제청산 + 미체결 지정가 전부 취소 + 잔고 0 리셋**, 각 포지션은 `kind='liquidation'` 주문(청산가=그 시점 서버 시세). 심볼 가격을 하나라도 못 받은 라운드는 건너뜀(불완전 데이터로 오청산 방지). 트리거되면 그 라운드의 지정가/SL·TP 평가는 스킵.
+- **청산가 표시(추정치)**: `PositionsPanel`/`Chart` 가 클라에서 `entry - (balance + Σ전체margin + 다른 포지션들 미실현손익) / (size*dir)` — 강제청산 조건과 같은 식(증거금 항 포함)이지만 클라 추정(실제 판단은 서버 다음 폴링).
+- **⚠ markPrices(청산가 즉시·일관 표시)**: `checkTriggers` 가 자기가 fetch 한 시세 맵을 반환 → `loadState(env,uid,marks)` 가 `markPrices` 로 응답에 싣고 → 클라 `useTradingStore.apply` 가 `useMarketStore.prices` 에 시드. 서버 강제청산과 **똑같은 시세**로 폴링을 기다리지 않고 즉시 계산(OX 미열람·진입 직후 포함 — 클라 폴링만으로는 OX 포지션 현재가가 안 들어와 전 포지션 청산가가 비었다). `open` 은 체결가, `close` 는 청산가를 marks 에 추가.
+- **리필(`functions/api/refill.ts`)**: **평가자산 ≤ 0 일 때만 지급** — 포지션이 있으면 서버가 시세 fetch 로 판정(하나라도 못 받으면 거부). `users.refill_count`/`refill_date`(KST) 로 **1일 최대 3회, 1회 +10,000 USDT**, 날짜가 바뀌면 `refill_date !== 오늘` 이라 카운트 0 취급(리셋 cron 불필요 — "폴링 시점에 계산" 패턴). `loadState` 가 `refillsLeft` 포함, `Header.tsx` 도 같은 식으로 버튼을 미리 비활성화. **⚠ 자산이 0 이면 팝업이 자동으로 뜬다(`RefillModal.tsx`)** — 헤더 구석 버튼만으로는 강제청산당한 사람에게 게임이 끝난 것처럼 보였다. 판정은 `useEquity` 하나만(헤더 버튼과 어긋나지 않게), 닫으면 **평가자산이 0 을 벗어날 때까지** 다시 안 뜬다(리필 성공 시 자동 초기화), 스토어 공용 `error` 는 **이 팝업에서 눌러본 뒤에만** 표시.
+- **체결 체크 = 접속 폴링(빠른 경로) + cron sweep(접속 무관, 느린 경로)**: Pages Functions 는 정기 실행이 없어 `functions/_trading.ts checkTriggers(env,uid)` 를 `state.ts`(GET, `useTriggerPoll` 2.5초)와 `order.ts`(POST 액션 직후, 수동 조작과 레이스 방지)에서 호출해 **그 유저의 요청 시점에** 강제청산/지정가/SL·TP/조건부를 평가·체결한다(체결가는 지정가/SL/TP 값 그대로, 슬리피지 모델링 없음). 아무도 접속하지 않아도 `cron/` 워커(Pages 는 Cron 미지원이라 별도 배포, 같은 D1 바인딩)가 매 1분 `sweepTriggers(env)` 로 **포지션·미체결·조건부가 있는 전 유저**를 훑는다 — **주기만 다르고 기능 차이는 없다**. 배포·시크릿은 §5(⚠ cron 워커는 수동 재배포).
+  - 평가 본체는 `runTriggers(env,uid,pendings,positions,conditionals,prices)` 하나를 `checkTriggers`(1인분)와 `sweepTriggers`(전 유저)가 **공유** — 새 트리거 기능을 추가해도 자동으로 양쪽에서 돈다(sweep 이 강제청산만이던 시절엔 앱을 닫으면 조건부가 멈췼다 — 유저 요청이 유일한 클럭이었기 때문).
+  - **⚠ 마켓메이커 틱 예산은 총량 고정, 코인들이 나눠 쓴다**(`cron/index.ts` `MM_TICK_BUDGET`=24, `MM_BUDGET_PER_PAIR = MM_TICK_BUDGET / VIRTUAL_PAIRS.length`, 현재 2코인 × 12틱). 틱은 순수 계산이고 커밋이 페어당 1회라 틱 수가 쿼리·쓰기를 거의 안 늘린다 — 상한을 정하는 건 **CPU(무료 10ms/invocation, 실측 24틱 ≈ 3.5ms)**. 코인을 늘려도 총량은 그대로(코인당 틱만 줄어 움직임이 성겨진다).
+  - **⚠ 유저가 보고 있으면 cron 은 물러난다**(`marketMakerTickBudget`, `POLL_ACTIVE_MS`=20s, `BURST_MIN_TICKS`=4): `/api/spot` 폴링이 이미 초당 재호가를 돌리는데 cron 이 12틱을 더 얹는 건 쓰기만 배로 나가는 중복. `last_run` 이 방금이면 폴링이 클럭이라 최소치만(cron 이 찍은 `last_run` 은 다음 실행 때 60초 전이라 안 섞인다). **⚠⚠ 이 판정은 라운드 루프 밖에서 실행당 한 번만** — 안에서 라운드마다 하면 직전 라운드의 자기 `last_run` 을 보고 "누가 폴링 중"이라 오판해 물러난다.
+  - **⚠ 트리거는 "현재가 한 점"이 아니라 "지나온 가격 범위"로 판정**(`_trading.ts` `PriceRanges`/`rangeOfPath`): OX 가격은 봇 틱이 돌 때만 움직이고 cron 은 1분치 틱을 몰아 돌리므로, 끝난 뒤 한 점만 보면 그 사이 딥/스파이크를 놓친다. 버스트가 돌려준 경로의 **최저/최고**로 조건부(발동·재무장)·SL/TP·지정가 크로스를 한 번에 판정(거래소의 구간 고저 스탑 판정과 같고 점 샘플링보다 정확). **강제청산만은 현재가**(스쳐간 저가로 파산시키면 되돌릴 수 없다). ⚠ 예전의 "sweep 4라운드 반복"은 sweep 1회가 D1 ~18쿼리라 무료 한도(50)를 넘겼다 — 되돌리지 말 것.
+  - **⚠ `MAX_SWEEP_USERS`(8)**: 한 invocation 이 훑는 유저 수 상한. 유저가 늘어도 쿼리 수가 늘지 않게 분 단위로 회전(접속 유저는 자기 폴링이 즉시 처리하므로 늦어지는 건 앱을 닫아둔 유저만).
+  - 실제 코인 시세는 한 cron 안에서 재사용(`sweepTriggers(env, cachedPrices?)` → 반환 `prices` 를 다음 라운드에), OX 는 매 라운드 새로 읽는다(`spot_bot_state.ref_price` 가 라운드마다 실제로 바뀐다).
+  - 체감 주기: 접속 중 폴링 2.5초 / 미접속 1분 1회. `continuous` 는 하한 5초라 접속 중 분당 최대 12회, 미접속 분당 1회. cron 1분이 Cloudflare 최소 — 더 촘촘히 하려면 §6 예산 먼저.
+  - 한 유저의 평가가 예외로 터져도 나머지는 계속(try/catch + `console.error`). 로컬 검증: `cd cron && npx wrangler dev` → `curl .../cdn-cgi/handler/scheduled`(유저 요청 0회로 조건부 반복·cooldown·1회성 삭제·지정가·SL 체결까지 확인 가능).
+- **⚠ 거래 수수료 + VIP 등급**: 모든 체결에 `수수료 = 명목금액(체결가×수량) × VIP 요율`.
+  - **등급 = 누적 거래대금(`users.total_volume`)**, 증거금이 아니라 **명목금액(레버리지 포함)** 을 진입·청산 각각 누적. **등급은 컬럼으로 저장하지 않는다** — `_shared.ts vipOf(totalVolume)` 가 항상 파생(총거래량 하나가 진실원본).
+  - **⚠⚠ 등급은 표가 아니라 공식이고 상한이 없다**(무한 레벨, `_shared.ts`):
     ```
     등급 t 진입 거래대금 = VIP_BASE_VOLUME(1만) × VIP_VOLUME_GROWTH(4)^(t-1)   (t>=1, VIP0=0)
     등급 t 수수료율      = max(VIP_MIN_RATE(1e-9), VIP_BASE_RATE(0.0003) × VIP_RATE_DECAY(0.79)^t)
@@ -255,592 +190,41 @@ ox64/
     | 등급 | 누적 거래대금(USDT) | 요율 |
     | --- | --- | --- |
     | VIP0 | 0 | 0.03% |
-    | VIP1 | 1만 | 0.0237% |
     | VIP5 | 256만 | 0.00923% |
     | VIP10 | 26억 | 0.00284% |
     | VIP20 | 2.7경 | 0.000269% |
-    | VIP30 | 2.9해 | 0.0000255% |
-    | VIP40 | 3.0자 | 0.0000024% |
     | VIP54+ | 8.1e35 | 0.0000001%(하한) |
-    - **밸런스 근거**: ①거래대금 **4배/등급** — 첫 등급이 1만 USDT 라 몇 번만 거래해도 VIP1 이 뜨고(초반 보상), 이후로도 "조금만 더 하면 오른다"가 유지된다. 거래대금은 명목금액이라 고배율 유저는 한 판에 몇 등급씩 뛴다 → 100배가 아니라 4배로 촘촘히 썰어야 레벨업이 자주 일어난다. 현재 최상위 유저(~1e24)가 VIP34 근처. ②요율 **×0.79/등급** — **옛 13행 표를 그대로 근사한 값**이다(1e12→옛 0.001%/새 0.00111%, 1e20→옛 0.00005%/새 0.0000517%, 1e24→옛 0.00001%/새 0.00000992%). 즉 **등급 숫자만 촘촘해지고 실제 경제(이만큼 거래하면 수수료가 이 정도)는 그대로**다. 5등급이면 대략 반토막. ③하한 **0.0000001%** — 0 으로 두면 상위 등급 거래가 거래소 수익에 전혀 안 잡힌다(랭킹 수수료 수익 표시가 멈춤).
-    - ⚠ 표시 자릿수 **`format.ts fmtFeeRate`(소수 8자리)** 는 이 하한에 맞춰져 있다(6자리였을 땐 0.0000001% 가 "0" 으로 뭉개졌다). 하한을 더 내리면 그쪽도 같이 늘릴 것.
-    - ⚠ **로그로 구한 등급은 기준선에 정확히 걸친 값에서 한 칸 어긋난다**(1e4·4^k 를 넣어도 지수가 k−1e-16 으로 나옴) — `vipOf` 는 계산 뒤 실제 기준선(`vipMinVolume`)과 대조해 양방향으로 보정한다. 검증: 1~45 등급 기준선에서 정확히 그 등급 / 기준선 직전 값은 한 등급 아래.
-    - ⚠ **등급표를 통째로 클라에 내려보낼 수 없다**(무한). `loadState` 는 `vipTierWindow(tier)`(현재 등급 −2 ~ +6)만 보내고, 진행률에 필요한 현재 구간 하한은 **`vipFrom` 으로 따로** 보낸다 — 예전처럼 클라가 표에서 `find(t => t.tier === tier)` 로 찾으면 창을 벗어나는 순간 조용히 0 이 되어 진행률이 100% 로 굳는다. 곡선 파라미터(`vipCurve`)도 함께 보내 모달 설명 문구("한 등급당 ×4 / ×0.79")를 하드코딩하지 않는다.
-    - ⚠ `VipBadge` 배색은 13단계뿐이라 **`STYLE_SPAN`(3)등급마다 한 칸씩** 올라가고 끝에서 고정된다(3인 이유: 새 곡선 3등급 ≈ 옛 곡선 1등급이라 같은 거래대금이면 예전과 거의 같은 색).
-  - **등급은 컬럼으로 저장하지 않는다** — `_shared.ts vipOf(totalVolume)` 가 항상 파생한다(총거래량 하나만 진실원본이라 등급이 어긋날 여지가 없음). `loadState` 가 `vipTier/feeRate/vipNextAt/vipFrom/vipTiers/vipCurve/totalVolume/totalFees` 를 응답에 실어 보낸다.
-  - **⚠ 진입은 증거금과 "함께" 차감해야 한다**: 조건부 UPDATE 가드가 `balance - (margin + fee) >= -uPnL` 이어야 원자성이 유지된다. 따로 빼면 증거금은 통과하고 수수료만 실패하는 틈이 생긴다. 청산은 환급액에서 차감(`margin + pnl - fee`). 지정가는 **주문 시점이 아니라 체결 시점**에 뗀다(거래소 관행 — 증거금은 주문 시 이미 잠갔으므로 체결 때 수수료만 차감).
-  - **⚠ 강제청산은 수수료를 걷지 않는다** — 직후 잔고를 0 으로 리셋하므로 실제로 걷을 수 없는 돈이다(부과하면 원장에 걷지도 못한 수익이 잡힌다). 대신 거래대금은 누적하고 `fee=0` 인 `kind='liquidation'` 원장 행을 남겨 "강제청산으로 얼마가 돌았는지"도 집계된다.
-  - **⚠ OX 호가창 walking 경로**(청크 체결)는 청크마다 잔고만 정산하고 **부기(카운터+원장)는 합계로 1번만** 부른다(원장이 청크 수만큼 불어나지 않게). 요율은 주문 하나당 한 번만 확정 — 청크마다 다시 읽으면 체결 도중 등급이 올라 청크별 요율이 달라진다. 시장가의 "감당 가능한 만큼만" 역산도 **1코인당 비용에 수수료를 포함**해야 한다(`price/leverage + price*rate`) — 빼먹으면 딱 가용만큼 사려다 가드에 걸려 체결이 멈춘다.
-  - **수익 원장 = `fee_ledger`**(체결 1건당 1행: user/symbol/kind/notional/rate/fee/created_at). 심볼별·기간별·종류별 분해가 필요할 때 쓰는 진실원본.
-  - **⚠ 거래소 수수료 수익 총액은 `users` 를 집계한다(원장 아님)**: `GET /api/leaderboard` 가 `revenue{total,fromUsers,fromBots,volume}` 를 함께 내려주고 랭킹 모달 상단에 표시한다. 값은 `SUM(users.total_fees)` — **`fee_ledger` 를 SUM 하면 정확하지만 그 테이블은 체결 1건당 1행이라 봇 때문에 빠르게 수백만 행이 된다**(랭킹은 5초 폴링이라 매번 전체 스캔할 수 없다). `feeAccrualStmts` 가 원장과 `users.total_fees` 를 같은 batch 에서 함께 갱신하므로 두 값은 항상 일치한다(prod·로컬에서 검증). 봇이 물량 대부분을 만들어 수수료도 대부분 봇에서 나오므로 유저분/봇분을 분리해 보여준다.
-  - **⚠ 클라 슬라이더도 수수료를 넣고 역산**: 서버 가드가 `증거금+수수료 <= 가용` 이므로 `명목가 = 가용 / (1/leverage + feeRate)`. 빼먹으면 250배에서 수수료가 증거금의 ~7.5% 라 기존 0.1% 여유로는 못 덮어 **슬라이더 100% 가 그대로 거부된다**.
-  - UI: `VipBadge.tsx`(헤더 이름 옆·모바일 더보기·랭킹 각 행) + **`VipModal.tsx` 진행도 모달**(뱃지 클릭 → 다음 등급까지 진행 막대·%·남은 거래대금·누적 거래대금/낸 수수료·현재 등급 주변 등급표 + "계속 이어집니다(상한 없음)" 행). 모바일 더보기엔 미니 진행 막대. `OrderPanel` 정보란에 예상 수수료 + 현재 등급/요율. **⚠ 등급 기준은 서버가 `loadState`(vipTiers/vipFrom/vipCurve)로 내려준 값을 그대로 쓴다** — 클라에 같은 공식을 또 적으면 서버 기준이 바뀔 때 조용히 어긋나고, 수수료는 서버가 떼므로 화면만 틀리게 된다. 진행률 = `(누적 − vipFrom) / (vipNextAt − vipFrom)`.
-  - **⚠ 큰 금액 표시는 `fmtKor`(만/억/조) 이고 반올림이 아니라 내림** — 등급 기준이 억/조 단위라 K/M/B 보다 직관적이고, 999,999 를 "100만" 으로 올려 보여주면 기준선을 넘은 것처럼 읽혀("100만인데 왜 아직 VIP0?") 혼란스럽다.
+    근거: ①거래대금 **×4/등급** — 첫 등급 1만이라 초반 보상이 빠르고, 거래대금이 명목금액이라 고배율 유저는 한 판에 몇 등급씩 뛰므로 촘촘해야 레벨업이 자주 보인다. ②요율 **×0.79/등급** — 옛 13행 표(VIP0~12, 100배/단계)를 근사한 값이라 **등급 숫자만 촘촘해지고 실제 경제는 그대로**(5등급 ≈ 반토막). ③하한 0.0000001% — 0 이면 상위 등급 거래가 수수료 수익에 안 잡혀 랭킹 표시가 멈춘다.
+    - ⚠ `format.ts fmtFeeRate`(소수 8자리)는 이 하한에 맞춰져 있다 — 하한을 내리면 같이 늘릴 것.
+    - ⚠ 로그로 구한 등급은 기준선에 정확히 걸친 값에서 한 칸 어긋난다(지수가 k−1e-16) — `vipOf` 는 실제 기준선(`vipMinVolume`)과 대조해 양방향 보정.
+    - ⚠ **등급표를 통째로 클라에 내려보낼 수 없다**(무한). `loadState` 는 `vipTierWindow(tier)`(현재 −2 ~ +6)만 보내고, 진행률용 현재 구간 하한은 **`vipFrom` 으로 따로**(클라가 표에서 `find` 하면 창을 벗어나는 순간 0 이 되어 진행률이 100% 로 굳는다), 곡선 파라미터 `vipCurve` 도 함께(모달 문구 하드코딩 금지). 응답: `vipTier/feeRate/vipNextAt/vipFrom/vipTiers/vipCurve/totalVolume/totalFees`.
+    - ⚠ `VipBadge` 배색은 13단계라 **`STYLE_SPAN`(3)등급마다 한 칸**씩 올라가고 끝에서 고정(새 3등급 ≈ 옛 1등급).
+  - **⚠ 진입은 증거금과 "함께" 차감**: 가드 `balance - (margin + fee) >= -uPnL` 하나로(따로 빼면 증거금은 통과하고 수수료만 실패하는 틈). 청산은 환급액에서 차감(`margin + pnl - fee`). 지정가는 주문 시점이 아니라 **체결 시점**에 뗀다.
+  - **⚠ 강제청산은 수수료를 걷지 않는다** — 직후 잔고 0 리셋이라 걷을 수 없는 돈. 거래대금은 누적하고 `fee=0` 인 `kind='liquidation'` 원장 행을 남긴다.
+  - **⚠ OX 호가창 walking 경로는 부기(카운터+원장)를 합계로 1번만**(청크마다 부르면 원장이 청크 수만큼 불어난다), 요율은 주문당 1회 확정(청크마다 읽으면 도중 등급 상승으로 요율이 갈린다). 감당 역산은 **1코인당 비용에 수수료 포함**(`price/leverage + price*rate`) — 빼먹으면 딱 가용만큼 사려다 가드에 걸린다.
+  - **수익 원장 = `fee_ledger`**(체결 1건당 1행: user/symbol/kind/notional/rate/fee/created_at) — 심볼별·기간별·종류별 분해의 진실원본. **⚠ 거래소 수수료 수익 총액은 `users.total_fees` 를 SUM 한다**(`GET /api/leaderboard` 의 `revenue{total,fromUsers,fromBots,volume}`, 랭킹 모달 상단) — 원장은 봇 때문에 수백만 행이라 5초 폴링으로 스캔 불가. `feeAccrualStmts` 가 원장과 카운터를 같은 batch 에서 갱신하므로 둘은 항상 일치. 봇이 물량 대부분을 만들므로 유저분/봇분을 분리 표시.
+  - **⚠ 클라 슬라이더도 수수료를 넣고 역산**: 서버 가드가 `증거금+수수료 <= 가용` 이므로 `명목가 = 가용 / (1/leverage + feeRate)`(250배에선 수수료가 증거금의 ~7.5% 라 빼먹으면 슬라이더 100% 가 거부된다).
+  - UI: `VipBadge.tsx`(헤더 이름 옆·모바일 더보기·랭킹 행) + `VipModal.tsx`(진행 막대·%·남은 거래대금·누적/낸 수수료·주변 등급표 + "계속 이어집니다(상한 없음)" 행), `OrderPanel` 정보란 예상 수수료+등급/요율. **⚠ 등급 기준은 서버 `loadState`(vipTiers/vipFrom/vipCurve) 값을 그대로 쓴다** — 클라에 공식을 또 적으면 서버 기준이 바뀔 때 화면만 틀려진다. 진행률 = `(누적 − vipFrom) / (vipNextAt − vipFrom)`.
+  - **⚠ 큰 금액 표시는 `fmtKor`(만/억/조), 반올림이 아니라 내림** — 999,999 를 "100만"으로 올려 보이면 기준선을 넘은 것처럼 읽힌다.
 - **아직 없음**: 펀딩비.
 
 ### 가상 코인 — OX/USDT · EW/USDT (서버 = `functions/api/order.ts` + `functions/api/spot.ts`) — 실제 코인과 동일한 레버리지, 체결가만 봇이 생성
 
-> **⚠ 가상 코인은 2종이고 전부 페어 파라미터로 흐른다(2026-07-31).** 아래 설명이 "OX" 라고 적혀 있어도
-> 전부 페어별로 독립 동작한다(봇 심리상태·호가 사다리·캔들·체결 테이프·재고가 모두 pair 키). **새 가상
-> 코인을 추가할 때 손댈 곳은 딱 셋** — `functions/api/spot.ts VIRTUAL_PAIRS`, `src/symbols.ts
-> VIRTUAL_SYMBOLS`, D1 `spot_bot_state` 시작가 행(§5). 그 외에 심볼을 하드코딩하면 그 경로만 OX 전용이
-> 되어 조용히 갈라지므로 절대 금지. EW/USDT 는 2026-07-31 에 시작가 1 USDT 로 개설했다.
-> ⚠ 코인을 늘릴 때 **cron 틱 예산(`MM_TICK_BUDGET`)을 코인 수만큼 곱하지 말 것** — invocation당 D1
-> 쿼리 한도(1,000)에 부딪힌다(§ cron). 현재 24틱을 2코인이 12틱씩 나눠 쓴다.
+> **상세는 [docs/VIRTUAL_COIN.md](docs/VIRTUAL_COIN.md)** — 봇 심리 모델(국면/탐욕·공포/세션/코일/저항·지지), 체결 미세구조(호가 바운스·flurry·스톱헌팅·아이스버그), 호가창 지속/취소(`prevBook`), 수량 계층 분포(`SIZE_TIERS`), `book_json`/`tape_json`/`live_json` 링 버퍼, 캔들 영속(`PERSIST_INTERVALS`/`open_at`·`close_at`), 벽 존중, 봇 수수료·재고 정산, 매칭 엔진(시장가/지정가/sweep/`Aggressor`), 유효숫자 4자리 틱. **그 파일이 규칙의 진실원본**이고 여기엔 손댈 때 반드시 지킬 것만 적는다.
 
-**OX 는 다른 38종과 완전히 동일하게 레버리지 롱/숏으로 거래된다** — `OrderPanel`/`PositionsPanel`/
-`order.ts` 어디에도 OX 전용 분기가 없다(가상 전용 매칭·에스크로·보유 OX 개념은 전부 제거됨, 예전엔
-있었으나 "실제 코인과 다르게 할 이유가 없다"는 판단으로 통합). **유일한 차이는 체결가 소스**: 실제
-코인은 OKX/Coinbase, OX 는 `spot.ts` 의 봇이 만드는 내부가격(`fetchPrice` 의 `isVirtualSymbol` 분기).
-
-- **체결가 = 봇("AI") 이 만든 합성 시세**: `functions/api/spot.ts` 의 예약된 봇 유저 2명(`bot-mm-1`/
-  `bot-mm-2`, `BOT_USER_IDS`, schema.sql 에서 시딩, 랭킹에서 제외) 중 한 명이 폴링 틱마다 기준가를
-  아래 심리 모델로 옮기고(`spot_bot_state`) 그 주변에 매수/매도 호가 사다리(`BOT_LEVELS_PER_SIDE`=22 단계, 물량은 개미~고래
-  계층 분포 — § 수량의 계층 분포)를 깐다. 이 기준가를 실제 코인의 OKX 시세 대신 그대로 체결가로 쓴다 — LLM 호출이 아니라
-  결정론적 알고리즘.
-- **⚠ 봇 매매 심리 모델(`nextMarketState`, 2026-07-20)**: 예전 기준가는
-  `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 매 틱이 직전과 완전히 독립이라 추세도
-  변동성 뭉침도 과열도 공포도 없는 무특징 노이즈였고, 차트에 읽을 구조가 없어 분석도 재미도 성립하지
-  않았다("사람 심리가 안 들어간 매매라 노잼"). 지금은 실제 시장의 정형화된 사실(stylized facts)을 작은
-  상태기계로 재현한다. 상태(`drift`/`vol`/`sentiment`/`anchor`/`regime`/`regime_ticks`/`peak`/`trough`)는
-  **`spot_bot_state` 행에 얹혀 틱 사이에 지속**되므로 추가 DB 왕복이 없다(어차피 읽고 쓰던 행 — 컬럼이
-  몇 개든 UPDATE 는 1행이라 **쓰기 비용도 그대로 0 증가**다, §6):
-  - **추세 지속** — 수익률이 AR(1) 자기상관(`drift = drift*DRIFT_PERSIST + noise`) → 한 번 잡힌 방향이 이어짐
-  - **변동성 클러스터링** — `vol` 이 AR(1) + 2% 확률의 "뉴스" 충격 → 잔잔한 구간과 거친 구간이 뭉침
-  - **과열 후 평균회귀** — 적정가(`anchor`) 대비 괴리(`stretch`)가 커질수록 되돌림이 **제곱으로** 강해짐
-  - **탐욕-공포 국면**(`REGIME_PARAMS`) — `calm→rally→euphoria→panic→capitulation→…` 전이. **비대칭**:
-    `panic` 이 `euphoria` 보다 bias·변동성·거래량이 모두 크다(떨어질 땐 빠르고 거칠게). 각 국면은
-    `minTicks` 만큼 최소 지속되고 그 뒤로 매 틱 `exit` 확률로 벗어난다(평균 수명 ≈ `minTicks + 1/exit`).
-    실측 점유율 ≈ calm 39 / rally 24 / pullback 23 / panic 9 / euphoria 6 / capitulation 0.3%
-  - **라운드넘버 자석**(50틱 간격 근처에서 머뭇거림), **팻테일**(3% 확률로 수익률 2~4배), 그리고
-    **거래량·체결 방향(taker buy 비율)·호가 스프레드가 국면에 함께 반응**(패닉엔 거래량 폭증 + 스프레드
-    확대 = 마켓메이커 후퇴) — 한 틱의 체결들도 직전 기준가에서 새 기준가로 "걸어가며" 찍어 봉마다
-    시가/고가/저가/종가와 꼬리가 제대로 생긴다(예전엔 전부 같은 가격이라 꼬리 없는 몸통뿐이었다).
-  - **⚠ 탐욕/공포 심화(2026-08-12)**: 위 항목들은 **가격의 통계적 성질**이지 사람의 행동이 아니었다 —
-    군중 심리(`sentiment`)가 사실상 최근 수익률의 즉석 함수라 "쌓였다 꺼지는 무드"가 아니었고, 시장이
-    **자기 고점/저점을 기억하지 않아** 저항 돌파·지지 붕괴 같은 사람이 읽는 사건이 아예 없었다. 그래서:
-    - **무드의 관성·군집(herding)** — `sentiment` 가 자기 자신을 되먹이되 `s(1-s²)` 라 극단에서 포화한다.
-      ⚠ 실효 지속계수가 `MOOD_PERSIST(0.91) + HERD_GAIN(0.05) = 0.96 < 1` 이라 **수학적으로 발산이 불가능**하다 —
-      되먹임을 넣을 땐 이 상한을 반드시 유지할 것(1 을 넘기면 무드가 한쪽으로 굳어 시장이 멈춘다).
-    - **고점/저점 기억(`peak`/`trough`)** — 새 극값이면 즉시 갱신, 아니면 현재가 쪽으로 서서히 잊힌다
-      (`EXTREME_DECAY`, 반감기 ≈ 139틱). 여기서 **공포 = 고점 대비 낙폭 / 탐욕 = 저점 대비 상승폭**
-      (`GAUGE_FULL`=22% 에서 100% — 스윙 크기가 바뀔 때마다 같이 재보정한다, § 되돌림)을 뽑아
-      전이 확률·변동성·거래량·호가 두께에 먹인다.
-      ⚠ 이 게이지가 **포화되면(항상 ~1) 모든 게 망가진다** — 초기 튜닝에서 `GAUGE_FULL` 이 6%,
-      감쇠가 느려서 평균 공포 0.86 이 나왔고, 그 결과 공포 기반 전이가 전부 최대치로 걸려 panic 점유율이
-      17%(정상 5%)까지 치솟고 1분봉 폭이 5.7%(정상 2.2%)로 폭발했다. 목표는 **평균 0.3 안팎**이다.
-    - **사건 2종** — 신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄(cascade). **연쇄가 1.5배 크고 더 자주**
-      터진다(계단으로 오르고 엘리베이터로 떨어진다). 그 방향으로 이미 쏠려 있을 때만 발동해 평상시엔
-      아무 일도 안 일어난다.
-    - **투매(`capitulation`) 국면** — 공포가 극단(>0.8)이고 무드가 -0.6 아래인 `panic` 에서만 열리는
-      마지막 단계. bias -0.85%/틱·거래량 6배로 짧고 격렬하게 쏟아진 뒤 십여 틱 만에 소진돼 반등한다
-      (V 바닥). 실측 하루 7~8회 — **가끔 나와야 사건이 된다**(초기 튜닝에선 하루 200회가 나왔다).
-    - **레버리지 효과** — 떨어질 때가 오를 때보다 시끄럽다(공포 게이지로 이번 틱 변동성만 증폭).
-      ⚠ 증폭분을 상태에 **저장하면 안 된다** — AR(1) 에 곱해져 공포가 이어지는 동안 기하급수로 커진다.
-    - **버블 피로** — `euphoria` 는 오래 끌수록·적정가에서 벌어질수록 붕괴 확률이 커진다(예전엔 고정
-      34% 라 "고점일수록 위험하다"는 감각이 없었다).
-    - **호가 깊이의 비대칭** — 공포장엔 매수벽이 걷히고 매도벽이 쌓인다(반대로 광기엔 매도호가가
-      사라진다). 실측 공포 구간 매수/매도 두께비 **0.5**, 광기 구간 **5.1** — 심리가 가격뿐 아니라
-      **유동성**으로 드러나므로 같은 크기 시장가라도 패닉 때 훨씬 깊게 파고든다(대량 주문은 여전히
-      `synthMaker` 의 3% 시장충격 상한이 막는다).
-    - 실측 비대칭: 수익률 왜도 **-1.7**, 급락(-0.5%↓) 3.7% vs 급등(+0.5%↑) 2.1%.
-  - **⚠⚠ 다이내믹 재설계(2026-08-26) — "사팔사팔 빠르게 하면서 느리게 상승/하락추세"**: 위 항목들이
-    다 들어있는데도 차트는 **방향 없이 잘게 떨리기만** 했다("급등도 급락도 없다"). 원인은 심리가 아니라
-    **두 개의 숫자**였다:
-    1. **국면 수명이 ~8틱**이었다(`minTicks` 2~8 + 전이 확률 매 틱 13~35%). rally 가 만드는 이동이
-       `0.00085×8 ≈ 0.7%` 인데 같은 시간의 노이즈가 그만큼이라, 국면은 이름만 있고 화면엔 안 보였다.
-    2. **평균회귀가 드리프트의 82%를 그 자리에서 취소**했다. 되돌림 `-0.045×stretch`(반감기 15틱)에
-       `anchor` 가 1%/틱로 따라오므로, 국면 드리프트 `g` 가 실제로 가격에 남기는 몫은
-       `g×a/(k+a) = g×0.01/0.055 = 18%` 뿐이었다 — 즉 rally 든 panic 이든 대부분이 즉시 상쇄되고
-       **남는 건 매 틱 새로 뽑는 가우시안 노이즈**였다. 그게 "사팔사팔"의 정체다.
-    수정(전부 파라미터·수식 변경, **컬럼 추가 없음 = D1 비용 증가 0**):
-    - 국면 수명 **8틱 → 67틱**(`minTicks` 5~60 + `exit` 0.007~0.13, 확률 기준선을 국면마다 하나로 모아
-      "평균 몇 틱 사는가"가 코드에서 바로 읽히게 했다 — 예전엔 0.13·0.26·0.34 가 분기마다 흩어져 있어
-      아무도 그게 8틱짜리라는 걸 눈치채지 못했다).
-    - 되돌림 `REVERT_LIN` **0.045 → 0.014**(드리프트의 42%가 살아남는다) + 2차항 `REVERT_SQ` 0.30 이
-      과열 ±10% 부근에서 급브레이크를 걸어 발산을 막는다.
-    - 모멘텀 지속 `DRIFT_PERSIST` **0.86 → 0.94**(반감기 4.6 → 11틱), 무드 지속 0.90 → 0.91.
-    - **순수 노이즈는 오히려 줄였다** — `TICK_NOISE` 0.00095 → 0.00052. 다이내믹함은 노이즈가 아니라
-      추세·국면·사건에서 나와야 한다(노이즈는 방향이 없어서 키우면 봉만 지저분해진다).
-    - **FOMO/연쇄 킥을 `ret` 이 아니라 `drift` 에 꽂는다** — 예전엔 한 틱만 튀고 끝나 다음 봉이면 흔적이
-      없었다. drift 에 넣으면 감쇠하며 이어져 킥 `k` 가 총 `k/(1-0.94) ≈ 17k` 의 이동으로 풀린다(=돌파 후 추격).
-    - 상승장 거래량 — `sizeMult` 에 탐욕 배수를 넣고(`1 + 0.5×공포 + 0.4×탐욕`) rally 1.10→1.45,
-      euphoria 2.20→3.10. "급등하면 매수도 많이 붙어야" 급등처럼 보인다(예전엔 공포에만 배수가 붙어
-      상승장은 조용하고 하락장만 시끄러웠다).
-    - 장기 tether(`BOT_BASE_PULL`)를 **로그 거리의 제곱**으로 바꿨다 — 되돌림을 약하게 만든 만큼
-      ±30% 파도는 그대로 두고 몇 배 표류만 막아야 하는데, 선형 복원은 그 둘을 구분하지 못한다.
-      ⚠ **세기 조정은 sim 만 보고 정하면 안 된다** — 이 힘은 "지금 가격이 기준선에서 얼마나 떨어져
-      있나"에만 걸리므로, **prod 의 현재 가격**에 그대로 꽂힌다. 처음 잡은 `0.00004` 는 sim 상 멀쩡했지만
-      그때 prod OX 가 2.68 이라 틱당 1.4e-4(=유휴 기준 하루 -90%)로 끌어내리는 값이었다 — 시장 dynamics 가
-      아니라 상수 하나가 만드는 하락이다. `0.000012` 로 낮춰 2.7배 지점에서 반감기 ~1일이 되게 했다
-      (45일 시뮬에서도 0.16~5.35 범위로 여전히 발산하지 않는다 — 발산을 막는 건 세기가 아니라 제곱 항이다).
-    실측 대비(`npm run sim:bot`, 20일×4회): **추세효율(30틱 창의 순이동/절대이동 합) 0.28 → 0.58**,
-    국면 수명 8 → 67틱, 8% 이상 스윙의 평균 크기 12.3% → 20.8%, 20% 이상 대형 스윙 3회/일 → 75회/일,
-    1분봉 폭 2.18% → 2.70%, **틱 표준편차는 0.31% → 0.27% 로 감소**(노이즈는 줄고 방향만 커졌다).
-    ⚠ 대신 MDD 가 -47% → -96% 로 커졌고 가격 범위도 45일 기준 0.16~5.35 로 넓어졌다 — 의도된 것이다
-    (급등락이 곧 큰 낙폭이고, 몇 배씩 오르내리지 않으면 "다이내믹"이 성립하지 않는다).
-  - **⚠⚠ 사람 심리 4차 확장 — 하루 리듬 · 수축 후 확장 · 저항/지지 · 체결 미세구조(2026-09-07)**:
-    2026-08-26 재설계로 "방향"은 생겼지만 모델은 여전히 **정상(stationary)** 이었다 — 새벽 4시와 저녁
-    11시의 시장이 통계적으로 완전히 같고, 전 고점에 다가가도 아무 일이 없고, 관망이 60틱이든 600틱이든
-    성격이 똑같았다. 사람이 모여 만드는 시장의 가장 큰 규칙성 셋이 통째로 빠져 있었던 것이다.
-    **전부 벽시계·기존 상태(regimeTicks/peak/trough)에서 파생 — 컬럼 추가 0 = D1 읽기·쓰기 증가 0.**
-    - **하루 리듬(세션·주말, `sessionActivity`)** — 아시아(UTC 03)·유럽(UTC 09)·유럽·미국 겹침(UTC 14:30,
-      하루의 정점)·미국 후장(UTC 19)을 원형 시계의 가우시안 봉우리로 겹쳐 활성도(평균 1)를 만든다.
-      실측 KST 시각별: 08시 0.68(가장 한산) → 12시 0.89 → 18시 1.23 → **22~00시 1.38(정점)**. 주말은
-      ×0.8(평일은 주 평균이 1 이 되도록 ×1.08). 활성도는 **변동성·거래량·국면 전이율·사건 발생률**에만
-      곱한다. ⚠⚠ **방향(bias)은 절대 안 건드린다** — 시간대 편향은 하루 단위로 누적돼 장기 안정성을
-      통째로 무너뜨린다. ⚠ 프로파일은 평균이 정확히 1 이어야 한다(`SESSION_MEAN`) — 아니면 전체
-      변동성·거래량이 조용히 바뀌어 이미 튜닝된 지표(1분봉 폭·틱 sd)가 다 어긋난다.
-      ⚠ 전이 확률은 `roll` 을 스케일하지 말고 **`P.exit` 기준선에** 곱할 것 — `nextRegime` 엔 `roll` 을
-      확률 문턱이 아니라 **분기 선택**(데드캣 바운스 vs 진정)에 쓰는 자리가 있어서 분포가 비뚤어진다.
-      실측: 활발한 시간 틱 sd 0.30% vs 한산한 시간 0.24%, 거래량 배수 2.46 vs 1.17.
-    - **수축 후 확장(coil)** — `calm` 이 길어질수록 변동성·거래량이 스스로 조여들고(`COIL_MIN` 0.45 까지,
-      반감기 `COIL_HALF` 260틱), 국면이 깨지는 순간 그 방향으로 `drift` 에 킥이 실린다(`COIL_RELEASE`,
-      코일 길이에 비례). 차트에서 "삼각수렴 후 급등/급락"으로 읽히는 그 패턴이다. 실측 코일 비
-      (긴 관망 |ret| ÷ 짧은 관망 |ret|) **0.77**.
-    - **전 고점·전 저점의 마찰(저항/지지)** — `peak`/`trough` 는 지금까지 게이지와 사건 방아쇠로만 쓰였다.
-      이제 전 고점 아래로 다가갈수록 매도 압력(본전 매도 = disposition effect), 전 저점 위로 다가갈수록
-      매수 압력이 걸린다(`LEVEL_ZONE` 2.2% 영향권, 세기는 거리에 반비례, 무드가 극단이면 약해진다).
-      ⚠ **극값 바로 앞 `LEVEL_DEAD`(0.12%)는 무저항 구간**이다 — 거기까지 왔다는 건 저항이 이미 소진됐다는
-      뜻이라, 그래야 "저항선을 뚫으면 저항이 사라지고 FOMO 추격이 붙는다"가 성립한다(이 데드존이 없으면
-      돌파 자체가 막힌다). 구조가 대칭이라 장기 편향은 없지만 **추세를 늦추므로** 추세효율 0.55 선을
-      반드시 다시 확인할 것.
-    - **사건 발생률이 심리·시간의 함수** — FOMO/손절연쇄 확률에 `활성도 × (0.55 + 1.1×게이지)` 를 곱하고
-      무드 문턱을 0.3 → 0.22 로 낮췄다. 새벽의 신고점은 조용히 지나가고, 사람이 몰린 시간에 이미 탐욕이
-      달아올랐을 때 돌파 추격이 터진다.
-    - **다중 스케일 라운드넘버 자석(`ROUND_MAGNETS`)** — 1.00/1.05(500틱) 격자가 1.000/1.005(50틱)보다
-      강하고 넓게 붙잡는다. 예전엔 격자가 하나뿐이라 "큰 자리"라는 개념이 없었다.
-    - **체결 미세구조 = 호가 바운스(§ 아래 별 항목)** — 체결가를 만드는 인과를 뒤집었다.
-    검증(`npm run sim:bot`, 7일×8회 + 21일×3회): **로그드리프트 −0.81e-6**(무편향, 위험선 28e-6),
-    추세효율 **0.582**, 국면 수명 **69틱**, 1분봉 폭 **2.72%**, 틱 sd **0.27%**, acf1 0.527 / |acf1| 0.443,
-    왜도 −1.66, 국면 점유율 calm 38.6 / pullback 24.0 / rally 23.0 / panic 8.8 / euphoria 5.2 /
-    capitulation 0.3% — **전 지표가 개편 전과 사실상 동일**하다(24회 대조 실측: 개편 전 로그드리프트
-    0.04e-6 · 효율 0.578 · 수명 67틱 · 1분봉 2.73%). 즉 새 심리가 얹혔지만 장기 균형은 그대로다.
-  - **⚠⚠ 체결 미세구조 — "가격은 누가 호가를 때렸나에서 나온다"(`simulateTick`, 2026-09-07 재설계)**:
-    예전엔 체결가를 `walk × 가우시안 지터`로 뽑고 그 방향에서 라벨을 되짚었다(tick rule). 라벨 자체는
-    맞았지만 **원인과 결과가 뒤바뀐 모델**이라 테이프가 호가창과 따로 놀았다 — 체결가가 최우선 매수/매도
-    호가와 아무 관계 없는 값이라 실제 테이프의 지배적인 모습인 **호가 바운스**(매수·매도가 두 가격 사이를
-    딸깍딸깍 왕복)가 아예 없었고, 세력이 사다리를 훑고 올라가는 모습도 안 보였다. 지금은 순서를 뒤집었다:
-    ①테이커 방향을 먼저 뽑고(국면 편향 `buyProb` + 주문 흐름 자기상관 `FLOW_PERSIST`) ②매수면 최우선
-    매도호가에, 매도면 최우선 매수호가에 찍고(`MICRO_HALF_SPREAD`, 사다리 최상단과 같은 자리) ③수량이
-    클수록 사다리를 깊이 파고든다(`MICRO_DIG`).
-    - **⚠ mid 를 상태로 들고 흐름이 밀도록 해야 한다**(`MICRO_MID_FOLLOW`) — 매 체결마다 목표 경로에서
-      곧바로 `walk×(1±스프레드)` 를 계산하면, 큰 매수가 파고든 뒤 다음 작은 매수가 **더 낮은 가격**에
-      찍혀 "상승틱인데 빨강"이 된다(실측 라벨-가격 불일치 18.7%). 실제 사다리는 소비된 만큼 최우선호가가
-      밀려 있고 마커가 채울 때까지 그 자리를 유지한다 → 같은 방향이 이어지는 동안 가격이 **단조**로 걸어간다.
-    - **⚠ "라벨-가격 불일치 0%"는 목표가 아니다.** 2026-08-19~09-03 사이엔 라벨을 가격 방향에서 되짚었으니
-      정의상 0% 였을 뿐이다(동어반복). 지금 라벨은 **원인 그 자체**(누가 덮쳤나)이고, 시장이 흐름과 반대로
-      걸어갈 때 생기는 **10~20%** 는 실제 거래소 데이터의 tick-rule 오분류율과 같은 값이다. 대신
-      **상승틱 매수라벨 77% / 하락틱 22%** 로 인과는 예전보다 강하게 유지된다(prod 사다리 실측 6.7%).
-      ⚠ 그래도 라벨을 가격과 **독립적으로** 뽑아선 절대 안 된다(2026-08-19 의 그 버그 — 상승틱의 39%가
-      빨강이었다). 새 체결 경로를 추가할 때 이 인과를 끊지 말 것.
-    - **체결 도착의 군집(flurry)** — 낮은 확률로 "몰리는 틱"이 있고 평상시는 한산하다(가중평균 1 =
-      `FLURRY_MEAN` 으로 나눠 기대 건수 불변). 상한을 26 → `PRINTS_PER_TICK_MAX`(40)로 올린 건 그 꼬리를
-      자르지 않기 위한 것이다(자르면 평균이 깎여 캔들 거래량이 조용히 줄어든다). 테이프는 링 버퍼 JSON 이라
-      **건수를 늘려도 D1 쓰기·읽기는 1행 그대로**다.
-    - **스톱 헌팅 꼬리(`HUNT_*`)** — 낮은 확률(틱당 1.2%)로 한 틱 안에서 **군중 반대편**을 훅 찔렀다가
-      되돌아온다(다들 롱이면 아래를 찔러 손절을 털고 올라온다). 삼각 프로파일이라 꼬리가 뾰족하다.
-      ⚠ **기준가(ref=종가)는 건드리지 않는다** — 장기 안정성과 완전히 분리되고, 트리거 판정(SL/TP·조건부)도
-      기준가 경로만 보므로 "꼬리에 스탑이 털렸다"는 논란이 안 생긴다(예전 jitter 가 만들던 봉 고저와 성격이
-      같고, 테이프에 실제로 찍힌 체결이라 유령 가격도 아니다).
-    - **⚠ 체결 시각의 단조성은 두 곳에서 지켜진다.** ①틱 **내부** 프린트는 그 틱의 10ms 창
-      (`TICK_PRINT_SPAN_MS` ≤ `TICK_SPACING_MS`)에 고르게 편다 — 예전 `now + i` 는 건수가 11 을 넘으면
-      다음 틱의 시각을 넘어서서 테이프 정렬이 틱 경계에서 뒤섞였다. ②틱 시각의 **출발점은 `Date.now()` 가
-      아니라 테이프의 마지막 체결 시각**이다(`runBotTicks`) — 버스트 12틱은 실제로 몇 ms 만에 끝나는데
-      과거로 소급할 수 없어(마감된 봉이 변한다) 10ms 씩 앞당겨 찍으므로 마지막 체결이 벽시계보다 ~120ms
-      앞에 놓이고, 그 직후 폴링이 `Date.now()` 에서 다시 시작하면 그 구간이 역행으로 남는다(prod 실측 700건
-      중 14건 → 수정 후 0건). ⚠ 출발점에는 상한(`TS_SEED_MAX_AHEAD_MS`)을 둔다 — 먼 미래 시각이 한 번
-      들어오면 그 뒤 모든 틱이 거기에 묶인다.
-    - **⚠ "평균 보존" 불변식은 여기서도 유효하다** — 세션·코일 배수는 각각 평균 1 인데도 **활성도가 변동성과
-      상관**되어 있어(활발한 시간엔 `intensity` 도 오른다) 곱의 평균이 1 을 넘는다(실측 거래량 +26%).
-      `FLOW_CORR_NORM`(0.823)으로 그 상관분을 되돌려 **틱당 거래량을 개편 전과 같게** 맞췄다(실측 105,516 vs
-      개편 전 100,003, 틱당 건수 11.7 vs 11.9, 수량 자릿수 분포 동일). 크기 분포·세션 게인을 손보면 이 값을
-      다시 잴 것.
-  - **⚠⚠ 호가창은 매 틱 다시 태어나지 않는다 — 지속(resting)과 취소(cancel)(`simulateTick`, 2026-09-08)**:
-    사다리를 `book_json` 한 칸으로 옮겨 **비용**은 0 이 됐지만 **내용은 여전히 매 틱 통째로 새것**이었다 —
-    44개 레벨의 가격과 물량을 전부 새로 뽑았으니, 호가창을 1초마다 보면 44줄의 숫자가 전부 바뀌었다.
-    실제 호가창엔 성격이 다른 두 종류가 섞여 있다: 초 단위로 넣고 빼는 마켓메이커(최우선호가 경쟁)와,
-    걸어두고 기다리는 지정가(깊은 자리 — 몇 분씩 그대로 앉아 있다). 게다가 통째로 새로 깔면 **유저가
-    대량 체결로 파먹은 자리가 1초 뒤 감쪽같이 복구**돼 시장충격이 호가창에 전혀 남지 않았다. 지금은
-    이전 사다리를 물려받아(`prevBook`) 세 규칙으로 굴린다 — 상태는 이미 매 틱 쓰던 그 한 칸이라
-    **D1 읽기·쓰기 증가 0**, CPU 는 오히려 감소(24틱 버스트 1.51 → 1.32ms — 재사용한 레벨은 수량을
-    다시 뽑지 않는다):
-    ①이번 틱에 **가격이 지나간 자리**의 호가는 체결된 것이므로 사라진다(매수는 저가 이상, 매도는 고가
-    이하) ②남은 주문은 mid 에 가까울수록 잘 취소된다(`QUOTE_CHURN_TOP` 0.55 ~ `QUOTE_CHURN_DEEP` 0.06,
-    거친 국면일수록 전체적으로 더 자주) ③**슬롯마다** "그 자리에 이미 앉아 있는 주문"을 찾아 쓰고 없는
-    자리에만 새로 깐다. 실측: 직전 틱과 가격·물량이 **그대로인 레벨 27%**, 호가 평균 수명 4.6틱(최대
-    636틱 — 벽은 오래 남고 최우선호가는 매 틱 바뀐다), 레벨 22개·총 유동성·틱당 거래량은 개편 전과 동일.
-    ⚠ 순서가 뒤집혀 있다 — **체결(테이프)을 먼저 찍고 그 결과로 사다리를 만든다**(①이 이번 틱의
-    고가·저가를 필요로 한다). 그래서 `simulateTick` 이 `prevBook` 을 받고, 호출자(`runBotTicks`)는 직전
-    틱이 만든 사다리(첫 틱이면 D1 의 `book_json`)를 물려줘야 한다 — **유저 체결이 파먹은 자리가 그 안에
-    남아 있어야** 시장충격이 호가창에 남는다.
-    함정이 셋이다(전부 실측으로 잡았다):
-    ①**살아남은 주문을 먼저 다 앉히고 남은 자리에 새 호가**로 짜면 안 된다 — mid 쪽 생존자가 정원(22)을
-    먹어치워 **깊은 레벨이 아예 안 깔리고** 총 유동성이 35% 빠진다(슬리피지가 조용히 커진다).
-    ②슬롯 귀속 판정은 목표가가 아니라 **지터를 뺀 슬롯 중심**(`LEVEL_STEP` 격자)으로 — 목표가엔 매 틱
-    `LEVEL_JITTER` 가 실려서 그걸 중심으로 잡으면 인접 슬롯 사이에 간격의 73%짜리 틈이 생기고, 그 틈에
-    떨어진 주문이 통째로 버려진다(지속 33% → 8%, 레벨 22 → 16.6).
-    ③슬롯 배정은 **새 호가보다 먼저** — 라운드 가격 격자가 고정돼 있어(아래 `priceHash`) 새 호가가 살아
-    있는 주문과 같은 가격에 내려앉기 쉽고, 순서를 섞으면 그 주문이 "이미 쓴 가격"으로 밀려 버려진다
-    (틱당 생존 19.8 중 13.4 가 그렇게 사라져 지속률이 7% 로 주저앉았다).
-    ⚠ 호가 역전은 여전히 **원천적으로** 불가능하다: 살아남는 매수는 전부 저가보다 아래(< low ≤ ref),
-    매도는 고가보다 위(> high ≥ ref)이고 새 호가는 ref 기준 양쪽으로만 깔린다. 즉 규칙 ①이 곧 역전 방지다
-    (120,000틱 검증: 역전 0 · 중복 가격 0 · 정렬 오류 0 · 한쪽 레벨 항상 22 이상, 유저 벽 press 경로 포함).
-    ⚠ 사다리 기하(`SPREAD_BASE`/`LEVEL_STEP`/`LEVEL_JITTER`)는 **한 곳에만** 적는다 — 목표가·최대 거리·
-    슬롯 중심이 같은 숫자를 각자 적고 있으면 한쪽만 고쳐도 살아있는 주문이 조용히 버려진다.
-  - **⚠ 라운드 가격의 벽은 "그 가격"에 고정이다(`priceHash`, 2026-09-08)**: 어떤 격자에 붙을지를
-    `Math.random()` 으로 정하면 1.4500 짜리 벽이 매 틱 주사위를 다시 굴려 **1초마다 생겼다 사라진다**.
-    실제 시장의 벽은 그 자리에 계속 있고, 그래서 사람이 "저걸 뚫으면 간다"고 읽는다. 지금은 격자
-    인덱스의 **해시**로 정하므로 특정 가격은 계속 벽이고 나머지는 계속 평범한 자리다(가격에서 파생 →
-    상태 컬럼 0). ⚠ `depth` 를 확률에 곱하면 같은 가격이 레벨에 따라 붙었다 말았다 해서 다시 깜빡인다 —
-    `depth` 는 문턱(`tol`)에만 남긴다.
-  - **⚠⚠ 주문 쪼개기 — 아이스버그·TWAP(`SLICE_CHANCE`, 2026-09-08)**: 예전엔 테이프의 매 프린트가 완전히
-    독립 추출이라 고래 한 건 뒤에 개미 한 건이 오는 식이었고, 그래서 테이프를 들여다봐도 **한 사람의
-    의도가 이어지는 모습**이 없었다(사람이 아니라 주사위가 내는 주문처럼 보였다). 지금은 낮은 확률로
-    부모 주문이 시작되고 그 뒤 2~5건이 **같은 방향·비슷한 수량**으로 이어진다(2,384 / 2,391 / 2,384 …
-    실제 테이프에서 세력을 알아보는 가장 흔한 단서다). 실측 연속 프린트의 31% 가 이 모양이다.
-    ⚠⚠ 쪼갤지 말지는 **뽑힌 수량과 무관하게** 정해야 한다 — "큰 주문일 때만 쪼갠다"로 조건을 걸면 자식
-    프린트의 주변분포가 큰 쪽으로 조건화돼(E[크기 | 큰 주문] > 평균) **캔들 거래량이 조용히 늘어난다**
-    (§ "평균 보존" 불변식). 무조건 뽑으면 각 프린트의 주변분포가 그대로 `orderSize` 라 총량이 정확히
-    보존된다(실측 틱당 거래량 3,430 → 3,427).
-    ⚠ 예전 `FLOW_PERSIST`(같은 방향이 이어질 확률 0.2)는 이 현상의 **조잡한 대용품**이었다 — 원인을
-    모델에 넣었으므로 그 상수는 지웠다(방향은 매 건 `buyProb` 에서 새로 뽑고, 이어짐은 부모 주문이
-    만든다). 전환율 28.2% → 25.8% 로 실제 테이프 수준(25~40%)을 유지한다.
-  - **⚠ "평균 보존"은 sim 이 아니라 상태를 고정한 A/B 로 잰다(2026-09-08)**: `npm run sim:bot` 의 틱당
-    거래량은 국면 궤적(수명 68틱 × 2만 틱 = 표본 300개)의 표본오차가 커서 **같은 코드로도 93k~111k 를
-    왕복한다** — 그 숫자로 ±10% 를 판정하면 안 된다. 크기 분포·호가 물량을 손봤을 때는 상태를 하나로
-    고정하고 `simulateTick` 만 20만 번 돌려 개편 전 코드와 대조할 것(그러면 SE 가 0.1% 수준이다).
-    ⚠ 대신 그 방식은 가격이 틱마다 되돌아가므로 **지속률은 못 잰다**(실제 궤적으로 따로 볼 것).
-  - **⚠ 장기 안정성 — 파라미터를 바꿨으면 `npm run sim:bot` 을 반드시 돌릴 것**(`scripts/sim-bot.ts`,
-    모델이 DB 접근 없는 순수 함수라 5~20일치를 몇 초에 굴린다. `SIM_DAYS`/`SIM_RUNS` 로 조절):
-    `REGIME_PARAMS.bias` 는 국면 점유율로 가중하면 합이 ~0 이 되게 맞춰져 있고, 그 위에 `anchor` 를
-    기준선(`BOT_BASE_PRICE=1`)으로 약하게 당기는 힘을 얹었다. 둘 중 하나라도 빠지면
-    며칠 만에 가격이 0 으로 붕괴하거나 발산한다(초기 튜닝에서 5일 -40%, 2026-08-12 확장 중에 5일 -73% 와
-    +730%, 2026-08-26 재설계 중에 5일 -80% 를 각각 실측했다). ⚠ **평형은 놀랄 만큼 민감하다** — 틱당 편향
-    `2.8e-5`(rally bias 를 0.0010→0.0009 만큼) 차이가 5일 뒤 가격 2.4배로 나타난다. 국면 수명을 늘리면
-    같은 bias 로도 누적 편향이 커지므로 **수명과 bias 는 반드시 같이 재조정**할 것. 검증 기준:
-    5~20일치에서 가격이 시작가의 0.5~2배 안, 수익률 lag1 자기상관 ~0.55(추세), |수익률| lag1 자기상관
-    ~0.45(변동성 뭉침), 1분봉 평균 고저폭 ~2.9%, **추세효율 0.55 이상**(이게 낮으면 "사팔사팔"이 돌아온
-    것이다), **되돌려주는 몫 55% 미만**(아래 § 되돌림), 국면 점유율이 위 표와 비슷할 것.
-    ⚠⚠ **로그드리프트의 표본오차를 얕보지 말 것**(2026-09-10 실측) — 예전 주석은 "틱이 수백만이라
-    SE 0.01e-6" 이라고 적어뒀지만 그건 틱이 독립일 때 얘기다. 국면이 ~69틱씩 살고 acf1 이 0.5 라
-    **유효 표본은 국면 개수**이고, 실측 SE 는 7일 1회 ~4e-6 · 8회 ~1.4e-6 · 24회 ~0.8e-6 이다.
-    기본 8회 실행에서 나온 -2.6e-6 을 편향으로 오독한 적이 있다(48회로 재니 +0.45e-6). **편향을
-    판정할 땐 `SIM_RUNS=24` 이상**으로 다시 돌릴 것.
-  - **⚠⚠ 되돌림(mean reversion) 재설계 — "EMA 를 뚫고 되돌아옴이 너무 심하다"(2026-09-10)**:
-    2026-08-26 재설계로 방향은 생겼지만 **한 번 뻗은 움직임이 너무 빨리 회수**됐다. 원인은 적정가 대비
-    되돌림의 **2차항**(`0.30 × x|x|`)이 평범한 과열 구간에서 이미 너무 셌던 것 — 과열 5% 에서
-    0.075%/틱, 10% 에서 0.30%/틱 이라 **틱 표준편차(0.27%)만 한 힘이 매 틱 한 방향으로** 걸렸고,
-    그래서 EMA 를 뚫고 나간 봉이 1~2분 만에 통째로 되감겼다. 고친 것은 둘뿐이다:
-    - **2차 → 3차(`REVERT_CUBE`=1.5)** — 발산을 막는 먼 구간(±30%)의 브레이크 세기는 그대로 두고
-      (1.5×0.30³ ≈ 옛 0.30×0.30²) 가까운 구간만 푼다: 과열 5% 에서 6배 · 10% 에서 3배 약하다.
-    - **거리를 로그로 잰다**(`logStretch = ln(ref/anchor)`) — 산술 과열은 위아래가 비대칭이라
-      (-50% 와 +100% 가 같은 거리인데 산술로는 0.5 와 1.0) 스윙이 커지면 복원력이 아래쪽에 더 세게
-      걸려 **가격에 하락 편향**이 생긴다. 실측으로 드러났다: 되돌림을 푼 직후 로그드리프트가
-      -5.4e-6/틱(7일에 0.35배)이었는데 거리만 로그로 바꾸니 -1.1e-6 으로 돌아왔다.
-      ⚠ **심리·국면 판정은 산술 `stretch` 그대로** — 그쪽 임계값(0.010 / 0.02 / -0.015)이 전부 산술
-      기준으로 튜닝돼 있어 같이 바꾸면 국면 점유율이 통째로 움직인다.
-    **⚠⚠ 되돌림을 풀면 `GAUGE_FULL` 을 반드시 같이 넓힐 것** — 게이지는 "한 파도가 이 정도면 공포
-    100%"라는 **자**라서, 스윙이 커졌는데 자를 그대로 두면 평범한 눌림이 공포 만점으로 읽힌다.
-    실제로 0.18 을 그대로 뒀더니 평균 공포가 0.30→0.36 으로 올라 변동성·거래량·투매가 통째로 부풀었다
-    (1분봉 2.74%→3.07%, 투매 54→72회/7일). **0.22 로 넓히니 되돌림만 줄고 나머지는 개편 전으로 복귀**했다.
-    **측정 지표 = 분산비(variance ratio)**: q틱 구간 분산 ÷ (q × 틱 분산). 랜덤워크면 1, 추세면 >1,
-    되돌리면 <1 이다. 이 모델은 짧은 구간에서 부풀었다가(추세) 긴 구간에서 꺾여 내려오는데(되돌림)
-    그 **낙폭이 곧 "쌓은 변동 중 몇 %를 되돌려주나"** 이고, `npm run sim:bot` 이 이제 그 줄을 찍는다.
-    실측 대비(24회×7일, 같은 시뮬):
-
-    | 지표 | 개편 전 | 개편 후 |
-    | --- | --- | --- |
-    | **되돌려주는 몫**(분산비 60틱→1800틱) | **59%** (9.01→3.73) | **41%** (10.76→6.38) |
-    | EMA20(1분봉) 한쪽에 머무는 봉 수 | 5.9봉 | **7.0봉** |
-    | 크로스 후 2봉 안에 되돌아오는 휩쏘 | 26.2% | **23.1%** |
-    | 크로스 후 최대 이탈(중앙값) | 6.63% | **8.91%** |
-    | 추세효율(30틱) | 0.584 | 0.613 |
-    | 1분봉 폭 · 틱 sd | 2.74% · 0.27% | 2.89% · 0.27% |
-    | 국면 수명 · 점유율 | 68틱 · 38.5/23.8/23.1/9.0/5.4/0.4 | 69틱 · 39.2/23.4/22.9/9.1/5.1/0.3 |
-    | 평균 공포 / 탐욕 | 0.303 / 0.291 | 0.289 / 0.264 |
-    | 로그드리프트/틱 | 0.17e-6 | 0.45e-6(48회) |
-    | MDD · 대형스윙(20%+) | -87.8% · 75회/일 | -93.5% · 83회/일 |
-
-    ⚠ **대가는 낙폭이다** — 되돌려주지 않는다는 건 큰 움직임이 그대로 남는다는 뜻이라 MDD 가 -88%→-94%,
-    7일 가격 범위도 0.31~4.09 → 0.38~8.66 으로 넓어졌다(의도된 것). 더 풀고 싶으면 `REVERT_CUBE` 를
-    낮추면 되지만 1.2 에서 이미 1분봉이 3.08% 로 합격선을 넘는다.
-  - **⚠⚠ 기준가 클램프는 "시세 범위"가 아니라 0·Infinity 안전장치다(`_shared.VIRTUAL_PRICE_MIN/MAX`,
-    2026-09-10)**: `nextMarketState` 의 클램프는 `clamp(s.ref*(1+ret), 1e-12, 1e12)` 이고, 합성 흡수
-    (`synthMaker`)의 `Math.max` 하한도 같은 상수를 쓴다. **같은 버그가 두 번 났다** — 처음엔 하한이
-    **0.02**(2026-07-24 수정), 그다음이 **0.0001** 이었다. 둘 다 "그 시절의 최소 틱"을 하한에 그대로
-    적어둔 것이고, 그래서 대량 매도로 가격이 내려가면 **그 값에서 딱 멈춰 아무리 팔아도 더 안 떨어졌다**
-    (차트가 그 값에 수평으로 굳는다 = 제보). 틱은 2026-08-01 부터 **가격 비례**(유효숫자 4자리)라
-    저가대에서도 호가가 뭉개지지 않으므로 하한이 그 자리에 있을 이유가 애초에 없었다. 지금은 기준선(1)을
-    중심으로 **로그상 대칭**인 1e-12 ~ 1e12 이고, 그 범위 안에선 모델·사다리·격자·자석이 전부 스케일
-    무관이다(검증: 1e-4 대와 1.0 대의 한 틱 분포가 동일, 1e-8 대 1,500틱에서 호가 역전 0·레벨 22 유지).
-    ⚠ **하한을 더 내릴 땐 표시 자릿수를 같이 볼 것** — `virtualPrecision(1e-12)=15` 이고
-    `toLocaleString` 의 `maximumFractionDigits` 는 구형 엔진에서 20 이 상한이라 1e-18 밑으로 내리면
-    화면이 RangeError 로 죽는다(`format.ts fmtPrice` 가 20 에서 자르는 방어선을 뒀다).
-    ⚠ **하한을 없앤다고 가격이 거기 머무르지는 않는다** — `BOT_BASE_PULL` 이 anchor 를 기준선 1 로 당기는
-    힘이 **로그 거리의 제곱**이라 멀어질수록 급격히 세진다(1e-4 에서 틱당 +0.27%, 1e-9 부터는 클램프에
-    걸려 +1%/틱). 즉 극단적 덤핑은 몇 시간에 걸쳐 되돌아온다 — 이건 장기 안정성 장치라 의도된 동작이고,
-    낮은 가격을 오래 유지하고 싶으면 이 상수를 손봐야 한다(그때는 `npm run sim:bot` 재보정이 선행).
-- **⚠ DB I/O 최소화(runMarketMaker 재작성, 2026-07-18)**: 예전엔 한 틱에 봇 호가 16개를 "개별 batch 로
-  취소"(16 왕복)하고 다시 16개를 "개별 `placeBotOrder`"(각각 매칭 SELECT 2회+쓰기 = 32 왕복)로 깔아 한
-  틱에 수십~100+ 문장/수십 왕복이 나갔다. 지금은 **(취소 1문 + 사다리 16문 + 합성체결 1문 + 기준가 1문)을
-  단 하나의 `DB.batch`(왕복 1회)** 로 처리하고, 재호가 게이트(현재 `BOT_TICK_MIN/MAX_MS`=0.45~0.95초, 체결
-  딜레이 감소용으로 예전 3~8초에서 단축)를 통과하지 못한 폴링은 **state read
-  1회로 즉시 반환**한다(동시 폴링은 조건부 upsert 로 이 틱을 원자 선점 → 중복 requote 방지). `matchBuy`/
-  `matchSell`/`placeBotOrder`/**호가 에스크로**(주문 걸 때 잠그고 취소 때 환불)는 전부 제거했다 — 봇은
-  무한 유동성 공급자라 "돈이 모자라 호가를 못 깐다"는 상태가 없어서, 틱마다 수십 번 나가던 그 왕복이
-  순수 낭비였다. 유저↔봇 체결의 물량 소비만 조건부 UPDATE 로 원자 처리하면 된다.
-  **⚠ 단, 체결된 뒤의 재고/현금 정산은 한다(`botFillStmts`, 2026-07-23 복원)** — 에스크로와 달리 이미
-  도는 batch 에 문장 하나가 얹힐 뿐이라 왕복이 안 늘어난다. 아래 "봇 재고/현금 정산" 참고.
-- **⚠⚠ 봇 호가 사다리 = `spot_bot_state.book_json` 한 칸(2026-07-31, `spot_orders` 폐기)**: 위 2026-07-18
-  개편으로 **왕복**은 1회가 됐지만 **문장 수**는 그대로 44+1 이었다. 그게 두 가지를 동시에 터뜨렸다 —
-  (a) 하루 172만 행을 쓰고 지워 월 rows written 포함분(5,000만)을 넘겼고 (b) **cron 1회가 D1 쿼리
-  한도(invocation당 1,000)의 950 을 먹어** 가상 코인을 하나도 더 못 늘렸다(2개면 1,900 → 확정 초과).
-  근본 원인은 "매 틱 통째로 교체되는 **스냅샷**을 44행짜리 테이블로 들고 있었던 것" — 이력이 아니므로
-  행으로 쪼갤 이유가 없다. 지금은 사다리 전체가 `{"o":액터봇,"b":[[가격,수량]..],"a":[..]}` JSON 한 칸이고,
-  **봇이 어차피 갱신하던 심리상태 UPDATE 에 컬럼 두 개가 붙을 뿐**이라 재호가 문장이 45개 → **0개**다.
-  - 읽는 쪽은 전부 `parseBook`/`makerLevels`(가격 우선순위 정렬 + 지정가 크로스 필터) → 메모리 walking →
-    `bookWriteStmt` 1문장. `makerLevels` 가 돌려주는 원소는 **book 안의 객체 참조**라 `level.size -= take`
-    로 깎으면 그대로 직렬화된다.
-  - 소비 되쓰기는 `book_version` 가드(낙관적 동시성) — 그 사이 재호가가 새 사다리를 깔았으면 0행이 되어
-    **옛 사다리로 덮어쓰는 사고를 막는다**. 0행이어도 체결은 그대로 성립한다(봇은 무한 유동성이라
-    "물량이 모자라 못 판다"가 없다 — 예전 `spot_orders` best-effort 소비와 같은 관용구).
-  - 덤으로 `matchLimitPendingAgainstBook` 이 **청크마다 왕복하던 최대 500회 루프**(체결 하나에 D1 쿼리
-    수백 개)를 시장가 경로와 같은 "스냅샷 → 메모리 walking → 단일 batch" 로 통일했다. 대신 한 방에
-    체결하므로 **pending 을 조건부 UPDATE/DELETE 로 먼저 선점**(claim-first)해 유저 폴링과 cron sweep 이
-    같은 주문을 두 번 체결하지 못하게 한다(예전엔 봇 호가 claim 이 그 역할을 간접적으로 했다).
-  - `recordVirtualFill`(SL/TP 등 호가 walking 안 타는 정산)도 최우선호가 SELECT+UPDATE 를 50회까지
-    왕복하던 걸 메모리 walking + 1문장으로 바꿨다.
-  - **⚠ `spot_orders` 테이블은 이제 아무도 읽지도 쓰지도 않는다**(롤백 여지로 정의만 남김). 새 코드에서
-    이 테이블을 다시 참조하지 말 것.
-- **⚠ 사람처럼 "떨어지는" 호가 가격·수량(price clustering, 2026-07-20)**: 예전엔 호가를 전부
-  `ref * (1 ± spread)` 로만 찍어서 **1.4067 / 1.4074 / 1.4081** 처럼 어중간한 값이 기계적으로 균일한
-  간격으로 늘어섰다 — 실제 호가창은 그렇게 안 생겼다. 사람은 **1.4000 / 1.3900 같은 딱 떨어지는 가격에
-  주문을 몰아 걸고, 그 자리 물량이 훨씬 크다**(심리적 지지·저항 "벽"). 수정: `humanQuotePrice()` 가
-  목표가를 `PRICE_GRIDS`(0.05 / 0.01 / 0.005 / 0.001, 굵을수록 `sizeMult` 큼)로 끌어당기고 그 자리에
-  물량을 몇 배로 얹는다. **매수는 내림(floor)·매도는 올림(ceil)** 으로만 스냅해 항상 mid 에서 멀어지는
-  방향이라 **호가 역전이 원천적으로 불가능**하다. 얼마나 끌려갈지는 `tol`(깊은 레벨일수록 관대)로
-  제한해 사다리가 뭉개지지 않게 하고, 두 레벨이 같은 가격이 되면 원래 목표가로 되돌려 호가창 단계 수를
-  유지한다. **수량은 반대로 불규칙하게 둔다** — 가격과 달리 수량엔 라운드
-  넘버 심리가 약해서, 실제 호가창은 2,384 개 같은 어중간한 값이 대부분이고 딱 떨어지는 수량은 가끔
-  섞일 뿐이다(예전엔 전부 1,000/5,000 으로 맞춰서 그것대로 기계 같았다). `humanSize(raw, roundProb)` 는
-  기본은 정수로만 다듬고 일부만 떨어지는 수량으로 만들되, **떨어질 확률은 계층마다 다르다**(아래).
-  **체결 테이프도 65% 확률로 0.001 격자에 스냅** — 실제 시장의 체결은 "거기 걸려 있던
-  호가" 가격에 일어나므로 테이프만 어중간하면 호가창과 따로 노는 시장으로 보인다. 실측: 호가의 약 79%
-  가 0.001 이상 배수(0.01 배수 24%·0.005 배수 19%·0.001 배수 36%), 나머지 21% 만 어중간한 값.
-  ⚠ 라운드 가격 `sizeMult` 때문에 호가창 총 유동성이 예전의 ~2배가 됐다(시장가 슬리피지가 그만큼 줄었다).
-- **⚠⚠ 수량의 계층 분포 — 개미·세력·고래(`SIZE_TIERS`/`orderSize`, 2026-08-31)**: 위에서 "수량은
-  불규칙하게"까지는 했지만 **범위 자체가 좁았다** — 체결은 `uniform(1000, 8000)`, 호가는
-  `uniform(2000, 10000)` 한 줄이라 화면의 모든 수량이 **네다섯 자리에 뭉쳐** 있었고, 그래서 테이프를
-  아무리 봐도 **개미와 세력이 구분되지 않았다**("수량이 네 자리 아니면 다섯 자리로만 나온다" 제보).
-  실제 거래소의 주문 크기는 균등분포가 아니라 **멱함수**다: 건수의 절반 이상은 개미가 만들고, 거래량의
-  대부분은 소수의 세력·고래가 만든다. 지금은 계층을 먼저 뽑고(가중치) 그 계층 안에서 **로그균등**으로
-  배수를 뽑아 같은 계층 안에서도 자릿수가 흩어지게 한다.
-  | 계층 | 건수 비중 | 평균 대비 배수 | 라운드 확률 | 거래량 몫(실측) |
-  | --- | --- | --- | --- | --- |
-  | 개미 | 56% | 0.012~0.16 | 55% | 0.8%(하위 50% 합) |
-  | 일반 개인 | 30% | 0.16~1.3 | 30% | — |
-  | 세력(기관·알고) | 11.5% | 1.3~10 | 12% | 상위 10% 가 87% |
-  | 고래 | 2.5% | 10~70 | 6% | 상위 1% 가 48% |
-  - **라운드 확률이 계층마다 다른 이유**: 개미는 "100개/500개"처럼 손으로 딱 떨어지게 넣고, 세력·알고리즘은
-    큰 물량을 잘게 쪼개 넣어(아이스버그) 어중간한 수량이 나온다. `humanSize` 의 라운드 **격자도 값 크기를
-    따라가야 한다** — 140 개를 5,000 격자로 반올림하면 개미 주문이 통째로 사라진다.
-  - **⚠ 평균은 정규화로 보존한다**(`SIZE_TIER_MEAN` = 로그균등의 기댓값 `(hi-lo)/ln(hi/lo)` 을 가중합).
-    호출자는 "평균 몇 개짜리 시장인가"만 정하고(`BOT_TRADE_MEAN`/`BOOK_LEVEL_MEAN`) 분포를 손봐도
-    **캔들 거래량·호가 총 유동성이 흔들리지 않는다**. 분포 표를 고치면 이 불변식을 반드시 다시 잴 것.
-  - **체결은 건수를 2배로, 평균 크기를 절반으로**(틱당 3~6건 → 6~14건, 평균 5,130 → 2,370). 개미 체결이
-    화면에 실제로 보이려면 건수가 있어야 하고, **곱이 그대로라 캔들 거래량은 변하지 않는다**(같은 심리
-    경로로 대조: 틱당 100,981 → 100,984). 테이프는 링 버퍼 JSON 이라 건수를 늘려도 **D1 쓰기·읽기는 1행**
-    그대로다(§6). ⚠ 대신 링 버퍼가 2배 빨리 회전하므로 `TAPE_MAX` 를 400 → 700 으로 올렸다(1s 캔들이
-    볼 수 있는 과거가 90초 → 70초로 유지된다. 바이트만 늘고 행 수는 그대로 = 과금 무관, 실측 17KB).
-  - **호가 한 단계 = 여러 주문의 합**(1~3명). 호가창은 가격별 SUM 만 보여주므로 한 자리에 개미 하나만
-    있으면 얇고(수백 개) 세력이 끼면 두껍다(수만~수십만) — 시장가가 얇은 구간을 훅 지나가고 벽 앞에서
-    멈춘다. 깊은 레벨일수록 두껍게(`depthTilt`, 평균 1 이라 **총 유동성 불변**: 대조 실측 +0.2%).
-  - **⚠ 큰 체결은 가격을 민다(시장충격)** — 수량을 가격보다 **먼저** 뽑아 그 틱의 jitter 를
-    `min(4.5, 0.55 + 0.75√(sz/평균))` 배로 키운다. 개미 체결은 호가 하나 먹고 끝이라 가격이 거의 안
-    움직이고, 고래가 들어오면 봉에 꼬리가 남는다(예전엔 크기와 가격이 완전히 독립이라 테이프에 20만개가
-    찍혀도 차트는 아무 일 없다는 듯 흘렀다). ⚠ **배수의 평균이 1 이어야 봉 폭이 안 변한다**(실측 0.98).
-  - 실측 자릿수 분포 — 체결: 2자리 23% / 3자리 40% / 4자리 26% / 5자리 9% / 6자리 1.6%(전: 4자리 54% +
-    5자리 41% = 95%). 호가: 3자리 36% / 4자리 40% / 5자리 17% / 6자리 3%(전: 4자리 60% + 5자리 39%).
-  - ⚠ 이 분포는 **가격 모델(`nextMarketState`)을 건드리지 않는다** → `npm run sim:bot` 지표 전부 불변
-    (추세효율 0.58 · 국면 수명 66틱 · 1분봉 2.76% · 국면 점유율 동일). 크기만 바꿀 땐 sim 이 아니라 위
-    "평균 보존" 대조를 봐야 한다.
-  ⚠ **격자 스냅은 반드시 오차 흡수(1e-9)와 함께** — `Math.floor(price/step)` 을 그냥 쓰면 정확히 격자
-  위에 있는 값이 한 칸 밀린다(`1.45/0.0001 = 14499.999999999998` → 1.4499). 봇 호가(`humanQuotePrice`)와
-  클라 호가창 묶어보기(`OrderBook.snapToGrid`) 양쪽 모두 이 함정이 있었다(§6 참고).
-  ⚠ **호가 밀도는 봇 계정 수가 아니라 한 봇이 까는 단계 수로 만든다** — 호가창은 가격대별 합계만
-  보여주므로 계정을 늘려도 화면상 차이가 없다. `BOT_LEVELS_PER_SIDE` 를 8→22 로 올려 촘촘하게 채웠다.
-- **⚠ 호가 역전 방지 = 매 틱 페어 전체 비우고 재호가**: 봇이 2명이라 "선택된 액터의 호가만" 취소하면
-  다른 봇의 오래된 호가가 남아 랜덤워크 후 역전(최우선매수 > 최우선매도)이 생긴다(예전엔 봇끼리 크로스
-  매칭이 이걸 정리했지만 그 왕복을 없앴다). 그래서 한 틱마다 `DELETE FROM spot_orders WHERE pair=?`
-  (두 봇 모두)로 봇 호가를 통째로 비우고 한 액터가 일관된 사다리를 다시
-  깐다 — spot_orders 엔 봇 호가만 있어(유저 주문은 pending_orders) pair 전체를 지워도 유저 주문엔 영향
-  없고, batch 원자성으로 호가창이 빈 순간은 노출되지 않는다. 봇끼리 체결로 테이프를 움직이던 방식 대신
-  **합성 체결을 같은 batch 안에서 기록**(체결가=새 기준가 mid, 매칭 왕복 없음)해 차트/체결내역이 계속
-  움직이게 한다. 호가 스프레드는 실거래소처럼 타이트하게(base ~0.12%, 깊은 레벨로 갈수록 확대) 잡아
-  시장가 체결이 mid 근처에서 이뤄지되 대량 주문엔 슬리피지가 생긴다.
-- **⚠⚠ 봇이 만드는 행은 "쌓이면 안 된다"(2026-07-31, DB 무한 증식 차단)**: 봇은 분당 12틱 이상 영구히
-  도는 유일한 컴포넌트라, **틱당 남기는 행 하나가 곧 "하루 2만 행"** 이다. 실제로 그렇게 터졌다 —
-  재호가가 옛 호가를 지우지 않고 `status='cancelled'` 로 **마킹만** 해서 prod 에 `spot_orders`
-  **1,358만 행**(하루 +86만 행)이 쌓였고, 영구 보존이던 `spot_trades` 도 157만 행이 됐다. 그 결과
-  **DB 3.38GB / 하루 +200MB → D1 의 DB당 한도 10GB 까지 한 달**(도달하면 D1 이 쓰기를 거부해 가상코인이
-  아니라 **트레이딩 전체가 정지**한다). 지금은 (a)재호가가 `DELETE` 로 **실제로 지우고**(그 테이블은 항상
-  "지금 깔린 호가 ~45행"만 들고 있는 임시 스냅샷이다 — 부분/전량 체결로 `filled` 이 된 행도 같이 청소된다)
-  (b)체결 테이프는 `TRADE_RETENTION_MS`(6시간)만 보존한다(가끔 도는 틱이 잘라냄). 차트 히스토리는
-  `spot_candles` 가 따로 영구 보관하므로 잃는 게 없다. **⚠ 봇 경로에 새 INSERT 를 추가할 땐 "이 행을
-  누가 언제 지우는가"를 반드시 같이 정할 것** — 안 정하면 그게 다음 3GB 다.
-- **⚠⚠⚠ 봇 합성 체결 테이프 = `spot_bot_state.tape_json` 링 버퍼(2026-08-01, 실제 $47 청구서를 만든 항목)**:
-  위 (b)로 "쌓이지는" 않게 됐지만 **쓰고 지우는 행 자체가 과금 대상**이라는 걸 놓쳤다. 봇은 한 틱에 3~6건(당시 값 — 지금은 2~40건, § 수량의 계층 분포)을
-  찍으므로 **초당 ~4.5행이 영구히 INSERT** 되고 6시간 뒤 같은 수만큼 DELETE 됐다 → 실측(`wrangler d1
-  insights`, 2026-08-01) **하루 96만 행 중 76만 행(79%)이 이 테이프**였다(INSERT 51만 + DELETE 25만).
-  근본 원인은 §6 의 원칙 위반 — 이 테이프를 읽는 곳은 (a)호가창 "체결" 탭 최근 30건 (b)`<60s` 캔들
-  버킷팅뿐이고 차트 히스토리는 `spot_candles` 가 따로 보관하므로, **이력 테이블이 아니라 최근 N건짜리 링
-  버퍼**다. 사다리(`book_json`)와 똑같이 상태 행의 JSON 한 칸(`tape_json`, 최근 `TAPE_MAX`=700건,
-  `[[가격,수량,1=매수테이커/0=매도,시각ms],…]`)에 담으니 **봇이 어차피 매 틱 UPDATE 하던 문장에 컬럼
-  하나가 붙을 뿐**이라 테이프 쓰기 비용이 **0**이 되고, 보존기간 DELETE 도 통째로 사라졌다(링 버퍼는 넘치는
-  쪽이 자동으로 잘려나가므로 "누가 언제 지우나" 문제 자체가 없다). 남는 건 **틱당 5행**(상태 1 + 캔들 3 +
-  봇 수수료 카운터 1)뿐이었다 — 2026-08-14 무료 플랜 전환으로 여기서 더 줄어 지금은 **커밋 1회당
-  1행**이다(§6 · § spot.ts runBotTicks). prod 검증(2026-08-01 배포 직후): 합성 체결 INSERT **0건**, 테이프·`book_version`·
-  `ref_price` 정상 전진, 유저 체결만 테이블에 들어옴.
-  - **⚠ 유저 체결은 계속 `spot_trades` 에 행으로 남긴다** — 사람이 내는 주문은 하루 수백 건 규모라 비용이
-    없고 체결 원장으로서의 가치는 그대로다. 그래서 읽는 쪽(`loadSpotMarket`·`bucketTradesToCandles`)이
-    **테이프와 테이블을 시간순으로 병합**한다(`mergeRecentTrades`). 테이프 항목엔 행 id 가 없어 `t<시각>-<i>`
-    합성 키를 준다(리스트 렌더 key 용도). **새 체결 경로를 추가할 때: 봇이 만드는 것이면 테이프에, 유저
-    것이면 테이블에.**
-  - `<60s`(1s) 캔들이 볼 수 있는 과거 범위가 링 버퍼 길이(≈90초)로 제한된다 — `<60s` 는 애초에 과거
-    페이지가 없고(`loadSpotCandles` 가 `endTime` 에 빈 배열 반환) 기본 표시가 ~38봉이라 실사용 영향은 없다.
-    더 길게 보여주고 싶으면 `TAPE_MAX` 만 올리면 된다(**행 수가 아니라 바이트만 늘어 과금과 무관**).
-  - cron 버스트는 테이프를 시작에 한 번 읽어 틱 사이에 메모리로 이어받는다. cron 과 유저 폴링 틱이 겹치면
-    뒤에 쓴 쪽이 상대의 append 를 덮어쓸 수 있는데, 잃는 건 **표시용 테이프 몇 건**뿐이다(캔들·기준가·
-    잔고·재고는 각자 자기 문장으로 쓴다).
-- **⚠ 봇 거래량(한 틱=버스트) + 접속 무관 활성화(cron 버스트)**: 예전엔 한 틱에 5~45 짜리 합성체결 1건이라
-  캔들 거래량이 ~300 에 그쳐 "봇이 쫄보"였고, 게다가 마켓메이커는 `/api/spot` 폴링(=유저가 OX 를 볼 때)
-  으로만 돌아서 **아무도 안 켜놓으면 cron(예전 5분) 때만 1틱** → 차트가 사실상 멈췄다. 수정:
-  (1) `marketMakerTick()` 이 한 틱에 **큰 합성체결 여러 건**(당시 3~6건 × 1,000~8,000 — 지금은 틱당 2~40건·평균 ~2,370 개, § 수량의 계층 분포)을
-  찍는다 — 캔들 거래량이 요청당 ~1.5만~4만, 유저가 볼 때 분당 수십만으로 뛴다. 캔들은 버스트 총량으로
-  1회 upsert(문장 수 억제). (2) **cron 은 매 1분**(`cron/wrangler.toml`)마다 `runMarketMakerBurst()` 로
-  **여러 틱을 몰아** 돌린다 → 접속자 없어도 매 분 가격 움직임+거래량이 생긴다.
-  **⚠ 버스트 체결 시각은 절대 소급하지 않는다(마감된 봉이 변하던 버그)**: 예전엔 각 틱을 `[now-55s, now]`
-  에 퍼뜨려 빈 봉을 메웠는데(cron 이 5분 주기이던 시절의 잔재), 매 1분이 된 뒤로는 그 소급분이 **이미
-  마감된 직전 분봉 버킷**에 upsert 돼 `high/low/close/volume` 이 계속 갱신됐다 → OX 차트는 1초마다
-  캔들 전체를 `setData` 로 다시 그리므로 "봉이 마감됐는데 이전 봉이 계속 바뀌는" 현상이 그대로 보였다.
-  지금은 각 틱의 시각을 **그 틱을 실제로 실행하는 시점(`Date.now()`, 단조 증가)** 으로 찍어 과거 버킷을
-  건드리지 않는다(cron 이 매 분 도니 1분봉은 어차피 매 봉 채워져 빈 봉도 안 생김). 새 체결 경로를 추가할
-  땐 **`candleUpsertStmts` 에 넘기는 `now` 가 과거 시각이면 마감된 봉이 변조된다**는 점을 반드시 지킬 것. `runMarketMaker()`(폴링용, 게이트 있음)와 `marketMakerTick()`
-  (실제 한 틱, 게이트 없음)을 분리해 폴링/cron 이 공유. **⚠ cron 워커는 Git 자동배포가 아니라 수동 재배포
-  필요**(`cd cron && npx wrangler deploy`) — 스케줄/코드 변경은 이 명령을 돌려야 반영됨(§5).
-- **⚠ 벽 소비량은 벽 크기에 비례(`wallAbsorbSize`)**: 예전엔 press 시 벽 가격에 놓는 봇 호가가 **벽 크기와 무관하게 항상 2,000~10,000** 이라, 100만주 벽이면 뚫는 데 수 분씩 걸리고 그동안 기준가가 벽에 붙어 굳어버렸다("봇이 쫄보라 큰 벽을 못 뚫는 느낌"). 실제 시장에서 큰 벽은 **저항**이지 무한 방벽이 아니다. 지금은 벽 물량의 일정 비율(기본 5~12%)을 먹되 **국면 공격성**(`REGIME_PARAMS.sizeMult`, calm 0.55 ~ panic 2.9)과 **군중 심리 강도**로 배수를 걸고, **6% 확률로 "고래 스윕"** 이 터져 벽의 35~90% 를 한 틱에 쓸어간다. 작은 벽은 기존 절대량(2,000~10,000)이 하한이라 예전처럼 즉시 정리된다. 이를 위해 벽 조회가 가격뿐 아니라 **그 가격의 총 물량**까지 가져온다. 실측(100만주 벽): 예전 ~4.5분 → calm 54초 / panic 17초, 로컬 D1 검증에서 고래 스윕으로 3초 만에 54% 소진.
-- **⚠ 봇이 유저 지정가 "벽"을 존중(가짜 high 버그 수정)**: 예전엔 봇 기준가(랜덤워크)가 유저의 최우선 매도벽
-  위로(또는 매수벽 아래로) 자유롭게 움직이고 그 값에 합성체결을 찍어서, **"1.1 에 큰 매도벽을 걸어둬도 봇이
-  1.11 에 체결을 찍어 차트 high 만 1.11 로 가짜로 뜨고(벽은 안 팔림)"** 버그가 있었다. 실제 시장이라면 그 벽을
-  먼저 소비해야 벽 너머 가격이 나온다. 수정: 매 틱 유저 pending 의 최우선 매수벽/매도벽을 한 쿼리로 구해
-  기준가를 `[wallBid, wallAsk]` 안으로 **클램프**하고, 벽에 눌리면(press) 그 벽 가격에 봇 호가를 하나 더 얹어
-  아래 `sweepRestingOxPendings` 가 **벽을 그 가격에 실제 체결로 조금씩 소비**하게 한다 → 벽 너머 가짜 체결이
-  안 찍히고(차트 high 가 벽에서 멈춤), 유저 벽은 물량이 소진될 때까지 저항으로 작동하다 뚫린다(실거래소 동일).
-  **⚠ 단, marketable 주문은 벽에서 제외한다(2026-07-24 교착 버그 수정)**: 벽은 **현재가 너머**의 저항/지지여야
-  한다 — 매도벽은 `price >= prev.ref`(현재가 이상), 매수벽은 `price <= prev.ref`(현재가 이하)만 인정. 유저가
-  현재가보다 **낮게 건 매도**(=지금 팔겠다는 marketable 청산/지정가)나 **높게 건 매수**를 벽으로 잡으면, 기준가를
-  그 주문 가격으로 끌어내려/끌어올려 **시장이 그 주문 쪽으로 통째로 끌려가고**(예: 시세 1.0 인데 0.5 청산 예약
-  하나에 시장이 0.5 로 붕괴), 사다리가 그 가격에 깔려 정작 그 주문이 크로스가 안 돼 거의 안 팔리는 교착이 생겼다.
-  marketable 주문은 벽에서 빼면 sweep 이 정상 사다리에 walking 체결한다(비-marketable 저항/지지 벽은 그대로 존중
-  → 가짜 high 방지 유지). 로컬 검증: 시세 1.0 에 0.5 청산 예약 → 시장이 0.5 로 안 끌려가고 몇 틱 만에 전량 체결.
-- **⚠ 봇도 거래 수수료를 낸다(`botFillStmts`)**: 합성 체결(봇끼리)이든 유저 상대 체결(maker 로 잡힌 물량)이든 봇도 요율을 적용받는다. **시장 물량의 대부분이 봇에서 나오는데 봇만 면제하면 수수료 집계가 실제 거래량과 동떨어진다**. 요율은 유저와 똑같이 누적 거래대금에서 파생(`vipOf`)하므로 봇도 거래가 쌓이면 등급이 오른다(특혜 없음).
-  **⚠ 단 봇은 `fee_ledger` 에 행을 남기지 않는다(2026-07-31)** — 봇은 영구히 도니 하루 2.9만 행씩 원장을 채우는데 정작 그 행을 읽는 곳이 없었다: 랭킹의 "거래소 수수료 수익"은 `users.total_fees` 를 집계하고(`leaderboard.ts` — 원장은 행이 너무 많아 5초 폴링으로 스캔 불가), 원장의 존재 이유인 "유저별·심볼별 분해"에서 봇 몫은 애초에 분해 대상이 아니다. 총액은 카운터에 그대로 누적되므로 **화면 숫자는 1원도 안 바뀐다**. 겸사겸사 봇 부기를 (카운터 UPDATE + 원장 INSERT + 현금/재고 UPDATE) 3문장 → **1문장**으로 합쳤다(같은 행을 두 번 UPDATE 할 이유가 없다).
-- **⚠ 봇 재고/현금 정산(`botFillStmts`, 2026-07-23)**: 유저 상대로 체결되면 봇의 `users.balance`(USDT)·`ox_balance`(OX 재고)가 실제로 움직인다 — 봇이 팔면 현금 +명목금액·재고 −수량, 사면 반대(수수료는 양쪽 다 차감). **예전엔 이 정산이 아예 없어서 두 봇의 잔고가 DB I/O 개편(2026-07-18) 시점 값에 영구히 얼어붙어 있었다**(아무리 사고팔아도 숫자가 그대로 → "봇 재고"라는 개념 자체가 없었다). 정산 위치는 각 매칭 함수가 이미 부르는 **합계 batch 1회**(청크마다 부기하면 원장·문장이 청크 수만큼 불어난다) — 왕복 증가 0.
-  - **⚠ 잔고 가드는 절대 붙이지 않는다**(조건부 UPDATE 아님, 호가 에스크로도 부활시키지 않는다) — 봇은 설계상 무한 유동성 공급자라 현금/재고가 **음수로 내려가도 체결이 계속돼야** 한다. 가드를 붙이는 순간 대량 시장가 완결(`synthMaker` 경로)이 봇 잔고 바닥에서 끊긴다. 봇 재고는 "유저 전체 순포지션의 거울"이라 유저가 순매수면 봇 OX 는 자연히 마이너스로 간다(정상).
-  - **합성 체결(봇↔봇)은 재고 변화 0** — `buyer_id=seller_id=actor` 라 같은 계정 안에서 상계된다(`botSide=null` → 수수료만). 로컬 검증: 합성 틱을 아무리 돌려도 잔고 불변.
-  - **⚠ 강제청산도 반드시 반영**(`_trading.ts liquidateIfBankrupt` → `reflectVirtualFill`): 진입 때 봇이 판 물량을 청산 때 되사주지 않으면 **유저가 청산될 때마다 봇 재고가 한쪽으로 영구히 어긋난다**(진입 −수량만 남고 +수량이 영영 안 들어옴). 겸사겸사 청산 물량이 체결 테이프/차트에도 찍힌다. 유저는 청산 수수료를 안 내지만(위 참고) 봇은 낸다.
-  - **⚠ `synthMaker` 는 스텝마다 두 봇을 번갈아** 쓴다 — 예전엔 `BOT_USER_IDS[0]` 하드코딩이라 대량 시장가의 합성 흡수분이 전부 1번 봇에 쌓여 누적 거래대금이 **700배 넘게** 벌어졌고(prod 실측 2.39조 vs 33.9억), 그 탓에 두 봇의 VIP 요율까지 갈라졌다(VIP4 vs VIP2).
-  - 로컬 D1 검증: 5만개 진입 → 봇 재고 정확히 −50,000·현금 +명목−수수료, 청산 시 +50,000 복귀. 121만개 대량 시장가(합성 흡수 포함)도 두 봇 합계가 정확히 −1,216,654, 강제청산 후 전량 복귀(수량 보존 오차 0).
-- **호가창·체결내역 = "표시용" 시장 데이터**: `GET /api/spot` 은 이제 유저별 데이터(잔고/내 주문) 없이
-  시장 전체의 `{ book, trades }` 만 반환한다(`loadSpotMarket()`). `OrderBook.tsx` 가 실제 코인은
-  바이낸스 WS, OX 는 이 데이터를 1초 통합 폴링(`useSpotPoll`)으로 받아 **같은 컴포넌트, 같은 UI**로 보여준다 —
-  클릭하면 그 가격이 지정가 입력에 채워지는 것도 동일.
-- **⚠ 호가창에 유저 자신의 지정가가 안 보이던 버그와 그 수정**: OX 지정가 주문은 `order.ts` 의
-  `pending_orders` 에 쌓이는데, 호가창은 봇 전용 `spot_orders` 만 읽어서 **유저가 건 지정가가 호가창에
-  절대 안 나타나는** 구조적 문제가 있었다(실제 코인은 바이낸스의 진짜 시장이 워낙 커서 이 괴리가
-  안 보이지만, OX 는 그 자체가 유일한 "시장"이라 바로 티가 남). **수정**: `loadSpotMarket()` 의 bids/asks
-  쿼리가 `spot_orders` 와 `pending_orders`(symbol='OXUSDT', long=매수/short=매도, limit_price 기준)를
-  `UNION ALL` 해서 같은 가격대끼리 합산한다. `pending_orders` 는 취소/체결 시 즉시 그 행이 사라지므로
-  별도 동기화 로직 없이 항상 최신 상태가 자동 반영된다.
-- **⚠ 호가 역전 & "20만개가 유령가격에 즉시 체결" 버그와 그 근본 수정 — 실제 호가창 매칭 엔진** —
-  OX 는 사실상 **두 개의 분리된 주문 풀**이 화면에서만 UNION 으로 합쳐 보였다: 봇 호가(`spot_orders`)는
-  봇끼리만 매칭하고, 유저 주문은 **호가창을 완전히 무시한 채 스칼라 `ref_price` 한 값에 "전량" 체결**됐다
-  (예전 `fillOxPending`/`fillMarketableOxLimits`, 이제 제거됨). 그래서 (1) 봇 매도호가가 유저의 더 높은
-  매수를 안 보고 지나가 호가 역전이 나고, (2) **있지도 않은 20만개가 최우선 매도호가보다도 싼 유령가격에
-  즉시 체결**되는 심각한 버그가 있었다(호가창엔 매도물량이 ~280개뿐이고 최저가가 1.0996인데 20만개를
-  1.0969 에 매수). **근본 수정 = 실제 호가창 매칭 엔진**(`spot.ts`):
-  - `matchLimitPendingAgainstBook(env, pendingId)` — 유저 지정가 하나를 봇 호가창(`spot_orders`)에
-    **가격-시간 우선순위로 walking** 매칭. 있는 물량만, 실제 호가 가격에 체결(매수는 최우선 매도가부터
-    위로, 최우선호가보다 싸게는 절대 안 삼). 못 채운 잔량은 `pending_orders` 에 그대로 남아 대기.
-    증거금은 생성 시 `limit_price` 로 잠갔으므로 실제 체결가와의 차액을 환불(매수)/추가징수(드묾)한다.
-  - `matchMarketOxOrder(env,…)` — 시장가는 가격제한 없이 walking, 있는 만큼만 체결하고 잔량은 버린다
-    (체결분마다 실제 체결가로 조건부 증거금 차감).
-  - `sweepRestingOxPendings(env)` — `runMarketMaker()` 가 **봇 재호가(requote) 직후** 호출해 **전 유저의
-    대기 지정가**를 새 봇 유동성에 이어서 매칭 → 주문 낸 유저의 접속/폴링과 무관하게(크론 포함) 체결이
-    진행되고 호가 역전이 화면에 안 남는다(예전엔 게이트와 무관하게 매 폴링 sweep 했으나, 호가창은 requote
-    틱에만 바뀌므로 낭비 → 제거). `checkTriggers`(그 유저 2.5초 폴링)·`order.ts`(제출 직후)도 공유 호출.
-  - 봇 maker 는 원자적 선점(조건부 UPDATE, 동시 이중체결 방지)으로 소비한다. 봇 쪽 대금/재고 정산은
-    청크마다가 아니라 **주문 하나당 합계 batch 1회**(`botFillStmts`, 위 "봇 재고/현금 정산" 참고).
-    봇 유동성은 크게 유지(레벨 22, 물량은 계층 분포).
-  - 결과: 큰 주문은 실제 호가를 walking 하며 슬리피지와 함께 부분 체결되고 잔량은 대기하다 유동성이
-    생기면 이어서 체결(가격이 위로 밀리는 시장충격 발생). 실제 코인 38종은 별도 봇 시장이 없어 기존
-    `limit_price` 체결(`checkTriggers`)·외부시세 시장가 경로 그대로.
-- **유저 체결이 합성 시장에 반영**: 진입(시장가/지정가)은 위 매칭 엔진이 봇 호가를 실제 소비하며 체결
-  테이프(`spot_trades`)·기준가(`ref_price`)를 직접 갱신한다. **청산(close)·SL/TP** 는 여전히 서버 시세
-  (ref)로 정산한 뒤 `spot.ts` 의 `recordVirtualFill()` 로 시장에 반영한다 — 체결내역에 기록하고 기준가를
-  그 가격으로 당기며 **반대편 최우선호가부터 체결수량만큼 `spot_orders` 를 소비**한다(파생 청산은 mark
-  정산이 표준이라 진입처럼 호가창을 walking 하진 않음). 봇 잔고는 무한 풀이라 조정 불필요.
-- **⚠ 가격 정밀도 = 유효숫자 4자리 고정(2026-08-01, 예전엔 "소수 4자리" 고정)**: 가상 코인은 외부 거래소가 없어 봇이 만드는 가격이라, 봇 기준가·호가·체결가를 정해진 틱에 스냅하지 않으면 화면 표기와 실제 체결이 어긋난다. 예전 규칙은 **틱 0.0001 절대 고정**이었는데 그건 가격이 1 USDT 근처일 때만 성립한다 — 0.002 대로 내려가면 유효숫자가 2자리뿐이라 한 틱이 4%씩 튀고(0.0024↔0.0025), 100 USDT 를 넘으면 의미 없는 자릿수(123.4567)가 붙는다. 지금은 실제 거래소처럼 **가격대에 따라 틱이 10배씩** 바뀐다: `0.9234→0.0001 / 0.002434→0.000001 / 123.4→0.1`.
-  - 진실원본은 `_shared.ts` 의 `virtualTick`/`roundVirtual`/`virtualPrecision`(+`VIRTUAL_SIG_DIGITS=4`). 지수는 `Math.log10` 이 아니라 `toExponential` 로 뽑는다 — `Math.log10(0.001)=-3.0000000000000004` 라 floor 가 한 자리 어긋난다. `roundVirtual` 은 `Number(p.toExponential(3))` 이라 0.99996→1.000 같은 자릿수 올림 캐리도 알아서 처리한다.
-  - `spot.ts roundOx = roundVirtual` 이 봇 ref/호가 사다리/체결 테이프/`recordVirtualFill` 을, `order.ts` 가 유저 지정가·청산 지정가·조건부 트리거가·재무장가를 이 틱에 스냅한다.
-  - **⚠ 틱이 가격 비례이므로 가격 관련 상수를 절대값으로 쓰면 안 된다** — 전부 "틱 몇 개"로 적는다: `PRICE_GRIDS`(라운드 가격 격자, 50/10/5틱), `ROUND_STEP_TICKS`(라운드넘버 자석, 50틱), 합성 체결 테이프 스냅(5틱). 예전 값(0.05/0.01/0.005/0.001)은 가격이 1 근처일 때의 그 값과 정확히 같다.
-  - **⚠ 사다리 레벨이 겹치면 원래 목표가로 되돌리지 말고 mid 에서 한 틱씩 더 민다**(`placeQuote`) — 틱이 굵어지면(예 1.05 근처는 0.001) 레벨 간 목표 간격이 한 틱보다 좁아져서, 되돌린 목표가도 이미 쓴 가격이라 22단계 사다리가 몇 단계로 뭉개진다.
-  - 클라 표시 자릿수는 `src/format.ts` 의 **같은 규칙 사본**(intervalSec 과 같은 이유로 독립 보관 — ⚠ 한쪽만 고치면 보이는 자릿수와 실제 체결 틱이 어긋난다)에서 나오고, `useMarketStore.setPrice` 가 가상 심볼이면 가격에서 `precisions[symbol]` 을 파생한다(진실원본 1곳 → 차트를 안 보는 심볼도 헤더/포지션에서 올바른 자릿수). `Chart` 는 캔들이 올 때마다 `applyPrec` 로 축·크로스헤어 `priceFormat` 을 갱신한다.
-  - 로컬 D1 검증(0.99 / 0.002434 / 123.4 세 가격대): 호가 44개가 전부 유효숫자 4자리, 사다리 22단계 유지, 호가 역전 0, 지정가 121.4567→121.5·100.1234→100.1·조건부 118.98765→119 로 스냅, 시장가 진입/청산 walking 정상.
-- **레버리지는 포지션당 고정**: `OrderPanel.tsx` 는 현재 심볼에 보유 포지션이 있으면 그 레버리지로
-  슬라이더를 동기화하고 잠근다(서버도 물타기 시 항상 기존 포지션의 레버리지를 쓰므로, 슬라이더가
-  다른 값을 보여주면 실제 체결과 화면이 어긋나 보이는 문제가 있었음).
-- **⚠ 캔들(차트) = 영속 집계 테이블(`spot_candles`, 시간 지나도 히스토리 안 지워짐)**: 외부 시세가
-  없어 서버가 체결 기록으로 OHLCV 를 만든다(`GET /api/spot?candles=1&interval=..&limit=..`,
-  `loadSpotCandles()`). **예전엔 매 요청마다 "최신 `spot_trades` 5000건"을 JS 버킷팅**해서, 총 거래가
-  5000건을 넘으면 오래된 거래가 읽기 창 밖으로 밀려 **옛 캔들이 통째로 사라졌다**(특히 큰 인터벌은
-  5000건이 몇 시간치뿐이라 봉이 몇 개만 남음 = "시간 지나면 차트 데이터가 지워지는" 문제). **지금은 모든
-  체결(봇 합성체결 `runMarketMaker`·유저 매칭체결 `spotTradeStmts`·`recordVirtualFill`)이
-  `candleUpsertStmts` 로 인터벌별 OHLCV 를 `spot_candles` 에 누적 upsert**(같은 batch, 왕복 추가 없음)하고,
-  `loadSpotCandles` 는 그 테이블에서 `(pair,interval)` 인덱스로 필요한 봉만 읽는다 → 거래가 아무리 쌓여도
-  히스토리 영구 보존 + 읽기도 가볍다. **1s(및 <60s)만 예외**로 영속화하지 않고(단기 조회 전용) 최신 거래
-  버킷팅(`bucketTradesToCandles`, 위 최신 5000건 방식)으로 처리한다. 영속 테이블이 아직 빈 인터벌(신규
-  배포 직후)은 거래 버킷팅으로 폴백해 차트가 비지 않게 한다(백필 스크립트 불필요 — 체결이 쌓이며 자연히
-  채워짐). 실시간 갱신은 WS 대신 **통합 폴링**(`useSpotPoll` 1초)이 스토어에 넣은 봉을 `Chart.tsx` 가 구독한다(§2 — 차트가 직접 재요청하지 않는다. 표시 범위는 최초 로드 때만 설정 —
-  매 폴링마다 재설정하면 사용자가 확대/축소한 뷰가 계속 리셋되는 버그가 있었음).
-  **⚠ 저장하는 인터벌은 `PERSIST_INTERVALS` = 1m/1h/1d 세 종류뿐이다(2026-07-31)** — 예전엔 15종을 전부
-  upsert 해서 체결 한 묶음마다 15문장이 나갔고, 봇이 영구히 도니 그것만으로 하루 29만 write 였다. 나머지
-  (3m/5m/15m/30m, 2h/4h/6h/8h/12h, 3d/1w/1M)는 전부 이 셋의 **정수배**라 `loadSpotCandles` 가 조회 시
-  굴려서(rollup: open=첫 봉, close=마지막 봉, high/low=극값, volume=합) 만든다 — 값이 저장했을 때와
-  정확히 같다. 원본을 `limit × 배수` 만큼 더 읽고 `slice(-limit)` 로 잘라내므로, 페이지 맨 왼쪽 봉이
-  드물게 부분 집계일 수 있다(스크롤 페이지 경계에서만, 시각적으로 무해). **인터벌을 추가할 땐 그게 1m/
-  1h/1d 중 하나의 정수배인지 확인할 것** — 아니면 가장 가까운 하위 인터벌로 떨어져 버킷이 어긋난다.
-  **⚠⚠ 한 버킷의 `open`/`close` 는 "먼저 쓴 쪽"이 아니라 "먼저·나중에 **체결된** 쪽"이 갖는다
-  (`spot_candles.open_at`/`close_at`, 2026-09-02 버그 수정)** — 같은 버킷에 쓰는 주체가 둘(봇은 버킷이
-  닫힐 때 `live_json` 을 flush, 유저 체결은 그때그때)이라 시각 없이는 가릴 수가 없다. 예전엔 upsert 가
-  `open` 을 아예 안 건드려 **그 버킷에 먼저 INSERT 한 쪽이 시가를 가졌는데**, 2026-08-14 에 봇 캔들을
-  `live_json` 에 모으면서 **진행 중 버킷엔 봇 행이 아예 없게** 되어 전제가 깨졌다: 유저가 시장가를 내면
-  그게 항상 첫 INSERT 라 **그 봉의 시가가 유저 체결가(호가창 walking 이라 슬리피지 포함)로 덮였다**.
-  1m 뿐 아니라 **1h·1d 도 같이** 오염되고(그게 5m/4h/1w 롤업의 원본이다), flush 도 `open` 을 안 건드려
-  그 오차가 **영구히 남았다**("봉이 새로 만들어지는 타이밍에 첫 시장가 매매를 하면 시가가 바뀐다" 제보).
-  지금은 `CANDLE_UPSERT_SQL`/`CANDLE_FLUSH_GUARDED_SQL` 이 `open_at` 이 더 이른 쪽의 `open` 을,
-  `close_at` 이 더 늦은 쪽의 `close` 를 남기고, **읽기 경로(`mergeLiveBar`)도 정확히 같은 규칙**을 쓴다
-  (다르면 버킷이 닫히는 순간 시가가 바뀌어 보인다). 컬럼이 늘어도 인덱스는 안 늘어 **쓰기 행 수는 그대로**
-  다(§6 과금 모델). ⚠ 새 체결 경로를 추가할 때 `candleUpsertStmts` 에 넘기는 `now` 는 **그 체결이 실제로
-  일어난 시각**이어야 한다 — 그게 시가/종가 판정의 유일한 근거다.
-- **평단선/SL·TP선/청산가/미실현PnL/강제청산은 전부 공짜**: OX 포지션도 `positions` 테이블의 평범한
-  한 행이라, `Chart.tsx`(심볼 필터)·`PositionsPanel.tsx`(청산가 계산)·`_trading.ts`(강제청산 평가) 가
-  이미 심볼에 무관하게 동작하므로 별도 구현 없이 실제 코인과 똑같이 표시·평가된다.
-- **잔존 컬럼**: `users.ox_balance`/`spot_orders`/`spot_trades` 는 스키마 변경 없이 남아있지만, 이제
-  **봇 유저 2명 전용**이다(실유저는 더 이상 참조/사용 안 함 — DROP COLUMN 마이그레이션은 안 함).
-  `ox_balance` 는 위 "봇 재고/현금 정산" 이후로 **봇의 OX 재고**로 실제 쓰인다(유저에겐 여전히 무의미 —
-  유저의 OX 노출은 `positions` 의 레버리지 포지션이지 현물 잔고가 아니다).
+- 가상 코인은 2종이고 전부 **페어 파라미터**로 흐른다. 새 코인 추가 시 손댈 곳은 딱 셋 — `functions/api/spot.ts VIRTUAL_PAIRS`, `src/symbols.ts VIRTUAL_SYMBOLS`, D1 `spot_bot_state` 시작가 행. 그 외 심볼 하드코딩 금지. cron 틱 예산(`MM_TICK_BUDGET`=24)은 코인 수로 **나눠** 쓴다(곱하지 말 것).
+- OX 는 다른 38종과 **완전히 동일한 코드**(order.ts/OrderPanel/PositionsPanel 에 가상 분기 없음)로 거래되고, 유일한 차이는 체결가 소스(`fetchPrice` 의 `isVirtualSymbol` 분기 → 봇 기준가 `spot_bot_state.ref_price`).
+- **봇은 무한 유동성 공급자** — 호가 에스크로·잔고 가드를 절대 붙이지 않는다(음수 재고 정상). 체결 뒤 재고/현금 정산만 `botFillStmts` 로 합계 batch 1회. 봇은 `fee_ledger` 에 행을 남기지 않는다(카운터만).
+- **봇 경로에 "행을 남기는" 설계 금지** — 매 틱 교체되는 스냅샷(사다리·테이프·진행 중 캔들)은 상태 행의 JSON 칸(`book_json`/`tape_json`/`live_json`)에 담는다(쓰기 비용 0). 새 INSERT 를 넣을 땐 "누가 언제 지우나"를 반드시 같이 정할 것. 봇이 만든 것은 테이프에, 유저 것은 `spot_trades` 테이블에.
+- 틱은 순수 계산(`simulateTick`), N틱 메모리 → 커밋 1회 = 1행(`runBotTicks`). 커밋은 `last_run` 가드가 선점을 겸하고, 진 쪽은 가격 경로를 빈 배열로 반환한다. 닫힌 캔들 flush 도 같은 가드.
+- **심리 파라미터를 바꿨으면 `npm run sim:bot`** — 합격선: 5~20일 가격 0.5~2배, 수익률 acf1≈0.55, |수익률| acf1≈0.45, 1분봉 폭 ~2.9%, 추세효율 ≥0.55, 되돌려주는 몫 <55%, 평균 공포 ~0.3, 국면 점유율 calm 39/rally 24/pullback 23/panic 9/euphoria 5/capitulation 0.3%. 로그드리프트 편향 판정은 `SIM_RUNS=24` 이상. `bias` 와 국면 수명은 같이 재조정. `BOT_BASE_PULL` 은 prod 현재 가격에 그대로 꽂히므로 sim 만 보고 정하지 말 것. 되돌림을 풀면 `GAUGE_FULL` 을 같이 넓힐 것. `MOOD_PERSIST+HERD_GAIN<1` 유지.
+- 크기 분포·호가 물량을 바꿨으면 sim 이 아니라 **상태 고정 A/B**(`simulateTick` 20만 회)로 "평균 보존"을 잰다(`SIZE_TIER_MEAN`/`FLOW_CORR_NORM`/`FLURRY_MEAN` 정규화). 쪼개기(`SLICE_CHANCE`)는 뽑힌 수량과 무관하게 결정.
+- 체결 라벨은 **누가 호가를 때렸나**(원인)에서 나온다 — 가격과 독립적으로 뽑지 말 것. 유저 주문은 `Aggressor`(resting 지정가가 봇에 채워지면 라벨만 반전, buyer/seller·잔고는 `userSide`).
+- 호가 사다리는 이전 틱을 물려받는다(`prevBook`) — 체결(테이프)을 먼저 찍고 그 고저로 사다리를 만든다. 슬롯 귀속은 지터 뺀 `LEVEL_STEP` 격자 중심, 생존 주문을 먼저 다 앉히지 말고 슬롯마다 배정, 배정은 새 호가보다 먼저. 사다리 기하(`SPREAD_BASE`/`LEVEL_STEP`/`LEVEL_JITTER`)는 한 곳에만. 라운드 가격 벽은 `priceHash` 로 고정.
+- 격자 스냅은 반드시 1e-9 오차 흡수와 함께(`humanQuotePrice`/`OrderBook.snapToGrid`). 가격 관련 상수는 절대값이 아니라 "틱 몇 개"로(`roundVirtual`/`virtualTick`, 유효숫자 4자리). 기준가 클램프는 `VIRTUAL_PRICE_MIN/MAX`(1e-12~1e12) 안전장치일 뿐 — 시세 하한을 거기 적지 말 것.
+- 캔들 upsert 에 넘기는 `now` 는 그 체결이 실제로 일어난 시각(과거 시각이면 마감된 봉이 변조된다). 저장 인터벌은 1m/1h/1d 뿐, 나머지는 조회 시 롤업 — 새 인터벌은 그 셋의 정수배여야 한다.
+- 벽은 현재가 너머의 비-marketable 주문만(`price>=ref` 매도 / `<=ref` 매수). `sweepRestingOxPendings` 는 요청당 `MAX_SWEEP_FILLS`(2) 체결까지.
+- `spot_orders` 테이블은 아무도 읽지도 쓰지도 않는다(롤백 여지로 정의만) — 새 코드에서 참조 금지.
 
 ## 5. 빌드 / 실행 / 배포
 
@@ -1145,388 +529,190 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
     → 연결을 5~10초로 끊어 재연결하는 설계가 필요하고, 봇 틱 레이트가 5배가 되므로 **`npm run sim:bot`
     재보정이 선행**돼야 한다(1분봉 폭·국면 점유율이 틱 수에 직접 걸려 있다).
 
+
 ## 7. 퍼즐게임 (ox64.app/b, `functions/api/puzzle.ts` + `src/puzzle/`)
 
-> "헬로타운 스핑크스 보석찾기" 이벤트를 확장한 미니 퍼즐게임. **코인 트레이딩과 완전히 무관** —
-> 같은 계정(이름+패스코드, 세션 쿠키 공유)을 그대로 쓰지만 재화·기록은 `users.balance`(USDT)와
-> 전혀 다른 별도 D1 테이블(`puzzle_stats`/`puzzle_games`)이다. 트레이딩 쪽 번들이 딸려오지 않도록
-> `src/main.tsx` 가 `location.pathname` 만으로 완전히 분리된 진입점을 동적 import 한다(라우터 없음).
+> "헬로타운 스핑크스 보석찾기"를 확장한 미니게임. **트레이딩과 완전히 무관** — 같은 계정(세션 쿠키 공유)을
+> 쓰지만 재화·기록은 별도 테이블(`puzzle_stats`/`puzzle_games`). `src/main.tsx` 가 `location.pathname` 으로
+> 진입점을 동적 import 해 트레이딩 번들이 딸려오지 않는다(라우터 없음).
 
-- **규칙**: NxN 격자에 여러 칸을 차지하는 보석(모양별로 다름 — 배틀쉽처럼 1~6칸)이 숨어 있다. 칸을
-  하나씩 열 때마다(코스트 1 소모) 그 칸이 "보석 조각"인지 "빈 땅"인지 알려주는데, 조각이면 **색깔
-  (보석 종류) + 같은 보석이 상하좌우 어느 방향으로 더 이어지는지("부위")** 까지 함께 보여줘서, 색과
-  이어지는 모양을 보고 다음에 열 칸을 유추해가며 찾는다(위치 자체를 미리 알려주진 않음 — 지뢰찾기식
-  숫자 힌트도 아니고, 정확히 원작의 "색+부위 보고 유추" 방식). 보드에 어떤 보석이 몇 개 숨어있는지
-  (색·모양·개수)는 게임 시작 전부터 "범례"로 보여주고, 한 보석의 모든 칸을 다 열어 획득하면 그 종류를
-  범례에서 지운 것처럼 표시한다(취소선+흐리게, `Legend.tsx`). 목표 보석을 전부 획득하면 클리어(재화
-  보상). **재화가 0이 되면 게임오버**. 클리어 없이도 다음 판을 몇 번이든 다시 시작할 수 있다("무한
-  도전" — 원작의 일일 시도 횟수 제한이 없음).
-- **⚠ 서버 권위 = 보드 정답은 서버만 안다**: `puzzle_games.board`(좌표→보석ID JSON)와 각 보석의 전체
-  칸 목록(`gems[gemId].cells`, 안 연 칸 포함)은 클라 응답에 절대 포함하지 않는다. `publicGame()` 이
-  `revealed`(이미 연 칸) 배열만 걸러 `{x,y,gemId,label,color,connects}` 로 내려준다 —
-  `connects`(상하좌우 4방향 boolean)는 **그 칸이 같은 보석의 어느 방향으로 더 이어지는지**만 알려주고
-  (`connectsFor()`, 전체 `cells` 목록 대비 계산), 몇 칸 뒤에서 끝나는지·정확히 어디인지는 여전히 안 연
-  칸을 열어봐야 안다 — 개발자도구로도 안 연 칸의 정답을 미리 볼 방법이 없다. 트레이딩의 "체결가는
-  서버가 fetch" 원칙과 동일한 사상.
-- **범례(`legendOf()`, `PuzzleGame.legend`)**: 이 보드에 실제로 배치된 보석을 종류별로 묶어
-  `{색,모양,개수,그중 몇개 찾음}` 만 알려주고 위치는 안 준다. 레벨 선택 화면에서도 `levels[].types`
-  로 같은 정보를 미리 보여준다(시작 전부터 "이 레벨엔 뭐가 숨어있는지" 알 수 있음). ⚠ 클라
-  (`usePuzzleStore.open`) 는 오픈 직후 판이 끝나(won/lost) 서버 `activeGame` 이 `null` 로 빠지는
-  경우, 로컬 `legend` 에서 방금 완성된 보석의 `label` 을 매칭해 `found` 를 수동으로 +1 해 흉내낸다
-  (서버가 다시 계산해 내려줄 게 없으므로).
-- **재화(`puzzle_stats.currency`)**: 신규 유저 시작값 60, 영구 누적(USDT 잔고와 완전 별도 컬럼).
-  칸 오픈마다 `OPEN_COST`(현재 레벨 무관 고정 1) 만큼 원자적 조건부 UPDATE(`currency >= cost`)로
-  차감 — 실패하면(잔고 부족) 그 오픈 자체가 거부된다(게임 상태 불변). 클리어 시 레벨별 `reward`
-  (레벨1=12 ~ 레벨10=105)를 더한다. 색+부위 힌트가 있어도 완전한 좌표 힌트는 아니라 운이 나쁘면
-  코스트를 많이 써서 재화가 마이너스 추세로 갈 수 있다 — 이건 원작의 긴장감과 같은 의도된 리스크
-  (트레이딩의 강제청산과 유사한 포지션). **재화가 0일 때만** `refill`(+40, 1일 최대 5회, KST 날짜
-  기준 — `functions/api/refill.ts` 와 동일한 리필 패턴)로 재도전 가능.
-- **레벨 1~10**: 보드 크기(6×6~12×12)·보석 구성(`LEVELS[].plan`, `functions/api/puzzle.ts`)·클리어
-  보상이 완만하게 커진다. 등급표(VIP_TIERS)와 같은 패턴으로 **서버가 `GET /api/puzzle` 의 `levels`
-  필드로 기준표를 내려주고 클라는 그걸 그대로 렌더**(중복 정의 없음). ⚠ 색+부위 힌트가 있어도 실측
-  밸런스가 아니라 초기 추정값이다 — 체감 난이도를 보고 `LEVELS` 배열(보드 크기/보석 개수/보상)만
-  조정하면 된다(한곳에 모아둠).
-- **보석 모양(`SHAPES`)**: single(1칸)/domino(2)/tromino(3)/square(4)/cross(5)/big(6). 배치
-  (`generateBoard`)는 각 인스턴스마다 무작위 회전(0/90/180/270)+반전 후 빈 칸에 겹치지 않게 최대
-  300회 시도해서 놓는다 — 실패하면(공간 부족) 그 보석 인스턴스만 조용히 스킵(낮은 밀도로 설계돼
-  거의 발생 안 함). `Board.tsx` 는 열린 보석 칸을 색깔 배경 + `connects` 방향으로 튀어나온 작은
-  "돌기"(퍼즐 조각 이음새 느낌)로 그려서 어느 쪽을 더 열어야 할지 시각적으로 유추되게 한다.
-- **한 계정당 활성 게임 1판**: `start` 액션은 그 유저의 기존 `status='active'` 판을 전부
-  `abandoned` 로 접고 새 판을 만든다(이미 쓴 코스트는 환불하지 않음 — 언제든 새로 시작 가능해야
-  "무한 도전"이 성립하므로 페널티는 그 판에서 쓴 코스트로 충분). `abandon` 액션은 명시적 포기(같은
-  처리, 자산에 영향 없음).
-- **⚠ 클라가 서버의 `activeGame` 스냅샷에 의존하지 않는 이유**: `loadPuzzleState().activeGame` 은
-  `status='active'` 인 판만 찾는다 — 그래서 방금 오픈으로 승/패가 확정된 판은 거기서 `null` 이 된다.
-  `open` 응답은 그 오픈의 결과를 `gameStatus`/`cell`/`justCompleted`/`reward` 로 별도로 실어보내고,
-  클라(`usePuzzleStore.open`)는 로컬에 들고 있던 보드에 이 결과만 이어붙인다 — 그래야 클리어/게임오버
-  직후에도 마지막 보드 상태가 화면에서 사라지지 않고 "클리어!"/"게임 오버" 배너와 함께 보인다.
-- **라우팅**: 별도 라우터 라이브러리 없음. `src/main.tsx` 가 `location.pathname === '/b'` 면
-  `src/puzzle/PuzzleApp.tsx` 를, 아니면 `src/App.tsx` 를 동적 `import()` 한다 — 빌드 시 별개
-  청크(`PuzzleApp-*.js`)로 분리돼 트레이딩 스토어/서비스가 퍼즐 페이지 번들에 안 딸려온다. Cloudflare
-  Pages 는 정적 SPA 기본 동작상 `/` 외 경로 새로고침이 404 날 수 있어 `public/_redirects`
-  (`/* /index.html 200`)로 폴백시킨다(Functions·정적파일이 `_redirects` 보다 먼저 매칭되므로
-  `/api/*` 는 영향 없음).
+- **규칙**: NxN 격자에 1~6칸짜리 보석이 숨어 있고, 칸을 열면(코스트 1) 빈 땅/조각 + 조각이면 **색(종류)과
+  상하좌우 어느 방향으로 이어지는지("부위")** 를 보여준다 — 지뢰찾기식 숫자 힌트 아님. 보석 구성(색·모양·개수)은
+  시작 전부터 범례(`Legend.tsx`)로 보이고 다 연 종류는 취소선. 전부 획득=클리어(보상), **재화 0=게임오버**, 판은 무한 재시작.
+- **⚠ 서버 권위 = 보드 정답은 서버만 안다**: `puzzle_games.board` 와 `gems[gemId].cells` 는 응답에 절대 안 싣는다.
+  `publicGame()` 이 `revealed` 칸만 `{x,y,gemId,label,color,connects}` 로 내려주고, `connects`(`connectsFor()`)는
+  이어지는 방향만 알려준다 — 어디서 끝나는지는 열어봐야 안다.
+- **범례(`legendOf()`)**: 종류별 `{색,모양,개수,찾은 수}` 만(위치 없음). 레벨 선택 화면도 `levels[].types` 로 같은 정보.
+  ⚠ 오픈 직후 판이 끝나 서버 `activeGame` 이 `null` 이 되면 클라(`usePuzzleStore.open`)가 로컬 `legend` 의 `found` 를 +1 한다.
+- **재화(`puzzle_stats.currency`)**: 시작 60, 영구 누적. 오픈마다 `OPEN_COST`(레벨 무관 1)를 조건부 UPDATE(`currency >= cost`)로
+  원자 차감 — 실패면 오픈 자체 거부(상태 불변). 클리어 `reward` 는 레벨1=12 ~ 레벨10=105. 운 나쁘면 적자는 의도된 리스크.
+  **재화 0 일 때만** `refill`(+40, 1일 5회, KST — `refill.ts` 패턴).
+- **레벨 1~10**: 보드 6×6~12×12·구성(`LEVELS[].plan`)·보상이 완만히 커진다. **서버가 `GET /api/puzzle` 의 `levels` 로
+  기준표를 내려주고 클라는 그대로 렌더**(중복 정의 없음). ⚠ 밸런스는 초기 추정값 — 체감 난이도는 `LEVELS` 한곳만 조정.
+- **보석 모양(`SHAPES`)**: single/domino/tromino/square/cross/big(1~6칸). `generateBoard` 가 무작위 회전+반전으로 최대 300회
+  시도해 놓고 실패한 인스턴스는 조용히 스킵. `Board.tsx` 는 열린 칸을 색 배경 + `connects` 방향 돌기로 그린다.
+- **한 계정당 활성 1판**: `start` 가 기존 `active` 판을 전부 `abandoned` 로 접는다(코스트 환불 없음 — 그게 페널티).
+  `abandon` 은 명시적 포기(같은 처리).
+- **⚠ 클라는 서버 `activeGame` 스냅샷에 의존하지 않는다**: 그건 `status='active'` 만 찾아 승/패 직후 `null` 이 된다.
+  `open` 응답의 `gameStatus`/`cell`/`justCompleted`/`reward` 를 로컬 보드에 이어붙여야 마지막 보드가 배너와 함께 남는다.
+- **라우팅**: `main.tsx` 가 `/b` 면 `PuzzleApp.tsx` 를 동적 `import()`(별개 청크). 새로고침 404 는 `public/_redirects`
+  (`/* /index.html 200`)로 폴백 — Functions·정적파일이 먼저 매칭되므로 `/api/*` 무영향.
 
 ## 8. 5분 던전 (ox64.app/5m, `functions/api/dungeon.ts` + `src/dungeon/`)
 
-> 원작 "5-Minute Dungeon"(2~5인이 손패를 실시간으로 동시에 내어 몬스터가 요구하는 아이콘 조합을
-> 맞추고, 5분 벽시계가 다 되기 전에 던전을 클리어하는 협동 카드게임)을 재현한 온라인 실시간
-> 멀티플레이. **코인 트레이딩·퍼즐 어느 쪽과도 완전히 무관** — 같은 계정(이름+패스코드, 세션 쿠키
-> 공유)을 그대로 쓰지만 재화 없이 승패 통계만 별도 D1 테이블(`dungeon_stats`)에 기록한다. 원작
-> 카드의 정확한 텍스트/수량은 기억에 확신이 없어 그대로 베끼지 않았다 — **메커니즘**(아이콘 매칭,
-> 개인 덱 히든드로우, 손패 공개, 함정/포션/보스, 5분 타이머, 파티 체력, 인원수 난이도 스케일링)은
-> 재현하되 영웅 이름·카드 구성·몬스터 목록은 이 프로젝트 오리지널이다. 현재 규모: **아이콘 5종 ·
-> 영웅 6종 · 몬스터 24 · 함정 6 · 포션 4 · 보스 4 · 던전 4개**(난이도별).
+> 원작 "5-Minute Dungeon"(손패를 실시간 동시에 내어 요구 아이콘 조합을 맞추고 5분 안에 클리어하는 협동 카드게임)의
+> 온라인 재현. **트레이딩·퍼즐과 무관** — 같은 계정, 재화 없이 승패 통계만 `dungeon_stats`. 카드 텍스트는 베끼지 않고
+> **메커니즘**만 재현, 영웅·카드·몬스터는 오리지널. 규모: 아이콘 5 · 영웅 6 · 몬스터 24 · 함정 6 · 포션 4 · 보스 4 · 던전 4.
 
-- **⚠ 동기화 = Durable Objects/WebSocket 이 아니라 D1 + 짧은 폴링**: 진짜 실시간(수십 ms) 응답을 주는
-  Durable Objects 는 별도 Worker 배포가 필요하다. 계정은 Workers **Paid** 라 기술적으로 **쓸 수는
-  있지만**(⚠ 예전에 "무료 플랜이라 불가능"이라 적어둔 건 틀린 전제였다), **2026-08-14 부터 무료 플랜
-  한도 안에서 운영하는 것이 목표**라(§6) 새 인프라·새 배포를 늘리지 않는 쪽을 택했다 — 기존 OX
-  마켓메이커(`useSpotPoll`)와 완전히 같은 "D1 + 짧은 폴링" 패턴을 재사용해 같은 Pages 배포 안에서
-  구현했다. 즉 지금 이 방식을 유지하는 이유는 "불가능해서"가 아니라 **이미 잘 돌고 배포가 안 늘어나서**다.
-  ⚠ 폴링 간격을 줄이려면 §6 D1 예산을 먼저 읽을 것. 모든 액션(POST)은 자기 응답으로 즉시 상태를
-  갱신하므로(폴링을 기다리지 않음 — 트레이딩 스토어와 동일) 폴링 지연은 "남이 한 일이 내 화면에
-  보이기까지"에만 영향을 준다.
-- **⚠ 폴링 간격은 적응형이고, 그 전제는 "GET 이 싸다"는 것**(`useDungeonStore.delayFor`):
-  진행 중 **0.5초** / 로비 1초 / 종료 2초 / 방 없음 4초. `setInterval` 이 아니라 자기 자신을 다시
-  예약하는 `setTimeout` 루프라 매 틱마다 방 상태로 간격을 다시 계산한다.
-  **간격을 더 줄이려면 반드시 서버 GET 비용부터 확인할 것** — 처음엔 GET 한 번이 D1 왕복 6회였고
-  그중 2회가 쓰기(`ensureStats` 의 `INSERT OR IGNORE` 를 폴링마다 두 번)였다. D1 무료 플랜은
-  읽기(5M/일)보다 **쓰기(100K/일) 한도가 훨씬 빡빡해서**, 그 상태로 0.5초 폴링을 켜면 4인 파티
-  한 시간에 쓰기 10만 건을 넘겨 한도를 태운다. 지금은 (stats+내 방코드)/(방+파티원)을 각각 `batch`
-  로 묶어 **왕복 2회·쓰기 0회**이고, stats 행은 실제로 없을 때만(계정당 평생 1회) INSERT 한다.
-  클라도 직전 응답과 JSON 이 같으면 `setState` 를 건너뛰어(`lastSnapshot`) 0.5초마다 전체 트리가
-  리렌더되지 않게 한다 — 타이머 카운트다운은 `GameBoard` 의 자체 250ms 틱이 따로 굴린다.
-- **파티**: 방 코드(6자, 헷갈리는 O/0/I/1 제외)로 모인 1~4명, 각자 영웅 1종 선택(방 내 중복 불가).
-  한 유저는 항상 최대 1개 방에만 속한다(`dungeon_players` 에서 `user_id` 로 자기 방을 역참조 —
-  클라가 코드를 안 보내도 서버가 세션으로 "내 방"을 찾는다, 코드 위조로 남의 방을 조작할 수 없음).
-- **영웅 6종**(`functions/_dungeonData.ts HEROES`), 각 16장 개인 덱(주 아이콘 9장 + 보조 4장 +
-  와일드 2장 + 고유 특수카드 1장): 바바리안(힘, "결전의 함성"=요구치 한 항목 즉시 3) · 위저드(마법,
-  "치유의 주문"=체력 +2) · 닌자(민첩, "그림자 밟기"=내 손패 보충) · 팔라딘(신성, "수호의 방벽"=다음
-  함정 1개 무효) · 드루이드(자연, "자연의 부름"=파티 전원 손패 보충) · 음유시인(자연/마법이지만
-  **덱 절반이 와일드**인 만능형, "영감의 노래"=남은 요구치에 총 2 자동 분배). 특수는 판당 1회이고
-  손패의 특수카드는 일반 카드처럼 못 내며 `useSpecial` 액션 전용이다(서버가 거부).
-- **⚠ 난이도는 인원수에 맞춰 스케일된다**(`partyScale`, 요구치는 3인 기준으로 적혀 있다): 1인 0.55배 ·
-  2인 0.8배 · 3인 1배 · 4인 1.2배. 사람이 많을수록 초당 낼 수 있는 카드가 늘기 때문.
-- **⚠ 파티가 낼 수 없는 아이콘은 'any' 로 완화된다**(`adaptReq`): 예컨대 바바리안(힘/민첩) 혼자
-  들어간 판에서 «밴시»(신성+마법)를 만나면 와일드 2장으로는 절대 못 잡아 **타이머가 끝날 때까지
-  교착**된다. 그래서 덱 생성 시 (1)파티가 커버하는 아이콘만 쓰는 몬스터를 우선 고르고 (2)그래도
-  남는 미커버 아이콘은 «아무거나»로 바꾼다 → 어떤 영웅 조합이든 항상 클리어 가능하다.
-- **손패는 파티 전원에게 공개**(원작처럼 다 같이 보고 소리치며 조합 — `PlayerOut.hand` 를 서버가
-  모두에게 그대로 내려준다). 단 **개인 덱의 남은 순서와 몬스터/이벤트 덱의 남은 순서는 서버만
-  안다**(`dungeon_players.deck_json`/`dungeon_rooms.deck_json`, 응답엔 개수만) — 트레이딩의 "체결가는
-  서버가 fetch"·퍼즐의 "보드 정답은 서버만 앎"과 같은 서버 권위 원칙.
-- **몬스터/함정/포션/보스**: 몬스터·포션은 `{아이콘:수량}` 요구치를 공개하고, 파티원 누구나 자기
-  손패에서 맞는 아이콘 카드를 버려 기여 → 총합 충족 시 즉시 격파(포션은 격파 시 체력 회복, 최대
-  `MAX_HP`=10)하고 다음 카드 공개. **함정은 공개 즉시 자동 발동**(체력 차감 + 전원 손패 일부 강제
-  버림+리드로우)한 뒤 조용히 다음 카드로 넘어간다(연쇄 함정도 처리, `revealNext`). 팔라딘의 방벽
-  (`dungeon_rooms.ward`)이 있으면 그 함정 하나가 통째로 무효화된다. **보스는 덱의 항상 마지막
-  카드**(원작 관행)이고 2페이즈 — ⚠ 2페이즈 요구치(`req2`)는 **현재 카드가 들고 다닌다**(보스는
-  이미 큐에서 빠진 뒤라 덱을 다시 뒤져도 없다). 클라에도 같이 내려가 "다음 페이즈 예고"로 보여준다.
-- **이벤트 로그**(`dungeon_rooms.log_json`, 최근 20개): 함정 발동·격파·페이즈 전환·특수 사용·승패를
-  서버가 방에 기록하고 `EventLog.tsx` 가 보여준다. **폴링 방식이라 내가 손패를 보는 사이에 함정이
-  터지거나 몬스터가 격파될 수 있는데**, 그걸 놓치면 화면이 갑자기 바뀐 것처럼만 보인다.
-- **⚠ 동시성 = `version` 컬럼 낙관적 동시성 제어(다인원 조건부 UPDATE)**: 트레이딩 전반의
-  `UPDATE ... WHERE balance>=margin` 원자 가드 관용구를 다인원 상태로 일반화했다 — 여러 파티원이
-  동시에 카드를 내도(`playCards`) `UPDATE dungeon_rooms SET ... WHERE code=? AND version=?` 로
-  경합을 막고, 0행이면 재조회 후 재시도(`applyContribution`, 최대 5회). **⚠ D1 batch 는 조건부
-  UPDATE 가 0행이어도 "성공"으로 본다**(editLimit/conditionalOpen 과 같은 교훈, §4) — 그래서 카드
-  격파→다음 카드 공개(+함정 연쇄로 다른 파티원 손패 변경)·승패 확정은 **반드시 버전 가드 UPDATE 를
-  단독으로 먼저 실행해 성공(`meta.changes>0`)을 확인한 뒤에만** 다른 플레이어 손패 갱신·통계 반영
-  같은 후속 쓰기를 수행한다 — 성공 전엔 아무 것도 안 쓰므로 재시도가 항상 안전하다.
-- **⚠⚠ 남의 손패를 쓸 땐 "바뀐 사람만, 버전 가드로"(카드 복사 버그)**: 격파 처리(`applyContribution`)는
-  함정이 다른 파티원 손패를 건드릴 수 있어 파티원 행도 쓴다. 예전엔 **전원의 손패를 처리 시작 시점
-  스냅샷으로 무조건 덮어썼는데**, 그 사이에 다른 파티원이 카드를 내면 그 사람의 손패가 **낸 카드까지
-  포함된 옛 상태로 되돌아갔다** — 기여는 이미 집계됐는데 카드는 손에 돌아오는 **카드 복사** 버그였다
-  (동시 입력이 잦은 4인에서 잘 터진다). 지금은 (1)함정이 실제로 바꾼 사람만 쓰고 (2)그 사람의
-  `version` 이 그대로일 때만 쓴다. 가드에 걸리면 그 함정의 버림 효과만 건너뛴다(복사보다 훨씬 낫다).
-  같은 이유로 닌자/드루이드의 손패 보충 특수도 전부 버전 가드로 쓴다. **`dungeon_players` 의
-  hand/deck/discard 를 쓰는 코드를 추가할 땐 반드시 이 규칙을 지킬 것.**
-  회귀 방지: 4인이 쉬지 않고 동시에 카드를 내는 스트레스 테스트로 **각 플레이어의 (손패+덱+버림)이
-  항상 정확히 16장**임을 매 라운드 검증했다(복사가 생기면 즉시 16을 넘는다).
-- **⚠ 동시 입력은 에러가 아니라 재시도 대상**: 다른 파티원의 격파 처리가 내 행 `version` 을 올리면
-  `playCards`/`rest` 의 조건부 UPDATE 가 0행이 된다. 예전엔 그대로 "다시 시도해주세요"를 띄웠는데
-  4명이 동시에 누르는 게 정상인 게임이라 **평범한 플레이 중에도 자주** 떴다 — 지금은 서버가 최신
-  상태로 몇 번 다시 읽어 조용히 성공시키고, 정말로 카드가 넘어간 경우에만 사람이 읽을 수 있는
-  이유("그 사이 다음 카드로 넘어갔습니다")를 돌려준다.
-- **5분 타이머 = 폴링 시점 평가**(`expireIfNeeded`): `dungeon_rooms.ends_at` 을 그대로 클라에 실어
-  보내 로컬에서 카운트다운만 그리고(Chart.tsx 카운트다운과 동일 패턴), 서버는 다음 poll/action
-  요청이 들어올 때 `Date.now() > ends_at` 이면 그 자리에서 `status='lost'` 로 전환한다. 강제청산과
-  달리 **돈이 걸려있지 않으므로 cron 불필요**(checkTriggers 의 "접속 시점에 평가" 철학 재사용).
-- **승패**: 보스 2페이즈까지 클리어하면 승리(`status='won'`, 클리어 소요시간을 `dungeon_stats
-  .best_clear_ms` 최단기록으로 갱신). 타이머 만료 / 파티 체력 0 / 전원 동시 지침(덱+버림더미+손패가
-  모두 빈 상태, `allExhausted`) 중 하나면 패배(`status='lost'`). 승패 확정 시 파티 전원의
-  `dungeon_stats.games_played`(+wins)를 한 batch 로 갱신.
-- **방 나가기**: 로비/종료(승·패) 상태에서만 가능(`leave`), 진행 중(active)엔 이탈 불가(막판에
-  파티원이 빠져 판이 깨지는 것 방지). 방장이 나가면 다음 참가자에게 방장이 승계되고, 마지막 인원이
-  나가면 방이 삭제된다.
-- **UI 설명 원칙**: 처음 들어온 사람이 규칙을 몰라 멈추지 않도록 `Rules.tsx`(로비에 기본 펼침)에
-  전체 규칙을, `IconLegend` 로 아이콘 뜻을, 카드 타입마다 한 줄 힌트(`EVENT_TYPE_META.hint`)를,
-  버튼마다 `title` 툴팁을 붙였다. 카드에도 이모지뿐 아니라 **속성 이름을 같이** 적는다(이모지만
-  있으면 무슨 속성인지 안 읽힌다). **"전부 내기"**(`planAutoPlay`)는 지금 요구치에 쓸 수 있는 카드를
-  한 번에 다 내서 클릭 수와 요청 수를 함께 줄인다 — 요구치를 넘겨 낭비하지 않도록 전용 아이콘을
-  와일드보다 먼저, 남은 필요량을 넘지 않는 선에서 큰 값부터 배치한다.
+- **⚠ 동기화 = Durable Objects/WebSocket 아니라 D1 + 짧은 폴링**: DO 는 별도 Worker 배포가 필요한데 무료 플랜 목표(§6)라
+  새 인프라를 안 늘리고 OX 마켓메이커(`useSpotPoll`)와 같은 패턴을 재사용했다(불가능해서가 아니라 잘 돌고 배포가 안 늘어서).
+  액션(POST)은 자기 응답으로 즉시 갱신하므로 폴링 지연은 "남이 한 일이 보이기까지"에만 영향. ⚠ 간격을 줄이려면 §6 먼저.
+- **⚠ 폴링은 적응형(`useDungeonStore.delayFor`)이고 전제는 "GET 이 싸다"**: 진행 중 0.5s / 로비 1s / 종료 2s / 방 없음 4s,
+  자기 자신을 재예약하는 `setTimeout` 루프. **GET 은 D1 왕복 2회·쓰기 0회를 유지할 것** — (stats+내 방코드)/(방+파티원)을
+  각각 `batch`, stats 행은 없을 때만(계정당 평생 1회) INSERT. 예전엔 왕복 6·쓰기 2(`ensureStats` 의 `INSERT OR IGNORE` 를
+  폴링마다)라 4인 한 시간에 무료 쓰기 한도(10만/일)를 태웠다. 클라는 직전 응답과 JSON 이 같으면 `setState` 스킵
+  (`lastSnapshot`); 타이머는 `GameBoard` 자체 250ms 틱.
+- **파티**: 방 코드 6자(O/0/I/1 제외), 1~4명, 영웅 중복 불가. 유저는 최대 1개 방 — `dungeon_players.user_id` 로 서버가
+  "내 방"을 역참조하므로 코드 위조로 남의 방을 못 만진다.
+- **영웅 6종**(`_dungeonData.ts HEROES`), 각 16장(주 9 + 보조 4 + 와일드 2 + 특수 1): 바바리안(힘, 요구치 한 항목 즉시 3) ·
+  위저드(마법, 체력 +2) · 닌자(민첩, 내 손패 보충) · 팔라딘(신성, 다음 함정 무효) · 드루이드(자연, 전원 손패 보충) ·
+  음유시인(덱 절반 와일드, 남은 요구치에 2 자동 분배). 특수는 판당 1회, `useSpecial` 전용(일반 카드처럼 내면 서버가 거부).
+- **⚠ 난이도는 인원수 스케일**(`partyScale`, 요구치는 3인 기준): 1인 0.55 · 2인 0.8 · 3인 1 · 4인 1.2배.
+- **⚠ 파티가 못 내는 아이콘은 'any' 로 완화**(`adaptReq`): 안 그러면 커버 못 하는 몬스터에서 타이머 끝까지 교착. 덱 생성 시
+  커버 아이콘 몬스터 우선 + 남는 미커버 아이콘은 «아무거나» → 어떤 조합이든 클리어 가능.
+- **손패는 전원 공개**(`PlayerOut.hand`), 단 **개인 덱·몬스터 덱의 남은 순서는 서버만**(`deck_json`, 응답엔 개수만) — 서버 권위.
+- **몬스터/함정/포션/보스**: 몬스터·포션은 `{아이콘:수량}` 요구치, 누구나 기여 → 충족 시 즉시 격파(포션은 체력 회복, `MAX_HP`=10).
+  **함정은 공개 즉시 자동 발동**(체력 차감 + 전원 손패 일부 버림·리드로우) 후 다음 카드로(연쇄 처리, `revealNext`); 팔라딘 방벽
+  (`dungeon_rooms.ward`)이 하나를 무효화. **보스는 항상 마지막 카드**, 2페이즈 — ⚠ `req2` 는 **현재 카드가 들고 다닌다**
+  (큐에서 빠진 뒤라 덱엔 없다), 클라에 "다음 페이즈 예고"로 내려간다.
+- **이벤트 로그**(`dungeon_rooms.log_json`, 최근 20): 함정·격파·페이즈·특수·승패를 `EventLog.tsx` 가 보여준다 — 폴링이라
+  놓친 사건을 따라잡는 용도.
+- **⚠ 동시성 = `version` 컬럼 낙관적 동시성**: `UPDATE dungeon_rooms … WHERE code=? AND version=?`, 0행이면 재조회 후 재시도
+  (`applyContribution`, 최대 5회). **⚠ D1 batch 는 0행 UPDATE 도 성공으로 본다**(§4) — 격파→다음 카드·승패 확정은 **버전 가드
+  UPDATE 를 단독으로 먼저 실행해 `meta.changes>0` 을 확인한 뒤에만** 후속 쓰기(남의 손패·통계)를 한다. 성공 전엔 아무것도
+  안 쓰므로 재시도가 항상 안전.
+- **⚠⚠ 남의 손패는 "바뀐 사람만, 버전 가드로"(카드 복사 버그)**: 전원 손패를 스냅샷으로 덮어쓰면 그 사이 카드를 낸 사람의
+  손패가 옛 상태로 되돌아가 **기여는 집계되고 카드는 손에 돌아오는 복사**가 난다. 함정이 실제로 바꾼 사람만, 그 사람의
+  `version` 이 그대로일 때만 쓰고 가드에 걸리면 그 버림 효과만 건너뛴다. 닌자/드루이드 보충도 동일. **`dungeon_players` 의
+  hand/deck/discard 를 쓰는 코드는 반드시 이 규칙.** 회귀 검증: 4인 동시 연타 스트레스에서 (손패+덱+버림)=16장 유지.
+- **⚠ 동시 입력은 에러가 아니라 재시도 대상**: 남의 격파 처리로 내 `version` 이 올라 `playCards`/`rest` 가 0행이면 서버가
+  최신 상태로 몇 번 재시도해 조용히 성공시키고, 정말 카드가 넘어갔을 때만 이유("그 사이 다음 카드로 넘어갔습니다")를 돌려준다.
+- **5분 타이머 = 폴링 시점 평가**(`expireIfNeeded`): `ends_at` 을 클라에 실어 카운트다운만 로컬, 서버는 다음 요청 때
+  `Date.now() > ends_at` 이면 `lost`. 돈이 안 걸려 cron 불필요.
+- **승패**: 보스 2페이즈 클리어=`won`(`best_clear_ms` 갱신). 타이머 만료 / 체력 0 / 전원 지침(`allExhausted`)=`lost`.
+  확정 시 전원 `games_played`(+wins)를 한 batch.
+- **방 나가기**(`leave`): 로비/종료에서만(진행 중 불가). 방장 승계, 마지막 인원 나가면 방 삭제.
+- **UI 원칙**: `Rules.tsx`(로비 기본 펼침)·`IconLegend`·카드 타입 힌트(`EVENT_TYPE_META.hint`)·버튼 `title`. 카드엔 이모지 +
+  **속성 이름**. "전부 내기"(`planAutoPlay`)는 전용 아이콘을 와일드보다 먼저, 남은 필요량을 넘지 않게 큰 값부터 배치.
 
 ## 9. 미니 RTS (ox64.app/s1, `src/sc/`)
 
-> 스타크래프트1 스타일 실시간 전략 게임(테란 1종족, 컴퓨터와 1:1). 자원 채집 → 인구 관리 →
-> 테크 → 교전이라는 핵심 루프를 재현했다. **블리자드 리소스는 전혀 쓰지 않는다** — 그래픽은
-> 전부 도형으로 코드에서 그리고, 유닛 구성·수치도 감각만 맞춘 오리지널이다(퍼즐/5분 던전에서
-> 원작을 그대로 베끼지 않은 것과 같은 방침).
+> 스타크래프트1 스타일 RTS(테란 1종족, AI 1:1). 채집→인구→테크→교전 루프 재현. **블리자드 리소스 전혀 안 씀** — 그래픽은
+> 전부 도형, 수치도 오리지널.
 
-- **⚠ 이 게임만 서버가 없다(전부 클라이언트)**: RTS 는 초당 수십 회 시뮬레이션이 필요한데
-  Pages Functions + D1 폴링으로는 근처도 못 간다(5분 던전이 0.5초 폴링인 걸 생각하면 40배 차이).
-  그래서 **온라인 대전을 포기하고 AI 대전 단일 플레이**로 만들었고, 서버 코드도 로그인도 없다
-  (`/api/*` 를 아예 안 부른다). 다른 게임들과 달리 `functions/` 에 대응 파일이 없는 이유.
-- **⚠ 전적은 D1 이 아니라 localStorage**(`ox64_s1_record`): 시뮬레이션이 통째로 클라에 있어서
-  서버에 기록해봐야 콘솔로 얼마든지 위조할 수 있고, 그러면 트레이딩 잔고 같은 **진짜 서버 권위
-  기록 옆에 가짜 권위 기록**이 하나 생긴다. 위조 가능한 값은 위조 가능한 곳에 둔다.
-- **고정 틱 30Hz**(`TICK_S`): 렌더는 rAF 로 매 프레임 돌지만 시뮬은 누적 시간을 쪼개 항상 같은
-  간격으로만 전진한다 — 안 그러면 프레임레이트에 따라 유닛 속도·공격속도가 달라진다. 탭 전환 등으로
-  큰 dt 가 들어와도 한 번에 250ms 까지만 소화한다(갑자기 순간이동하지 않게).
-- **맵**: 64×64 타일(타일 24px). **180° 회전 대칭**으로 생성해 양쪽 시작 조건을 같게 맞추고,
-  생성 후 **두 본진이 실제로 이어져 있는지 플러드 필로 확인**해 안 되면 다시 만든다(바위가 맵을
-  반으로 가르면 그 판은 시작부터 성립하지 않는다).
-- **길찾기**: 그리드 A*(최소 힙, 대각선 모서리 관통 금지, 직선 구간 평활화). ⚠ **유닛은 장애물로
-  넣지 않는다** — 넣으면 한 부대가 서로를 막아 길이 계속 끊긴다. 대신 겹침은 분리력(`separate`)으로
-  밀어내고, 이동이 막힌 게 감지되면(`stuck`) 길을 다시 찾는다.
-- **전장의 안개**: `explored`(한 번이라도 본 곳) + `visible`(지금 시야). 적 유닛은 시야 안에서만,
-  적 건물은 한 번 본 자리면 계속 보인다(원작의 "마지막으로 본 모습"). 안 보이는 적은 클릭도 안 된다.
-  ⚠ **안개는 플레이어 쪽만 계산한다** — AI 는 맵 전체를 보는 전지형이다(AI 용 시야를 따로 굴리는
-  비용에 비해 체감 차이가 거의 없어 의도적으로 생략).
-- **⚠ 카메라는 방향키만(WASD 아님)**: A=공격, S=정지/일꾼, D=디팟, B=건설, F=팩토리/파이어뱃처럼
-  알파벳이 전부 명령 단축키라서, WASD 를 카메라에 주면 **명령을 누를 때마다 화면이 밀린다**.
-  원작도 화면 이동은 방향키·미니맵·화면 가장자리다.
-- **⚠ 게임 상태는 React state 가 아니라 ref**: 매 프레임 도는 루프가 state 를 읽으면 클로저가 낡고,
-  state 를 쓰면 초당 60번 리렌더가 난다. React 는 HUD 표시에만 쓰고(8Hz 스냅샷), 시뮬레이션·입력·
-  카메라는 전부 ref 로 처리한다. 미니맵도 10Hz 로만 다시 그린다(타일 64×64 를 60fps 로 칠하면
-  그것만으로 프레임을 깎아먹는다).
-- **⚠⚠ 모바일에서 시작 몇 초 뒤 흰 화면으로 튕기던 원인 = 캔버스 백버퍼 재할당 루프**:
-  `canvas.width = …` 대입은 백버퍼를 **통째로 재할당**한다(폰 해상도면 한 번에 수 MB). 그런데
-  모바일은 스크롤에 따라 주소창이 접혔다 펴지며 `clientHeight` 가 **프레임마다** 바뀌고, 예전 코드는
-  크기가 1px 만 달라도 즉시 다시 잡았다 → 초당 60번 수 MB 재할당 → 몇 초 만에 탭이 메모리로 죽는다.
-  방어를 세 겹으로 둔다: (1) 컨테이너 높이를 **`100dvh`**(주소창 뺀 실제 보이는 높이, 미지원 브라우저는
-  `h-screen`=100vh 로 폴백) (2) 캔버스에 **`touch-action: none`** + `overscroll-behavior: none` 으로
-  스크롤/핀치줌 자체를 브라우저에 넘기지 않음 (3) 그래도 남는 흔들림은 **8px 임계값** 아래면 무시.
-  **캔버스 크기를 다시 잡는 코드를 건드릴 땐 이 임계값을 없애지 말 것.**
-- **⚠ 터치엔 우클릭이 없다 — 탭 하나가 선택과 명령을 겸한다**: 모바일에선 우클릭이 없어서 그대로 두면
-  이동·공격·채집을 **아예 시킬 수 없다**. 규칙: **내 유닛/건물을 탭하면 선택, 그 외(빈 땅·적·자원)를
-  탭하면 지금 선택한 것들에게 명령**(드래그는 데스크톱과 같이 범위 선택). 마우스는 기존 좌클릭=선택 /
-  우클릭=명령 그대로다(`pointerType === 'touch'` 로만 분기). 화면 가장자리 스크롤도 마우스 전용 —
-  터치는 손을 뗀 뒤에도 마지막 좌표가 남아 화면이 혼자 밀린다.
-- **⚠ 게임 루프 예외는 에러 바운더리가 못 잡는다**: rAF 콜백은 React 렌더 밖이라 `ErrorBoundary` 가
-  잡지 못하고, 화면만 멈춘 채 원인이 아무 데도 안 남는다(폰에선 콘솔을 볼 방법도 마땅치 않다).
-  그래서 루프 본문을 `try/catch` 로 감싸 메시지를 화면에 띄우고, React 렌더 쪽은 별도로
-  `ErrorBoundary` 가 받는다 — 흰 화면 대신 항상 무엇이 터졌는지가 보이게.
-- **AI**: 0.5초마다 판단하고 사람처럼 정해진 순서로 확장한다(일꾼 14기 → 인구 → 배럭 → 리파이너리 →
-  팩토리 → 병력 → 기준선 넘으면 공격, 밀리면 후퇴 후 재집결). ⚠ **미네랄이 남으면 생산 시설이
-  부족하다는 뜻** — 예전엔 배럭 상한 3·대기열 1칸이라 AI 가 미네랄을 1,000 넘게 쌓아두고도 병력을
-  못 뽑았다. 지금은 자원이 쌓이면 배럭을 6개까지 늘리고 대기열도 최대 3칸까지 채운다.
-- **⚠ 검증은 헤드리스로 한다**: 빌드가 통과한다고 게임이 되는 게 아니라서, `Game` + `AI` 둘을
-  붙여 **AI 대 AI 로 끝까지 돌려** 채집·건설·생산·교전·승부가 실제로 일어나는지 확인했다(`AI` 가
-  owner 를 생성자로 받는 이유). 실측 12판 전부 정상 진행, 판당 3~6분에 결착. 렌더러는 시뮬이 한 줄도
-  실행하지 않으므로 **가짜 2D 컨텍스트를 물려 202프레임을 그려보는** 별도 검증을 돌렸다.
-  ⚠ 같은 코드끼리 붙이면 P0 가 7~8할 이긴다 — 한 틱 안에서 엔티티 순서대로 처리해 먼저 생성된 쪽이
-  먼저 쏘기 때문(순차 시뮬의 구조적 특성). 사람이 P0 라 이 미세한 이점은 플레이어 쪽으로 간다.
+- **⚠ 이 게임만 서버가 없다(전부 클라)**: 초당 수십 회 시뮬은 Functions+D1 폴링으로 불가(던전 0.5s 의 40배). 온라인 대전을
+  포기하고 AI 단일 플레이, 로그인도 `/api/*` 호출도 없다(`functions/` 에 대응 파일 없음).
+- **⚠ 전적은 localStorage**(`ox64_s1_record`): 시뮬이 클라에 있어 서버에 기록해도 위조 가능 — 서버 권위 기록 옆에 가짜 권위를
+  두지 않는다.
+- **고정 틱 30Hz**(`TICK_S`): 렌더는 rAF, 시뮬은 누적 시간을 고정 간격으로만 전진(프레임레이트 무관 속도). 큰 dt 는 한 번에
+  250ms 까지만 소화.
+- **맵**: 64×64 타일(24px), **180° 회전 대칭** + 두 본진 연결성을 플러드 필로 확인(안 되면 재생성).
+- **길찾기**: 그리드 A*(최소 힙, 대각 모서리 관통 금지, 평활화). ⚠ **유닛은 장애물로 넣지 않는다**(부대가 서로 막는다) —
+  겹침은 분리력(`separate`), 막히면(`stuck`) 재탐색.
+- **전장의 안개**: `explored` + `visible`. 적 유닛은 시야 안만, 적 건물은 한 번 본 자리면 계속. ⚠ **플레이어 쪽만 계산**
+  — AI 는 전지형(의도적 생략).
+- **⚠ 카메라는 방향키만(WASD 아님)**: A/S/D/B/F 가 전부 명령 단축키라 WASD 면 명령마다 화면이 밀린다.
+- **⚠ 게임 상태는 React state 아니라 ref**: 루프가 state 를 읽으면 클로저가 낡고 쓰면 60fps 리렌더. React 는 HUD(8Hz 스냅샷)만,
+  미니맵은 10Hz.
+- **⚠⚠ 모바일 흰 화면 = 캔버스 백버퍼 재할당 루프**: `canvas.width=` 대입은 백버퍼 통째 재할당인데 모바일 주소창 때문에
+  `clientHeight` 가 프레임마다 바뀌어 초당 60번 수 MB 재할당 → 탭 사망. 방어 3겹: (1) `100dvh`(폴백 `h-screen`) (2) 캔버스
+  `touch-action: none` + `overscroll-behavior: none` (3) **8px 임계값** 아래 흔들림 무시. **캔버스 크기 코드를 건드릴 때 이
+  임계값을 없애지 말 것.**
+- **⚠ 터치엔 우클릭이 없다 — 탭이 선택과 명령을 겸한다**: 내 유닛/건물 탭=선택, 그 외(빈 땅·적·자원) 탭=선택된 것들에 명령,
+  드래그=범위 선택. 마우스는 좌=선택/우=명령 그대로(`pointerType === 'touch'` 분기). 가장자리 스크롤은 마우스 전용.
+- **⚠ 게임 루프 예외는 에러 바운더리가 못 잡는다**: rAF 콜백은 React 밖 — 루프 본문을 `try/catch` 로 감싸 화면에 띄우고,
+  렌더 쪽은 `ErrorBoundary`.
+- **AI**: 0.5s 마다 판단, 일꾼 14 → 인구 → 배럭 → 리파이너리 → 팩토리 → 병력 → 공격/후퇴. ⚠ **미네랄이 남으면 생산 시설
+  부족** — 배럭 최대 6·대기열 3칸까지 채운다(예전 상한 3·1칸엔 1,000 넘게 쌓였다).
+- **⚠ 검증은 헤드리스**: `Game`+`AI` 를 AI 대 AI 로 끝까지(`AI` 가 owner 를 생성자로 받는 이유), 렌더러는 가짜 2D 컨텍스트로
+  프레임 검증. ⚠ 같은 코드끼리면 P0 가 7~8할 이긴다(엔티티 순서 처리) — 사람이 P0.
 
 ## 10. 상자깡 (ox64.app/c, `functions/api/crate.ts` + `functions/_crateData.ts` + `src/crate/`)
 
-> 상자를 까서 재료·돈을 얻고, **같은 재료 2개를 합쳐(merge) 레벨을 올려 값을 불리는** 미니게임.
-> 트레이딩·퍼즐·던전 어느 쪽과도 완전히 무관 — 같은 계정(이름+패스코드, 세션 쿠키)을 그대로 쓰지만
-> 재화(`crate_stats.coins`, "골드")는 `users.balance`(USDT)와 전혀 다른 별도 컬럼이다.
-> 폴링이 없다(싱글플레이라 남의 상태를 볼 이유가 없다).
+> 상자를 까서 재료·골드를 얻고 **같은 재료 2개를 합쳐(merge) 레벨을 올려 값을 불리는** 미니게임. 트레이딩·퍼즐·던전과 무관,
+> 같은 계정. 재화(`crate_stats.coins`, 골드)는 USDT 와 별도 컬럼. 싱글플레이라 폴링 없음(랭킹 모달만 예외).
 
-- **⚠⚠ 한 유저의 모든 상태가 `crate_stats` 한 행이다** — 인벤토리(`inv_json`)·보유 상자(`crates_json`)·
-  도감(`seen_json`)이 전부 JSON 칸 하나씩이라 **상자를 10개 까든 재료가 30종이든 D1 쓰기가 1행**이다
-  (§6 "매 틱 통째로 교체되는 스냅샷은 행으로 쪼개지 말고 이미 UPDATE 하는 행의 JSON 칸에 담는다" —
-  봇 호가 사다리 `book_json` 과 같은 사상). **아이템을 행으로 쪼개는 설계로 절대 되돌리지 말 것** —
-  개봉 한 번이 수십 행이 되어 무료 플랜 일일 쓰기(10만)를 그 기능 하나로 태운다. 한 요청은 항상
-  **읽기 1행 + 쓰기 1행**(신규 유저만 INSERT 1회 추가)이라 invocation당 쿼리 한도(50)와도 무관하다.
-- **⚠ 밸런스의 진실원본은 `functions/_crateData.ts` 하나이고, 확률·가격·가치를 건드렸으면 반드시
-  `npm run sim:crate` 를 돌릴 것**(`scripts/sim-crate.ts` — 드롭 테이블이 순수 함수라 상자당 20만 회
-  개봉을 몇 초에 굴린다). 합격선:
-  | 지표 | 목표 | 실측(2026-09-10, 보상 개편 후) |
+- **⚠⚠ 한 유저의 모든 상태가 `crate_stats` 한 행이다** — 인벤토리(`inv_json`)·보유 상자(`crates_json`)·도감(`seen_json`)이
+  JSON 칸이라 개봉 10연도 **쓰기 1행**(§6, `book_json` 과 같은 사상). **아이템을 행으로 쪼개는 설계로 되돌리지 말 것** —
+  개봉 한 번이 수십 행이 된다. 한 요청 = 읽기 1행 + 쓰기 1행(신규만 INSERT 1) → 쿼리 한도(50)와 무관.
+- **⚠ 밸런스 진실원본은 `functions/_crateData.ts` 하나. 확률·가격·가치를 건드렸으면 반드시 `npm run sim:crate`**
+  (`scripts/sim-crate.ts`, 상자당 20만 회). 회수율은 **나온 상자를 재귀적으로 끝까지 깐 값**으로 잰다. 합격선:
+  naive(머지 없이 다 팔기) 78~92% · optimal(끝까지 머지) 125~320% · 두 정책 비 1.3 이상 · **요일 이벤트 7일 평균 naive
+  100% 미만** · 잭팟의 optimal 몫 5% 미만. (2026-09-10 실측: naive 83~86% / optimal 132~203% / 이벤트 평균 90.4%.)
+  **⚠⚠ 핵심 불변식: 상자만 까서 다 팔면 반드시 적자(naive < 100%)** — 넘으면 상자만으로 골드가 불어나는 무한 인플레.
+  돈을 버는 건 머지다. 보상 장치는 하나하나 몇 %p 씩 얹히므로(처음 넣었을 때 naive 106%) 합계를 시뮬로 다시 잴 것.
+- **보상 장치** — 숫자를 올리는 대신 **눈에 보이는 사건**으로(같은 +15% 라도 "✨ 보너스! 2개 더"는 매번 보인다):
+  | 장치 | 내용 | 기여 |
   | --- | --- | --- |
-  | naive 회수율(머지 없이 다 팔기) | 78~92% | 83.6 / 82.5 / 85.5 / 83.2 / 85.5% |
-  | optimal 회수율(끝까지 머지 후 판매) | 125~320% | 202.8 / 192.6 / 180.8 / 154.7 / 132.0% |
-  | 두 정책의 비 | 1.3 이상 | ×2.43 / ×2.33 / ×2.11 / ×1.86 / ×1.54 |
-  | **요일 이벤트 7일 평균 naive** | **100% 미만** | **90.4%** |
-  | 잭팟이 optimal 에서 차지하는 몫 | 5% 미만 | 1.6~2.6% |
-  **⚠⚠ naive 가 100% 를 넘으면 안 된다** — 넘는 순간 상자만 까도 골드가 불어나 머지가 무의미해지고
-  무한 인플레가 된다. 초기값(naive 70%)은 "대충 하면 계속 깎인다"가 너무 세게 체감돼(제보) 보상
-  장치 넷을 얹어 완화했는데, 그걸 처음 넣었을 때 곧바로 **naive 106%** 가 나왔다 — 아래 값들은
-  하나하나가 회수율에 몇 %p 씩 얹히므로 반드시 시뮬로 합계를 다시 잴 것.
-  **핵심 불변식: 상자만 까서 다 팔면 반드시 적자여야 한다.** 돈을 버는 건 상자가 아니라 머지다 —
-  이게 깨지면(naive 가 100% 를 넘으면) 상자를 무한히 까는 것만으로 골드가 불어나는 인플레 경로가 된다.
-  회수율은 **나온 상자를 재귀적으로 끝까지 깐 값**으로 재야 한다(상자 드롭을 "가격"으로 환산하면
-  상자에서 상자가 나오는 경로가 통째로 과대평가된다).
-- **보상을 퍼주는 장치 넷** — 회수율 숫자를 그냥 올리는 대신 **눈에 보이는 사건**으로 얹었다.
-  같은 +15% 라도 "확률표가 좋아졌다"는 안 느껴지지만 "✨ 보너스! 2개 더"는 매번 보인다.
-  | 장치 | 내용 | 회수율 기여 |
-  | --- | --- | --- |
-  | ① 개봉 보너스(`BONUS_TIERS`) | 매 개봉마다 굴려 **하나만** 적용 — ✨보너스 14%(항목 2개 추가) · 🔥더블 5%(×2) · ⚡트리플 1.2%(×3) · 💥메가 0.25%(×5 + 2개) | +14%p |
-  | ② 마일스톤(`MILESTONES`) | 누적 개봉 40/200/1000회마다 상자. **`opened` 컬럼을 그대로 게이지로 쓴다**(저장 상태 0) | +8%p |
-  | ③ 대량 개봉(`rollBulkBonus`) | 10개 이상 한 번에 까면 35% 확률로 공짜 1개 | +3.5%p |
-  | ④ 업적(`ACHIEVEMENTS`) | 21개, 누적 통계가 기준선을 넘으면 자동 지급(총 6만 골드 상당) | 일회성 |
-  | ⑤ 요일 이벤트(`DAILY_EVENTS`) | 🎁선물(보너스×1.6)·⛏️광부(재료×1.25)·💰황금(골드×1.35)·🧩조각(조각×2)·📦할인(10%)·🍀행운(잭팟×3)·🎉축제(대량확정) | +9%p(7일 평균) |
-  - **⚠⚠ ⑤는 KST 날짜에서 파생한다** — 저장할 상태도, 스케줄러도, cron 도 없다(`eventOfDay(todayKst())`).
-    트레이딩 리필의 "요청 시점에 KST 날짜를 계산" 패턴과 같은 사상이고, 그래서 요일이 바뀌면 저절로
-    다음 이벤트가 걸린다. 할인은 `priceOf(level, ev)` 가 상점 응답과 구매 검증 **양쪽에** 적용한다.
-  - **⚠⚠ 이벤트는 회수율에 직접 얹히므로 평균이 100% 를 넘으면 안 된다** — 이벤트가 하루씩 도니
-    평균 기여 = 각 효과의 1/7 합이다. `npm run sim:crate` 가 **요일별 회수율과 7일 평균**을 따로 찍고
-    평균이 100% 이상이면 실패한다(실측 94.9%). 이벤트를 세게 만들려면 **평상시 드롭을 같이 낮출 것** —
-    처음 넣었을 때 평균 102.5% 가 나와 보너스 확률·마일스톤 간격을 되돌렸다.
-  - **⚠ 이벤트의 잭팟 배수는 잭팟 슬롯에만 건다**(`rollCrate` 의 `slot.jackpot && ev`) — 평범한 슬롯에
-    까지 먹이면 그게 곧 회수율 폭증이다.
-  - **⚠ ③은 확정 지급으로 두면 안 된다** — "10개마다 1개"면 그것만으로 +10%p 라 밸런스의 주인이 된다.
-  - **⚠ ①의 추가 항목은 잭팟 슬롯을 제외하고 뽑는다**(`rollExtraRewards`) — 잭팟은 잭팟 확률로만 나와야 한다.
-  - **⚠⚠ 업적 수령 기록은 `seen_json`(도감) 배열에 `a:<key>` 로 같이 담는다** — prod 에 ALTER 를
-    돌릴 수 없어 컬럼을 못 늘리기 때문이다. `parseInvKey('a:open10')` 이 `null` 을 돌려주고 도감은
-    `CATS` 기준으로만 그리므로 재료에 섞이지 않는다. **재료 카테고리에 `a` 를 절대 쓰지 말 것.**
-  - **⚠ 업적 지급은 `grantAchievements(w)` 한 곳에서만** 한다(모든 액션 끝에서 호출) — 액션마다
-    흩뿌리면 새 액션을 추가할 때 빠뜨린다. 응답의 `achieved`(방금 받은 것)와 `achievements[].done`
-    (이미 받았나)은 **다른 필드다** — 한때 둘 다 `achieved` 라 서로 덮어썼다.
-- **⚠ 이모지는 Unicode 11.0 이하로만** — 12.0/13.0 대(🪵 U+1FAB5 등)는 구형 폰트에 글리프가 없어
-  두부(□)로 뜬다(실제로 목재 아이콘이 그렇게 깨졌다는 제보로 🌳 U+1F333 으로 교체했다).
-- **머지 규칙** — 같은 카테고리·같은 레벨 **2개 → 다음 레벨 1개**, 가치는 `MERGE_MULT`(2.25)배.
-  즉 개당 1.125배씩 이득이고, 이 "머지 프리미엄"이 이 게임의 유일한 성장 동력이다.
-  **⚠ 카테고리는 절대 안 바뀌고 레벨만 오른다.** 상자는 머지 대상이 아니다(재료만 합쳐진다).
-  카테고리는 8종 — 약초/목재/광석/섬유/보석/정수는 **Lv1~12**(`MAX_MAT_LEVEL`), 상자조각은 Lv1~4,
-  골드복권은 레벨이 없다(Lv1 고정). 상자는 **Lv1~5**(100 / 450 / 2,000 / 9,000 / 40,000골드).
-  - **⚠⚠ 레벨 상한을 바꾸면 `MERGE_MULT` 도 같이 재조정해야 한다** — Lv1→최고 레벨의 가치 배율은
-    `(MERGE_MULT/2)^(상한-1)` 이라 상한에 **지수로** 반응한다. 상한을 6→12 로 올리면서 2.35 를 그대로
-    뒀더니 배율이 2.24 → 6.28 로 뛰어 optimal 회수율이 통째로 폭발했다(2.25 로 내려 3.65배가 됐다).
-  - **⚠ 상위 상자는 이미 합쳐진 고레벨 재료를 준다** — 그래서 optimal 회수율이 상위 상자일수록 낮다
-    (Lv1 203% → Lv5 132%). 남은 머지 단계가 적어서지 밸런스가 틀린 게 아니다.
-- **⚠⚠ 골드복권(`lotto`)은 다른 재료와 규칙이 다르다** — **레벨이 없고(Lv1 고정), 팔 수도 합칠 수도
-  없으며 긁는 것만 된다**(`noSell`, `maxLevel: 1`). 그래서 `base` 는 판매가가 아니라 **상금 기준액**
-  (`LOTTO_BASE` 300골드)이고, 상금은 그 **0.1~800배**(30 ~ 240,000골드)다. 기대 배수 2.57.
-  - **⚠ 팔 수 없으므로 총자산·파산 판정에서 판매가로 치면 안 된다** — `inventoryValue` 가 복권만
-    **기대 상금**(기준액 × 2.57)으로 계산한다. 안 그러면 복권만 잔뜩 든 사람이 빈털터리로 판정돼
-    구제를 받으면서 실제로는 부자인 상태가 된다.
-  - **⚠ `noSell` 은 `loadState` 응답에 반드시 실어 보낼 것** — 클라가 판매 버튼을 숨기는 근거다.
-    빠뜨리면 버튼이 그대로 뜨고 눌러야 거부 메시지를 본다(한 번 그랬다).
-  - **⚠ 꼬리를 키울 땐 기대 배수를 다시 계산할 것** — `p × mult` 가 큰 항 하나가 평균을 통째로
-    끌고 간다(0.1% × 800배 = 0.8배가 평균에 그대로 더해진다).
-- **⚠ 상자조각 일괄 개봉은 인벤토리 헤더에 전용 버튼으로 둔다** — `mergeAll` 에서 일부러 빼놨으므로
-  (도박이라 유저가 직접 눌러야 한다) 칸을 찾아 선택해야만 열 수 있었고, 조각이 쌓이면 그게 번거롭다
-  (제보). 한 요청 처리량은 `MAX_MERGE_TIMES`(200)로 묶고 **그 상한을 클라에 내려준다** — 넘겨 보내면
-  조용히 잘려서 "왜 절반만 열렸지?" 가 된다. 결과는 **레벨별로 집계**해 돌려준다(200개를 열었는데
-  레벨을 그대로 나열하면 읽을 수가 없다).
-- **⚠ 상자조각은 유일한 예외** — 최고 레벨(Lv4) 2개를 합치면 다음 레벨 대신 **랜덤 상자**가 나온다
-  (`SHARD_CRATE_ODDS`, 확률적으로 더 비싼 상자). 기댓값(444골드)이 Lv4 조각 2개 판매가(260골드)보다
-  **확실히 높아야**(현재 ×1.71) "조각은 팔지 말고 합쳐라"가 성립한다. 그래서 `sellAll` 은 상자조각을
-  제외하고, `mergeAll` 도 상자조각 최고 레벨은 건드리지 않는다(그건 도박이라 유저가 직접 눌러야 한다).
-- **⚠ 극한 확률 잭팟(`JACKPOTS`)의 상한 규칙** — 모든 상자에 공통으로 붙는 1/2,000 · 1/25,000 ·
-  1/250,000 짜리 슬롯이고 보상은 **그 상자 가격의 배수**(×25 · ×150 · ×1,500)다. 확률이 자릿수로 낮아
-  기대 회수율 기여는 2.5% 뿐이면서 도박성만 얹는 게 목적이다. **`Σ(p × mult)` 가 0.05(가격의 5%)를
-  넘지 않게 할 것** — 넘으면 밸런스의 주인이 머지가 아니라 잭팟이 되어 "많이 까는 사람이 확률적으로
-  무조건 이기는" 인플레 경로가 된다.
-- **⚠ 서버 권위** — 드롭 추첨(`rollCrate`)·머지·판매·잔고를 전부 서버가 계산한다. 클라가 보내는 건
-  "무엇을 몇 개" 뿐이다(트레이딩의 "체결가는 서버가 fetch" 와 같은 사상). 확률표·가격·재료 가치는
-  서버가 `GET /api/crate` 응답(`cats`/`shop`/`shardOdds`)으로 내려주고 클라는 그대로 렌더한다 —
-  **클라에 같은 표를 또 적지 말 것**(VIP 등급표와 같은 이유: 서버 밸런스를 고칠 때 화면만 조용히 틀려진다).
-- **⚠ 모든 액션이 read-modify-write 라 `version` 가드가 필수다** — 인벤토리가 JSON 한 칸이라 두 요청이
-  겹치면 뒤에 쓴 쪽이 상대의 보상을 통째로 지운다(더블클릭 한 번이면 재현된다). `commit()` 이
-  `WHERE user_id=? AND version=?` 로 원자적으로 막고 0행이면 재시도를 돌려준다(`dungeon_rooms.version`
-  과 같은 관용구). **새 액션을 추가할 때 `commit()` 을 우회해 직접 UPDATE 하지 말 것.**
-- **애니메이션은 "아주 살짝만"**(`src/crate/crate.css`, 전부 0.2~0.7초) — 상자가 0.42초 흔들린 뒤 결과
-  카드가 40ms 간격으로 튀어나온다. ⚠ 여러 개를 깔 때 **상자별로 차례로 보여주면 10연차가 고문**이
-  되므로 같은 보상끼리 합산해(`aggregate`) 한 번에 띄운다. 서버 응답이 애니메이션보다 빨리 와도
-  흔들림은 끝까지 재생한다(`Promise.all` 로 최소 시간 보장 — 안 그러면 결과만 툭 튀어나온다).
-- **⚠ 인벤토리는 6×8 고정 격자 + 페이징이다**(`Inventory.tsx`) — 예전엔 재료 종류마다 섹션을 세로로
-  쌓아서 상자를 깔수록 페이지가 한없이 길어졌고, 그룹마다 팔기·합치기 버튼이 붙어 같은 버튼이 화면에
-  열 개씩 떠 있었다(제보). 지금은 **빈 칸도 그려서 격자가 항상 48칸**이라 높이가 내용에 따라 흔들리지
-  않고, 조작은 격자 아래 **액션 바 한 곳**에서만 한다(그 바도 `min-h` 로 높이를 고정 — 선택 여부에
-  따라 격자가 위아래로 밀리면 안 된다).
-  - **한 칸 = 재료 1개다(스택이 아니다)** — 머지가 "같은 걸 둘 겹친다"는 조작이라 스택으로 묶으면
-    끌어다 놓을 상대가 사라진다. 늘어난 칸은 페이징이 흡수하고, DB 에는 여전히 개수만 저장되므로
-    칸이 몇 개로 보이든 **D1 비용은 같다**. 정렬은 카테고리 순 → 레벨 오름차순(합칠 것이 앞 페이지에).
-  - **⚠ 포인터 좌표를 리렌더에 태우지 않는다** — 매 `pointermove` 마다 `setState` 하면 48칸이 전부
-    다시 그려진다. 고스트는 `ref` 로 DOM 을 직접 움직이고 리렌더는 **드롭 대상이 바뀔 때만** 일어난다.
-    고스트는 조건부로 마운트하면 안 되고(첫 프레임에 (0,0) 에서 튄다) `pointer-events: none` 이어야
-    한다(`elementFromPoint` 가 아래 칸을 못 찾는다).
-  - **⚠ 선택한 칸은 같은 그룹의 아무 칸으로 폴백한다** — "1개 팔기" 로 개수가 줄면 선택했던 인덱스가
-    사라져서, 정확히 일치하는 칸만 찾으면 재료가 남았는데도 액션 바가 안내 문구로 되돌아간다.
-  - **⚠⚠ "끌 수 없다"와 "누를 수 없다"는 다르다** — `onDown` 이 `count < 2`(합칠 상대가 없는 칸)에서
-    곧장 return 해버리면 `down` 이 안 남고, `onUp` 의 `if (!d) return` 에 걸려 **그 칸은 눌러도 선택
-    자체가 안 된다**(액션 바가 영영 안 뜬다). 상위 레벨 재료는 보통 1개뿐이라 사실상 대부분의 칸이
-    그랬다(제보 "칸을 눌러도 조작이 안 나옴"). 지금은 `down` 을 항상 기록하고 `draggable` 플래그로
-    드래그만 막으며, `onUp` 은 `d` 가 없어도 탭으로 처리한다.
-  - **⚠ 개수 배지는 "이 페이지에서 그 재료가 처음 나오는 칸"에 붙인다**(`badgeAt`) — 그룹 전체의 첫
-    칸(`idx === 0`)에 붙이면 재료가 48개를 넘는 순간 그 칸이 1페이지에만 있어 2페이지부터 개수가
-    통째로 안 보인다. 자릿수가 늘면 글자를 줄이고(`countClass`) 만/억으로 축약한다(`fmtCount`) —
-    칸이 50px 남짓이라 "12345" 는 아이콘을 통째로 덮는다. ⚠ 크기 클래스는 **완성된 문자열로**
-    돌려줄 것(`text-[13px]`) — 런타임에 조립하면 Tailwind 가 소스를 정적으로 훑기 때문에 누락된다.
-  - 끌어 놓기 · **탭**(선택, 같은 종류를 또 탭하면 머지) · **마우스 호버 툴팁**(PC 전용 — 터치는 탭
-    선택이 곧 상세 보기다)을 같은 포인터 이벤트로 처리한다(모바일엔 우클릭도 hover 도 없다).
-- **랭킹**(`GET /api/crate?board=1` + `Leaderboard.tsx`) — 소지 골드 순위. 모달이 열려 있는 동안
-  5초마다 갱신하고 **탭이 백그라운드면 멈춘다**(§6 — 안 보이는 화면에 요청을 쓰는 건 낭비).
-  - **⚠ 이 경로는 읽기 전용을 유지할 것** — 열어두면 계속 도는 폴링이라 쓰기가 한 줄이라도 붙으면
-    그게 곧 "스스로 반복해서 도는 쓰기 경로"가 된다(§6). 서버도 SELECT 하나뿐이다.
-  - **정렬은 `coins` 컬럼으로 SQL 이 하고 `LIMIT 100` 으로 자른다** — 총자산(재료·상자 환산)은 JSON 을
-    파싱해야 나오는 파생값이라 SQL 로는 못 자르므로, 상위 100명을 먼저 뽑고 그 안에서 계산한 뒤
-    **총자산 정렬은 클라가** 다시 세운다(데이터가 이미 다 가 있다). 유저가 늘어도 한 요청이 읽는 행이
-    100 을 안 넘게 묶어두는 게 목적이다.
-  - 두 기준을 함께 보여주는 이유: **재료를 쌓아두면 골드 순위는 내려가도 총자산은 그대로**다. 골드만
-    보여주면 "머지가 유일한 흑자 경로"라는 설계와 순위가 어긋난다(재료를 모으는 사람이 꼴찌로 보인다).
-- **⚠⚠ 회생 — 지원은 돈이 아니라 상자로 준다**: 이 게임은 **가난할수록 회복이 구조적으로 어렵다**.
-  흑자를 내려면 머지를 해야 하는데(상자만 까면 70%) 머지에는 같은 재료 2개가 필요하고, 그러려면
-  상자를 여러 개 까야 한다 — 즉 골드를 조금씩 쥐여주면 그 돈으로 상자 한두 개를 까고 재료가 흩어진 채
-  끝나 **70% 손실만 반복**된다. 실제로 유저 한 명이 전 재산을 잃고 그 상태에서 회복하지 못했다.
-  상자를 한꺼번에 여러 개 줘야 같은 재료가 모여 머지가 성립하고, 거기서부터 스스로 굴러간다.
-  - 지급은 두 단계이고 **컬럼을 더 쓰지 않는다**(`refill_date` + `refill_count` 두 개로 처리 —
-    prod 에 ALTER 를 돌릴 수 없는 상황이라 마이그레이션 없이 돌아가야 했다):
-    그날 **첫 수령**(`refill_count === 0`)은 조건 없는 일일 지원(Lv1 상자 4개 + 200골드), 그 뒤는
-    **총자산이 상자 3개 값에 못 미칠 때만** 주는 파산 구제(상자 3개 + 400골드, 하루 4회).
-  - 일일 지원에 조건이 없는 이유: 부자에겐 하루 600골드가 푼돈이라 순위에 영향이 없고 빈털터리에겐
-    생명줄이라, 그 자체로 따라잡기 장치가 된다.
-  - **⚠ 파산선은 "상자 1개"가 아니라 "상자 3개" 값이다**(`BROKE_CRATES`) — 상자 하나로는 같은 재료가
-    안 모여 머지가 성립하지 않으므로, 1개 값으로 잡으면 "구제는 받았는데 여전히 회생 불가"가 된다.
-  - **⚠ 회생이 실제로 되는지는 `npm run sim:crate` 가 검증한다**(골드 0·재료 0 에서 14일 플레이).
-    합격선은 **파산 탈출 60/60회**이고, 실측 평균 1.1일 · 14일 뒤 평균 9,459골드(최악 3,948)로
-    폭증 없이 회복된다. 지원을 끄면 탈출 0/60 — 골드가 0 이면 상자를 못 사서 영원히 0 이다.
-  - KST 날짜가 바뀌면 자동 초기화된다(트레이딩 `refill.ts` 와 같은 "요청 시점에 계산" 패턴, cron 불필요).
+  | ① 개봉 보너스(`BONUS_TIERS`) | 개봉마다 **하나만** — ✨보너스 14%(+2개) · 🔥더블 5% · ⚡트리플 1.2% · 💥메가 0.25%(×5+2개) | +14%p |
+  | ② 마일스톤(`MILESTONES`) | 누적 40/200/1000회마다 상자, **`opened` 컬럼이 게이지**(저장 상태 0) | +8%p |
+  | ③ 대량 개봉(`rollBulkBonus`) | 10개 이상이면 35% 확률로 공짜 1개 | +3.5%p |
+  | ④ 업적(`ACHIEVEMENTS`) | 21개, 누적 통계 기준선 넘으면 자동 지급 | 일회성 |
+  | ⑤ 요일 이벤트(`DAILY_EVENTS`) | 🎁선물·⛏️광부·💰황금·🧩조각·📦할인·🍀행운·🎉축제 | +9%p(7일 평균) |
+  - **⚠⚠ ⑤는 KST 날짜에서 파생**(`eventOfDay(todayKst())`) — 저장 상태·스케줄러·cron 없음. 할인은 `priceOf(level, ev)` 가
+    상점 응답과 구매 검증 **양쪽**에 적용. **7일 평균이 100% 를 넘으면 안 된다** — `sim:crate` 가 요일별·평균을 찍고 평균
+    100% 이상이면 실패. 이벤트를 세게 하려면 평상시 드롭을 같이 낮출 것.
+  - ⚠ 이벤트 잭팟 배수는 잭팟 슬롯에만(`slot.jackpot && ev`). ⚠ ③은 확정 지급 금지("10개마다 1개"면 +10%p 로 밸런스의 주인).
+    ⚠ ①의 추가 항목은 잭팟 슬롯 제외(`rollExtraRewards`).
+  - **⚠⚠ 업적 수령 기록은 `seen_json` 에 `a:<key>` 로** — prod 에 ALTER 를 못 돌려 컬럼을 못 늘렸다. `parseInvKey` 가 `null`,
+    도감은 `CATS` 기준이라 재료에 안 섞인다. **재료 카테고리에 `a` 금지.** 지급은 `grantAchievements(w)` 한 곳(모든 액션 끝)
+    에서만. 응답 `achieved`(방금 받은 것)와 `achievements[].done`(이미 받았나)은 다른 필드.
+- **⚠ 이모지는 Unicode 11.0 이하만** — 12.0+(🪵 등)는 구형 폰트에서 두부(□)로 뜬다(목재는 🌳 로 교체).
+- **머지 규칙** — 같은 카테고리·같은 레벨 2개 → 다음 레벨 1개, 가치 `MERGE_MULT`(2.25)배(개당 1.125배 = 유일한 성장 동력).
+  **카테고리는 절대 안 바뀌고 레벨만 오른다.** 상자는 머지 대상 아님. 카테고리 8종 — 약초/목재/광석/섬유/보석/정수 **Lv1~12**
+  (`MAX_MAT_LEVEL`), 상자조각 Lv1~4, 골드복권 Lv1 고정. 상자 Lv1~5(100 / 450 / 2,000 / 9,000 / 40,000골드).
+  - **⚠⚠ 레벨 상한을 바꾸면 `MERGE_MULT` 도 재조정** — Lv1→최고 가치 배율은 `(MERGE_MULT/2)^(상한-1)` 로 상한에 지수 반응
+    (6→12 로 올리며 2.35 를 두면 2.24→6.28배로 폭발, 2.25 로 3.65배).
+  - ⚠ 상위 상자는 이미 합쳐진 고레벨 재료를 주므로 optimal 이 상위일수록 낮다(Lv1 203% → Lv5 132%) — 정상.
+- **⚠⚠ 골드복권(`lotto`)** — 레벨 없음, **팔 수도 합칠 수도 없고 긁기만**(`noSell`, `maxLevel: 1`). `base` 는 **상금 기준액**
+  (`LOTTO_BASE` 300)이고 상금은 0.1~800배, 기대 배수 2.57.
+  - ⚠ 총자산·파산 판정은 판매가가 아니라 **기대 상금**(`inventoryValue`) — 안 그러면 복권 부자가 빈털터리로 판정된다.
+  - ⚠ `noSell` 은 `loadState` 응답에 반드시 실을 것(판매 버튼 숨김 근거). ⚠ 꼬리를 키우면 기대 배수 재계산(`p×mult` 큰 항이 평균을 끈다).
+- **⚠ 상자조각 일괄 개봉은 인벤토리 헤더 전용 버튼** — `mergeAll` 에선 일부러 뺐다(도박은 직접 눌러야). 한 요청 처리량
+  `MAX_MERGE_TIMES`(200)를 클라에 내려주고(넘겨 보내면 조용히 잘린다), 결과는 **레벨별 집계**로 돌려준다.
+- **⚠ 상자조각은 유일한 예외** — 최고 레벨(Lv4) 2개 → **랜덤 상자**(`SHARD_CRATE_ODDS`). 기댓값(444)이 Lv4 2개 판매가(260)보다
+  확실히 높아야(×1.71) "조각은 합쳐라"가 성립 → `sellAll`·`mergeAll` 은 조각 최고 레벨을 건드리지 않는다.
+- **⚠ 잭팟(`JACKPOTS`)** — 모든 상자 공통 1/2,000 · 1/25,000 · 1/250,000 슬롯, 보상은 상자 가격 ×25 · ×150 · ×1,500.
+  **`Σ(p × mult) ≤ 0.05`(가격의 5%)** — 넘으면 밸런스의 주인이 잭팟이 되어 "많이 까면 확률적으로 이기는" 인플레.
+- **⚠ 서버 권위** — 추첨(`rollCrate`)·머지·판매·잔고 전부 서버. 확률표·가격·가치는 `GET /api/crate`(`cats`/`shop`/`shardOdds`)로
+  내려주고 클라는 그대로 렌더 — **클라에 표를 또 적지 말 것**(VIP 표와 같은 이유).
+- **⚠ 모든 액션은 read-modify-write 라 `version` 가드 필수** — `commit()` 이 `WHERE user_id=? AND version=?` 로 막고 0행이면
+  재시도(더블클릭이면 재현). **새 액션은 `commit()` 을 우회해 UPDATE 하지 말 것.**
+- **애니메이션은 "아주 살짝만"**(`crate.css`, 0.2~0.7초). 여러 개 개봉은 같은 보상끼리 합산(`aggregate`)해 한 번에; 흔들림은
+  `Promise.all` 로 최소 시간 보장.
+- **⚠ 인벤토리는 6×8 고정 격자 + 페이징**(`Inventory.tsx`) — 빈 칸도 그려 항상 48칸(높이 고정), 조작은 격자 아래 **액션 바
+  한 곳**(`min-h` 로 고정).
+  - **한 칸 = 재료 1개(스택 아님)** — 머지가 "둘 겹치기"라 스택이면 상대가 사라진다. DB 는 개수만 저장 → D1 비용 동일.
+    정렬 카테고리 → 레벨 오름차순.
+  - ⚠ 포인터 좌표를 리렌더에 안 태운다 — 고스트는 `ref` 로 DOM 직접 이동, 리렌더는 드롭 대상이 바뀔 때만. 고스트는 항상 마운트
+    + `pointer-events: none`.
+  - ⚠ 선택 칸은 같은 그룹의 아무 칸으로 폴백(개수가 줄어 인덱스가 사라져도 액션 바 유지).
+  - **⚠⚠ "끌 수 없다"≠"누를 수 없다"** — `onDown` 이 `count < 2` 에서 return 하면 그 칸은 선택 자체가 안 된다. `down` 은 항상
+    기록하고 `draggable` 로 드래그만 막으며 `onUp` 은 `d` 없어도 탭 처리.
+  - ⚠ 개수 배지는 "이 페이지에서 처음 나오는 칸"(`badgeAt`), 자릿수 늘면 `countClass`/`fmtCount`(만/억). 크기 클래스는 **완성된
+    문자열로**(Tailwind 정적 스캔).
+  - 끌어 놓기 · 탭(선택, 같은 종류 재탭=머지) · 호버 툴팁(PC 전용)을 같은 포인터 이벤트로 처리.
+- **랭킹**(`GET /api/crate?board=1` + `Leaderboard.tsx`) — 골드 순위. 모달 열린 동안 5s, 탭 숨기면 정지.
+  - **⚠ 읽기 전용 유지** — 폴링에 쓰기가 붙으면 "스스로 반복하는 쓰기 경로"(§6). 서버도 SELECT 하나.
+  - 정렬은 `coins` 로 SQL `LIMIT 100`, 총자산(JSON 파생) 정렬은 그 100명 안에서 **클라가**. 두 기준을 함께 보여주는 이유:
+    재료를 쌓으면 골드 순위는 내려가도 총자산은 그대로다.
+- **⚠⚠ 회생 — 지원은 돈이 아니라 상자로**: 가난할수록 회복이 어렵다(머지엔 같은 재료 2개가 필요한데 골드 몇 푼으론 상자 한두
+  개라 재료가 흩어져 적자만 반복). 상자를 여러 개 줘야 머지가 성립한다.
+  - 두 단계, **컬럼 추가 없이** `refill_date`+`refill_count` 로: 그날 첫 수령(`refill_count === 0`)은 조건 없는 일일 지원(Lv1 상자
+    4 + 200골드), 그 뒤는 **총자산 < 상자 3개 값**일 때만 파산 구제(상자 3 + 400골드, 하루 4회). 일일 지원에 조건이 없는 건
+    부자에겐 푼돈·빈털터리엔 생명줄이라 그 자체가 따라잡기 장치.
+  - **⚠ 파산선은 "상자 3개" 값**(`BROKE_CRATES`) — 1개론 머지가 안 성립해 "구제받았는데 회생 불가".
+  - **⚠ 회생 검증은 `sim:crate`**(골드 0·재료 0 에서 14일): 합격선 **파산 탈출 60/60**(지원을 끄면 0/60). KST 날짜 바뀌면 자동 초기화.
 
 ## 11. 백로그 (열린 항목)
 

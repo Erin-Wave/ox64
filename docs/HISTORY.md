@@ -205,3 +205,8 @@ RangeError 로 화면이 통째로 죽는다 — `virtualPrecision(1e-12)=15` �
 이 **틀렸다는 것도 실측으로 확인**해 고쳤다(틱이 독립일 때 얘기다 — 국면이 69틱씩 살아 유효 표본은
 국면 개수이고, 실측 SE 는 7일 8회에 ~1.4e-6 이다. 8회 실행의 -2.6e-6 을 편향으로 오독했다가 48회로
 재니 +0.45e-6 이었다 → 편향 판정은 `SIM_RUNS=24` 이상에서).
+
+## 차트 인디케이터 확장 + CLAUDE.md 정리 — 2026-09-11
+
+- [x] **인디케이터 레지스트리화 + 12종 추가 + 표시/숨김 토글** — `src/services/indicatorDefs.ts`(INDICATOR_DEFS) 한 표로 Chart 가 그림(타입 분기 제거). SMA/VWAP(롤링)/Ichimoku/PSAR/SuperTrend/MACD/Stoch/ATR/ADX/CCI/OBV/W%R 추가, own 패널은 개수로 높이 분배, null 은 whitespace 로 넣어 선이 끊김(SuperTrend·후행스팬), Ichimoku 선행스팬은 시간 연장. `IndicatorConfig{params,visible}` 로 저장 형식 변경(구 `{period,mult}` 마이그레이션), `toggleIndicator` = 시리즈 `visible:false`(삭제 아님).
+- [x] **CLAUDE.md 272KB → 135KB** — §1~4·§7~11 압축, 가상 코인 절(564줄)은 docs/VIRTUAL_COIN.md 로 통째 이동(규칙 진실원본은 그 파일, 본문엔 요약+포인터). §5~6 은 원문 유지.

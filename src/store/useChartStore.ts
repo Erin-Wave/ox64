@@ -1,21 +1,25 @@
 import { create } from 'zustand';
+import {
+  INDICATOR_DEFS,
+  clampParam,
+  defaultParams,
+  isIndicatorType,
+  type IndicatorParams,
+  type IndicatorType,
+} from '@/services/indicatorDefs';
 
-export type IndicatorType = 'ema' | 'bb' | 'rsi';
+export type { IndicatorType, IndicatorParams } from '@/services/indicatorDefs';
 // 캔들/배경 등 차트 전용 색상 프리셋 — 사이트 다크/라이트/고대비 테마와는 별개(차트만 독립적으로 색을 바꿈).
 export type ChartColorScheme = 'binance' | 'okx' | 'tradingview';
 
+/** 차트에 올린 인디케이터 인스턴스 하나. 어떤 파라미터가 있는지는 indicatorDefs 의 정의(`params`)가 정하고,
+ * 여기엔 그 값만 든다. `visible=false` 는 **숨김**이다 — 설정을 잃지 않고 잠시 끄는 것(삭제와 별개). */
 export interface IndicatorConfig {
   id: string;
   type: IndicatorType;
-  period: number;
-  mult?: number; // bb 전용 (표준편차 배수)
+  params: IndicatorParams;
+  visible: boolean;
 }
-
-const DEFAULTS: Record<IndicatorType, Omit<IndicatorConfig, 'id' | 'type'>> = {
-  ema: { period: 20 },
-  bb: { period: 20, mult: 2 },
-  rsi: { period: 14 },
-};
 
 let seq = 0;
 const nextId = () => `ind_${++seq}_${Math.floor(Math.random() * 1e6)}`;
@@ -82,7 +86,10 @@ interface ChartState {
   setColorScheme: (cs: ChartColorScheme) => void;
   addIndicator: (type: IndicatorType) => void;
   removeIndicator: (id: string) => void;
-  updateIndicator: (id: string, patch: Partial<Pick<IndicatorConfig, 'period' | 'mult'>>) => void;
+  /** 파라미터 일부 변경(정의 범위로 클램프) */
+  updateIndicator: (id: string, patch: IndicatorParams) => void;
+  /** 표시/숨김 토글 — 삭제하지 않고 끈다 */
+  toggleIndicator: (id: string) => void;
 }
 
 export const BOOK_ROWS_MIN = 5;
@@ -127,6 +134,35 @@ const cleanLimit = (v: unknown): number | null => {
   return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : null;
 };
 
+/** 저장된 인디케이터 목록 정리 — (a)모르는 타입 제거 (b)파라미터를 정의 범위로 (c)**구 형식 `{period, mult}`**
+ * (레지스트리 이전 저장값)을 `params` 로 마이그레이션 — 첫 파라미터가 곧 period 였고 mult 는 BB 전용이었다.
+ * visible 이 없으면(구 저장값) 보이는 것으로 본다. */
+function migrateIndicators(raw: unknown): IndicatorConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const out: IndicatorConfig[] = [];
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue;
+    const rec = r as Record<string, unknown>;
+    if (!isIndicatorType(rec.type)) continue;
+    const type = rec.type;
+    const def = INDICATOR_DEFS[type];
+    const params = defaultParams(type);
+    const savedParams = rec.params;
+    if (savedParams && typeof savedParams === 'object') {
+      for (const p of def.params) {
+        const v = clampParam(type, p.key, (savedParams as Record<string, unknown>)[p.key]);
+        if (v !== undefined) params[p.key] = v;
+      }
+    } else {
+      const first = def.params[0];
+      if (first && typeof rec.period === 'number') params[first.key] = clampParam(type, first.key, rec.period) ?? first.def;
+      if (typeof rec.mult === 'number' && def.params.some((p) => p.key === 'mult')) params.mult = clampParam(type, 'mult', rec.mult) ?? params.mult;
+    }
+    out.push({ id: typeof rec.id === 'string' ? rec.id : nextId(), type, params, visible: rec.visible !== false });
+  }
+  return out;
+}
+
 const saved = load();
 export const useChartStore = create<ChartState>((set, get) => ({
   showCountdown: saved.showCountdown ?? true,
@@ -145,7 +181,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   tradeStrength: saved.tradeStrength ?? true,
   visibleBars: saved.visibleBars ?? 38,
   colorScheme: saved.colorScheme ?? 'binance',
-  indicators: saved.indicators ?? [],
+  indicators: migrateIndicators(saved.indicators),
   toggle: (k) => {
     set((s) => ({ [k]: !s[k] }) as Partial<ChartState>);
     persist(get());
@@ -172,7 +208,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
     persist(get());
   },
   addIndicator: (type) => {
-    const cfg: IndicatorConfig = { id: nextId(), type, ...DEFAULTS[type] };
+    const cfg: IndicatorConfig = { id: nextId(), type, params: defaultParams(type), visible: true };
     set((s) => ({ indicators: [...s.indicators, cfg] }));
     persist(get());
   },
@@ -182,8 +218,20 @@ export const useChartStore = create<ChartState>((set, get) => ({
   },
   updateIndicator: (id, patch) => {
     set((s) => ({
-      indicators: s.indicators.map((i) => (i.id === id ? { ...i, ...patch } : i)),
+      indicators: s.indicators.map((i) => {
+        if (i.id !== id) return i;
+        const params = { ...i.params };
+        for (const [k, v] of Object.entries(patch)) {
+          const c = clampParam(i.type, k, v);
+          if (c !== undefined) params[k] = c;
+        }
+        return { ...i, params };
+      }),
     }));
+    persist(get());
+  },
+  toggleIndicator: (id) => {
+    set((s) => ({ indicators: s.indicators.map((i) => (i.id === id ? { ...i, visible: !i.visible } : i)) }));
     persist(get());
   },
 }));
