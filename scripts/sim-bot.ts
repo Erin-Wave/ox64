@@ -378,8 +378,8 @@ function runOnce(): RunStat {
  * 체결 테이프·호가창(미세구조) — `simulateTick` 을 그대로 돌린다(1초 틱 = 유저 폴링과 같은 조건).
  * ⚠ 메인 루프에 섞지 않는다: 틱마다 테이프 배열(최대 700건)을 복사하므로 무겁다. 정상성 지표라 하루치면 충분하다.
  */
-function runTape(ticks = 86_400, dtSec = 1) {
-  let s = fresh();
+function runTape(ticks = 86_400, dtSec = 1, p0 = 1) {
+  let s = fresh(p0);
   let tape: TapeTrade[] = [];
   let book: BotBook = { owner: 'bot-mm-1', bids: [], asks: [] };
   // 관심도 구간별 집계: quiet(<0.25) / mid / hot(>2)
@@ -390,6 +390,13 @@ function runTape(ticks = 86_400, dtSec = 1) {
     mid: { ticks: 0, zero: 0, prints: 0, kept: 0, keptDen: 0, vol: 0 },
     hot: { ticks: 0, zero: 0, prints: 0, kept: 0, keptDen: 0, vol: 0 },
   };
+  // **체결로 만든** 1분봉 폭(유저가 차트에서 보는 봉) — 공정가 범위와 달리 호가 바운스·격자 스냅이 들어간다.
+  // 관심도 구간별로 나눈다(그 분의 평균 관심도 기준). ⚠ 틱이 굵은 가격대(1.x, 10~19.x)에서 따로 볼 것.
+  const candle: Record<Band, number[]> = { quiet: [], mid: [], hot: [] };
+  let cHi = -Infinity;
+  let cLo = Infinity;
+  let cInt = 0;
+  const perMin = Math.round(60 / dtSec);
   let prints = 0;
   let up = 0;
   let down = 0;
@@ -430,7 +437,10 @@ function runTape(ticks = 86_400, dtSec = 1) {
       spreadSum += r.book.asks[0].price / r.book.bids[0].price - 1;
       spreadN++;
     }
+    cInt += prevInterest;
     for (const x of newPrints) {
+      cHi = Math.max(cHi, x.price);
+      cLo = Math.min(cLo, x.price);
       prints++;
       a.vol += x.size;
       const d = x.price - lastPrice;
@@ -452,6 +462,13 @@ function runTape(ticks = 86_400, dtSec = 1) {
       const dg = String(Math.round(x.size)).length;
       digits[dg] = (digits[dg] ?? 0) + 1;
     }
+    if ((t + 1) % perMin === 0) {
+      const mi = cInt / perMin;
+      if (cHi > 0 && cLo < Infinity) candle[mi < 0.25 ? 'quiet' : mi > 2 ? 'hot' : 'mid'].push(cHi / cLo - 1);
+      cHi = -Infinity;
+      cLo = Infinity;
+      cInt = 0;
+    }
     prevInterest = r.next.interest;
     s = r.next;
     tape = r.tape.length > 700 ? r.tape.slice(-700) : r.tape; // prod 링 버퍼와 같은 길이(복사 비용도 막는다)
@@ -468,6 +485,7 @@ function runTape(ticks = 86_400, dtSec = 1) {
         perSec: a.ticks ? a.prints / a.ticks / dtSec : NaN,
         rest: a.keptDen ? a.kept / a.keptDen : NaN,
         volPerSec: a.ticks ? a.vol / a.ticks / dtSec : NaN,
+        candle: median(candle[b]),
       };
     }),
     upBuy: up ? upBuy / up : NaN,
@@ -563,12 +581,13 @@ console.log(
   console.log(`가격 수준 독립성(${LEVEL_RUNS}회): ${rows.join(' / ')} — 셋 다 0 근처여야 "돌아가야 할 가격"이 없다`);
 }
 
-const tp = runTape();
-console.log('\n── ④ 체결 테이프·호가창(1초 틱 = 유저 폴링, 하루) ──');
+const TAPE_P0 = Number(process.env.SIM_TAPE_P0) || 1;
+const tp = runTape(86_400, 1, TAPE_P0);
+console.log(`\n── ④ 체결 테이프·호가창(1초 틱 = 유저 폴링, 하루, 시작가 ${TAPE_P0}) ──`);
 for (const b of tp.bands) {
   console.log(
     `${b.band.padEnd(5)} 시간 ${pct(b.share, 0).padStart(4)}  체결 없는 초 ${pct(b.zero, 0).padStart(4)}  초당 체결 ${b.perSec.toFixed(2)}건  ` +
-      `초당 거래량 ${Math.round(b.volPerSec).toLocaleString()}  호가 지속(직전 초와 같은 레벨) ${pct(b.rest, 0)}`,
+      `초당 거래량 ${Math.round(b.volPerSec).toLocaleString()}  호가 지속(직전 초와 같은 레벨) ${pct(b.rest, 0)}  체결 1분봉 폭(중앙) ${pct(b.candle)}`,
   );
 }
 console.log(

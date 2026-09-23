@@ -862,9 +862,14 @@ const SLICE_CHANCE = 0.2;
 const SLICE_MIN = 2;   // 자식 최소 건수
 const SLICE_RAND = 4;  // 자식 수 = SLICE_MIN + floor(rand × SLICE_RAND)
 const SLICE_JITTER = 0.12; // 자식끼리의 크기 흔들림(완전히 똑같으면 그것도 기계적이다)
-/** 최우선 매수/매도호가의 half-spread — 사다리 최상단(level 0 ≈ 0.0008)과 같은 자리에 찍히게 맞춘다. */
-const MICRO_HALF_SPREAD = 0.0006;
-/** 큰 체결이 사다리를 파고드는 깊이 계수(수량 √배에 비례)와 그 상한. */
+/** 최우선 매수/매도호가의 half-spread — 사다리 최상단(`SPREAD_BASE`)과 **같은 값**이어야 체결이 호가 자리에 찍힌다.
+ * ⚠ 2026-09-23 0.0006 → 0.00035(아래 SPREAD_BASE 참고) — 둘을 따로 바꾸면 체결이 호가 안쪽/바깥에 찍힌다. */
+const MICRO_HALF_SPREAD = 0.00035;
+/** 큰 체결이 사다리를 파고드는 깊이 계수(수량 √배에 비례)와 그 상한. ⚠ 가격 거리라 **쓰는 자리에서** 진폭에 맞춘다
+ * (× √MOVE_SCALE, 스톱헌팅과 같은 규칙 — 2026-09-23). 예전 값 그대로면 한산한 시장에서도 고래 한 건이 봉을 0.5% 넘게
+ * 찢어, 공정가는 0.06% 움직이는데 1분봉은 0.4% 인 "조용한데 봉만 큰" 차트가 됐다.
+ * ⚠ 여기서 곱하면 안 된다 — MOVE_SCALE 은 아래에 정의돼 있어 모듈 초기화 시점엔 아직 없다(TDZ 예외 또는 번들러가
+ * var 로 바꾸면 NaN → 체결가 전부 NaN). 모듈 상수끼리는 **위에 정의된 것만** 참조할 것. */
 const MICRO_DIG = 0.0009;
 const MICRO_DIG_MAX = 0.008;
 /** 틱 안의 mid(호가 중간값)가 목표 가격 경로를 따라가는 속도.
@@ -897,7 +902,10 @@ const QUOTE_CHURN_TOP = 0.55;
 /** 사다리의 기하 — 최우선호가 스프레드 / 레벨 간격 / 레벨마다 실리는 지터. ⚠ 슬롯 귀속 판정
  * (§ placeQuote)이 이 값들로 구간을 계산하므로 **한 곳에만** 적는다: 예전엔 목표가 계산과 최대 거리
  * 계산이 각자 0.0006/0.00055/0.0004 를 적고 있어서, 한쪽만 고치면 살아있는 주문이 조용히 버려진다. */
-const SPREAD_BASE = 0.0006;
+// ⚠ SPREAD_BASE 는 2026-09-23 에 0.0006 → 0.00035. 격자 스냅(바깥쪽 floor/ceil)·스프레드 배수·한산 가산이 얹혀
+// 실측 최우선 스프레드가 0.28~0.31% 였다 — 움직임이 크던 시절엔 가려졌지만, 관심도 도입 후 한산한 시장의 1분봉이
+// 스프레드(호가 바운스) 폭에 묶여 공정가보다 몇 배 커 보였다. 지금 실측 ~0.15%(밈코인 수준). MICRO_HALF_SPREAD 와 같은 값.
+const SPREAD_BASE = 0.00035;
 const LEVEL_STEP = 0.00055;
 const LEVEL_JITTER = 0.0004;
 const LEVEL_HALF_STEP = LEVEL_STEP / 2;
@@ -1240,7 +1248,7 @@ const DRIFT_NOISE = 0.00026;
 /** 변동성 충격 e^(0.45g) 의 평균(= e^(0.45²/2)) — business time 식에서 평균과 요동을 나눠 적는 데 쓴다. */
 const VOL_SHOCK_MEAN = Math.exp((0.45 * 0.45) / 2);
 /** 한산할 때 스프레드가 벌어지는 정도 — 관심도 0 이면 ×(1+이 값). 경쟁하는 마켓메이커가 적다. */
-const QUIET_SPREAD = 0.3;
+const QUIET_SPREAD = 0.15;
 /** 호가 교체 속도의 하한(business time 환산) — 관심도가 바닥이어도 호가는 가끔 넣고 뺀다. 관심도 0.3 수준에 해당. */
 const BOOK_PACE_FLOOR = 0.3;
 
@@ -1424,7 +1432,13 @@ function humanQuotePrice(target: number, side: 'buy' | 'sell', depth: number): {
     if (priceHash(idx, g.ticks) > g.pull) continue;
     return { price: roundOx(snapped), sizeMult: g.sizeMult };
   }
-  return { price: roundOx(target), sizeMult: 1 }; // 어느 격자에도 안 붙으면 원래 값(어중간한 가격도 섞여야 자연스럽다)
+  // 어느 격자에도 안 붙으면 원래 값(어중간한 가격도 섞여야 자연스럽다) — ⚠⚠ 단 **틱에도 바깥쪽으로** 맞춘다(2026-09-23).
+  // 가장 가까운 틱으로 반올림(roundOx)하면 목표가 반 틱 안쪽일 때 mid 쪽으로 넘어간다: 공정가를 반올림하지 않게 되고
+  // (§ BotState.ref) 스프레드를 좁힌 뒤, 가격 1.x(틱 0.1%)에서 새 매도호가가 공정가 **아래로** 반올림돼 살아남은
+  // 매수호가와 겹쳤다(sim 하루 41회 호가 역전). 매수는 내림·매도는 올림이면 매수 < 공정가 < 매도가 구조적으로 보장된다.
+  const t = virtualTick(target);
+  const k = target / t;
+  return { price: roundOx((side === 'buy' ? Math.floor(k + 1e-9) : Math.ceil(k - 1e-9)) * t), sizeMult: 1 };
 }
 
 /**
@@ -2098,7 +2112,7 @@ export function simulateTick(
         sliceLeft = SLICE_MIN - 1 + Math.floor(Math.random() * SLICE_RAND);
       }
     }
-    const dig = Math.min(MICRO_DIG_MAX, MICRO_DIG * Math.max(0, Math.sqrt(sz / tradeMean) - 0.6)); // ③ 파고든 깊이
+    const dig = Math.sqrt(MOVE_SCALE) * Math.min(MICRO_DIG_MAX, MICRO_DIG * Math.max(0, Math.sqrt(sz / tradeMean) - 0.6)); // ③ 파고든 깊이(× 진폭)
     const dir = flowSide === 'buy' ? 1 : -1;
     // ③ 파고든 만큼 **mid 자체가 밀린다**(사다리가 소비됐다) — 그리고 목표 경로가 서서히 되돌린다.
     //    그래서 고래가 훑고 간 자리엔 꼬리가 남고, 같은 방향이 이어지는 동안엔 가격이 단조로 걸어간다.
@@ -2115,8 +2129,13 @@ export function simulateTick(
     // 가격에 일어나는데, 그 호가들이 위 humanQuotePrice 로 라운드 가격에 뭉쳐 있기 때문. 테이프만
     // 어중간한 값이면 호가창과 따로 노는 시장으로 보인다. 스냅 격자는 위 PRICE_GRIDS 의 가장 촘촘한
     // 격자(5틱)와 맞춘다. (예전엔 마지막 체결을 기준가에 강제했다 — 위 "마지막 체결을 맞추지 않는다" 참고)
+    // ⚠⚠ **스냅은 호가 스프레드 안쪽에서만**(2026-09-23). 유효숫자 4자리 틱은 가격대에 따라 굵어서(19.55 면
+    // 0.01 → 5틱 = 0.26%, 1.x 면 0.001 → 5틱 = 0.5%) 무조건 스냅하면 체결이 **최우선호가 바깥까지** 끌려가
+    // 한산한 시장의 1분봉이 스프레드의 몇 배로 부풀었다(관심도 도입 후 prod 에서 드러남 — 공정가는 0.06% 움직이는데
+    // 봉은 0.3~0.8%). 스냅 거리가 반 스프레드를 넘으면 그 격자는 포기하고 틱에만 맞춘다.
     const tapeStep = 5 * virtualTick(raw);
-    const snapped = Math.random() < 0.65 ? Math.round(raw / tapeStep) * tapeStep : raw;
+    const grid = Math.round(raw / tapeStep) * tapeStep;
+    const snapped = Math.random() < 0.65 && Math.abs(grid - raw) <= half * raw ? grid : raw;
     const price = clampToWalls(roundOx(snapped));
     if (i === 0) open = price;
     close = price;
