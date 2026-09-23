@@ -57,7 +57,11 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
             )
           : Promise.resolve(null),
       ]);
-      return json({ market, candles, state });
+      // ⚠ mark = 봇 공정가(반올림된 ref_price). 헤더 현재가·청산가 추정은 이 값을 쓴다 — 캔들 종가(마지막
+      // 체결가)는 호가(bid/ask)에 찍히므로 공정가와 반 스프레드쯤 다를 수 있다(§ spot.ts "마지막 체결을 기준가에
+      // 맞추지 않는다"). 서버의 강제청산·트리거도 이 값을 보므로 화면과 판정이 어긋나지 않는다.
+      // 봇 틱이 실패했거나 sweep 체결로 낡은 경우는 null — 클라는 그때만 봉 종가로 대신한다.
+      return json({ market, candles, state, mark: tickCtx?.mark ?? null });
     }
 
     // 지정가/SL/TP 체결 체크 — 폴링 시점마다 평가(서버에 cron 없음, functions/_trading.ts 참고).

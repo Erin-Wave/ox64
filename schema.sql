@@ -171,7 +171,8 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   sentiment    REAL NOT NULL DEFAULT 0,       -- 군중 심리 -1(공포) ~ +1(탐욕)
   anchor       REAL NOT NULL DEFAULT 0,       -- 완만히 따라오는 "적정가"(과열/과매도 판정 기준, 0=미초기화)
   regime       TEXT NOT NULL DEFAULT 'calm',  -- calm|rally|euphoria|pullback|panic|capitulation
-  regime_ticks INTEGER NOT NULL DEFAULT 0,    -- 현재 국면이 지속된 틱 수(최소 지속시간 보장용)
+  regime_ticks INTEGER NOT NULL DEFAULT 0,    -- 현재 국면의 나이(최소 지속시간 보장용). ⚠ 2026-09-23 부터 틱 수가 아니라
+                                              -- business time 누적이라 소수가 들어간다(INTEGER 친화 컬럼이라 SQLite 가 REAL 로 그대로 둔다)
   -- ⚠ 서서히 잊히는 최근 고점/저점(2026-08-12). 탐욕/공포 게이지의 기준이자 "저항 돌파 추격(FOMO)"·
   -- "지지 붕괴 손절 연쇄"의 방아쇠 — 시장이 자기 고점/저점을 기억해야 사람이 읽는 사건이 생긴다.
   -- 0 = 미초기화(첫 틱에 현재가로 세팅).
@@ -200,7 +201,15 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   -- 행에 누적되므로(같은 1행 UPDATE) 정확도 손실 없이 쓰기만 사라진다 — 정산이 최대 몇 분 늦을 뿐이다.
   pend_notional REAL NOT NULL DEFAULT 0,      -- 아직 users.total_volume/total_fees 에 안 넘긴 합성체결 명목금액
   pend_rows     INTEGER NOT NULL DEFAULT 0,   -- 아직 usage_meter 에 안 넘긴 예상 쓰기 행 수
-  pend_ticks    INTEGER NOT NULL DEFAULT 0    -- 마지막 정산 이후 돈 틱 수(정산 주기 판정용)
+  pend_ticks    INTEGER NOT NULL DEFAULT 0,   -- 마지막 정산 이후 돈 틱 수(정산 주기 판정용)
+  -- ⚠ 관심도(2026-09-23, functions/api/spot.ts § 관심도). 시장 시간이 흐르는 속도 — 낮으면 체결이 드물고 호가가
+  -- 멈춰 있고, 거래가 몰리면 1초에 몇 틱치 시장이 흐른다. 0 = 미초기화(첫 틱에 목표값에서 시작).
+  interest      REAL NOT NULL DEFAULT 0,
+  hype          REAL NOT NULL DEFAULT 0,      -- 화제성(몇 시간짜리 느린 관심, 평균 ~1). 0 = 미초기화
+  -- 반올림 전 공정가. ref_price 는 틱 격자(유효숫자 4자리)에 스냅된 값이라 한산한 틱의 작은 이동이 버려지므로
+  -- 원본을 따로 둔다. ⚠ ref_price 가 이 값의 반올림일 때만 이어 쓴다 — 유저 체결은 ref_price 만 바꾸므로
+  -- 둘이 어긋났다면 유저가 가격을 옮긴 것이고, 그땐 ref_price 에서 다시 시작한다(§ toBotState). 0 = 미초기화
+  fair          REAL NOT NULL DEFAULT 0
 );
 
 -- 가상 코인 시작가 — 이 행이 있어야 그 페어의 봇이 돈다(functions/api/spot.ts VIRTUAL_PAIRS 와 짝).
@@ -547,6 +556,16 @@ CREATE INDEX IF NOT EXISTS idx_dungeon_players_room ON dungeon_players(room_code
 -- (배포 시점에 진행 중이던 버킷 하나만 해당 — 다음 버킷부터는 정상).
 -- ALTER TABLE spot_candles ADD COLUMN open_at INTEGER NOT NULL DEFAULT 0;
 -- ALTER TABLE spot_candles ADD COLUMN close_at INTEGER NOT NULL DEFAULT 0;
+
+-- ⚠ 일회성 마이그레이션 (2026-09-23 추가, 가상 코인 관심도): spot_bot_state 에 관심도·화제성·반올림 전 공정가.
+-- 위 CREATE TABLE 에는 이미 포함돼 있지만 기존 DB(=prod)엔 CREATE TABLE IF NOT EXISTS 가 컬럼을
+-- 더해주지 않으므로 최초 1회만 아래를 직접 실행할 것.
+-- ⚠⚠ **코드 배포 전에 먼저 적용돼야 한다** — 봇 커밋 UPDATE 와 유저 체결의 기준가 upsert 가 이 컬럼들을
+-- 쓰므로, 없으면 봇 틱과 **OX/EW 체결 batch 가 통째로 롤백된다**(= 가상 코인 시장·거래가 멈춘다).
+-- 전부 DEFAULT 0(=미초기화)이라 기존 행도 첫 틱에 스스로 초기화된다. 컬럼이 늘어도 UPDATE 는 1행 그대로다.
+-- ALTER TABLE spot_bot_state ADD COLUMN interest REAL NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_bot_state ADD COLUMN hype REAL NOT NULL DEFAULT 0;
+-- ALTER TABLE spot_bot_state ADD COLUMN fair REAL NOT NULL DEFAULT 0;
 
 -- ── 상자깡(ox64.app/c) — 상자를 까서 재료·돈을 얻고, 재료를 합쳐 값을 올리는 미니게임 ────────────
 -- 트레이딩·퍼즐·던전 어느 쪽과도 완전히 분리된 별도 재화(coins)다. 계정만 기존 users 테이블

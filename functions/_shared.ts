@@ -119,7 +119,8 @@ export function virtualPrecision(price: number): number {
 // ⚠ 하한을 더 내릴 땐 **표시 자릿수**를 같이 볼 것 — `virtualPrecision(1e-12)=15` 이고 `toLocaleString`
 // 의 `maximumFractionDigits` 는 구형 엔진에서 20 이 상한이라, 1e-18 밑으로 내리면 화면이 터진다
 // (`src/format.ts fmtPrice` 가 방어로 20 에서 자르지만 그 아래 자릿수는 어차피 표시되지 않는다).
-// 실사용에선 여기 닿기 한참 전에 `BOT_BASE_PULL`(anchor 를 1 로 당기는 로그거리 제곱 복원력)이 되돌린다.
+// ⚠ 2026-09-23 부터 기준선(1)으로 되돌리는 힘(BOT_BASE_PULL)은 없다 — 가격은 로그 랜덤워크로 자유롭게 떠돌고
+// (편향은 sim 로그드리프트 ≈ 0 으로 관리), 이 클램프는 수십 년에 한 번 닿을까 말까 한 순수 안전장치다.
 export const VIRTUAL_PRICE_MIN = 1e-12;
 export const VIRTUAL_PRICE_MAX = 1e12;
 

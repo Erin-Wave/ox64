@@ -236,7 +236,7 @@ export const api = {
    * 무료 플랜(하루 10만 요청)에서 "하루 총 시청 시간 11.4시간"이라는 천장을 만들었다.
    * `state` 는 매번 받지 않는다 — 매번 받으면 요청은 줄어도 계정 읽기가 2.5배가 되어 읽기 쪽이 손해다. */
   spotTick: (pair: string, o: { interval: string; bars: number; state?: boolean; ordersSince?: number }) =>
-    req<{ market: SpotState; candles: Candle[]; state: AppState | null }>(
+    req<{ market: SpotState; candles: Candle[]; state: AppState | null; mark?: number | null }>(
       `/state?tick=${encodeURIComponent(pair)}&interval=${encodeURIComponent(o.interval)}&bars=${o.bars}` +
         (o.state ? '&state=1' : '') +
         (o.state && o.ordersSince ? `&ordersSince=${o.ordersSince}` : ''),

@@ -115,7 +115,6 @@ export default function Chart() {
   const symbol = useMarketStore((s) => s.symbol);
   const interval = useMarketStore((s) => s.interval);
   const setIntervalCode = useMarketStore((s) => s.setInterval);
-  const setPrice = useMarketStore((s) => s.setPrice);
   const setPrecision = useMarketStore((s) => s.setPrecision);
   const setConnected = useMarketStore((s) => s.setConnected);
 
@@ -560,7 +559,9 @@ export default function Chart() {
         setConnected(true);
         if (l) {
           applyPrec(l.close);
-          setPrice(symbol, l.close);
+          // ⚠ 현재가는 여기서 넣지 않는다(2026-09-23) — 가상 코인의 봉 종가는 마지막 체결가라 매수면
+          // 매도호가·매도면 매수호가에 찍혀 공정가(서버 mark)와 반 스프레드쯤 다르다. 헤더·청산가는 통합
+          // 폴링이 받은 mark 를 쓴다(useTradingStore.spotTick) — 둘 다 넣으면 숫자가 번갈아 깜빡인다.
           if (!hovering.current) setLegend(l);
         }
         if (!hovering.current) setIndLegend(lastIndLegend());

@@ -502,6 +502,11 @@ export const useTradingStore = create<TradingState>((set) => ({
       });
       applySpot(set, r.market);
       if (r.candles.length) set({ spotCandles: r.candles, spotCandlesAt: Date.now(), spotCandlesKey: key });
+      // ⚠ 가상 코인의 현재가 = 서버 mark(봇 공정가) — 차트는 가상 코인에서 setPrice 를 하지 않는다(Chart.tsx).
+      // 봉 종가(마지막 체결가)는 매수면 매도호가·매도면 매수호가에 찍혀 공정가와 반 스프레드쯤 다르고, 그걸
+      // 헤더에 넣으면 3초마다 오는 markPrices 와 번갈아 **숫자가 깜빡인다**(고배율이면 손익도 같이 튄다).
+      const mark = r.mark ?? r.candles.at(-1)?.close;
+      if (typeof mark === 'number' && isFinite(mark) && mark > 0) useMarketStore.getState().setPrice(pair, mark);
       if (r.state) apply(set, r.state);
     } catch {
       /* 다음 폴링에서 재시도 — 마지막 알려진 값 유지 */
