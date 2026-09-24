@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useTradingStore } from '@/store/useTradingStore';
 import { useMarketStore } from '@/store/useMarketStore';
-import { fmtKrw, fmtMoney, fmtNumInput, unfmtNum } from '@/format';
+import { fmtKrw, fmtMoney, fmtMoneyShort, fmtNumInput, unfmtNum } from '@/format';
 import { quoteOf, USDT_KRW, type Quote } from '@/symbols';
 import { fetchBithumbPrices } from '@/services/bithumb';
 
@@ -64,8 +64,14 @@ export default function ConvertModal({ onClose }: { onClose: () => void }) {
   // "최대"는 표시 자릿수에서 **내림** — 반올림으로 올리면 서버 한도를 살짝 넘는다(서버는 그 정도는 최대치로 맞춰 준다).
   const setMax = () => {
     const f = Math.pow(10, digits);
-    setAmount(String(Math.floor(convertible * f) / f));
+    const v = Math.floor(convertible * f) / f;
+    // ⚠ 1e21 이상은 String() 이 지수 표기("8.4e+45")라 입력칸이 읽을 수 없게 된다 — 전체 자릿수로 편다(OrderPanel trimNum 과 같은 이유)
+    setAmount(v >= 1e21 ? v.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 }) : String(v));
   };
+  // ⚠ 잔고가 1e45 까지 가는 사이트라 금액은 전부 축약하고(§format.fmtMoneyShort) 전체값은 title 로 — 안 그러면 한 줄이
+  // 모달 밖으로 밀리고 옆 라벨이 한 글자씩 세로로 쪼개졌다(제보 스크린샷).
+  const full = (v: number, q: Quote) => `${fmtMoney(v, q)} ${q}`;
+  const short = (v: number, q: Quote) => fmtMoneyShort(v, q, 12);
   const swap = () => {
     setFrom(to);
     setAmount('');
@@ -77,10 +83,10 @@ export default function ConvertModal({ onClose }: { onClose: () => void }) {
   };
 
   const walletRow = (q: Quote, v: number) => (
-    <div className="flex items-baseline justify-between text-xs">
-      <span className="text-muted">{q === 'USDT' ? 'USDT 지갑' : '원화 지갑'}</span>
-      <span className="font-semibold tabular-nums text-text">
-        {q === 'KRW' ? fmtKrw(v) : fmtMoney(v, 'USDT')} {q}
+    <div className="flex items-baseline justify-between gap-2 text-xs">
+      <span className="shrink-0 text-muted">{q === 'USDT' ? 'USDT 지갑' : '원화 지갑'}</span>
+      <span className="min-w-0 truncate font-semibold tabular-nums text-text" title={full(v, q)}>
+        {short(v, q)} {q}
       </span>
     </div>
   );
@@ -101,17 +107,17 @@ export default function ConvertModal({ onClose }: { onClose: () => void }) {
         <div className="mb-3 space-y-1 rounded-xl border border-border bg-bg p-3">
           {walletRow('USDT', balance)}
           {walletRow('KRW', krwBalance)}
-          <div className="flex items-baseline justify-between border-t border-border pt-1 text-xs">
-            <span className="text-muted">환율 (빗썸)</span>
+          <div className="flex items-baseline justify-between gap-2 border-t border-border pt-1 text-xs">
+            <span className="shrink-0 text-muted">환율 (빗썸)</span>
             <span className="tabular-nums text-text">{rate ? `1 USDT = ${fmtKrw(rate)} KRW` : '불러오는 중…'}</span>
           </div>
         </div>
 
         {/* 보내는 쪽 */}
-        <div className="mb-1 flex items-center justify-between text-xs text-muted">
-          <span>보내는 금액</span>
-          <button onClick={setMax} className="text-accent hover:underline" title="환전 가능액 전부">
-            최대 {from === 'KRW' ? fmtKrw(convertible) : fmtMoney(convertible, 'USDT')} {from}
+        <div className="mb-1 flex items-center justify-between gap-2 text-xs text-muted">
+          <span className="shrink-0 whitespace-nowrap">보내는 금액</span>
+          <button onClick={setMax} className="min-w-0 truncate text-accent hover:underline" title={`환전 가능액 전부 — ${full(convertible, from)}`}>
+            최대 {short(convertible, from)} {from}
           </button>
         </div>
         <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
@@ -136,10 +142,10 @@ export default function ConvertModal({ onClose }: { onClose: () => void }) {
         </div>
 
         {/* 받는 쪽(미리보기) */}
-        <div className="mb-3 flex items-center justify-between rounded-md bg-panel2 px-3 py-2 ring-1 ring-border">
-          <span className="text-xs text-muted">받는 금액(예상)</span>
-          <span className="text-sm font-semibold tabular-nums text-text">
-            {amt > 0 && rate ? (to === 'KRW' ? fmtKrw(received) : fmtMoney(received, 'USDT')) : '—'} {to}
+        <div className="mb-3 flex items-center justify-between gap-2 rounded-md bg-panel2 px-3 py-2 ring-1 ring-border">
+          <span className="shrink-0 whitespace-nowrap text-xs text-muted">받는 금액(예상)</span>
+          <span className="min-w-0 truncate text-sm font-semibold tabular-nums text-text" title={amt > 0 && rate ? full(received, to) : undefined}>
+            {amt > 0 && rate ? short(received, to) : '—'} {to}
           </span>
         </div>
 

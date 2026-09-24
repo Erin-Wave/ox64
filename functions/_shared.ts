@@ -330,17 +330,110 @@ async function fromBinanceMirror(symbol: string): Promise<number> {
 // 예비 소스는 없다 — 빗썸이 멈추면 원화 심볼은 가격이 비고, 그동안 원화 지갑의 강제청산 판정은 건너뛴다.
 export const bithumbMarket = (s: string) => `KRW-${s.slice(0, -3)}`; // 'BTCKRW' → 'KRW-BTC', 'USDTKRW' → 'KRW-USDT'
 let lastUsdtKrw: number | null = null; // 이 isolate 가 마지막으로 본 환율(§ toUsdtValue)
-async function fromBithumb(symbols: string[]): Promise<Record<string, number>> {
-  const syms = [...new Set([...symbols, USDT_KRW])]; // 환율은 항상 같이 받는다(공짜 — 같은 요청)
-  const r = await timedFetch(`https://api.bithumb.com/v1/ticker?markets=${syms.map(bithumbMarket).join(',')}`);
-  if (!r.ok) throw new Error(`bithumb ${r.status}`);
-  const arr = (await r.json()) as { market: string; trade_price: number }[];
+// ⚠⚠ **빗썸(과 업비트)은 Cloudflare 홍콩(HKG) 엣지에서 자주 멈춘다**(2026-09-24 운영 실측). 한국발 요청이 무료 플랜에서
+// HKG 로 가는 일이 있는데, 거기선 요청의 30~70% 가 2.5초 무응답이고 나쁜 구간엔 몰려서 다 멈춘다(도쿄 NRT 는 전부 ~100ms).
+// 헤더(UA·Origin)·엔드포인트(v1·구 API)를 바꿔도 같았다. 단발 요청이면 환전·원화 주문이 "환율/시세 조회 실패"로 자주
+// 떨어졌다(제보). 대응 셋: ① 시차를 두고 **최대 4번** 띄워 먼저 성공한 걸 쓴다(첫 요청이 0.4초 안에 오면 나머지는 안 나가서
+// 평소 외부 호출은 1회 그대로, 최악 4회) ② 환율은 **업비트 KRW-USDT 와 경주**/폴백(다른 거래소지만 환율은 몇 원 차이)
+// ③ 전부 실패하면 이 isolate 가 최근에 받은 값(§ BITHUMB_STALE_MS / RATE_STALE_MS).
+const BITHUMB_STAGGER_MS = [0, 400, 1000, 1800];
+const UPBIT_STAGGER_MS = [0, 600];
+const ATTEMPT_MS = 2500;
+async function hedgedJson(url: string, stagger: number[]): Promise<unknown> {
+  let settled = false;
+  const ctrls: AbortController[] = [];
+  const attempt = (delay: number) =>
+    new Promise<unknown>((resolve, reject) => {
+      setTimeout(async () => {
+        if (settled) return reject(new Error('cancelled')); // 앞 요청이 이미 성공 — 외부 호출을 만들지 않는다
+        const c = new AbortController();
+        ctrls.push(c);
+        const t = setTimeout(() => c.abort(), ATTEMPT_MS);
+        try {
+          const r = await fetch(url, { headers: HDR, signal: c.signal });
+          if (!r.ok) throw new Error(`status ${r.status}`);
+          resolve(await r.json());
+        } catch (e) {
+          reject(e);
+        } finally {
+          clearTimeout(t);
+        }
+      }, delay);
+    });
+  try {
+    return await Promise.any(stagger.map(attempt));
+  } catch {
+    throw new Error('timeout');
+  } finally {
+    settled = true;
+    for (const c of ctrls) c.abort(); // 아직 매달린 요청 정리
+  }
+}
+/** 업비트 USDT/KRW — 환율 전용 예비 소스(빗썸과 경로가 달라 동시에 멈출 확률이 낮다). */
+async function upbitUsdtKrw(): Promise<number> {
+  const arr = (await hedgedJson('https://api.upbit.com/v1/ticker?markets=KRW-USDT', UPBIT_STAGGER_MS)) as { trade_price: number }[];
+  const p = Number(arr?.[0]?.trade_price);
+  if (!(p > 0) || !isFinite(p)) throw new Error('upbit rate');
+  return p;
+}
+// 전부 실패했을 때 쓸 수 있는 "최근 값"의 나이 한도 — 거래 시세는 짧게(체결가가 낡으면 안 된다), 환율은 길게
+// (분 단위로 거의 안 움직이고 환전·랭킹 환산에만 쓴다).
+const BITHUMB_STALE_MS = 5_000;
+const RATE_STALE_MS = 5 * 60_000;
+const bithumbCache = new Map<string, { p: number; at: number }>();
+const remember = (s: string, p: number) => bithumbCache.set(s, { p, at: Date.now() });
+async function bithumbTickers(syms: string[]): Promise<Record<string, number>> {
+  const arr = (await hedgedJson(`https://api.bithumb.com/v1/ticker?markets=${syms.map(bithumbMarket).join(',')}`, BITHUMB_STAGGER_MS)) as {
+    market: string;
+    trade_price: number;
+  }[];
   const byMarket = new Map(arr.map((x) => [x.market, Number(x.trade_price)]));
   const out: Record<string, number> = {};
   for (const s of syms) {
     const p = byMarket.get(bithumbMarket(s));
-    if (p && isFinite(p) && p > 0) out[s] = p;
+    if (p && isFinite(p) && p > 0) {
+      out[s] = p;
+      remember(s, p);
+    }
   }
+  return out;
+}
+async function fromBithumb(symbols: string[]): Promise<Record<string, number>> {
+  const trade = [...new Set(symbols)].filter((s) => s !== USDT_KRW);
+  const out: Record<string, number> = {};
+  if (trade.length === 0) {
+    // 환율만 필요(환전·랭킹·리필) — 빗썸과 업비트를 **동시에** 띄워 먼저 온 쪽을 쓴다.
+    try {
+      out[USDT_KRW] = await Promise.any([
+        bithumbTickers([USDT_KRW]).then((m) => m[USDT_KRW] ?? Promise.reject(new Error('no rate'))),
+        upbitUsdtKrw(),
+      ]);
+      remember(USDT_KRW, out[USDT_KRW]);
+    } catch {
+      /* 아래 최근 값으로 */
+    }
+  } else {
+    try {
+      Object.assign(out, await bithumbTickers([...trade, USDT_KRW])); // 환율은 같은 요청에 실려 공짜
+    } catch {
+      /* 아래 최근 값·업비트 환율로 */
+    }
+  }
+  const now = Date.now();
+  for (const s of [...trade, USDT_KRW]) {
+    if (out[s] != null) continue;
+    const c = bithumbCache.get(s);
+    if (c && now - c.at <= (s === USDT_KRW ? RATE_STALE_MS : BITHUMB_STALE_MS)) out[s] = c.p;
+  }
+  if (out[USDT_KRW] == null && trade.length > 0) {
+    try {
+      out[USDT_KRW] = await upbitUsdtKrw();
+      remember(USDT_KRW, out[USDT_KRW]);
+    } catch {
+      /* 환율 없음 — 호출자가 처리 */
+    }
+  }
+  if (Object.keys(out).length === 0) throw new Error('bithumb timeout'); // 쓸 수 있는 값이 하나도 없다
   if (out[USDT_KRW]) lastUsdtKrw = out[USDT_KRW];
   return out;
 }

@@ -132,7 +132,7 @@ ox64/
 ```
 
 - **차트 시세 = 바이낸스 스팟**(REST `api.binance.com/api/v3/klines`, WS `stream.binance.com:9443`; 선물 WS 는 지역에 따라 막힘). **클라 시세는 표시 전용** — 체결가는 서버(`_shared.fetchPrice`)가 따로 받는다.
-- **원화 심볼(BTCKRW 등) = 전부 빗썸** — 차트·호가·체결·mark 는 브라우저↔빗썸 직결(`services/bithumb.ts`), 서버 체결가는 `fromBithumb`(원화 심볼 전부 + 환율을 **한 요청**으로). Cloudflare egress 에서 200 확인, 250~400ms. 예비 소스 없음.
+- **원화 심볼(BTCKRW 등) = 전부 빗썸** — 차트·호가·체결·mark 는 브라우저↔빗썸 직결(`services/bithumb.ts`), 서버 체결가는 `fromBithumb`(원화 심볼 전부 + 환율을 **한 요청**으로). ⚠⚠ **Cloudflare 홍콩(HKG) 엣지에선 빗썸·업비트 요청의 30~70% 가 무응답**(나쁜 구간엔 몰려서, 헤더·엔드포인트 무관 / 도쿄 NRT 는 전부 ~100ms, 2026-09-24 운영 실측) — 한국발 요청이 HKG 로 가는 일이 있어 단발 요청이면 환전·원화 주문이 자주 실패했다. 그래서 `hedgedJson` 이 0/0.4/1.0/1.8초에 최대 4번 띄워 먼저 성공한 걸 쓰고(평소 외부 호출 1회, 최악 4회), 환율만 필요하면 업비트 KRW-USDT 와 경주, 원화 시세가 실패하면 환율은 업비트로, 그래도 없으면 isolate 캐시(시세 5초·환율 5분). 개선 후 HKG 실측 시세·환율 각 18/18(최악 ~2초). 원화 코인 시세의 예비 거래소는 없다.
 - **⚠ 서버 시세 = OKX → Coinbase → 바이낸스미러 폴백**(바이낸스는 Worker egress IP 를 403 차단). OKX(`BASE-USDT`) 우선, Coinbase(`BASE-USD`, USD≈USDT) — 새 심볼 추가 시 두 매핑 확인. `timedFetch`(2.5s) 로 느린 소스는 즉시 다음 폴백.
 - **⚠ 실제 코인 mark(현재가/PnL) = OKX, 차트 캔들만 바이낸스**: 서버 체결가가 OKX 인데 클라 mark 가 바이낸스면 코인별 0.005~0.3% 어긋나 고배율에서 진입 즉시 손익이 튄다(200배면 0.05% 도 10% ROE). `useMarkPrices` 가 OKX 로 채우고 open 응답의 `markPrices[symbol]=체결가` 로 시드. **차트 WS(klineStream)는 캔들만 그리고 `setPrice` 하지 않는다**. ⚠ 가상 코인도 차트는 `setPrice` 안 한다(2026-09-23) — 봉 종가는 마지막 체결가(bid/ask)라 공정가와 반 스프레드 다르다. 헤더 현재가는 `?tick=` 응답의 `mark`(봇 공정가 = 서버 판정과 같은 값)를 `spotTick` 이 넣는다. 캔들은 바이낸스 유지(전 인터벌 — OKX 는 8h 미지원).
 - **가격 정밀도(심볼별)**: `binanceRest.fetchPricePrecision`(`PRICE_FILTER.tickSize`) → 차트 `priceFormat` + `useMarketStore.precisions[symbol]` → 모든 가격 표기는 `fmtPrice(v, precisionOf(...))`. ⚠ 차트가 "현재 심볼"만 채우면 다른 심볼 포지션이 소수 2자리 폴백 → `useMarkPrices` 가 보유·미체결·현재 심볼 전부 채운다(**가상 심볼은 가격에서 파생** — 유효숫자 4자리라 `setPrice` 가 매 갱신 계산, §4).
@@ -501,7 +501,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
          — 조용한 후퇴라 로그가 없으면 "봇이 왜 멈췄지?"를 알 방법이 없다.
        - 현재 페이스(하루 3~5만)면 이 선에 닿지 않는다 — **닿았다는 건 어딘가 새 폭주 경로가 생겼다는
          신호**이므로, 차단이 걸리면 임계값을 올리는 게 아니라 `npm run d1:budget` 으로 원인을 찾을 것.
-  - **원화 마켓(빗썸)의 비용**: 차트·호가·체결·mark·심볼 선택기는 **브라우저 직결이라 Cloudflare 요청·D1 0**. 서버는 원화 심볼이 걸린 요청마다 외부 호출 **+1**(원화 심볼 수와 무관하게 한 요청, invocation당 subrequest 50 에 여유). D1 행은 실제 코인 체결과 같다. ⚠ 서버에서 `/public/ticker/ALL_KRW`(171KB) 같은 전종목 조회를 하지 말 것 — CPU 10ms 를 파싱에 태운다.
+  - **원화 마켓(빗썸)의 비용**: 차트·호가·체결·mark·심볼 선택기는 **브라우저 직결이라 Cloudflare 요청·D1 0**. 서버는 원화 심볼이 걸린 요청마다 외부 호출 **평소 +1, 최악 +4**(홍콩 엣지 재시도 — §3, 환율 전용이면 업비트 경주로 최악 +6. 원화 심볼 수와 무관, invocation당 subrequest 50 에 여유). D1 행은 실제 코인 체결과 같다. ⚠ 서버에서 `/public/ticker/ALL_KRW`(171KB) 같은 전종목 조회를 하지 말 것 — CPU 10ms 를 파싱에 태운다.
   - **⚠ 폴링 경로 전수 점검 결과(2026-08-01)** — 클라의 모든 주기 요청 중 **D1 에 쓰기를 만드는 건 둘뿐**이고
     둘 다 위 계량·차단 아래에 있다. 새 폴링을 추가할 땐 이 표에 한 줄을 더할 수 있는지부터 확인할 것.
     | 폴링 | 주기 | D1 쓰기 | 요청 수(§ 10만/일) |
