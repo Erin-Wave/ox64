@@ -119,6 +119,29 @@ body {
 *::-webkit-scrollbar-track {
   background: transparent;
 }
+/* 호가창 마지막 체결가 테두리 — 체결될 때마다 한 번 번쩍(OrderBook 이 key 를 바꿔 다시 재생). 끝나면 테두리만 남는다. */
+@keyframes trade-blink {
+  0% {
+    opacity: 1;
+    background-color: rgb(var(--color-text) / 0.16);
+  }
+  45% {
+    opacity: 0.25;
+  }
+  100% {
+    opacity: 1;
+    background-color: transparent;
+  }
+}
+.trade-blink {
+  animation: trade-blink 0.35s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .trade-blink {
+    animation: none;
+  }
+}
+
 /* 가로로 스크롤되지만 스크롤바는 안 보이는 줄(차트 타임프레임 즐겨찾기 바 — 모바일에서 넘치면 밀어서 본다) */
 .no-scrollbar {
   scrollbar-width: none;

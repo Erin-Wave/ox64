@@ -195,6 +195,7 @@ export default function OrderBook() {
   const lastPrice = useMarketStore(selectLastPrice);
   const lastTakerSide = useMarketStore(selectLastTakerSide);
   const [book, setBook] = useState<OrderBookSnapshot | null>(null);
+  const blinkRef = useRef<{ obj: TickerTrade | undefined; n: number }>({ obj: undefined, n: 0 });
   const [groupIdx, setGroupIdx] = useState(0);
   const [tab, setTab] = useState<'book' | 'trades'>('book');
 
@@ -340,15 +341,26 @@ export default function OrderBook() {
   // 잠깐 기다려 흔들림을 흡수한다(§ useStickyCount).
   const listH = { height: rows * ROW_PX };
   const MID_PX = 22; // 상하 배치의 가운데 현재가 줄
+  // ── 마지막 체결가 행 ── 매수 체결(테이커 매수)은 매도호가를 먹었으니 매도 쪽, 매도 체결은 매수 쪽 행을 표시한다
+  // (방향을 모르면 양쪽). 묶어보기 중이면 그 가격이 속한 묶음 — aggregate 와 같은 snapToGrid 라 값이 정확히 같다.
+  // 그 가격의 호가가 다 먹혀 사라졌으면 표시할 행이 없다(억지로 가까운 행을 고르지 않는다).
+  const lastTrade = trades[0];
+  const lastBid = lastTrade && lastTrade.takerSide !== 'buy' ? snapToGrid(lastTrade.price, groupStep, 'down') : null;
+  const lastAsk = lastTrade && lastTrade.takerSide !== 'sell' ? snapToGrid(lastTrade.price, groupStep, 'up') : null;
+  // 새 체결마다 1씩 오르는 번호 — 체결 테이프 맨 앞 객체가 바뀔 때만 센다(같은 렌더를 두 번 해도 안 늘어난다).
+  if (blinkRef.current.obj !== lastTrade) blinkRef.current = { obj: lastTrade, n: blinkRef.current.n + 1 };
+  const blinkKey = blinkRef.current.n;
   // 한 단계 행. 좌우 배치는 막대가 가운데(스프레드) 쪽에서 바깥으로, 상하 배치는 둘 다 오른쪽에서 자란다.
   const row = (l: BookRow, side: 'bid' | 'ask') => {
     const v = valOf(l);
     const mine = mineOf(l);
+    const isLast = side === 'bid' ? l.price === lastBid : l.price === lastAsk;
     const fromRight = vertical || side === 'ask';
     const bar = side === 'bid' ? 'bg-upDim' : 'bg-downDim';
     const tip = [
       bookUnit === 'notional' ? `총금액 ${fmtMoney(v, quote)} ${quote} · 수량 ${fmtQty(l.qty)}` : '',
       l.mine ? `이 가격에 내 주문 ${fmtQty(l.mine)}` : '',
+      isLast ? '마지막 체결가' : '',
     ]
       .filter(Boolean)
       .join('\n');
@@ -371,6 +383,10 @@ export default function OrderBook() {
             className={`absolute inset-y-0 ${fromRight ? 'right-0' : 'left-0'} bg-accent/30`}
             style={{ width: `${Math.min(100, (mine / maxVal) * 100)}%` }}
           />
+        )}
+        {/* 마지막 체결가 테두리 — 체결 1건마다 key 가 바뀌어 새로 그려지므로 **같은 가격에 연달아 체결돼도 매번 깜빡인다** */}
+        {isLast && (
+          <span key={blinkKey} className="trade-blink pointer-events-none absolute inset-0 rounded-sm ring-1 ring-inset ring-text/80" />
         )}
         <span className={`relative z-10 flex items-center gap-1 font-medium ${side === 'bid' ? 'text-up' : 'text-down'}`}>
           {!!l.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
