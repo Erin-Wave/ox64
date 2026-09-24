@@ -4,6 +4,7 @@ import {
   useChartStore,
   BOOK_ROWS_MIN,
   BOOK_ROWS_MAX,
+  type BookLayout,
   type ChartColorScheme,
   type TradeFilterBasis,
 } from '@/store/useChartStore';
@@ -25,9 +26,30 @@ const CHART_COLOR_SCHEMES: { value: ChartColorScheme; label: string }[] = [
 const BOOK_ROW_PRESETS = [5, 10, 20, 30, 50];
 
 const TRADE_BASES: { value: TradeFilterBasis; label: string; desc: string }[] = [
-  { value: 'notional', label: '거래대금', desc: '가격 × 수량 (USDT)' },
+  { value: 'notional', label: '거래대금', desc: '가격 × 수량 (심볼 통화)' },
   { value: 'qty', label: '수량', desc: '코인 개수' },
 ];
+
+const BOOK_LAYOUTS: { value: BookLayout; label: string; desc: string }[] = [
+  { value: 'horizontal', label: '좌우', desc: '매수(왼쪽) · 매도(오른쪽)' },
+  { value: 'vertical', label: '상하', desc: '매도(위) · 현재가 · 매수(아래)' },
+];
+
+type Tab = 'view' | 'book' | 'trade';
+const TABS: { key: Tab; label: string }[] = [
+  { key: 'view', label: '화면' },
+  { key: 'book', label: '호가 · 체결' },
+  { key: 'trade', label: '거래' },
+];
+const TAB_KEY = 'ox64_settings_tab_v1';
+function loadTab(): Tab {
+  try {
+    const v = localStorage.getItem(TAB_KEY);
+    return v === 'book' || v === 'trade' ? v : 'view';
+  } catch {
+    return 'view';
+  }
+}
 
 const FONT_SIZES: { value: FontSize; label: string }[] = [
   { value: 'sm', label: '작게' },
@@ -47,6 +69,17 @@ export default function Settings({ onClose }: { onClose: () => void }) {
   const bookRows = useChartStore((s) => s.bookRows);
   const setBookRows = useChartStore((s) => s.setBookRows);
   const bookTogether = useChartStore((s) => s.bookTogether);
+  const bookLayout = useChartStore((s) => s.bookLayout);
+  const setBookLayout = useChartStore((s) => s.setBookLayout);
+  const [tab, setTab] = useState<Tab>(loadTab);
+  const pickTab = (t: Tab) => {
+    setTab(t);
+    try {
+      localStorage.setItem(TAB_KEY, t);
+    } catch {
+      /* 저장 불가 — 이번에만 */
+    }
+  };
   const toggleChart = useChartStore((s) => s.toggle);
   const tradeFilterOn = useChartStore((s) => s.tradeFilterOn);
   const tradeFilterBasis = useChartStore((s) => s.tradeFilterBasis);
@@ -58,7 +91,8 @@ export default function Settings({ onClose }: { onClose: () => void }) {
   // ''→0→'0' 으로 되돌아와 타이핑이 막힌다. 스토어엔 확정값만 밀어넣는다(빈칸=제한 없음=null).
   const [minInput, setMinInput] = useState(tradeFilterMin != null ? String(tradeFilterMin) : '');
   const [maxInput, setMaxInput] = useState(tradeFilterMax != null ? String(tradeFilterMax) : '');
-  const unitLabel = tradeFilterBasis === 'qty' ? '개' : 'USDT';
+  // 거래대금 기준 값은 **그 심볼의 결제통화** 단위로 적용된다(원화 심볼이면 원) — 한 값이 두 통화에 똑같이 걸린다.
+  const unitLabel = tradeFilterBasis === 'qty' ? '개' : 'USDT·KRW';
 
   return (
     <div
@@ -76,248 +110,288 @@ export default function Settings({ onClose }: { onClose: () => void }) {
           </button>
         </div>
 
+        {/* 탭 — 설정이 늘어 한 화면에 다 두면 스크롤이 길다. 마지막으로 연 탭은 이 브라우저에 기억한다. */}
+        <div className="sticky top-0 z-10 flex gap-1 border-b border-border bg-panel px-5 py-2">
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => pickTab(t.key)}
+              className={`flex-1 rounded-md py-1.5 text-xs font-semibold transition ${
+                tab === t.key ? 'bg-elevated text-text' : 'text-muted hover:bg-panel2 hover:text-text'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
         <div className="space-y-5 p-5">
-          <section>
-            <h3 className="mb-2 text-xs font-semibold text-muted">테마</h3>
-            <div className="grid grid-cols-3 gap-2">
-              {THEMES.map((t) => (
-                <button
-                  key={t.value}
-                  onClick={() => setTheme(t.value)}
-                  className={`rounded-lg px-2 py-2.5 text-xs font-semibold ring-1 transition ${
-                    theme === t.value
-                      ? 'bg-accent/15 text-accent ring-accent'
-                      : 'bg-panel2 text-text ring-border hover:bg-elevated'
-                  }`}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-          </section>
-
-          <section>
-            <h3 className="mb-2 text-xs font-semibold text-muted">차트 색상 (다크 테마일 때 적용)</h3>
-            <div className="grid grid-cols-3 gap-2">
-              {CHART_COLOR_SCHEMES.map((c) => (
-                <button
-                  key={c.value}
-                  onClick={() => setColorScheme(c.value)}
-                  className={`rounded-lg px-2 py-2.5 text-xs font-semibold ring-1 transition ${
-                    colorScheme === c.value
-                      ? 'bg-accent/15 text-accent ring-accent'
-                      : 'bg-panel2 text-text ring-border hover:bg-elevated'
-                  }`}
-                >
-                  {c.label}
-                </button>
-              ))}
-            </div>
-          </section>
-
-          <section>
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-xs font-semibold text-muted">호가 · 체결 표시 개수</h3>
-              <span className="rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold text-accent">{bookRows}개</span>
-            </div>
-            <input
-              type="range"
-              min={BOOK_ROWS_MIN}
-              max={BOOK_ROWS_MAX}
-              value={bookRows}
-              onChange={(e) => setBookRows(Number(e.target.value))}
-              className="w-full accent-accent"
-              aria-label="호가 · 체결 표시 개수"
-            />
-            <div className="mt-2 grid grid-cols-5 gap-1.5">
-              {BOOK_ROW_PRESETS.map((n) => (
-                <button
-                  key={n}
-                  onClick={() => setBookRows(n)}
-                  className={`rounded-md px-1 py-1.5 text-[11px] font-semibold ring-1 transition ${
-                    bookRows === n
-                      ? 'bg-accent/15 text-accent ring-accent'
-                      : 'bg-panel2 text-text ring-border hover:bg-elevated'
-                  }`}
-                >
-                  {n}
-                </button>
-              ))}
-            </div>
-            <p className="mt-2 text-[11px] leading-relaxed text-muted">
-              호가창의 매수·매도 각 열과 체결 목록이 한 화면에 보여줄 행 수({BOOK_ROWS_MIN}~{BOOK_ROWS_MAX}개).
-              실제 코인은 거래소 호가 스트림이 최대 20단계까지만 주므로 그보다 많이 설정해도 20줄까지만 채워집니다.
-            </p>
-
-            {/* PC 전용 옵션 — 모바일은 폭이 좁아 항상 탭이다(OrderBook 이 화면 폭도 함께 본다). */}
-            <button
-              onClick={() => toggleChart('bookTogether')}
-              className={`mt-2 flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left ring-1 transition ${
-                bookTogether ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
-              }`}
-            >
-              <span className="min-w-0">
-                <span className={`block text-xs font-bold ${bookTogether ? 'text-accent' : 'text-text'}`}>
-                  PC 에서 호가 · 체결 같이 보기
-                </span>
-                <span className="mt-0.5 block text-[11px] text-muted">
-                  탭 전환 없이 호가(위)·체결(아래)을 함께 표시 — 모바일은 폭이 좁아 그대로 탭입니다
-                </span>
-              </span>
-              <span
-                className={`shrink-0 rounded px-2 py-0.5 text-[11px] font-bold ${
-                  bookTogether ? 'bg-accent/20 text-accent' : 'bg-elevated text-muted'
-                }`}
-              >
-                {bookTogether ? '켬' : '끔'}
-              </span>
-            </button>
-          </section>
-
-          <section>
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-xs font-semibold text-muted">체결 목록 필터</h3>
-              <button
-                onClick={() => toggleChart('tradeFilterOn')}
-                className={`rounded px-2 py-0.5 text-[11px] font-bold ring-1 transition ${
-                  tradeFilterOn ? 'bg-accent/15 text-accent ring-accent' : 'bg-panel2 text-muted ring-border hover:bg-elevated'
-                }`}
-              >
-                {tradeFilterOn ? '켬' : '끔'}
-              </button>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              {TRADE_BASES.map((b) => (
-                <button
-                  key={b.value}
-                  onClick={() => setTradeFilter({ basis: b.value })}
-                  className={`rounded-lg px-3 py-2 text-left ring-1 transition ${
-                    tradeFilterBasis === b.value
-                      ? 'bg-accent/15 ring-accent'
-                      : 'bg-panel2 ring-border hover:bg-elevated'
-                  }`}
-                >
-                  <div className={`text-xs font-bold ${tradeFilterBasis === b.value ? 'text-accent' : 'text-text'}`}>
-                    {b.label}
-                  </div>
-                  <div className="mt-0.5 text-[11px] text-muted">{b.desc}</div>
-                </button>
-              ))}
-            </div>
-            <div className="mt-2 grid grid-cols-2 gap-2">
-              <div>
-                <label className="mb-1 block text-[10px] text-muted">이 값 이상만</label>
-                <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-                  <input
-                    value={fmtNumInput(minInput)}
-                    onChange={(e) => {
-                      const v = unfmtNum(e.target.value);
-                      setMinInput(v);
-                      setTradeFilter({ min: v ? Number(v) : null });
-                    }}
-                    inputMode="decimal"
-                    placeholder="제한 없음"
-                    className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
-                  />
-                  <span className="shrink-0 px-2 text-[10px] text-muted">{unitLabel}</span>
+          {tab === 'view' && (
+            <>
+              <section>
+                <h3 className="mb-2 text-xs font-semibold text-muted">테마</h3>
+                <div className="grid grid-cols-3 gap-2">
+                  {THEMES.map((t) => (
+                    <button
+                      key={t.value}
+                      onClick={() => setTheme(t.value)}
+                      className={`rounded-lg px-2 py-2.5 text-xs font-semibold ring-1 transition ${
+                        theme === t.value
+                          ? 'bg-accent/15 text-accent ring-accent'
+                          : 'bg-panel2 text-text ring-border hover:bg-elevated'
+                      }`}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
                 </div>
-              </div>
-              <div>
-                <label className="mb-1 block text-[10px] text-muted">이 값 이하만</label>
-                <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-                  <input
-                    value={fmtNumInput(maxInput)}
-                    onChange={(e) => {
-                      const v = unfmtNum(e.target.value);
-                      setMaxInput(v);
-                      setTradeFilter({ max: v ? Number(v) : null });
-                    }}
-                    inputMode="decimal"
-                    placeholder="제한 없음"
-                    className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
-                  />
-                  <span className="shrink-0 px-2 text-[10px] text-muted">{unitLabel}</span>
+              </section>
+              <section>
+                <h3 className="mb-2 text-xs font-semibold text-muted">차트 색상 (다크 테마일 때 적용)</h3>
+                <div className="grid grid-cols-3 gap-2">
+                  {CHART_COLOR_SCHEMES.map((c) => (
+                    <button
+                      key={c.value}
+                      onClick={() => setColorScheme(c.value)}
+                      className={`rounded-lg px-2 py-2.5 text-xs font-semibold ring-1 transition ${
+                        colorScheme === c.value
+                          ? 'bg-accent/15 text-accent ring-accent'
+                          : 'bg-panel2 text-text ring-border hover:bg-elevated'
+                      }`}
+                    >
+                      {c.label}
+                    </button>
+                  ))}
                 </div>
-              </div>
-            </div>
-            <p className="mt-2 text-[11px] leading-relaxed text-muted">
-              체결 목록에 이 범위의 체결만 보여줍니다(호가·차트·거래엔 영향 없는 <span className="text-text">표시 필터</span>).
-              설정은 <span className="text-text">모든 심볼에 똑같이</span> 적용되므로, 심볼을 옮겨 다니며 쓸 거면
-              가격대에 상관없는 <span className="text-text">거래대금</span> 기준이 편합니다(수량 기준은 BTC 0.5개와 PEPE
-              수십억 개가 같은 잣대를 받습니다). 필터가 걸려 있으면 체결 탭에 뱃지가 뜨고, 뱃지를 누르면 바로 꺼집니다.
-            </p>
+              </section>
+              <section>
+                <h3 className="mb-2 text-xs font-semibold text-muted">폰트 크기</h3>
+                <div className="grid grid-cols-3 gap-2">
+                  {FONT_SIZES.map((f) => (
+                    <button
+                      key={f.value}
+                      onClick={() => setFontSize(f.value)}
+                      className={`rounded-lg px-2 py-2.5 text-xs font-semibold ring-1 transition ${
+                        fontSize === f.value
+                          ? 'bg-accent/15 text-accent ring-accent'
+                          : 'bg-panel2 text-text ring-border hover:bg-elevated'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            </>
+          )}
+          {tab === 'book' && (
+            <>
+              <section>
+                <div className="mb-2 flex items-center justify-between">
+                  <h3 className="text-xs font-semibold text-muted">호가 · 체결 표시 개수</h3>
+                  <span className="rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold text-accent">{bookRows}개</span>
+                </div>
+                <input
+                  type="range"
+                  min={BOOK_ROWS_MIN}
+                  max={BOOK_ROWS_MAX}
+                  value={bookRows}
+                  onChange={(e) => setBookRows(Number(e.target.value))}
+                  className="w-full accent-accent"
+                  aria-label="호가 · 체결 표시 개수"
+                />
+                <div className="mt-2 grid grid-cols-5 gap-1.5">
+                  {BOOK_ROW_PRESETS.map((n) => (
+                    <button
+                      key={n}
+                      onClick={() => setBookRows(n)}
+                      className={`rounded-md px-1 py-1.5 text-[11px] font-semibold ring-1 transition ${
+                        bookRows === n
+                          ? 'bg-accent/15 text-accent ring-accent'
+                          : 'bg-panel2 text-text ring-border hover:bg-elevated'
+                      }`}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-2 text-[11px] leading-relaxed text-muted">
+                  호가창의 매수·매도 각 열과 체결 목록이 한 화면에 보여줄 행 수({BOOK_ROWS_MIN}~{BOOK_ROWS_MAX}개).
+                  실제 코인은 거래소 호가 스트림이 최대 20단계까지만 주므로 그보다 많이 설정해도 20줄까지만 채워집니다.
+                </p>
 
-            <button
-              onClick={() => toggleChart('tradeStrength')}
-              className={`mt-2 flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left ring-1 transition ${
-                tradeStrength ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
-              }`}
-            >
-              <span className="min-w-0">
-                <span className={`block text-xs font-bold ${tradeStrength ? 'text-accent' : 'text-text'}`}>
-                  강세 · 약세 레벨 배경
-                </span>
-                <span className="mt-0.5 block text-[11px] text-muted">
-                  체결 가격 뒤에 <span className="text-text">그 시점 평균보다 싸게(약세) · 비싸게(강세)</span> 체결됐는지를
-                  <span className="text-text"> 1~50 레벨</span> 바로 은은하게 깝니다 — 많이 벗어날수록 바가 길어집니다
-                  (마우스를 올리면 평균 대비 %와 레벨)
-                </span>
-              </span>
-              <span
-                className={`shrink-0 rounded px-2 py-0.5 text-[11px] font-bold ${
-                  tradeStrength ? 'bg-accent/20 text-accent' : 'bg-elevated text-muted'
-                }`}
-              >
-                {tradeStrength ? '켬' : '끔'}
-              </span>
-            </button>
-          </section>
-
-          <section>
-            <h3 className="mb-2 text-xs font-semibold text-muted">거래 모드</h3>
-            <div className="grid grid-cols-2 gap-2">
-              {(
-                [
-                  { value: 'easy' as TradingMode, label: 'Easy', desc: '시장가 주문만' },
-                  { value: 'standard' as TradingMode, label: 'Standard', desc: '지정가 · 손절 · 익절' },
-                ] as const
-              ).map((m) => (
+                {/* PC 전용 옵션 — 모바일은 폭이 좁아 항상 탭이다(OrderBook 이 화면 폭도 함께 본다). */}
                 <button
-                  key={m.value}
-                  onClick={() => setTradingMode(m.value)}
-                  className={`rounded-lg px-3 py-2.5 text-left ring-1 transition ${
-                    tradingMode === m.value
-                      ? 'bg-accent/15 ring-accent'
-                      : 'bg-panel2 ring-border hover:bg-elevated'
+                  onClick={() => toggleChart('bookTogether')}
+                  className={`mt-2 flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left ring-1 transition ${
+                    bookTogether ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
                   }`}
                 >
-                  <div className={`text-sm font-bold ${tradingMode === m.value ? 'text-accent' : 'text-text'}`}>
-                    {m.label}
+                  <span className="min-w-0">
+                    <span className={`block text-xs font-bold ${bookTogether ? 'text-accent' : 'text-text'}`}>
+                      PC 에서 호가 · 체결 같이 보기
+                    </span>
+                    <span className="mt-0.5 block text-[11px] text-muted">
+                      탭 전환 없이 호가(위)·체결(아래)을 함께 표시 — 모바일은 폭이 좁아 그대로 탭입니다
+                    </span>
+                  </span>
+                  <span
+                    className={`shrink-0 rounded px-2 py-0.5 text-[11px] font-bold ${
+                      bookTogether ? 'bg-accent/20 text-accent' : 'bg-elevated text-muted'
+                    }`}
+                  >
+                    {bookTogether ? '켬' : '끔'}
+                  </span>
+                </button>
+              </section>
+              <section>
+                <h3 className="mb-2 text-xs font-semibold text-muted">호가 배치</h3>
+                <div className="grid grid-cols-2 gap-2">
+                  {BOOK_LAYOUTS.map((l) => (
+                    <button
+                      key={l.value}
+                      onClick={() => setBookLayout(l.value)}
+                      className={`rounded-lg px-3 py-2.5 text-left ring-1 transition ${
+                        bookLayout === l.value ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
+                      }`}
+                    >
+                      <div className={`text-xs font-bold ${bookLayout === l.value ? 'text-accent' : 'text-text'}`}>{l.label}</div>
+                      <div className="mt-0.5 text-[11px] text-muted">{l.desc}</div>
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1.5 text-[11px] text-muted">
+                  수치를 코인 수량으로 볼지 총금액으로 볼지는 호가창 위 단위 버튼(예: BTC ⇄)으로 바꿉니다.
+                </p>
+              </section>
+              <section>
+                <div className="mb-2 flex items-center justify-between">
+                  <h3 className="text-xs font-semibold text-muted">체결 목록 필터</h3>
+                  <button
+                    onClick={() => toggleChart('tradeFilterOn')}
+                    className={`rounded px-2 py-0.5 text-[11px] font-bold ring-1 transition ${
+                      tradeFilterOn ? 'bg-accent/15 text-accent ring-accent' : 'bg-panel2 text-muted ring-border hover:bg-elevated'
+                    }`}
+                  >
+                    {tradeFilterOn ? '켬' : '끔'}
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {TRADE_BASES.map((b) => (
+                    <button
+                      key={b.value}
+                      onClick={() => setTradeFilter({ basis: b.value })}
+                      className={`rounded-lg px-3 py-2 text-left ring-1 transition ${
+                        tradeFilterBasis === b.value
+                          ? 'bg-accent/15 ring-accent'
+                          : 'bg-panel2 ring-border hover:bg-elevated'
+                      }`}
+                    >
+                      <div className={`text-xs font-bold ${tradeFilterBasis === b.value ? 'text-accent' : 'text-text'}`}>
+                        {b.label}
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-muted">{b.desc}</div>
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="mb-1 block text-[10px] text-muted">이 값 이상만</label>
+                    <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                      <input
+                        value={fmtNumInput(minInput)}
+                        onChange={(e) => {
+                          const v = unfmtNum(e.target.value);
+                          setMinInput(v);
+                          setTradeFilter({ min: v ? Number(v) : null });
+                        }}
+                        inputMode="decimal"
+                        placeholder="제한 없음"
+                        className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                      />
+                      <span className="shrink-0 px-2 text-[10px] text-muted">{unitLabel}</span>
+                    </div>
                   </div>
-                  <div className="mt-0.5 text-[11px] text-muted">{m.desc}</div>
-                </button>
-              ))}
-            </div>
-          </section>
+                  <div>
+                    <label className="mb-1 block text-[10px] text-muted">이 값 이하만</label>
+                    <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                      <input
+                        value={fmtNumInput(maxInput)}
+                        onChange={(e) => {
+                          const v = unfmtNum(e.target.value);
+                          setMaxInput(v);
+                          setTradeFilter({ max: v ? Number(v) : null });
+                        }}
+                        inputMode="decimal"
+                        placeholder="제한 없음"
+                        className="w-full bg-transparent px-2.5 py-1.5 text-xs font-semibold text-text outline-none placeholder:text-muted"
+                      />
+                      <span className="shrink-0 px-2 text-[10px] text-muted">{unitLabel}</span>
+                    </div>
+                  </div>
+                </div>
+                <p className="mt-2 text-[11px] leading-relaxed text-muted">
+                  체결 목록에 이 범위의 체결만 보여줍니다(호가·차트·거래엔 영향 없는 <span className="text-text">표시 필터</span>).
+                  설정은 <span className="text-text">모든 심볼에 똑같이</span> 적용되므로, 심볼을 옮겨 다니며 쓸 거면
+                  가격대에 상관없는 <span className="text-text">거래대금</span> 기준이 편합니다(수량 기준은 BTC 0.5개와 PEPE
+                  수십억 개가 같은 잣대를 받습니다). 필터가 걸려 있으면 체결 탭에 뱃지가 뜨고, 뱃지를 누르면 바로 꺼집니다.
+                </p>
 
-          <section>
-            <h3 className="mb-2 text-xs font-semibold text-muted">폰트 크기</h3>
-            <div className="grid grid-cols-3 gap-2">
-              {FONT_SIZES.map((f) => (
                 <button
-                  key={f.value}
-                  onClick={() => setFontSize(f.value)}
-                  className={`rounded-lg px-2 py-2.5 text-xs font-semibold ring-1 transition ${
-                    fontSize === f.value
-                      ? 'bg-accent/15 text-accent ring-accent'
-                      : 'bg-panel2 text-text ring-border hover:bg-elevated'
+                  onClick={() => toggleChart('tradeStrength')}
+                  className={`mt-2 flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-left ring-1 transition ${
+                    tradeStrength ? 'bg-accent/15 ring-accent' : 'bg-panel2 ring-border hover:bg-elevated'
                   }`}
                 >
-                  {f.label}
+                  <span className="min-w-0">
+                    <span className={`block text-xs font-bold ${tradeStrength ? 'text-accent' : 'text-text'}`}>
+                      강세 · 약세 레벨 배경
+                    </span>
+                    <span className="mt-0.5 block text-[11px] text-muted">
+                      체결 가격 뒤에 <span className="text-text">그 시점 평균보다 싸게(약세) · 비싸게(강세)</span> 체결됐는지를
+                      <span className="text-text"> 1~50 레벨</span> 바로 은은하게 깝니다 — 많이 벗어날수록 바가 길어집니다
+                      (마우스를 올리면 평균 대비 %와 레벨)
+                    </span>
+                  </span>
+                  <span
+                    className={`shrink-0 rounded px-2 py-0.5 text-[11px] font-bold ${
+                      tradeStrength ? 'bg-accent/20 text-accent' : 'bg-elevated text-muted'
+                    }`}
+                  >
+                    {tradeStrength ? '켬' : '끔'}
+                  </span>
                 </button>
-              ))}
-            </div>
-          </section>
+              </section>
+            </>
+          )}
+          {tab === 'trade' && (
+            <section>
+              <h3 className="mb-2 text-xs font-semibold text-muted">거래 모드</h3>
+              <div className="grid grid-cols-2 gap-2">
+                {(
+                  [
+                    { value: 'easy' as TradingMode, label: 'Easy', desc: '시장가 주문만' },
+                    { value: 'standard' as TradingMode, label: 'Standard', desc: '지정가 · 손절 · 익절' },
+                  ] as const
+                ).map((m) => (
+                  <button
+                    key={m.value}
+                    onClick={() => setTradingMode(m.value)}
+                    className={`rounded-lg px-3 py-2.5 text-left ring-1 transition ${
+                      tradingMode === m.value
+                        ? 'bg-accent/15 ring-accent'
+                        : 'bg-panel2 ring-border hover:bg-elevated'
+                    }`}
+                  >
+                    <div className={`text-sm font-bold ${tradingMode === m.value ? 'text-accent' : 'text-text'}`}>
+                      {m.label}
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-muted">{m.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
         </div>
       </div>
     </div>

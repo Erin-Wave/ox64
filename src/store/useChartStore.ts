@@ -67,6 +67,10 @@ interface ChartState {
   // PC(md+, 768px 이상)에서 호가와 체결을 탭 전환 없이 위아래로 같이 보여준다. 모바일은 폭이 좁아
   // 그대로 탭을 쓴다(이 값과 무관) — 옵션 이름에 PC 를 못 박은 이유.
   bookTogether: boolean;
+  // 호가 수치 — 코인 수량('qty') / 총금액('notional' = 가격×수량, 그 심볼의 결제통화). 호가창 상단 버튼으로 전환.
+  bookUnit: BookUnit;
+  // 호가 배치 — 'horizontal' 매수(좌)·매도(우) 2열 / 'vertical' 매도(위)·현재가·매수(아래) 한 열(설정).
+  bookLayout: BookLayout;
   // 체결 목록 필터(전 심볼 공통, 표시 전용). on 이 꺼져 있으면 min/max 값은 남겨두고 무시만 한다 —
   // 껐다 켤 때 값을 다시 입력하지 않아도 되게.
   tradeFilterOn: boolean;
@@ -86,6 +90,8 @@ interface ChartState {
   toggle: (k: BoolFlag) => void;
   toggleFavInterval: (code: string) => void;
   setBookRows: (n: number) => void;
+  setBookUnit: (u: BookUnit) => void;
+  setBookLayout: (l: BookLayout) => void;
   setTradeFilter: (patch: Partial<TradeFilter>) => void;
   setVisibleBars: (n: number) => void;
   setColorScheme: (cs: ChartColorScheme) => void;
@@ -96,6 +102,9 @@ interface ChartState {
   /** 표시/숨김 토글 — 삭제하지 않고 끈다 */
   toggleIndicator: (id: string) => void;
 }
+
+export type BookUnit = 'qty' | 'notional';
+export type BookLayout = 'horizontal' | 'vertical';
 
 export const BOOK_ROWS_MIN = 5;
 export const BOOK_ROWS_MAX = 50;
@@ -111,14 +120,14 @@ function load(): Partial<ChartState> {
 }
 function persist(s: ChartState) {
   const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook } = s;
-  const { bookRows, bookTogether, visibleBars, colorScheme, indicators, favIntervals } = s;
+  const { bookRows, bookTogether, bookUnit, bookLayout, visibleBars, colorScheme, indicators, favIntervals } = s;
   const { tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength } = s;
   try {
     localStorage.setItem(
       KEY,
       JSON.stringify({
         showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook,
-        bookRows, bookTogether, visibleBars, colorScheme, indicators, favIntervals,
+        bookRows, bookTogether, bookUnit, bookLayout, visibleBars, colorScheme, indicators, favIntervals,
         tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength,
       }),
     );
@@ -188,6 +197,8 @@ export const useChartStore = create<ChartState>((set, get) => ({
   orderBook: saved.orderBook ?? true,
   bookRows: clampRows(saved.bookRows ?? BOOK_ROWS_DEFAULT),
   bookTogether: saved.bookTogether ?? false,
+  bookUnit: saved.bookUnit === 'notional' ? 'notional' : 'qty',
+  bookLayout: saved.bookLayout === 'vertical' ? 'vertical' : 'horizontal',
   tradeFilterOn: saved.tradeFilterOn ?? false,
   tradeFilterBasis: saved.tradeFilterBasis ?? 'notional',
   tradeFilterMin: cleanLimit(saved.tradeFilterMin),
@@ -209,6 +220,14 @@ export const useChartStore = create<ChartState>((set, get) => ({
   },
   setBookRows: (n) => {
     set({ bookRows: clampRows(n) });
+    persist(get());
+  },
+  setBookUnit: (bookUnit) => {
+    set({ bookUnit });
+    persist(get());
+  },
+  setBookLayout: (bookLayout) => {
+    set({ bookLayout });
     persist(get());
   },
   setTradeFilter: (patch) => {

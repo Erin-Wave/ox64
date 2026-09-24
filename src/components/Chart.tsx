@@ -1186,6 +1186,7 @@ export default function Chart() {
               const def = INDICATOR_DEFS[ind.type];
               const parts: string[] = [];
               for (const ln of def.lines) {
+                if (ln.legend === false) continue;
                 const v = val[ln.key];
                 if (v == null) continue;
                 const txt = fmtIndValue(def.format, v, prec);

@@ -51,6 +51,8 @@ export interface IndicatorLineDef {
   color?: string;
   /** 점마다 def.states 의 라벨 색으로 칠한다(판정이 없는 워밍업 구간은 배정색) */
   colorByState?: boolean;
+  /** false 면 레전드에 값을 안 찍는다(밴드 경계처럼 보조로만 그리는 선) */
+  legend?: boolean;
 }
 export interface IndicatorStateLabel {
   text: string;
@@ -270,10 +272,17 @@ export const INDICATOR_DEFS: Record<IndicatorType, IndicatorDef> = {
     label: 'OBV',
     name: '누적 거래량(OBV) · 매집/분산 국면',
     pane: 'own',
-    params: [{ key: 'period', label: '기준선 기간', def: 20, min: 2, max: 500 }], // 1 이면 기준선 = OBV 라 판정이 안 된다
+    params: [
+      { key: 'period', label: '기준선 기간', def: 20, min: 2, max: 500 }, // 1 이면 기준선 = OBV 라 판정이 안 된다
+      // 노이즈 필터 — 기준선에서 평균 편차의 몇 배를 벗어나야 국면을 바꾸나(0 = 넘나들 때마다, § I.obvPhase)
+      { key: 'band', label: '노이즈 필터(0=끔)', def: 0.5, min: 0, max: 2, step: 0.1 },
+    ],
     lines: [
       { key: 'v', label: '', width: 2, colorByState: true },
       { key: 'base', label: '기준', style: 'dashed', color: '#8a94a6' },
+      // OBV 가 이 점선 밖으로 나가야 흐름(유입/유출) 판정이 바뀐다 — 기준선을 넘었는데 색이 안 바뀌는 이유가 보이게
+      { key: 'upper', label: '', style: 'dotted', color: '#8a94a666', legend: false },
+      { key: 'lower', label: '', style: 'dotted', color: '#8a94a666', legend: false },
     ],
     states: {
       key: 'phase',
@@ -289,7 +298,8 @@ export const INDICATOR_DEFS: Record<IndicatorType, IndicatorDef> = {
     compute: (c, p) => {
       const v = I.obv(c);
       const base = I.emaOf(v, p.period);
-      return { v, base, phase: I.obvPhase(closesOf(c), v, base, p.period) };
+      const r = I.obvPhase(closesOf(c), v, base, p.period, p.band ?? 0.5);
+      return { v, base, upper: r.upper, lower: r.lower, phase: r.phase };
     },
   },
   wr: {

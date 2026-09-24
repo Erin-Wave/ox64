@@ -279,41 +279,73 @@ export function obv(candles: Candle[]): Series {
   return out;
 }
 
+/** 슈미트 트리거 판정 — d(= 선 − 기준선)를 그 자신의 평균 절대편차(EMA(|d|, period))로 나눈 z 가 +band 를 넘어야
+ * 위, −band 밑으로 가야 아래로 **바뀐다**(그 사이면 직전 판정 유지). band=0 이면 부호 그대로(같으면 유지).
+ * 편차 척도가 아직 없는 워밍업 구간은 부호로 판정한다. */
+function hysteresis(d: Series, scale: Series, band: number): (boolean | null)[] {
+  let st: boolean | null = null;
+  return d.map((v, i) => {
+    if (v == null) return null;
+    const sc = scale[i];
+    const z = sc != null && sc > 0 ? v / sc : v;
+    const b = sc != null && sc > 0 ? band : 0;
+    if (st === null) st = v > 0;
+    else if (z > b) st = true;
+    else if (z < -b) st = false;
+    return st;
+  });
+}
+
 /** OBV 국면(매집/분산 사이클). 두 질문의 조합이다:
  *  - **돈이 들어오나** — OBV 가 자기 기준선(`base` = OBV 의 EMA) 위면 최근 순매수 유입, 아래면 순매도.
  *  - **가격이 올라가 있나** — 종가가 같은 기간의 가격 EMA 위인가.
  *  → 0 매집(유입 · 가격 아직 아래) / 1 끌어올림(유입 · 가격 위) / 2 정리(유출 · 가격 아직 위) / 3 하락(유출 · 가격 아래)
  *    / 4 반등(유출 · 가격 위 — 단 **하락 뒤**라 정리할 물량이 없는 경우).
  *  사이클 순서가 곧 번호 순서다(매집 → 끌어올림 → 정리 → 하락 → 매집).
- * ⚠⚠ "유출 · 가격 위"는 **어디서 왔나에 따라 뜻이 반대다** — 끌어올림 뒤면 높은 가격에 물량을 넘기는 정리(분산)지만,
- *   하락 뒤면 거래량이 안 받쳐주는 반등일 뿐이다(정리할 물량 자체가 없다). 예전엔 둘 다 "정리"라 하락 끝의 반등이
- *   전부 정리로 칠해졌고, 실제 캔들에서 하락을 벗어나는 전이의 1/3 이 이 경로였다(가격 EMA 가 OBV 기준선보다 먼저
- *   돌아선다 → 대개 1~3봉 뒤 OBV 가 기준선을 뚫고 끌어올림). 그래서 마지막으로 끌어올림을 거쳤는지(하락이 오면 리셋)를
- *   기억해 가른다. 반대쪽("유입 · 가격 아래")은 어디서 왔든 매집이다(하락 뒤 = 바닥 매집, 끌어올림 뒤 = 눌림 매수).
+ * ⚠⚠ **노이즈 필터 = 두 질문 모두 히스테리시스**(2026-09-24, `band`). 기준선을 살짝 넘나드는 것만으로 뒤집으면 실제
+ *   캔들(바이낸스 6코인 × 1m~1d, 3.6만 봉)에서 100봉당 23.9번 국면이 바뀌고 **국면의 62%가 1~2봉짜리**였다. 사후(중심
+ *   이동평균 기울기)로 본 "정답"은 성분당 100봉에 3.3번만 바뀌므로 대부분이 잔떨림이다. 선이 기준선에서 자기 평균 편차의
+ *   band 배 이상 벗어나야 바꾸면: band 0.5 → 전환 11.4/100봉·잔떨림 31%·정답 일치 59.2%(0 일 때 60.0%).
+ *   ⚠ 일치율은 **어떤 실시간 추정으로도 ~75%(성분)/60%(국면)가 천장**이다 — OBV−EMA 대신 ΔOBV 평활·k봉 모멘텀·EMA 교차로
+ *   바꿔도 73~75.5% 로 같았다(꺾인 건 꺾인 뒤에야 안다 = 원리적 지연). 밴드를 더 키우면 전환은 줄지만 그 지연이 커진다
+ *   (1.0 → 7.1/100봉 · 55.8%). 그래서 기본 0.5 이고 유저가 파라미터로 조절한다(0 = 예전 동작).
+ * ⚠ "유출 · 가격 위"는 **어디서 왔나에 따라 뜻이 반대다** — 끌어올림 뒤면 높은 가격에 물량을 넘기는 정리(분산)지만,
+ *   하락 뒤면 거래량이 안 받쳐주는 반등일 뿐이다(정리할 물량 자체가 없다). 실제 캔들에서 하락을 벗어나는 전이의 1/3 이
+ *   이 경로였다(가격 EMA 가 OBV 기준선보다 먼저 돌아선다). 마지막으로 끌어올림을 거쳤는지(하락이 오면 리셋)를 기억해 가른다.
+ *   반대쪽("유입 · 가격 아래")은 어디서 왔든 매집이다(하락 뒤 = 바닥 매집, 끌어올림 뒤 = 눌림 매수).
  * ⚠ 기준을 0(절대 수준)이 아니라 **OBV 자신의 이동평균**으로 잡는 이유: OBV 는 불러온 첫 봉에서 0 으로 시작하는
- *   누적값이라 절대 수준은 "어디서부터 셌나"(과거봉을 더 불러오면 통째로 이동)에 달려 있다 — 기준선과의 차이는
- *   그 상수 이동에 영향을 받지 않는다.
- * ⚠ 같으면(거래 없는 한산한 봉이 이어져 OBV 가 평평해지고 기준선이 따라붙은 자리) **직전 판정을 잇는다** —
- *   `>` 로만 가르면 평평한 구간이 전부 "유출"로 칠해진다. */
-export function obvPhase(closes: number[], obvS: Series, base: Series, period: number): Series {
+ *   누적값이라 절대 수준은 "어디서부터 셌나"(과거봉을 더 불러오면 통째로 이동)에 달려 있다 — 기준선과의 차이(와 그 편차
+ *   척도)는 그 상수 이동에 영향을 받지 않는다.
+ * 반환: phase(국면 인덱스) + upper/lower(OBV 가 이 밖으로 나가야 흐름 판정이 바뀌는 밴드 — 차트에 점선으로 그린다). */
+export function obvPhase(
+  closes: number[],
+  obvS: Series,
+  base: Series,
+  period: number,
+  band: number,
+): { phase: Series; upper: Series; lower: Series } {
   const pma = emaOf(closes, period);
-  const out = nulls(closes.length);
-  let flowUp: boolean | null = null;
-  let priceUp: boolean | null = null;
+  const dF: Series = obvS.map((v, i) => (v == null || base[i] == null ? null : v - (base[i] as number)));
+  const dP: Series = closes.map((c, i) => (pma[i] == null ? null : c - (pma[i] as number)));
+  const scaleF = emaOf(dF.map((v) => (v == null ? null : Math.abs(v))), period);
+  const scaleP = emaOf(dP.map((v) => (v == null ? null : Math.abs(v))), period);
+  const flow = hysteresis(dF, scaleF, band);
+  const price = hysteresis(dP, scaleP, band);
+  const phase = nulls(closes.length);
   let markedUp = false; // 마지막 하락 이후 끌어올림을 거쳤나 — 정리(분산)는 올려놓은 뒤에만 성립한다
   for (let i = 0; i < closes.length; i++) {
-    const v = obvS[i];
-    const b = base[i];
-    const m = pma[i];
-    if (v == null || b == null || m == null) continue;
-    if (v !== b || flowUp == null) flowUp = v > b;
-    if (closes[i] !== m || priceUp == null) priceUp = closes[i] > m;
-    const ph = flowUp ? (priceUp ? 1 : 0) : priceUp ? (markedUp ? 2 : 4) : 3;
+    const f = flow[i];
+    const p = price[i];
+    if (f == null || p == null) continue;
+    const ph = f ? (p ? 1 : 0) : p ? (markedUp ? 2 : 4) : 3;
     if (ph === 1) markedUp = true;
     else if (ph === 3) markedUp = false;
-    out[i] = ph;
+    phase[i] = ph;
   }
-  return out;
+  // 밴드가 0 이면 기준선과 겹치므로 그리지 않는다.
+  const bandLine = (sign: 1 | -1): Series =>
+    band > 0 ? base.map((b, i) => (b == null || scaleF[i] == null ? null : b + sign * band * (scaleF[i] as number))) : nulls(closes.length);
+  return { phase, upper: bandLine(1), lower: bandLine(-1) };
 }
 
 /** Williams %R = (최고 − 종가)/(최고 − 최저) × −100 (0 ~ −100). */

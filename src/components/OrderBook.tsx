@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { orderbookStream, type OrderBookLevel, type OrderBookSnapshot } from '@/services/binanceWs';
-import { useMarketStore, precisionOf } from '@/store/useMarketStore';
+import { useMarketStore, precisionOf, selectLastPrice, selectLastTakerSide } from '@/store/useMarketStore';
 import { useChartStore } from '@/store/useChartStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { baseOf, isVirtualSymbol, quoteOf } from '@/symbols';
 import { bithumbOrderbookStream } from '@/services/bithumb';
-import { fmtPct, fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
+import { fmtMoney, fmtMoneyShort, fmtPct, fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
 
 const EMPTY_TRADES: TickerTrade[] = [];
@@ -37,17 +37,26 @@ function snapToGrid(price: number, step: number, dir: 'down' | 'up'): number {
   const idx = dir === 'down' ? Math.floor(ticks + GRID_EPS) : Math.ceil(ticks - GRID_EPS);
   return Number((idx * step).toFixed(10));
 }
-function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'): OrderBookLevel[] {
-  if (!(step > 0)) return levels;
-  const map = new Map<number, { qty: number; mine: number }>();
+/** 묶은 호가 한 단계 — 수량과 함께 **총금액(Σ 가격×수량)** 도 합쳐 둔다(묶음 가격 × 합계수량으로 근사하지 않는다). */
+interface BookRow {
+  price: number;
+  qty: number;
+  mine: number;
+  notional: number;
+  mineNotional: number;
+}
+function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'): BookRow[] {
+  const map = new Map<number, BookRow>();
   for (const l of levels) {
-    const bucket = snapToGrid(l.price, step, side === 'bid' ? 'down' : 'up');
-    const cur = map.get(bucket) ?? { qty: 0, mine: 0 };
+    const bucket = step > 0 ? snapToGrid(l.price, step, side === 'bid' ? 'down' : 'up') : l.price;
+    const cur = map.get(bucket) ?? { price: bucket, qty: 0, mine: 0, notional: 0, mineNotional: 0 };
     cur.qty += l.qty;
     cur.mine += l.mine ?? 0;
+    cur.notional += l.price * l.qty;
+    cur.mineNotional += l.price * (l.mine ?? 0);
     map.set(bucket, cur);
   }
-  const out = [...map.entries()].map(([price, v]) => ({ price, qty: v.qty, mine: v.mine }));
+  const out = [...map.values()];
   out.sort((a, b) => (side === 'bid' ? b.price - a.price : a.price - b.price));
   return out;
 }
@@ -132,8 +141,9 @@ function useIsDesktop(): boolean {
   return is;
 }
 
-/** 호가창 + 체결내역 탭. 모바일에서도 한눈에 보이도록 매수(좌)·매도(우) 2열로 나란히 표시하고,
- * 각 열은 최우선호가가 맨 위로 오게 정렬한다. 클릭하면 그 가격이 지정가 주문 입력에 채워진다.
+/** 호가창 + 체결내역 탭. 배치는 설정(bookLayout) — 좌우: 매수(좌)·매도(우) 2열, 각 열 최우선호가가 맨 위 /
+ * 상하: 매도(위, 최우선매도가 가운데 쪽)·현재가·매수(아래). 수치는 코인 수량 또는 총금액(상단 버튼, bookUnit).
+ * 클릭하면 그 가격이 지정가 주문 입력에 채워진다.
  * 체결 탭 데이터는 useTradeTape(App.tsx 에서 항상 구동)이 채우는 useMarketStore.recentTrades 를 그대로 구독. */
 export default function OrderBook() {
   const symbol = useMarketStore((s) => s.symbol);
@@ -155,6 +165,11 @@ export default function OrderBook() {
   const filterMax = useChartStore((s) => s.tradeFilterMax);
   const showStrength = useChartStore((s) => s.tradeStrength);
   const toggleChart = useChartStore((s) => s.toggle);
+  const bookUnit = useChartStore((s) => s.bookUnit);
+  const setBookUnit = useChartStore((s) => s.setBookUnit);
+  const vertical = useChartStore((s) => s.bookLayout) === 'vertical';
+  const lastPrice = useMarketStore(selectLastPrice);
+  const lastTakerSide = useMarketStore(selectLastTakerSide);
   const [book, setBook] = useState<OrderBookSnapshot | null>(null);
   const [groupIdx, setGroupIdx] = useState(0);
   const [tab, setTab] = useState<'book' | 'trades'>('book');
@@ -195,7 +210,12 @@ export default function OrderBook() {
   const asks = useMemo(() => (activeBook ? aggregate(activeBook.asks, groupStep, 'ask').slice(0, rows) : []), [activeBook, groupStep, rows]);
   const bids = useMemo(() => (activeBook ? aggregate(activeBook.bids, groupStep, 'bid').slice(0, rows) : []), [activeBook, groupStep, rows]);
 
-  const maxQty = Math.max(1e-9, ...bids.map((b) => b.qty), ...asks.map((a) => a.qty));
+  // 막대 길이·표시 수치는 고른 단위(수량/총금액)로 — 금액으로 보면 비싼 가격대의 같은 수량이 더 길게 보인다.
+  const quote = quoteOf(symbol);
+  const valOf = (l: BookRow) => (bookUnit === 'qty' ? l.qty : l.notional);
+  const mineOf = (l: BookRow) => (bookUnit === 'qty' ? l.mine : l.mineNotional);
+  const fmtVal = (v: number) => (bookUnit === 'qty' ? fmtQty(v) : fmtMoneyShort(v, quote, quote === 'KRW' ? 5 : 6));
+  const maxVal = Math.max(1e-9, ...bids.map(valOf), ...asks.map(valOf));
   const groupPrec = precisionFromTick(groupStep);
 
   // 체결 목록: 틱 방향을 원본에 붙인 뒤 필터를 걸고, 설정한 행 수만큼 자른다.
@@ -235,10 +255,26 @@ export default function OrderBook() {
     <button
       onClick={cycleGroup}
       title="클릭하면 묶어보기 단위가 10배씩 바뀝니다"
-      className="ml-auto rounded px-1.5 py-0.5 text-[11px] text-muted transition hover:bg-panel2 hover:text-text"
+      className="rounded px-1.5 py-0.5 text-[11px] text-muted transition hover:bg-panel2 hover:text-text"
     >
       {fmtPrice(groupStep, groupPrec)}
     </button>
+  );
+  // 호가 수치 단위 — 코인 수량 ⇄ 총금액(가격×수량). 지금 단위를 보여주고 누르면 바뀐다(주문 패널 단위 버튼과 같은 모양).
+  const unitBtn = (
+    <button
+      onClick={() => setBookUnit(bookUnit === 'qty' ? 'notional' : 'qty')}
+      title={bookUnit === 'qty' ? `코인 수량(${baseOf(symbol)}) — 누르면 총금액(${quote})으로` : `총금액(${quote}) — 누르면 코인 수량(${baseOf(symbol)})으로`}
+      className="rounded px-1.5 py-0.5 text-[11px] font-semibold text-muted transition hover:bg-panel2 hover:text-text"
+    >
+      {bookUnit === 'qty' ? baseOf(symbol) : quote} ⇄
+    </button>
+  );
+  const bookTools = (
+    <div className="ml-auto flex items-center gap-0.5">
+      {unitBtn}
+      {groupBtn}
+    </div>
   );
   const sectionTitle = (label: string) => <span className="px-2 py-0.5 text-[11px] font-semibold text-text">{label}</span>;
 
@@ -272,70 +308,84 @@ export default function OrderBook() {
   // 줄어들어서, 체결이 한 건씩 흘러들어오거나(dripTrades) 호가 단계가 바뀔 때마다 패널 높이가
   // 오르내려 아래 컴포넌트가 통째로 밀렸다("height 가 와리가리" 제보). 빈 자리는 그냥 비워 둔다.
   const listH = { height: rows * ROW_PX };
+  const MID_PX = 22; // 상하 배치의 가운데 현재가 줄
+  // 한 단계 행. 좌우 배치는 막대가 가운데(스프레드) 쪽에서 바깥으로, 상하 배치는 둘 다 오른쪽에서 자란다.
+  const row = (l: BookRow, side: 'bid' | 'ask') => {
+    const v = valOf(l);
+    const mine = mineOf(l);
+    const fromRight = vertical || side === 'ask';
+    const bar = side === 'bid' ? 'bg-upDim' : 'bg-downDim';
+    const tip = [
+      bookUnit === 'notional' ? `총금액 ${fmtMoney(v, quote)} ${quote} · 수량 ${fmtQty(l.qty)}` : '',
+      l.mine ? `이 가격에 내 주문 ${fmtQty(l.mine)}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+    return (
+      <button
+        key={l.price}
+        onClick={() => pick(l.price)}
+        title={tip || undefined}
+        className={`relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2 ${
+          l.mine ? 'ring-1 ring-inset ring-accent/70' : ''
+        }`}
+      >
+        <span
+          className={`absolute inset-y-0 ${fromRight ? 'right-0' : 'left-0'} ${bar}`}
+          style={{ width: `${Math.min(100, (v / maxVal) * 100)}%` }}
+        />
+        {/* 내 물량은 같은 막대 위에 더 진하게 겹쳐 그려서 "이 중 얼마가 내 것"인지도 보인다 */}
+        {!!l.mine && (
+          <span
+            className={`absolute inset-y-0 ${fromRight ? 'right-0' : 'left-0'} bg-accent/30`}
+            style={{ width: `${Math.min(100, (mine / maxVal) * 100)}%` }}
+          />
+        )}
+        <span className={`relative z-10 flex items-center gap-1 font-medium ${side === 'bid' ? 'text-up' : 'text-down'}`}>
+          {!!l.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
+          {fmtPriceShort(l.price, groupPrec, 9)}
+        </span>
+        <span className={`relative z-10 ${l.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{fmtVal(v)}</span>
+      </button>
+    );
+  };
   const bookBody = !activeBook ? (
-    <div className="flex items-center justify-center text-muted" style={listH}>
+    <div className="flex items-center justify-center text-muted" style={vertical ? { height: rows * ROW_PX * 2 + MID_PX } : listH}>
       불러오는 중…
+    </div>
+  ) : vertical ? (
+    // 상하: 매도(위) — 최우선매도가 **맨 아래**(가운데 줄 바로 위)에 오도록 뒤집어 그리고, 단계가 모자라면 아래로 붙인다.
+    <div>
+      <div className="flex flex-col justify-end overflow-hidden" style={listH}>
+        {[...asks].reverse().map((a) => row(a, 'ask'))}
+      </div>
+      <div
+        className="flex items-center justify-between border-y border-border/60 px-1.5"
+        style={{ height: MID_PX }}
+        title="현재가 · 최우선 매도−매수 호가 차이"
+      >
+        <span
+          className={`text-[13px] font-bold ${lastTakerSide === 'buy' ? 'text-up' : lastTakerSide === 'sell' ? 'text-down' : 'text-text'}`}
+        >
+          {lastPrice != null ? fmtPriceShort(lastPrice, prec, 9) : '—'}
+        </span>
+        {bids[0] && asks[0] && (
+          <span className="text-[10px] text-muted">스프레드 {fmtPriceShort(Math.max(0, asks[0].price - bids[0].price), groupPrec, 9)}</span>
+        )}
+      </div>
+      <div className="overflow-hidden" style={listH}>
+        {bids.map((b) => row(b, 'bid'))}
+      </div>
     </div>
   ) : (
     <div className="grid grid-cols-2 gap-1.5">
       {/* 좌: 매수(bid) — 최우선호가(가격 가장 높음)가 맨 위 */}
       <div className="overflow-y-auto" style={listH}>
-        {bids.map((b) => (
-          <button
-            key={b.price}
-            onClick={() => pick(b.price)}
-            title={b.mine ? `이 가격에 내 주문 ${fmtQty(b.mine)}` : undefined}
-            className={`relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2 ${
-              b.mine ? 'ring-1 ring-inset ring-accent/70' : ''
-            }`}
-          >
-            <span
-              className="absolute inset-y-0 left-0 bg-upDim"
-              style={{ width: `${Math.min(100, (b.qty / maxQty) * 100)}%` }}
-            />
-            {/* 내 물량은 같은 막대 위에 더 진하게 겹쳐 그려서 "이 중 얼마가 내 것"인지도 보인다 */}
-            {!!b.mine && (
-              <span
-                className="absolute inset-y-0 left-0 bg-accent/30"
-                style={{ width: `${Math.min(100, (b.mine / maxQty) * 100)}%` }}
-              />
-            )}
-            <span className="relative z-10 flex items-center gap-1 font-medium text-up">
-              {!!b.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
-              {fmtPriceShort(b.price, groupPrec, 9)}
-            </span>
-            <span className={`relative z-10 ${b.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{fmtQty(b.qty)}</span>
-          </button>
-        ))}
+        {bids.map((b) => row(b, 'bid'))}
       </div>
       {/* 우: 매도(ask) — 최우선호가(가격 가장 낮음)가 맨 위 */}
       <div className="overflow-y-auto" style={listH}>
-        {asks.map((a) => (
-          <button
-            key={a.price}
-            onClick={() => pick(a.price)}
-            title={a.mine ? `이 가격에 내 주문 ${fmtQty(a.mine)}` : undefined}
-            className={`relative flex w-full items-center justify-between overflow-hidden rounded-sm px-1.5 py-px text-right leading-[14px] transition hover:bg-panel2 ${
-              a.mine ? 'ring-1 ring-inset ring-accent/70' : ''
-            }`}
-          >
-            <span
-              className="absolute inset-y-0 right-0 bg-downDim"
-              style={{ width: `${Math.min(100, (a.qty / maxQty) * 100)}%` }}
-            />
-            {!!a.mine && (
-              <span
-                className="absolute inset-y-0 right-0 bg-accent/30"
-                style={{ width: `${Math.min(100, (a.mine / maxQty) * 100)}%` }}
-              />
-            )}
-            <span className="relative z-10 flex items-center gap-1 font-medium text-down">
-              {!!a.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
-              {fmtPriceShort(a.price, groupPrec, 9)}
-            </span>
-            <span className={`relative z-10 ${a.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{fmtQty(a.qty)}</span>
-          </button>
-        ))}
+        {asks.map((a) => row(a, 'ask'))}
       </div>
     </div>
   );
@@ -401,7 +451,7 @@ export default function OrderBook() {
       <div className="border-b border-border bg-panel p-1.5 text-[11px] md:border-b-0 md:border-t">
         <div className="mb-1 flex items-center gap-1">
           {sectionTitle('호가')}
-          {groupBtn}
+          {bookTools}
         </div>
         {bookBody}
         <div className="mb-1 mt-1.5 flex items-center gap-1 border-t border-border pt-1.5">
@@ -417,7 +467,7 @@ export default function OrderBook() {
       <div className="mb-1 flex items-center gap-1">
         {tabBtn('book', '호가')}
         {tabBtn('trades', '체결')}
-        {tab === 'book' ? groupBtn : filterBadge}
+        {tab === 'book' ? bookTools : filterBadge}
       </div>
 
       {tab === 'book' ? bookBody : tradesBody}
