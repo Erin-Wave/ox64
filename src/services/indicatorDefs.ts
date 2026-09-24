@@ -274,7 +274,9 @@ export const INDICATOR_DEFS: Record<IndicatorType, IndicatorDef> = {
     pane: 'own',
     params: [
       { key: 'period', label: '기준선 기간', def: 20, min: 2, max: 500 }, // 1 이면 기준선 = OBV 라 판정이 안 된다
-      // 노이즈 필터 — 기준선에서 평균 편차의 몇 배를 벗어나야 국면을 바꾸나(0 = 넘나들 때마다, § I.obvPhase)
+      // 노이즈 필터 — 기준선에서 평균 편차의 몇 배를 벗어나야 국면을 바꾸나(0 = 넘나들 때마다, § I.obvPhase).
+      // ⚠ 상한 2 는 의도 — 실측(3.6만 봉) 2.0 에서 성분 정답 일치 59~62%·국면 중앙 24봉, 3.0 이면 52~54%(≈동전)·76봉이고
+      //   끌어올림−하락 이후 수익률 차가 1.1%→0 으로 사라진다(국면이 정보를 잃고 얼어붙는다).
       { key: 'band', label: '노이즈 필터(0=끔)', def: 0.5, min: 0, max: 2, step: 0.1 },
     ],
     lines: [

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { orderbookStream, type OrderBookLevel, type OrderBookSnapshot } from '@/services/binanceWs';
 import { useMarketStore, precisionOf, selectLastPrice, selectLastTakerSide } from '@/store/useMarketStore';
 import { useChartStore } from '@/store/useChartStore';
@@ -21,6 +21,30 @@ const fmtTime = (ms: number) => {
 // 한 행의 높이(px). 행 마크업이 `leading-[14px]` + `py-px` 라 폰트 크기 설정과 무관하게 항상 16px 이다 —
 // 이 값으로 "설정한 개수만큼만" 높이를 잡는다(설정 개수를 바꿀 땐 행 마크업의 leading/padding 과 같이 볼 것).
 const ROW_PX = 16;
+
+/** 호가 목록 높이를 **실제 단계 수만큼** 줄이되(묶어보기·거래소 단계 상한으로 빈칸이 생기면 그만큼 체결이 올라온다),
+ * 늘어날 땐 즉시 · 줄어들 땐 `holdMs` 동안 계속 적을 때만 줄인다 — 단계 수가 틱마다 9↔10 으로 흔들려도 패널이
+ * 오르내리지 않게(예전 "height 와리가리" 제보의 원인이 바로 그 흔들림이었다). `resetKey`(심볼·묶음 단위·행 수·
+ * 배치)가 바뀌면 기다리지 않고 바로 맞춘다 — 묶어보기를 눌렀는데 1초 넘게 빈칸이 남으면 반응이 굼떠 보인다. */
+function useStickyCount(n: number, resetKey: string, holdMs = 1500): number {
+  const [shown, setShown] = useState(n);
+  const keyRef = useRef(resetKey);
+  const reset = keyRef.current !== resetKey;
+  useEffect(() => {
+    if (keyRef.current !== resetKey) {
+      keyRef.current = resetKey;
+      setShown(n);
+      return;
+    }
+    if (n >= shown) {
+      if (n !== shown) setShown(n);
+      return;
+    }
+    const t = window.setTimeout(() => setShown(n), holdMs);
+    return () => window.clearTimeout(t);
+  }, [n, shown, resetKey, holdMs]);
+  return reset ? n : Math.max(n, shown);
+}
 const GROUP_MULTS = [1, 10, 100, 1000]; // 심볼 tick 단위의 10배씩 — 그룹 버튼을 눌러서 순환
 
 // 같은 가격대(step 배수)로 수량을 합쳐서 보여준다. bid 는 아래로(floor), ask 는 위로(ceil) 반올림 —
@@ -216,6 +240,12 @@ export default function OrderBook() {
   const mineOf = (l: BookRow) => (bookUnit === 'qty' ? l.mine : l.mineNotional);
   const fmtVal = (v: number) => (bookUnit === 'qty' ? fmtQty(v) : fmtMoneyShort(v, quote, quote === 'KRW' ? 5 : 6));
   const maxVal = Math.max(1e-9, ...bids.map(valOf), ...asks.map(valOf));
+  // 호가 목록 높이 = 실제 단계 수(최소 1행, 최대 설정 행 수). ⚠ 훅이라 배치와 무관하게 셋 다 항상 부른다.
+  const bookKey = `${symbol}|${groupIdx}|${rows}|${vertical ? 'v' : 'h'}`;
+  const hRows = useStickyCount(Math.max(bids.length, asks.length), bookKey);
+  const askRows = useStickyCount(asks.length, bookKey);
+  const bidRows = useStickyCount(bids.length, bookKey);
+  const hgt = (n: number) => ({ height: Math.max(1, Math.min(rows, n)) * ROW_PX });
   const groupPrec = precisionFromTick(groupStep);
 
   // 체결 목록: 틱 방향을 원본에 붙인 뒤 필터를 걸고, 설정한 행 수만큼 자른다.
@@ -298,15 +328,16 @@ export default function OrderBook() {
         filterMax != null ? `${filterBasis === 'qty' ? fmtQty(filterMax) : fmtUsd(filterMax)} 이하` : ''
       } ${unit}
 클릭하면 필터를 끕니다(설정에서 값 변경)`}
-      className="ml-auto max-w-[60%] truncate rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-semibold text-accent transition hover:bg-accent/25"
+      className="min-w-0 truncate rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-semibold text-accent transition hover:bg-accent/25"
     >
       필터 {filterText} {unit}
     </button>
   ) : null;
 
-  // ⚠ 세 목록(매수·매도·체결)은 전부 **고정 높이**다(maxHeight 아님). 예전엔 내용이 적으면 그만큼
-  // 줄어들어서, 체결이 한 건씩 흘러들어오거나(dripTrades) 호가 단계가 바뀔 때마다 패널 높이가
-  // 오르내려 아래 컴포넌트가 통째로 밀렸다("height 가 와리가리" 제보). 빈 자리는 그냥 비워 둔다.
+  // ⚠ 체결 목록은 **고정 높이**다(maxHeight 아님) — 체결이 한 건씩 흘러들어오며(dripTrades) 높이가 오르내리면
+  // 아래 컴포넌트가 통째로 밀린다("height 와리가리" 제보). 호가 목록은 반대로 **실제 단계 수만큼 압축**한다
+  // (묶어보기·거래소 단계 상한으로 생긴 빈칸은 쓸모없는 공간이라 그만큼 체결이 올라오게) — 대신 줄어들 땐
+  // 잠깐 기다려 흔들림을 흡수한다(§ useStickyCount).
   const listH = { height: rows * ROW_PX };
   const MID_PX = 22; // 상하 배치의 가운데 현재가 줄
   // 한 단계 행. 좌우 배치는 막대가 가운데(스프레드) 쪽에서 바깥으로, 상하 배치는 둘 다 오른쪽에서 자란다.
@@ -356,7 +387,7 @@ export default function OrderBook() {
   ) : vertical ? (
     // 상하: 매도(위) — 최우선매도가 **맨 아래**(가운데 줄 바로 위)에 오도록 뒤집어 그리고, 단계가 모자라면 아래로 붙인다.
     <div>
-      <div className="flex flex-col justify-end overflow-hidden" style={listH}>
+      <div className="flex flex-col justify-end overflow-hidden" style={hgt(askRows)}>
         {[...asks].reverse().map((a) => row(a, 'ask'))}
       </div>
       <div
@@ -373,18 +404,18 @@ export default function OrderBook() {
           <span className="text-[10px] text-muted">스프레드 {fmtPriceShort(Math.max(0, asks[0].price - bids[0].price), groupPrec, 9)}</span>
         )}
       </div>
-      <div className="overflow-hidden" style={listH}>
+      <div className="overflow-hidden" style={hgt(bidRows)}>
         {bids.map((b) => row(b, 'bid'))}
       </div>
     </div>
   ) : (
     <div className="grid grid-cols-2 gap-1.5">
       {/* 좌: 매수(bid) — 최우선호가(가격 가장 높음)가 맨 위 */}
-      <div className="overflow-y-auto" style={listH}>
+      <div className="overflow-hidden" style={hgt(hRows)}>
         {bids.map((b) => row(b, 'bid'))}
       </div>
       {/* 우: 매도(ask) — 최우선호가(가격 가장 낮음)가 맨 위 */}
-      <div className="overflow-y-auto" style={listH}>
+      <div className="overflow-hidden" style={hgt(hRows)}>
         {asks.map((a) => row(a, 'ask'))}
       </div>
     </div>
@@ -435,8 +466,16 @@ export default function OrderBook() {
                 <span className={`relative block truncate text-right ${color}`}>{fmtPriceShort(t.price, prec, 9)}</span>
               </span>
               {/* 수량도 같은 방향 색으로 — 가격만 칠하면 목록을 훑을 때 매수/매도 흐름이 한눈에 안 읽힌다. */}
-              <span className={`truncate text-right ${color}`} title={`거래대금 ${fmtUsd(t.price * t.qty)} ${quoteOf(symbol)}`}>
-                {fmtQty(t.qty)}
+              {/* 호가창 단위 버튼(수량 ⇄ 총금액)을 체결에도 똑같이 따른다 — 툴팁엔 반대쪽 값 */}
+              <span
+                className={`truncate text-right ${color}`}
+                title={
+                  bookUnit === 'qty'
+                    ? `거래대금 ${fmtUsd(t.price * t.qty)} ${quote}`
+                    : `수량 ${fmtQty(t.qty)} ${baseOf(symbol)}`
+                }
+              >
+                {bookUnit === 'qty' ? fmtQty(t.qty) : fmtVal(t.price * t.qty)}
               </span>
             </div>
           );
@@ -456,7 +495,7 @@ export default function OrderBook() {
         {bookBody}
         <div className="mb-1 mt-1.5 flex items-center gap-1 border-t border-border pt-1.5">
           {sectionTitle('체결')}
-          {filterBadge}
+          <div className="ml-auto flex min-w-0 max-w-[70%] items-center">{filterBadge}</div>
         </div>
         {tradesBody}
       </div>
@@ -467,7 +506,15 @@ export default function OrderBook() {
       <div className="mb-1 flex items-center gap-1">
         {tabBtn('book', '호가')}
         {tabBtn('trades', '체결')}
-        {tab === 'book' ? bookTools : filterBadge}
+        {tab === 'book' ? (
+          bookTools
+        ) : (
+          // 체결 탭에서도 단위를 바꿀 수 있게(호가와 같은 값을 공유한다)
+          <div className="ml-auto flex min-w-0 max-w-[80%] items-center gap-0.5">
+            {filterBadge}
+            {unitBtn}
+          </div>
+        )}
       </div>
 
       {tab === 'book' ? bookBody : tradesBody}

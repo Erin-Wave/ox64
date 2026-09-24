@@ -1090,7 +1090,8 @@ export default function Chart() {
                               value={ind.params[p.key] ?? p.def}
                               onChange={(e) => opts.updateIndicator(ind.id, { [p.key]: Number(e.target.value) })}
                               className="w-12 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
-                              title={p.label}
+                              // 범위 밖 값은 조용히 잘리므로(clampParam) 범위를 같이 보여준다 — "2 이상 안 올라간다"가 버그로 안 보이게
+                              title={`${p.label} · ${p.min}~${p.max}`}
                             />
                           ))}
                         </span>
