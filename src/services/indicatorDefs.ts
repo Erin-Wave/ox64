@@ -280,8 +280,9 @@ export const INDICATOR_DEFS: Record<IndicatorType, IndicatorDef> = {
       labels: [
         { text: '매집', color: '#42a5f5', hint: 'OBV 가 기준선 위(순매수 유입)인데 가격은 아직 평균 아래 — 조용히 모으는 중' },
         { text: '끌어올림', color: UP, hint: 'OBV·가격 둘 다 평균 위 — 모은 물량을 바탕으로 가격을 올리는 중' },
-        { text: '정리', color: SIGNAL_COLOR, hint: 'OBV 가 기준선 아래(순매도)인데 가격은 아직 평균 위 — 높은 가격에 물량을 넘기는 중' },
+        { text: '정리', color: SIGNAL_COLOR, hint: '끌어올린 뒤 OBV 가 기준선 아래로(순매도) 꺾였는데 가격은 아직 평균 위 — 높은 가격에 물량을 넘기는 중' },
         { text: '하락', color: DOWN, hint: 'OBV·가격 둘 다 평균 아래 — 매도세가 가격을 끌어내리는 중' },
+        { text: '반등', color: '#b39ddb', hint: '하락 뒤 가격은 평균 위로 올라왔지만 OBV 는 아직 기준선 아래 — 거래량이 받쳐주지 않는 반등(곧 OBV 가 따라오면 끌어올림, 못 따라오면 다시 하락)' },
       ],
     },
     format: 'volume',

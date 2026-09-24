@@ -282,8 +282,14 @@ export function obv(candles: Candle[]): Series {
 /** OBV 국면(매집/분산 사이클). 두 질문의 조합이다:
  *  - **돈이 들어오나** — OBV 가 자기 기준선(`base` = OBV 의 EMA) 위면 최근 순매수 유입, 아래면 순매도.
  *  - **가격이 올라가 있나** — 종가가 같은 기간의 가격 EMA 위인가.
- *  → 0 매집(유입 · 가격 아직 아래) / 1 끌어올림(유입 · 가격 위) / 2 정리(유출 · 가격 아직 위) / 3 하락(유출 · 가격 아래).
+ *  → 0 매집(유입 · 가격 아직 아래) / 1 끌어올림(유입 · 가격 위) / 2 정리(유출 · 가격 아직 위) / 3 하락(유출 · 가격 아래)
+ *    / 4 반등(유출 · 가격 위 — 단 **하락 뒤**라 정리할 물량이 없는 경우).
  *  사이클 순서가 곧 번호 순서다(매집 → 끌어올림 → 정리 → 하락 → 매집).
+ * ⚠⚠ "유출 · 가격 위"는 **어디서 왔나에 따라 뜻이 반대다** — 끌어올림 뒤면 높은 가격에 물량을 넘기는 정리(분산)지만,
+ *   하락 뒤면 거래량이 안 받쳐주는 반등일 뿐이다(정리할 물량 자체가 없다). 예전엔 둘 다 "정리"라 하락 끝의 반등이
+ *   전부 정리로 칠해졌고, 실제 캔들에서 하락을 벗어나는 전이의 1/3 이 이 경로였다(가격 EMA 가 OBV 기준선보다 먼저
+ *   돌아선다 → 대개 1~3봉 뒤 OBV 가 기준선을 뚫고 끌어올림). 그래서 마지막으로 끌어올림을 거쳤는지(하락이 오면 리셋)를
+ *   기억해 가른다. 반대쪽("유입 · 가격 아래")은 어디서 왔든 매집이다(하락 뒤 = 바닥 매집, 끌어올림 뒤 = 눌림 매수).
  * ⚠ 기준을 0(절대 수준)이 아니라 **OBV 자신의 이동평균**으로 잡는 이유: OBV 는 불러온 첫 봉에서 0 으로 시작하는
  *   누적값이라 절대 수준은 "어디서부터 셌나"(과거봉을 더 불러오면 통째로 이동)에 달려 있다 — 기준선과의 차이는
  *   그 상수 이동에 영향을 받지 않는다.
@@ -294,6 +300,7 @@ export function obvPhase(closes: number[], obvS: Series, base: Series, period: n
   const out = nulls(closes.length);
   let flowUp: boolean | null = null;
   let priceUp: boolean | null = null;
+  let markedUp = false; // 마지막 하락 이후 끌어올림을 거쳤나 — 정리(분산)는 올려놓은 뒤에만 성립한다
   for (let i = 0; i < closes.length; i++) {
     const v = obvS[i];
     const b = base[i];
@@ -301,7 +308,10 @@ export function obvPhase(closes: number[], obvS: Series, base: Series, period: n
     if (v == null || b == null || m == null) continue;
     if (v !== b || flowUp == null) flowUp = v > b;
     if (closes[i] !== m || priceUp == null) priceUp = closes[i] > m;
-    out[i] = flowUp ? (priceUp ? 1 : 0) : priceUp ? 2 : 3;
+    const ph = flowUp ? (priceUp ? 1 : 0) : priceUp ? (markedUp ? 2 : 4) : 3;
+    if (ph === 1) markedUp = true;
+    else if (ph === 3) markedUp = false;
+    out[i] = ph;
   }
   return out;
 }

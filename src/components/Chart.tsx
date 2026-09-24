@@ -87,11 +87,15 @@ const fmtKst = (realSec: number, withSeconds = false) => {
 // (SuperTrend 국면 전환, Ichimoku 후행스팬 끝, 워밍업). 건너뛰면 LWC 가 앞뒤 점을 이어 있지도 않은 선을 그린다.
 const line = (arr: Series, times: number[]): (LineData | WhitespaceData)[] =>
   arr.map((v, i) => (v == null ? { time: toChart(times[i]) } : { time: toChart(times[i]), value: v }));
-/** 점마다 국면 색을 입힌 선(indicatorDefs 의 colorByState). 판정이 없는 점은 시리즈 기본색. */
+/** 점마다 국면 색을 입힌 선(indicatorDefs 의 colorByState). 판정이 없는 점은 시리즈 기본색.
+ * ⚠ LWC 는 선분 (i−1 → i) 을 **시작점 i−1 의 색**으로 긋는다. 그대로 넣으면 국면이 바뀐 봉으로 들어가는 선분이
+ * 이전 국면 색이라, OBV 가 기준선을 뚫는 바로 그 선분이 뚫기 전 국면으로 칠해진다("기준선을 뚫었는데 왜 정리?").
+ * 그래서 점 i 에는 **다음 봉(i+1)의 국면 색**을 넣는다 → "이 봉으로 들어오는 선분 = 이 봉의 국면"(레전드와 일치). */
 const stateLine = (arr: Series, times: number[], state: Series, colors: string[]): (LineData | WhitespaceData)[] =>
   arr.map((v, i) => {
     if (v == null) return { time: toChart(times[i]) };
-    const c = state[i] == null ? undefined : colors[state[i] as number];
+    const st = state[i + 1] ?? state[i];
+    const c = st == null ? undefined : colors[st];
     return c ? { time: toChart(times[i]), value: v, color: c } : { time: toChart(times[i]), value: v };
   });
 const histData = (arr: Series, times: number[], up: string, down: string): (HistogramData | WhitespaceData)[] =>
