@@ -68,6 +68,18 @@ interface BookRow {
   mine: number;
   notional: number;
   mineNotional: number;
+  /** 마지막 체결가인데 지금 그 가격에 남은 호가가 없어 끼워 넣은 빈 행(§ withLastTrade) */
+  phantom?: boolean;
+}
+
+/** 마지막 체결가 행이 호가창에 없으면(체결이 그 가격대를 다 먹었다) **수량 없는 행으로 제자리에 끼워 넣는다** —
+ * 테두리가 "여기서 체결됐고 지금은 남은 호가가 없다"를 그대로 보여주게. 가상 코인은 체결이 그 단계를 소진한 뒤
+ * 다음 사다리가 한 칸 너머에서 시작하므로 이게 없으면 테두리가 거의 안 보였다(실측: 실제 코인은 90~100% 행이 남아 있음). */
+function withLastTrade(list: BookRow[], side: 'bid' | 'ask', target: number | null): BookRow[] {
+  if (target == null || list.some((r) => r.price === target)) return list;
+  const out = [...list, { price: target, qty: 0, mine: 0, notional: 0, mineNotional: 0, phantom: true }];
+  out.sort((a, b) => (side === 'bid' ? b.price - a.price : a.price - b.price));
+  return out;
 }
 function aggregate(levels: OrderBookLevel[], step: number, side: 'bid' | 'ask'): BookRow[] {
   const map = new Map<number, BookRow>();
@@ -232,8 +244,22 @@ export default function OrderBook() {
   // 유저가 정한다(설정 → 호가·체결 표시 개수, 5~50).
   // ⚠ 서버가 주는 단계 수(loadSpotMarket BOOK_LIMIT=50)가 상한이다 — 표시 개수를 더 늘릴 땐 그 값도
   // 같이 올릴 것. 실제 코인은 바이낸스 부분 호가 스트림이 최대 20단계라 그보다 많이는 채워지지 않는다.
-  const asks = useMemo(() => (activeBook ? aggregate(activeBook.asks, groupStep, 'ask').slice(0, rows) : []), [activeBook, groupStep, rows]);
-  const bids = useMemo(() => (activeBook ? aggregate(activeBook.bids, groupStep, 'bid').slice(0, rows) : []), [activeBook, groupStep, rows]);
+  // ── 마지막 체결가 행 ── 매수 체결(테이커 매수)은 매도호가를 먹었으니 매도 쪽, 매도 체결은 매수 쪽 행을 표시한다.
+  // 묶어보기 중이면 그 가격이 속한 묶음 — aggregate 와 같은 snapToGrid 라 값이 정확히 같다. 그 행이 없으면(다 먹혀
+  // 사라졌으면) 빈 행으로 끼워 넣는다(§ withLastTrade — 방향을 모르는 체결은 끼워 넣지 않고 있는 행만 표시).
+  const lastTrade = trades[0];
+  const lastBid = lastTrade && lastTrade.takerSide !== 'buy' ? snapToGrid(lastTrade.price, groupStep, 'down') : null;
+  const lastAsk = lastTrade && lastTrade.takerSide !== 'sell' ? snapToGrid(lastTrade.price, groupStep, 'up') : null;
+  const insertBid = lastTrade?.takerSide === 'sell' ? lastBid : null;
+  const insertAsk = lastTrade?.takerSide === 'buy' ? lastAsk : null;
+  const asks = useMemo(
+    () => (activeBook ? withLastTrade(aggregate(activeBook.asks, groupStep, 'ask'), 'ask', insertAsk).slice(0, rows) : []),
+    [activeBook, groupStep, rows, insertAsk],
+  );
+  const bids = useMemo(
+    () => (activeBook ? withLastTrade(aggregate(activeBook.bids, groupStep, 'bid'), 'bid', insertBid).slice(0, rows) : []),
+    [activeBook, groupStep, rows, insertBid],
+  );
 
   // 막대 길이·표시 수치는 고른 단위(수량/총금액)로 — 금액으로 보면 비싼 가격대의 같은 수량이 더 길게 보인다.
   const quote = quoteOf(symbol);
@@ -341,12 +367,6 @@ export default function OrderBook() {
   // 잠깐 기다려 흔들림을 흡수한다(§ useStickyCount).
   const listH = { height: rows * ROW_PX };
   const MID_PX = 22; // 상하 배치의 가운데 현재가 줄
-  // ── 마지막 체결가 행 ── 매수 체결(테이커 매수)은 매도호가를 먹었으니 매도 쪽, 매도 체결은 매수 쪽 행을 표시한다
-  // (방향을 모르면 양쪽). 묶어보기 중이면 그 가격이 속한 묶음 — aggregate 와 같은 snapToGrid 라 값이 정확히 같다.
-  // 그 가격의 호가가 다 먹혀 사라졌으면 표시할 행이 없다(억지로 가까운 행을 고르지 않는다).
-  const lastTrade = trades[0];
-  const lastBid = lastTrade && lastTrade.takerSide !== 'buy' ? snapToGrid(lastTrade.price, groupStep, 'down') : null;
-  const lastAsk = lastTrade && lastTrade.takerSide !== 'sell' ? snapToGrid(lastTrade.price, groupStep, 'up') : null;
   // 새 체결마다 1씩 오르는 번호 — 체결 테이프 맨 앞 객체가 바뀔 때만 센다(같은 렌더를 두 번 해도 안 늘어난다).
   if (blinkRef.current.obj !== lastTrade) blinkRef.current = { obj: lastTrade, n: blinkRef.current.n + 1 };
   const blinkKey = blinkRef.current.n;
@@ -360,7 +380,7 @@ export default function OrderBook() {
     const tip = [
       bookUnit === 'notional' ? `총금액 ${fmtMoney(v, quote)} ${quote} · 수량 ${fmtQty(l.qty)}` : '',
       l.mine ? `이 가격에 내 주문 ${fmtQty(l.mine)}` : '',
-      isLast ? '마지막 체결가' : '',
+      isLast ? (l.phantom ? '마지막 체결가 — 지금 이 가격엔 남은 호가가 없습니다' : '마지막 체결가') : '',
     ]
       .filter(Boolean)
       .join('\n');
@@ -392,7 +412,7 @@ export default function OrderBook() {
           {!!l.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
           {fmtPriceShort(l.price, groupPrec, 9)}
         </span>
-        <span className={`relative z-10 ${l.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{fmtVal(v)}</span>
+        <span className={`relative z-10 ${l.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{l.phantom ? '—' : fmtVal(v)}</span>
       </button>
     );
   };
