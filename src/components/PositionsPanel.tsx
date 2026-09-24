@@ -252,7 +252,19 @@ export default function PositionsPanel() {
                     .reduce((a, o) => a + o.size, 0);
                   const closable = Math.max(0, p.size - reservedClose);
                   return (
-                    <tr key={p.id} className="border-b border-border/60 transition hover:bg-panel2">
+                    // 행 아무 데나 눌러도 그 심볼 차트로 — 단 행 안의 조작(청산 수량·지정가 입력, 슬라이더, 청산·SL/TP
+                    // 버튼)은 제 할 일만 한다(청산 누르다 차트가 바뀌면 안 된다). 텍스트를 드래그해 복사할 때도 이동 안 함.
+                    <tr
+                      key={p.id}
+                      onClick={(e) => {
+                        if ((e.target as HTMLElement).closest('button, input, select, textarea, a, label')) return;
+                        if (window.getSelection()?.toString()) return;
+                        setSymbol(p.symbol);
+                      }}
+                      className={`cursor-pointer border-b border-border/60 transition hover:bg-panel2 ${
+                        p.symbol === symbol ? 'bg-panel2/50' : ''
+                      }`}
+                    >
                       <td className="px-3 py-2.5 font-medium text-text">
                         <button
                           onClick={() => setSymbol(p.symbol)}
