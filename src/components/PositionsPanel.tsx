@@ -2,12 +2,13 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtPrice, fmtPriceShort, fmtQty, fmtQtyShort, fmtUsd, fmtUsdShort, fmtPct, fmtNumInput, unfmtNum } from '@/format';
+import { fmtPrice, fmtPriceShort, fmtQty, fmtQtyShort, fmtMoney, fmtMoneyShort, fmtPct, fmtNumInput, unfmtNum, fmtKrw } from '@/format';
+import { baseOf, pairLabel, quoteOf } from '@/symbols';
 import type { ApiOrder } from '@/services/api';
 
 type Tab = 'positions' | 'pending' | 'conditional' | 'history';
 
-const KIND_LABEL: Record<ApiOrder['kind'], string> = { open: '진입', close: '청산', liquidation: '강제청산' };
+const KIND_LABEL: Record<ApiOrder['kind'], string> = { open: '진입', close: '청산', liquidation: '강제청산', convert: '환전' };
 // sv-SE 로케일은 'YYYY-MM-DD HH:mm:ss' 형식으로 떨어져서 KST 타임존 지정과 함께 편하게 재사용.
 const fmtTime = (ms: number) => new Date(ms).toLocaleString('sv-SE', { timeZone: 'Asia/Seoul' });
 
@@ -40,6 +41,7 @@ export default function PositionsPanel() {
   const conditionalOrders = useTradingStore((s) => s.conditionalOrders);
   const orders = useTradingStore((s) => s.orders);
   const balance = useTradingStore((s) => s.balance);
+  const krwBalance = useTradingStore((s) => s.krwBalance);
   const closePosition = useTradingStore((s) => s.closePosition);
   const limitClose = useTradingStore((s) => s.limitClose);
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
@@ -176,20 +178,21 @@ export default function PositionsPanel() {
     const dir = p.side === 'long' ? 1 : -1;
     return (live - p.entryPrice) * p.size * dir;
   };
-  const totalUnrealizedKnown = positions.every((p) => unrealizedOf(p) != null);
-  const totalUnrealized = positions.reduce((a, p) => a + (unrealizedOf(p) ?? 0), 0);
-  const totalMargin = positions.reduce((a, p) => a + (p.entryPrice * p.size) / p.leverage, 0);
 
-  // 청산가: 이 포지션의 가격이 얼마가 되면 계좌 평가자산이 0이 되는지.
+  // 청산가: 이 포지션의 가격이 얼마가 되면 **그 지갑의** 평가자산이 0이 되는지.
   // 평가자산 = 여유잔고 + Σ(잠긴 증거금 + 미실현손익) — 서버(functions/_trading.ts)의 강제청산 조건과
-  // 동일한 산식(증거금 항 포함). 추정치 표시용(실제 체결은 서버가 함).
+  // 동일한 산식(증거금 항 포함). ⚠ 크로스 담보는 지갑(결제통화)별이라 같은 통화의 포지션·잔고만 본다
+  // (원화 포지션의 손익이 USDT 포지션의 청산가를 움직이지 않는다). 추정치 표시용(실제 체결은 서버가 함).
   const liqPriceOf = (p: (typeof positions)[number]): number | null => {
-    if (!totalUnrealizedKnown) return null;
+    const q = quoteOf(p.symbol);
+    const walletPos = positions.filter((x) => quoteOf(x.symbol) === q);
+    if (!walletPos.every((x) => unrealizedOf(x) != null)) return null;
     const mine = unrealizedOf(p);
     if (mine == null) return null;
-    const others = totalUnrealized - mine;
+    const others = walletPos.reduce((a, x) => a + (unrealizedOf(x) ?? 0), 0) - mine;
+    const walletMargin = walletPos.reduce((a, x) => a + (x.entryPrice * x.size) / x.leverage, 0);
     const dir = p.side === 'long' ? 1 : -1;
-    return p.entryPrice - (balance + totalMargin + others) / (p.size * dir);
+    return p.entryPrice - ((q === 'KRW' ? krwBalance : balance) + walletMargin + others) / (p.size * dir);
   };
 
   const tabBtn = (t: Tab, label: string) => (
@@ -268,10 +271,10 @@ export default function PositionsPanel() {
                       <td className="px-3 py-2.5 font-medium text-text">
                         <button
                           onClick={() => setSymbol(p.symbol)}
-                          title={`${p.symbol.replace('USDT', '')} 차트로 이동`}
+                          title={`${pairLabel(p.symbol)} 차트로 이동`}
                           className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
                         >
-                          {p.symbol.replace('USDT', '')}
+                          {pairLabel(p.symbol)}
                         </button>
                       </td>
                       <td className="px-3 py-2.5">
@@ -285,23 +288,23 @@ export default function PositionsPanel() {
                       </td>
                       {/* ⚠ 가격도 축약한다(전체값은 title) — 특히 **청산가**는 숏에서 진입가 + 평가자산/수량
                           이라 1e20 을 예사로 넘고, 그 한 칸이 표 전체를 밀어냈다(§format.fmtPriceShort). */}
-                      <td className="px-3 py-2.5 text-right text-text" title={live != null ? `${fmtPrice(live, prec)} USDT` : undefined}>
+                      <td className="px-3 py-2.5 text-right text-text" title={live != null ? `${fmtPrice(live, prec)} ${quoteOf(p.symbol)}` : undefined}>
                         {live != null ? fmtPriceShort(live, prec, 10) : '—'}
                       </td>
-                      <td className="px-3 py-2.5 text-right text-text" title={`${fmtPrice(p.entryPrice, prec)} USDT`}>
+                      <td className="px-3 py-2.5 text-right text-text" title={`${fmtPrice(p.entryPrice, prec)} ${quoteOf(p.symbol)}`}>
                         {fmtPriceShort(p.entryPrice, prec, 10)}
                       </td>
                       <td
                         className="px-3 py-2.5 text-right text-down"
-                        title={liq != null && liq > 0 ? `강제청산 예상가 ${fmtPrice(liq, prec)} USDT` : undefined}
+                        title={liq != null && liq > 0 ? `강제청산 예상가 ${fmtPrice(liq, prec)} ${quoteOf(p.symbol)}` : undefined}
                       >
                         {liq != null && liq > 0 ? fmtPriceShort(liq, prec, 10) : '—'}
                       </td>
                       <td className="px-3 py-2.5 text-right text-text">
                         {/* 수량·증거금은 1e30 까지 가므로 축약(전체값은 title) — §format.fmtQtyShort */}
-                        <div title={`${fmtQty(p.size)} ${p.symbol.replace('USDT', '')}`}>{fmtQtyShort(p.size)}</div>
-                        <div className="text-[10px] text-muted" title={`증거금 ${fmtUsd(margin)} USDT`}>
-                          ({fmtUsdShort(margin, 9)} USDT)
+                        <div title={`${fmtQty(p.size)} ${baseOf(p.symbol)}`}>{fmtQtyShort(p.size)}</div>
+                        <div className="text-[10px] text-muted" title={`증거금 ${fmtMoney(margin, quoteOf(p.symbol))} ${quoteOf(p.symbol)}`}>
+                          ({fmtMoneyShort(margin, quoteOf(p.symbol), 9)} {quoteOf(p.symbol)})
                         </div>
                       </td>
                       {standard && (
@@ -360,9 +363,10 @@ export default function PositionsPanel() {
                         {pnl == null ? (
                           '—'
                         ) : (
-                          <span title={`미실현 ${fmtUsd(pnl)} USDT`}>
+                          <span title={`미실현 ${fmtMoney(pnl, quoteOf(p.symbol))} ${quoteOf(p.symbol)}`}>
                             {pos ? '+' : ''}
-                            {fmtUsdShort(pnl)}
+                            {fmtMoneyShort(pnl, quoteOf(p.symbol))}
+                            <span className="ml-0.5 text-[10px] font-normal opacity-70">{quoteOf(p.symbol)}</span>
                             <span className="ml-1 text-[10px] opacity-80">
                               ({pos ? '+' : ''}
                               {fmtPct(roe)}%)
@@ -470,10 +474,10 @@ export default function PositionsPanel() {
                       <td className="px-3 py-2.5 font-medium text-text">
                         <button
                           onClick={() => setSymbol(o.symbol)}
-                          title={`${o.symbol.replace('USDT', '')} 차트로 이동`}
+                          title={`${pairLabel(o.symbol)} 차트로 이동`}
                           className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
                         >
-                          {o.symbol.replace('USDT', '')}
+                          {pairLabel(o.symbol)}
                         </button>
                       </td>
                       <td className="px-3 py-2.5">
@@ -502,7 +506,7 @@ export default function PositionsPanel() {
                             className="w-20 rounded bg-panel2 px-1 py-0.5 text-right text-[11px] text-text outline-none ring-1 ring-border"
                           />
                         ) : (
-                          <span title={`${fmtPrice(o.limitPrice, precisionOf(precisions, o.symbol))} USDT`}>
+                          <span title={`${fmtPrice(o.limitPrice, precisionOf(precisions, o.symbol))} ${quoteOf(o.symbol)}`}>
                             {fmtPriceShort(o.limitPrice, precisionOf(precisions, o.symbol), 10)}
                           </span>
                         )}
@@ -595,10 +599,10 @@ export default function PositionsPanel() {
                       <td className="px-3 py-2.5 font-medium text-text">
                         <button
                           onClick={() => setSymbol(c.symbol)}
-                          title={`${c.symbol.replace('USDT', '')} 차트로 이동`}
+                          title={`${pairLabel(c.symbol)} 차트로 이동`}
                           className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
                         >
-                          {c.symbol.replace('USDT', '')}
+                          {pairLabel(c.symbol)}
                         </button>
                       </td>
                       <td className="px-3 py-2.5">
@@ -631,7 +635,7 @@ export default function PositionsPanel() {
                         ) : (
                           <>
                             <span className="text-muted">{c.triggerDir === 'above' ? '≥ ' : '≤ '}</span>
-                            <span title={`${fmtPrice(c.triggerPrice, prec)} USDT`}>{fmtPriceShort(c.triggerPrice, prec, 10)}</span>
+                            <span title={`${fmtPrice(c.triggerPrice, prec)} ${quoteOf(c.symbol)}`}>{fmtPriceShort(c.triggerPrice, prec, 10)}</span>
                             {/* 재무장 대기 중이면 다시 무장되는 가격을 함께 보여준다 */}
                             {c.repeating && c.repeatMode === 'rearm' && !c.armed && (
                               <div className="text-[10px] text-muted">
@@ -823,16 +827,37 @@ export default function PositionsPanel() {
                 {orders.map((o) => {
                   const prec = precisionOf(precisions, o.symbol);
                   const pos = o.pnl != null && o.pnl >= 0;
+                  // 환전 기록(/api/convert) — symbol=USDTKRW, price=환율, size=USDT 수량, long=원화→USDT.
+                  if (o.kind === 'convert') {
+                    const toKrw = o.side === 'short';
+                    const krw = o.size * o.price;
+                    return (
+                      <tr key={o.id} className="border-b border-border/60">
+                        <td className="whitespace-nowrap px-3 py-2 text-muted">{fmtTime(o.createdAt)}</td>
+                        <td className="px-3 py-2 font-medium text-text">USDT/KRW</td>
+                        <td className="px-3 py-2 text-muted">{toKrw ? 'USDT → KRW' : 'KRW → USDT'}</td>
+                        <td className="px-3 py-2 text-accent">{KIND_LABEL.convert}</td>
+                        <td className="px-3 py-2 text-right text-text" title="환율(1 USDT 당 원)">
+                          {fmtKrw(o.price)}
+                        </td>
+                        <td className="px-3 py-2 text-right text-text" colSpan={2}>
+                          {toKrw
+                            ? `${fmtMoney(o.size, 'USDT')} USDT → ${fmtKrw(krw)} KRW`
+                            : `${fmtKrw(krw)} KRW → ${fmtMoney(o.size, 'USDT')} USDT`}
+                        </td>
+                      </tr>
+                    );
+                  }
                   return (
                     <tr key={o.id} className="border-b border-border/60">
                       <td className="whitespace-nowrap px-3 py-2 text-muted">{fmtTime(o.createdAt)}</td>
                       <td className="px-3 py-2 font-medium text-text">
                         <button
                           onClick={() => setSymbol(o.symbol)}
-                          title={`${o.symbol.replace('USDT', '')} 차트로 이동`}
+                          title={`${pairLabel(o.symbol)} 차트로 이동`}
                           className="font-medium text-text underline-offset-2 transition hover:text-accent hover:underline"
                         >
-                          {o.symbol.replace('USDT', '')}
+                          {pairLabel(o.symbol)}
                         </button>
                       </td>
                       <td className="px-3 py-2">
@@ -849,7 +874,7 @@ export default function PositionsPanel() {
                           {KIND_LABEL[o.kind]}
                         </span>
                       </td>
-                      <td className="px-3 py-2 text-right text-text" title={`${fmtPrice(o.price, prec)} USDT`}>
+                      <td className="px-3 py-2 text-right text-text" title={`${fmtPrice(o.price, prec)} ${quoteOf(o.symbol)}`}>
                         {fmtPriceShort(o.price, prec, 10)}
                       </td>
                       <td className="px-3 py-2 text-right text-text" title={fmtQty(o.size)}>
@@ -857,9 +882,9 @@ export default function PositionsPanel() {
                       </td>
                       <td
                         className={`px-3 py-2 text-right font-medium ${o.pnl == null ? 'text-muted' : pos ? 'text-up' : 'text-down'}`}
-                        title={o.pnl == null ? undefined : `${fmtUsd(o.pnl)} USDT`}
+                        title={o.pnl == null ? undefined : `${fmtMoney(o.pnl, quoteOf(o.symbol))} ${quoteOf(o.symbol)}`}
                       >
-                        {o.pnl == null ? '—' : `${pos ? '+' : ''}${fmtUsdShort(o.pnl)}`}
+                        {o.pnl == null ? '—' : `${pos ? '+' : ''}${fmtMoneyShort(o.pnl, quoteOf(o.symbol))}`}
                       </td>
                     </tr>
                   );

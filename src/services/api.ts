@@ -21,7 +21,7 @@ export interface ApiOrder {
   price: number;
   size: number;
   leverage: number;
-  kind: 'open' | 'close' | 'liquidation';
+  kind: 'open' | 'close' | 'liquidation' | 'convert'; // convert = USDT↔원화 환전 기록(symbol USDTKRW, price=환율, size=USDT)
   pnl: number | null;
   createdAt: number;
 }
@@ -61,6 +61,8 @@ export interface ApiConditionalOrder {
 export interface AppState {
   name: string;
   balance: number;
+  /** 원화 지갑(빗썸 원화 마켓 담보, USDT 지갑과 분리된 크로스) — 구버전 서버 응답엔 없을 수 있다 */
+  krwBalance?: number;
   refillsLeft: number;
   /** VIP 등급(상한 없음) — 누적 거래대금에서 서버가 파생. 수수료율/진행도 표시에 사용 */
   vipTier: number;
@@ -229,6 +231,9 @@ export const api = {
   cancelConditional: (conditionalId: string) =>
     orderReq({ action: 'cancelConditional', conditionalId }),
   refill: () => req<AppState>('/refill', { method: 'POST' }),
+  /** USDT ↔ 원화 지갑 환전(수수료 0, 환율은 서버가 빗썸에서 받는다 — 여기서 보내지 않는다). */
+  convert: (from: 'USDT' | 'KRW', amount: number) =>
+    req<AppState>('/convert', { method: 'POST', body: JSON.stringify({ from, amount, ordersSince: ordersCursor }) }),
   leaderboard: () => req<{ leaderboard: LeaderRow[]; revenue: FeeRevenue }>('/leaderboard'),
   spotState: (pair: string) => req<SpotState>(`/spot?pair=${encodeURIComponent(pair)}`),
   /** ⚠ **통합 폴링**(§ functions/api/state.ts `?tick=`) — 호가·체결·캔들(+선택적으로 계정 상태)을

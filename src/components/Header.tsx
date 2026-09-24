@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import { useMarketStore, selectLastPrice, selectLastTakerSide, precisionOf } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtPrice, fmtPriceShort, fmtUsd, fmtUsdShort } from '@/format';
+import { fmtKrw, fmtMoneyShort, fmtPrice, fmtPriceShort, fmtUsd, fmtUsdShort } from '@/format';
+import { quoteOf } from '@/symbols';
+import ConvertModal from './ConvertModal';
 import SymbolSelect from '@/components/SymbolSelect';
 import Logo from './Logo';
 import VipBadge from './VipBadge';
@@ -37,10 +39,16 @@ export default function Header({
   const vipProgress =
     vipNextAt == null ? 1 : Math.min(1, Math.max(0, (totalVolume - vipFrom) / Math.max(1, vipNextAt - vipFrom)));
   const [showMenu, setShowMenu] = useState(false);
+  const [showConvert, setShowConvert] = useState(false);
+  const krwBalance = useTradingStore((s) => s.krwBalance);
+  const positions = useTradingStore((s) => s.positions);
 
   // 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익) — 식은 `useEquity` 한 곳에만 둔다
   // (파산 팝업 RefillModal 과 같은 판정을 써야 "버튼은 활성인데 팝업은 안 뜨는" 어긋남이 안 생긴다).
-  const { equity, broke: canRefill } = useEquity();
+  // ⚠ 지갑이 둘(USDT/원화)이라 헤더의 평가자산은 **합산(원화는 USDT 환산)** 이고, 원화 노출이 있으면 원화 지갑
+  // 평가자산을 옆에 따로 보여준다(강제청산은 지갑별이라 원화 쪽 여유를 따로 봐야 한다).
+  const { equity, wallets, broke: canRefill } = useEquity();
+  const hasKrw = krwBalance !== 0 || positions.some((p) => quoteOf(p.symbol) === 'KRW');
   // 마지막 체결이 매수 테이커면 매수색, 매도 테이커면 매도색 — 아직 체결이 없으면 기본색.
   const priceColor = lastTakerSide === 'buy' ? 'text-up' : lastTakerSide === 'sell' ? 'text-down' : 'text-text';
 
@@ -55,7 +63,7 @@ export default function Header({
         {/* 연결 상태는 텍스트 없이 점 색으로만(초록=실시간, 회색=끊김) */}
         <span
           className={`flex min-w-0 items-center gap-1 truncate text-xs font-bold sm:text-[15px] ${priceColor}`}
-          title={lastPrice != null ? `${fmtPrice(lastPrice, precisionOf(precisions, symbol))} USDT` : undefined}
+          title={lastPrice != null ? `${fmtPrice(lastPrice, precisionOf(precisions, symbol))} ${quoteOf(symbol)}` : undefined}
         >
           <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${connected ? 'bg-up' : 'bg-muted'}`} />
           {/* 가격도 길면 축약 — OX 는 상한이 1e6 이지만 실제 코인/미래 코인까지 같은 규칙으로 둔다(§fmtPriceShort) */}
@@ -66,16 +74,37 @@ export default function Header({
       {/* 우: 평가자산 · 리필 · (모바일)더보기 / (데스크톱)랭킹·설정·유저·로그아웃 */}
       <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
         <div className="flex flex-col items-end leading-none">
-          <span className="hidden text-[10px] text-muted sm:block">평가자산</span>
+          <span className="hidden text-[10px] text-muted sm:block">{hasKrw ? '총 평가자산' : '평가자산'}</span>
           <span
             className="mt-0 text-xs font-bold text-text sm:mt-0.5 sm:text-sm"
-            title={`평가자산 ${fmtUsd(equity)} USDT`}
+            title={
+              hasKrw
+                ? `총 평가자산 ${fmtUsd(equity)} USDT (USDT 지갑 ${fmtUsd(wallets.USDT)} + 원화 지갑 ${fmtKrw(wallets.KRW)} KRW 환산)`
+                : `평가자산 ${fmtUsd(equity)} USDT`
+            }
           >
             {/* ⚠ 200배 + 무한 조건부로 1e30 까지 가는 값이라 그대로 두면 헤더가 통째로 밀린다(§format.fmtUsdShort) */}
             {fmtUsdShort(equity, 9)}
             <span className="ml-0.5 text-[10px] font-normal text-muted">USDT</span>
           </span>
         </div>
+        {hasKrw && (
+          <div className="hidden flex-col items-end leading-none md:flex">
+            <span className="text-[10px] text-muted">원화 평가자산</span>
+            <span className="mt-0.5 text-sm font-bold text-text" title={`원화 지갑 평가자산 ${fmtKrw(wallets.KRW)} KRW`}>
+              {fmtMoneyShort(wallets.KRW, 'KRW', 9)}
+              <span className="ml-0.5 text-[10px] font-normal text-muted">KRW</span>
+            </span>
+          </div>
+        )}
+        {/* 환전 — 원화 마켓(BTC/KRW 등)은 원화 지갑으로 거래하므로 여기서 옮긴다 */}
+        <button
+          onClick={() => setShowConvert(true)}
+          title="USDT ↔ KRW 환전 (수수료 없음)"
+          className="hidden rounded-md bg-panel2 px-2 py-1.5 text-xs font-semibold text-text ring-1 ring-border transition hover:bg-elevated sm:block"
+        >
+          ⇄ 환전
+        </button>
 
         <button
           onClick={() => refill()}
@@ -115,6 +144,15 @@ export default function Header({
                   <div className="mt-1 h-1 w-full overflow-hidden rounded-full bg-elevated">
                     <div className="h-full rounded-full bg-accent" style={{ width: `${vipProgress * 100}%` }} />
                   </div>
+                </button>
+                <button
+                  onClick={() => {
+                    setShowConvert(true);
+                    setShowMenu(false);
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-xs text-text transition hover:bg-panel2"
+                >
+                  ⇄ 환전{hasKrw ? ` · ${fmtMoneyShort(wallets.KRW, 'KRW', 9)} KRW` : ''}
                 </button>
                 <button
                   onClick={() => {
@@ -175,6 +213,7 @@ export default function Header({
           </button>
         </div>
       </div>
+      {showConvert && <ConvertModal onClose={() => setShowConvert(false)} />}
     </header>
   );
 }

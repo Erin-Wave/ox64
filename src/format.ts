@@ -154,6 +154,21 @@ export function fmtUsd(v: number | null | undefined): string {
   return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+/** 원화 금액 — 세자리 콤마, 소수 없음(1원 미만은 의미가 없다). */
+export function fmtKrw(v: number | null | undefined): string {
+  if (v == null || !isFinite(v)) return '—';
+  return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+/** 결제통화별 금액(잔고·손익·증거금) — USDT 는 소수 2자리, KRW 는 정수. 단위 문자열은 붙이지 않는다. */
+export function fmtMoney(v: number | null | undefined, quote: 'USDT' | 'KRW'): string {
+  return quote === 'KRW' ? fmtKrw(v) : fmtUsd(v);
+}
+/** fmtMoney 의 축약판(§ fmtUsdShort) — 원화는 USDT 보다 1,400배 큰 숫자라 자릿수 한도를 3자리 더 준다. */
+export function fmtMoneyShort(v: number | null | undefined, quote: 'USDT' | 'KRW', maxIntDigits = 12): string {
+  if (v == null || !isFinite(v)) return '—';
+  return quote === 'KRW' ? shortNum(v, maxIntDigits + 3, fmtKrw) : shortNum(v, maxIntDigits, fmtUsd);
+}
+
 /** VIP 수수료율(분수, 예 0.0003)을 퍼센트 문자열로 — 뒤 0 트림, 최대 소수 8자리. ⚠ '%' 는 붙이지 않는다
  * (호출부가 붙임). 예: 0.0003→"0.03", 0.00001→"0.001", 0.000000001→"0.0000001".
  * ⚠ 자릿수는 **요율 하한(functions/_shared.ts VIP_MIN_RATE = 1e-9 → 0.0000001%)에 맞춰져 있다** — 예전

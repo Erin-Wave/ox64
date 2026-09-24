@@ -72,6 +72,24 @@ export function isVirtualSymbol(s: string): boolean {
   return (VIRTUAL_SYMBOLS as readonly string[]).includes(s);
 }
 
+// ── 원화(KRW) 마켓 — 빗썸(2026-09-24) ─────────────────────────────────────────
+// ⚠⚠ 원화 심볼은 **원화 지갑(`users.krw_balance`)** 으로 거래한다 — USDT 지갑(`users.balance`)과 완전히
+// 분리된 크로스 담보다. 증거금·손익·수수료·강제청산이 전부 그 심볼의 결제통화 지갑 안에서만 일어나고
+// (KRW 쪽이 파산해도 USDT 포지션은 안 건드린다), 두 지갑 사이는 `/api/convert` 로만 오간다.
+// 그래서 **잔고 컬럼을 하드코딩하지 말고 항상 `balColOf(symbol)`** 로 고를 것 — `balance` 를 그대로 쓰면
+// 원화 포지션의 증거금이 USDT 지갑에서 빠져나간다(단위가 1,400배 다른 돈이 섞인다).
+// 목록은 화이트리스트다(빗썸 원화 마켓 480개를 다 열지 않는다). src/symbols.ts KRW_SYMBOLS 와 같은 값.
+const KRW_SYMBOLS = ['BTCKRW', 'ETHKRW', 'SOLKRW', 'FKRW'] as const;
+export type Quote = 'USDT' | 'KRW';
+/** 결제통화. ⚠ 'FKRW' 처럼 기준통화가 한 글자인 심볼도 있어서 길이가 아니라 접미사로 가른다. */
+export const quoteOf = (s: string): Quote => (s.endsWith('KRW') ? 'KRW' : 'USDT');
+export const isKrwSymbol = (s: string): boolean => (KRW_SYMBOLS as readonly string[]).includes(s);
+/** 그 통화의 잔고 컬럼 — SQL 에 끼워 넣는 값이라 **이 고정 매핑에서만** 나와야 한다(입력값 금지). */
+export const balCol = (q: Quote): 'balance' | 'krw_balance' => (q === 'KRW' ? 'krw_balance' : 'balance');
+export const balColOf = (symbol: string) => balCol(quoteOf(symbol));
+/** 가격 맵에 실리는 환율 키 — 1 USDT 가 몇 원인지(빗썸 KRW-USDT 현재가). 거래 심볼이 아니다. */
+export const USDT_KRW = 'USDTKRW';
+
 // ── 가상 코인 호가 단위 = **유효숫자 4자리 고정** ─────────────────────────────
 // ⚠ 예전엔 "소수 4자리 고정"(틱 0.0001)이었다. 그건 가격이 1 USDT 근처일 때만 말이 되는 규칙이라,
 // 봇 가격이 0.002 대로 내려가면 유효숫자가 2자리뿐이라 호가가 뭉텅이로 움직이고(0.0024↔0.0025 =
@@ -141,9 +159,10 @@ const KST_OFFSET_MS = 9 * 3600 * 1000;
 export function todayKst(): string {
   return new Date(Date.now() + KST_OFFSET_MS).toISOString().slice(0, 10);
 }
-// USDT 페어 형식만 검증(고정 목록 동기화 부담 제거). 실제 존재 여부는 fetchPrice 가 검증.
+// USDT 페어는 형식만 검증(고정 목록 동기화 부담 제거, 실제 존재 여부는 fetchPrice 가 검증).
+// 원화 페어는 화이트리스트(KRW_SYMBOLS) — `USDTKRW`(환율 키)가 거래 심볼로 들어오면 안 된다.
 export function isSymbol(s: unknown): s is string {
-  return typeof s === 'string' && /^[A-Z0-9]{2,20}USDT$/.test(s);
+  return typeof s === 'string' && (/^[A-Z0-9]{2,20}USDT$/.test(s) || isKrwSymbol(s));
 }
 
 const COOKIE = 'ox64_sess';
@@ -301,6 +320,37 @@ async function fromBinanceMirror(symbol: string): Promise<number> {
   return Number(d.price);
 }
 
+// ── 빗썸(원화 마켓) ──
+// ⚠ 한 요청에 여러 마켓을 묶는다(`/v1/ticker?markets=A,B,…`, 실측 300개까지) — 원화 심볼이 몇 개든 환율까지
+// **외부 호출 1회**다(무료 플랜 invocation당 subrequest 50, §6). 실제 코인(OKX)은 심볼마다 1회라 대조적이다.
+// Cloudflare egress 에서 200 확인(2026-09-24, 바이낸스와 달리 차단 없음), 응답 250~400ms 로 OKX 보다 느리다.
+// 예비 소스는 없다 — 빗썸이 멈추면 원화 심볼은 가격이 비고, 그동안 원화 지갑의 강제청산 판정은 건너뛴다.
+export const bithumbMarket = (s: string) => `KRW-${s.slice(0, -3)}`; // 'BTCKRW' → 'KRW-BTC', 'USDTKRW' → 'KRW-USDT'
+let lastUsdtKrw: number | null = null; // 이 isolate 가 마지막으로 본 환율(§ toUsdtValue)
+async function fromBithumb(symbols: string[]): Promise<Record<string, number>> {
+  const syms = [...new Set([...symbols, USDT_KRW])]; // 환율은 항상 같이 받는다(공짜 — 같은 요청)
+  const r = await timedFetch(`https://api.bithumb.com/v1/ticker?markets=${syms.map(bithumbMarket).join(',')}`);
+  if (!r.ok) throw new Error(`bithumb ${r.status}`);
+  const arr = (await r.json()) as { market: string; trade_price: number }[];
+  const byMarket = new Map(arr.map((x) => [x.market, Number(x.trade_price)]));
+  const out: Record<string, number> = {};
+  for (const s of syms) {
+    const p = byMarket.get(bithumbMarket(s));
+    if (p && isFinite(p) && p > 0) out[s] = p;
+  }
+  if (out[USDT_KRW]) lastUsdtKrw = out[USDT_KRW];
+  return out;
+}
+/** 이 isolate 가 마지막으로 받은 환율(없으면 null). 원화 체결은 **같은 요청 안에서** 반드시 빗썸 시세를
+ * 먼저 받으므로(체결가가 곧 빗썸 시세) 체결 부기 시점엔 항상 채워져 있다. */
+export const krwPerUsdt = (): number | null => lastUsdtKrw;
+// 환율을 한 번도 못 받은 isolate 의 최후 폴백 — VIP 거래대금·수수료 수익 **집계**에만 쓰인다(잔고와 무관).
+const KRW_PER_USDT_FALLBACK = 1400;
+/** 금액을 USDT 환산(원화 심볼이면 ÷환율). VIP 거래대금·수수료 수익은 USDT 로 한 줄에 쌓는다. */
+export function toUsdtValue(symbol: string, amount: number): number {
+  return quoteOf(symbol) === 'KRW' ? amount / (lastUsdtKrw ?? KRW_PER_USDT_FALLBACK) : amount;
+}
+
 // OX/USDT 는 외부 거래소에 없으므로 봇(runMarketMaker, functions/api/spot.ts)이 랜덤워크로
 // 유지하는 내부 기준가를 그대로 체결가로 쓴다. D1 읽기라 외부 HTTP 처럼 실패할 일이 거의 없다.
 async function getVirtualPrice(env: Env, pair: string): Promise<number> {
@@ -316,6 +366,16 @@ async function getVirtualPrice(env: Env, pair: string): Promise<number> {
 
 export async function fetchPrice(env: Env, symbol: string): Promise<number> {
   if (isVirtualSymbol(symbol)) return getVirtualPrice(env, symbol);
+  if (quoteOf(symbol) === 'KRW') {
+    let p: number | undefined;
+    try {
+      p = (await fromBithumb([symbol]))[symbol];
+    } catch (e) {
+      throw new Error(`시세 조회 실패 (${e instanceof Error ? e.message : 'bithumb'})`);
+    }
+    if (!p) throw new Error('시세 조회 실패 (bithumb)');
+    return p;
+  }
   let last = '';
   for (const src of [fromOkx, fromCoinbase, fromBinanceMirror]) {
     try {
@@ -333,22 +393,32 @@ export async function fetchPrices(env: Env, symbols: string[], seed?: Record<str
   // OX 기준가가 그것이라, 다시 읽으면 같은 행을 한 번 더 읽는 것뿐이다.
   const out: Record<string, number> = { ...seed };
   const uniq = [...new Set(symbols)].filter((s) => out[s] == null);
-  await Promise.all(
-    uniq.map(async (s) => {
+  // 원화 심볼(+환율 키)은 빗썸 **한 요청**으로 묶고, 나머지는 예전처럼 심볼마다 병렬로.
+  const krw = uniq.filter((s) => quoteOf(s) === 'KRW');
+  const rest = uniq.filter((s) => quoteOf(s) !== 'KRW');
+  await Promise.all([
+    krw.length
+      ? fromBithumb(krw)
+          .then((m) => Object.assign(out, m))
+          .catch(() => {
+            /* 빗썸 실패 — 원화 심볼만 스킵 */
+          })
+      : null,
+    ...rest.map(async (s) => {
       try {
         out[s] = await fetchPrice(env, s);
       } catch {
         /* 그 심볼만 스킵 */
       }
     }),
-  );
+  ]);
   return out;
 }
 
-/** 크로스 마진 가용 증거금 계산용 — 유저 전 포지션의 미실현손익 합(marks 에 있는 심볼만 반영).
+/** 크로스 마진 가용 증거금 계산용 — 그 통화 지갑의 전 포지션 미실현손익 합(marks 에 있는 심볼만 반영).
  * 신규 주문 가용 = 여유잔고 + 이 값 (= 평가자산 − 사용중 증거금). 이익 중이면 그 미실현이익까지 새
  * 주문 증거금으로 쓸 수 있고(=크로스), 손실 중이면 가용이 줄어든다. 아이솔레이티드였다면 이 항이 없다. */
-export async function unrealizedTotal(env: Env, uid: string, marks: Record<string, number>): Promise<number> {
+export async function unrealizedTotal(env: Env, uid: string, marks: Record<string, number>, quote: Quote): Promise<number> {
   const positions = (
     await env.DB.prepare('SELECT symbol, side, entry_price, size FROM positions WHERE user_id = ?')
       .bind(uid)
@@ -356,6 +426,8 @@ export async function unrealizedTotal(env: Env, uid: string, marks: Record<strin
   ).results;
   let u = 0;
   for (const p of positions) {
+    // ⚠ 지갑별 크로스 — 다른 통화 포지션의 손익은 이 지갑의 담보가 아니다(단위부터 다르다).
+    if (quoteOf(p.symbol) !== quote) continue;
     const mark = marks[p.symbol];
     if (mark == null) continue;
     u += (mark - p.entry_price) * p.size * (p.side === 'long' ? 1 : -1);
@@ -368,6 +440,7 @@ export interface UserRow {
   id: string;
   name: string;
   balance: number;
+  krw_balance: number; // 원화 지갑(§ quoteOf) — ALTER 로 추가된 컬럼, DEFAULT 0
   refill_count: number;
   refill_date: string | null;
   ox_balance: number;
@@ -469,15 +542,19 @@ export function feeAccrualStmts(
    * 0/미지정이면 flat 단가에 이미 포함된 몫으로 본다. */
   prints = 0,
 ): D1PreparedStatement[] {
+  // ⚠ 누적 거래대금(VIP)·수수료 수익·원장은 **USDT 환산**으로 쌓는다 — 원화 체결의 명목금액(원)을 그대로
+  // 더하면 1,400배 부풀어 VIP 등급이 순식간에 치솟는다. 잔고에서 실제로 떼는 수수료(원)는 호출부 몫이다.
+  const notionalUsdt = toUsdtValue(symbol, notional);
+  const feeUsdt = toUsdtValue(symbol, fee);
   return [
     env.DB.prepare('UPDATE users SET total_volume = total_volume + ?, total_fees = total_fees + ? WHERE id = ?').bind(
-      notional,
-      fee,
+      notionalUsdt,
+      feeUsdt,
       uid,
     ),
     env.DB.prepare(
       'INSERT INTO fee_ledger (id, user_id, symbol, kind, notional, rate, fee, created_at) VALUES (?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), uid, symbol, kind, notional, rate, fee, now),
+    ).bind(crypto.randomUUID(), uid, symbol, kind, notionalUsdt, rate, feeUsdt, now),
     // ⚠ D1 쓰기 예산 계량(§ _budget.ts). **이 함수가 모든 체결 경로가 반드시 지나는 유일한 병목**이라
     // 여기 한 줄이면 시장가/지정가/지정가청산/SL·TP/조건부(1회성·반복)/강제청산/OX walking 이 전부 잡힌다
     // — 경로마다 흩뿌리면 새 체결 경로를 추가할 때 빠뜨리고, 그 누락이 곧 다음 청구서다.
@@ -605,7 +682,7 @@ export async function loadState(
   snapshot?: StateSnapshot | null,
 ) {
   const user = await env.DB.prepare(
-    'SELECT id, name, balance, refill_count, refill_date, total_volume, total_fees FROM users WHERE id = ?',
+    'SELECT id, name, balance, krw_balance, refill_count, refill_date, total_volume, total_fees FROM users WHERE id = ?',
   )
     .bind(uid)
     .first<UserRow>();
@@ -666,6 +743,7 @@ export async function loadState(
   return {
     name: user.name,
     balance: user.balance,
+    krwBalance: user.krw_balance ?? 0,
     refillsLeft,
     markPrices,
     // VIP 등급은 누적 거래대금에서 파생(저장 안 함) — 클라는 뱃지/수수료 예상액 표시에만 쓴다.

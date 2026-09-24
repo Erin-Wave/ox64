@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { TickerTrade } from '@/types';
-import { isVirtualSymbol } from '@/symbols';
+import { isVirtualSymbol, quoteOf } from '@/symbols';
 import { virtualPrecision } from '@/format';
 
 // 체결 테이프 보관 개수. 화면에 그리는 건 최대 50행(설정 상한)이지만 **버퍼는 훨씬 크게** 잡는다 —
@@ -89,7 +89,9 @@ export const useMarketStore = create<MarketState>((set, get) => ({
     set((s) => {
       if (s.prices[symbol] === price) return s;
       const prices = { ...s.prices, [symbol]: price };
-      if (!isVirtualSymbol(symbol)) return { prices };
+      // 원화 심볼도 거래소 tickSize 를 받아올 곳이 없어(빗썸 호가 단위는 가격대별 표) 가상 코인처럼 가격에서
+      // 파생한다 — 유효숫자 4자리 규칙이 빗썸 호가 단위와 맞는다(115,340,000→0, 157,700→0, 5.136→3).
+      if (!isVirtualSymbol(symbol) && quoteOf(symbol) !== 'KRW') return { prices };
       const prec = virtualPrecision(price);
       return s.precisions[symbol] === prec ? { prices } : { prices, precisions: { ...s.precisions, [symbol]: prec } };
     }),

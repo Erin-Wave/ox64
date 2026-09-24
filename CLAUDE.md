@@ -2,7 +2,8 @@
 
 > 지인들끼리 수익률을 겨루는 모의 선물 트레이딩 플랫폼. 실시간 시세(바이낸스) 기반 롱/숏 진입·청산 연습 + **친구 랭킹**.
 > **서버 권위 구조**: 잔고·포지션·주문·손익은 전부 서버(Cloudflare D1)가 계산·보관하고, 체결가는 서버가 외부
-> 거래소(OKX→Coinbase 폴백, §3)에서 직접 받아 쓴다 → 클라이언트가 가격/잔고를 조작해도 무의미.
+> 거래소(OKX→Coinbase 폴백, 원화 마켓은 빗썸, §3·§4)에서 직접 받아 쓴다 → 클라이언트가 가격/잔고를 조작해도 무의미.
+> **지갑이 둘**이다 — USDT 지갑(`users.balance`)과 원화 지갑(`users.krw_balance`, 빗썸 원화 마켓 전용). §4 "원화 마켓".
 > 프론트(정적 SPA) + 백엔드(Cloudflare Pages Functions) 를 **한 레포·한 배포**로 운영.
 
 > **이 문서 읽는 법** — §1~§3 = 구조 · §4 = 체결·정산 규칙(돈이 걸린 부분) · §5 = 배포·마이그레이션 ·
@@ -51,7 +52,8 @@ ox64/
 │       ├── login.ts        POST (없는 이름=가입, 있으면 패스코드 검증 → 쿠키 30일) · logout.ts POST
 │       ├── state.ts        GET (checkTriggers 후 계정 상태). **`?tick=<pair>` 통합 폴링** — 호가·체결·캔들(+`&state=1` 계정)을 한 요청으로(§6). ⚠ 이 파일이 `api/spot.ts` 를 import 하는 방향이어야 한다(반대면 순환)
 │       ├── order.ts        POST (open/close/limitClose/limitOpen/cancelLimit/editLimit/setSlTp/conditionalOpen/cancelConditional). 응답은 `loadState(…, body.ordersSince)` 로 **주문내역 증분**(§6)
-│       ├── refill.ts       POST (파산 안전망 — 1일 3회, +10,000 USDT)
+│       ├── refill.ts       POST (파산 안전망 — 1일 3회, +10,000 USDT, 판정은 두 지갑 합산)
+│       ├── convert.ts      POST USDT↔원화 지갑 환전(수수료 0, 환율=서버가 받은 빗썸 USDT/KRW, 한도 min(잔고, 잔고+그 지갑 uPnL), 기록=orders kind='convert')
 │       ├── spot.ts         GET (OX 호가창·체결 표시용, ?candles=1) + runMarketMaker() — 봇 심리 모델(nextMarketState)이 기준가를 옮기고 사다리를 깐다. **틱은 순수 계산(simulateTick), N틱 메모리 → 커밋 1회 = 1행**(runBotTicks) — 사다리(`book_json`)·테이프(`tape_json`)·진행 중 캔들(`live_json`)이 그 한 행. 봇 호가는 에스크로 없음, 체결 뒤 정산은 `botFillStmts`
 │       ├── leaderboard.ts  GET (자산=잔고+미실현PnL 순위)
 │       ├── puzzle.ts       GET/POST — 퍼즐게임(§7). 별도 재화, 보드 정답은 서버만
@@ -66,12 +68,13 @@ ox64/
     ├── main.tsx            pathname 으로 트레이딩·퍼즐(/b)·던전(/5m)·RTS(/s1)·상자깡(/c) 분기(라우터 없음, 동적 import). useSettingsStore 먼저 import(FOUC 방지). ⚠ /s1 만 StrictMode 안 씌움(이펙트 2회 실행이 rAF 루프를 두 벌 만든다)
     ├── index.css           Tailwind + 테마 CSS 변수 + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position/PendingOrder/Side)
-    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + INTERVAL_GROUPS + KST_OFFSET(+9h)
+    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + KRW_SYMBOLS(빗썸 원화 4종)/quoteOf/baseOf/**pairLabel**(화면 표기 'BTC/KRW' — `replace('USDT','')` 금지)/categoryOf + INTERVAL_GROUPS + KST_OFFSET(+9h)
     ├── format.ts           fmtPrice/fmtVol/precisionFromTick + 축약 헬퍼(§6)
     ├── services/
     │   ├── binanceRest.ts  초기 과거봉(스팟 REST)
     │   ├── binanceWs.ts    kline + orderbookStream(`@depth<N>@100ms` 를 `BOOK_THROTTLE_MS`=200ms 로 솎음) + aggTradeStream. ⚠ **브라우저↔바이낸스 직결**이라 요청·D1 을 안 쓴다 — 갱신 주기를 예산과 무관하게 당길 수 있다(가상 코인은 반대, §6)
     │   ├── okxRest.ts      OKX 시세(실제 코인 mark — 서버 체결가와 같은 소스)
+    │   ├── bithumb.ts      빗썸 원화 마켓 **브라우저 직결**(CORS `*`, Cloudflare 0): 캔들(요청당 200·`to`=KST 문자열, 2h/6h/8h/12h/3d 는 롤업, **1s 없음**) · ticker 일괄 · 24h(구 API) · WS 한 소켓을 체결·호가가 공유 · 실시간 봉은 체결로 쌓음(경계 = 차트 마지막 봉 기준)
     │   ├── indicators.ts   차트 보조지표 순수 계산 15종(EMA/SMA/BB/RSI/VWAP(롤링)/MACD/Stochastic/ATR/ADX(+DI/−DI)/CCI/OBV/Williams %R/Ichimoku/Parabolic SAR/SuperTrend). 입력=Candle[] 시간 오름차순, 출력=같은 인덱스 정렬(워밍업 null). Ichimoku 선행스팬은 길이가 n+kijun 이라 Chart 가 시간을 연장해 그린다
     │   ├── indicatorDefs.ts 인디케이터 레지스트리(`INDICATOR_DEFS`): 타입별 라벨·패널(overlay=캔들 위 / own=하단 별도 패널)·파라미터 정의(key/label/기본값/범위)·선 스펙(kind line/hist/dots, 스타일, 고정색)·기준선(RSI 70/30 등)·국면 판정(`states` — 봉마다 라벨 인덱스, `colorByState` 선은 점마다 라벨 색 + 레전드에 라벨. OBV = 기준선(OBV 의 EMA, 점선) 대비 유입/유출 × 가격 EMA 대비 위/아래 → 매집·끌어올림·정리·하락·반등. ⚠ "유출·가격 위"는 끌어올림을 거쳤을 때만 정리, 하락 뒤면 반등(경로 의존). ⚠ OBV 는 누적값이라 0 을 기준선으로 쓰지 말 것 — 과거봉 로드마다 통째로 이동한다. ⚠ LWC 는 선분을 시작점 색으로 그어서 `stateLine` 이 점 i 에 i+1 의 국면 색을 넣는다)·값 포맷·compute. **Chart 는 이 표만 보고 그리므로 지표 추가 = 여기 한 항목 + indicators.ts 계산 함수**(Chart/스토어에 타입 분기를 새로 넣지 말 것)
     │   └── api.ts          백엔드 클라이언트(/api/*, credentials 포함)
@@ -87,12 +90,13 @@ ox64/
     │   ├── useSettingsStore.ts 테마+거래모드(easy/standard), setTheme 이 `dataset.theme` 도 갱신
     │   └── useTradingStore.ts  서버 상태 캐시 + 액션 + spotBook/spotTrades(표시용). **체결 목록은 `dripTrades` 가 0.1~0.25초 간격으로 한 건씩** 흘려보낸다(§6, 비용 0). ⚠ 새 체결 식별은 **`createdAt`**(테이프 `id` 는 폴링마다 바뀜). 코인 전환 시 `spotClear` 가 타이머를 지울 것. `spotPair` = 호가·체결이 어느 코인 것인지 — `applySpot` 은 현재 심볼이 아닌 응답(전환 직전에 보낸 폴링)을 버린다
     └── components/
-        ├── RefillModal.tsx      파산 팝업 — 평가자산 ≤0 이면 자동. 판정은 `useEquity` 하나만. 닫으면 **0 을 벗어날 때까지** 다시 안 뜸
+        ├── RefillModal.tsx      파산 팝업 — 평가자산 ≤0 이면 자동. 판정은 `useEquity` 하나만(**두 지갑 합산**). 닫으면 **0 을 벗어날 때까지** 다시 안 뜸
+        ├── ConvertModal.tsx     USDT↔원화 환전(헤더 "⇄ 환전"). 환율·수령액은 미리보기, 열려 있는 동안 환율을 직접 받는다
         ├── VipModal.tsx · VipBadge.tsx  VIP 진행도·뱃지 — 기준표는 서버(loadState.vipTiers)
         ├── Logo.tsx            워드마크 — 15×3 픽셀아트 인라인 SVG(currentColor). 높이 3의 배수, 폭 w-auto(§6)
         ├── Login.tsx           이름+패스코드 로그인/가입
         ├── Header.tsx          심볼/현재가/평가자산/리필(평가자산≤0 일 때만)/랭킹/설정/로그아웃. 모바일은 "⋯" 더보기
-        ├── SymbolSelect.tsx    실제 38종 + 가상 코인을 **같은 목록·같은 정렬**로. OX 가격=`/api/spot`, 24h변동=`?candles=1&interval=1h&limit=24`. `statOf(sym)` 이 소스만 분기
+        ├── SymbolSelect.tsx    실제 38종 + 가상 + 원화를 **같은 목록·같은 정렬**로 + 검색(심볼·'BTC/KRW'·한글명) + 분류 필터(전체/KRW/USDT/가상, localStorage). OX 가격=`/api/spot`, 원화=빗썸 직결, 24h변동=`?candles=1&interval=1h&limit=24`. `statOf(sym)` 이 소스만 분기. 가격 정렬은 원화를 뒤로 모은다(단위가 달라 섞으면 무의미)
         ├── OrderBook.tsx       호가(매수 좌·매도 우)/체결 탭. 내 미체결 가격대 강조(서버 `mine`). 체결 행은 가격·수량 모두 테이커 방향 색. Standard+옵션(orderBook) 둘 다 켜야 표시. PC(md≥768)에서 `bookTogether` 면 호가·체결 상하 함께 — `useIsDesktop` 은 App.tsx 2열 분기와 **같은 경계**. ⚠ 훅을 `옵션 && useIsDesktop()` 처럼 단축 평가 뒤에 두면 훅 개수가 바뀌어 터진다. 높이=`bookRows × ROW_PX(16)` — ⚠ **maxHeight 가 아니라 height 고정**(체결이 흘러들 때 패널이 오르내림; 행 높이를 바꾸면 ROW_PX 도 같이). 강세/약세 레벨(tradeStrength): ⚠ 틱 방향이 아니라 **"이 가격이 싼가/비싼가"** — `strengthAt` 이 그 체결 **직전 120건의 중앙값/MAD(robust)** 대비 z(평균은 스윕 프린트가 잣대를 부풀림), z→레벨은 **꺾은선**(z=2.5 까지 선형 30, 위는 로그 압축으로 z=600 에서 50), 가격 칸 배경에 **왼쪽에서 자라는** 바. 기준은 **trailing**(행마다 자기 시점), **표시할 행에 대해서만**, 창은 **필터 이전 원본 테이프**에서
         ├── Settings.tsx        테마·차트 색·호가/체결 행 수·PC 함께 보기·체결 필터·강세/약세·거래모드·폰트 모달(`max-h-[90dvh] overflow-y-auto`)
         ├── Clock.tsx           KST 시계(자체 상태만 갱신). Chart 툴바 우측
@@ -127,6 +131,7 @@ ox64/
 ```
 
 - **차트 시세 = 바이낸스 스팟**(REST `api.binance.com/api/v3/klines`, WS `stream.binance.com:9443`; 선물 WS 는 지역에 따라 막힘). **클라 시세는 표시 전용** — 체결가는 서버(`_shared.fetchPrice`)가 따로 받는다.
+- **원화 심볼(BTCKRW 등) = 전부 빗썸** — 차트·호가·체결·mark 는 브라우저↔빗썸 직결(`services/bithumb.ts`), 서버 체결가는 `fromBithumb`(원화 심볼 전부 + 환율을 **한 요청**으로). Cloudflare egress 에서 200 확인, 250~400ms. 예비 소스 없음.
 - **⚠ 서버 시세 = OKX → Coinbase → 바이낸스미러 폴백**(바이낸스는 Worker egress IP 를 403 차단). OKX(`BASE-USDT`) 우선, Coinbase(`BASE-USD`, USD≈USDT) — 새 심볼 추가 시 두 매핑 확인. `timedFetch`(2.5s) 로 느린 소스는 즉시 다음 폴백.
 - **⚠ 실제 코인 mark(현재가/PnL) = OKX, 차트 캔들만 바이낸스**: 서버 체결가가 OKX 인데 클라 mark 가 바이낸스면 코인별 0.005~0.3% 어긋나 고배율에서 진입 즉시 손익이 튄다(200배면 0.05% 도 10% ROE). `useMarkPrices` 가 OKX 로 채우고 open 응답의 `markPrices[symbol]=체결가` 로 시드. **차트 WS(klineStream)는 캔들만 그리고 `setPrice` 하지 않는다**. ⚠ 가상 코인도 차트는 `setPrice` 안 한다(2026-09-23) — 봉 종가는 마지막 체결가(bid/ask)라 공정가와 반 스프레드 다르다. 헤더 현재가는 `?tick=` 응답의 `mark`(봇 공정가 = 서버 판정과 같은 값)를 `spotTick` 이 넣는다. 캔들은 바이낸스 유지(전 인터벌 — OKX 는 8h 미지원).
 - **가격 정밀도(심볼별)**: `binanceRest.fetchPricePrecision`(`PRICE_FILTER.tickSize`) → 차트 `priceFormat` + `useMarketStore.precisions[symbol]` → 모든 가격 표기는 `fmtPrice(v, precisionOf(...))`. ⚠ 차트가 "현재 심볼"만 채우면 다른 심볼 포지션이 소수 2자리 폴백 → `useMarkPrices` 가 보유·미체결·현재 심볼 전부 채운다(**가상 심볼은 가격에서 파생** — 유효숫자 4자리라 `setPrice` 가 매 갱신 계산, §4).
@@ -208,6 +213,18 @@ ox64/
   - **⚠ 큰 금액 표시는 `fmtKor`(만/억/조), 반올림이 아니라 내림** — 999,999 를 "100만"으로 올려 보이면 기준선을 넘은 것처럼 읽힌다.
 - **아직 없음**: 펀딩비.
 
+### 원화 마켓 — BTC/KRW · ETH/KRW · SOL/KRW · F/KRW (빗썸, 원화 지갑, 2026-09-24)
+
+- **⚠⚠ 지갑이 둘이고 크로스 담보는 지갑별이다.** 원화 심볼은 `users.krw_balance`, 나머지(가상 포함)는 `users.balance`. 증거금·손익·수수료·지정가 잠금/환불·강제청산이 전부 **그 심볼의 결제통화 지갑 안에서만** 일어난다. 그래서 **잔고 SQL 에 컬럼을 하드코딩하지 말고 `balColOf(symbol)`**(`_shared.ts`, 고정 매핑이라 인젝션 없음), **미실현 합은 `unrealizedTotal(env, uid, marks, quote)`**(quote 필수 인자 — 빠뜨리면 원화 손익(원)이 USDT 가용에 섞인다). 새 체결 경로를 추가할 때 이 둘을 안 거치면 원화 포지션의 증거금이 USDT 지갑에서 빠져나간다.
+- **강제청산 = 지갑별**(`liquidateIfBankrupt` 가 통화마다 따로 판정·청산·그 통화 미체결 취소·그 컬럼 0). 한 지갑의 시세가 비면 그 지갑만 건너뛴다(빗썸이 멈춰도 USDT 판정은 돈다). 클라 청산가(`PositionsPanel`/`Chart`)도 같은 통화의 포지션·잔고만.
+- **리필·랭킹 = 두 지갑 합산**(원화 ÷ 환율). 원화가 남아 있으면 리필 거부("환전해서 사용하세요"), 리필은 USDT 로 지급, 원화 시작 잔고 0. 클라 `useEquity` 가 `wallets`(지갑별)·`equity`(합산)·`rate` 를 준다.
+- **VIP 거래대금·수수료 수익·fee_ledger 는 USDT 환산**(`feeAccrualStmts` 내부 `toUsdtValue` — 이 isolate 가 마지막으로 받은 환율, 없으면 1400 폴백. 원화 체결은 같은 요청에서 빗썸 시세를 먼저 받으므로 항상 채워져 있다). 잔고에서 떼는 수수료는 원.
+- **환율 키 `USDTKRW`** = 1 USDT 가 몇 원(빗썸 KRW-USDT). 가격 맵(서버 `markPrices`·클라 `prices`)에 실리지만 **거래 심볼이 아니다** — `isSymbol` 은 원화를 화이트리스트(`KRW_SYMBOLS`)로만 받는다. 원화 심볼이 가격 맵에 들어가면 `fromBithumb` 가 환율도 같이 싣는다(공짜).
+- **환전(`/api/convert`)**: 수수료 0, 환율은 서버가 받는다(클라 값 안 씀), 한도 = `min(잔고, 잔고 + 그 지갑 uPnL)`(미실현 이익은 못 옮기고 손실만큼은 남긴다), 가드 UPDATE 를 **단독으로 먼저** 확정한 뒤 기록 INSERT(§4 batch 함정). 기록은 `orders` 에 `symbol='USDTKRW', kind='convert', price=환율, size=USDT 수량, side long=원화→USDT`. 차트 마커는 심볼로 거르므로 안 섞인다.
+- 심볼 추가 = `src/symbols.ts KRW_SYMBOLS`(+`KRW_NAMES`) **와** `functions/_shared.ts KRW_SYMBOLS` 두 곳(서버는 화이트리스트). 추가 전에 빗썸 `market_warning`(유의·경고=상장폐지 후보)과 거래대금을 볼 것 — **상장폐지 정산 규칙이 아직 없다**(가격이 영영 안 오면 그 지갑의 강제청산 판정이 계속 건너뛰어진다).
+- 가격 정밀도 = 가격에서 파생(`virtualPrecision`, 유효숫자 4자리 = 빗썸 호가 단위와 일치). 지정가 반올림 없음(실제 코인과 같음). 레버리지 상한 250 동일.
+- 빗썸 봉은 **KST 정렬**(4시간봉 KST 0·4·8시, 일봉 KST 자정 — 바이낸스의 UTC 정렬과 다르다). 롤업도 KST 기준. `to` 파라미터는 존 표기 없는 KST 문자열만(Z·+09:00 은 400).
+
 ### 가상 코인 — OX/USDT · EW/USDT (서버 = `functions/api/order.ts` + `functions/api/spot.ts`) — 실제 코인과 동일한 레버리지, 체결가만 봇이 생성
 
 > **상세는 [docs/VIRTUAL_COIN.md](docs/VIRTUAL_COIN.md)** — **관심도·business time·tether 제거(2026-09-23, 맨 앞 절이 우선)**, 봇 심리 모델(국면/탐욕·공포/세션/코일/저항·지지), 체결 미세구조(호가 바운스·flurry·스톱헌팅·아이스버그), 호가창 지속/취소(`prevBook`), 수량 계층 분포(`SIZE_TIERS`), `book_json`/`tape_json`/`live_json` 링 버퍼, 캔들 영속(`PERSIST_INTERVALS`/`open_at`·`close_at`), 벽 존중, 봇 수수료·재고 정산, 매칭 엔진(시장가/지정가/sweep/`Aggressor`), 유효숫자 4자리 틱. **그 파일이 규칙의 진실원본**이고 여기엔 손댈 때 반드시 지킬 것만 적는다.
@@ -263,6 +280,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
     **⚠ `usage_meter` 의 오늘 행은 전환 시 한 번 리셋해야 한다** — 예전 단가(틱당 7행)로 쌓인 값이라 새 임계값(§6, 일 8만)에서 즉시 차단이 걸린다. `DELETE FROM usage_meter WHERE day = <오늘 KST>`.
   - **⚠ `spot_candles.open_at`/`close_at`(캔들 시가 오염 수정, 2026-09-02)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE spot_candles ADD COLUMN open_at INTEGER NOT NULL DEFAULT 0"` 및 동일 형식으로 `close_at INTEGER NOT NULL DEFAULT 0`. **코드 배포 전에 먼저 적용돼야 한다** — 모든 체결의 캔들 upsert 와 봇의 캔들 flush 가 이 컬럼을 쓰므로 없으면 체결 batch 가 통째로 롤백된다(= 거래가 멈춘다). prod·로컬 적용 완료. 기존 행은 0(=가장 이른 시각)이라 시가가 예전 값 그대로 유지되고, 배포 시점에 진행 중이던 버킷 하나만 해당된다.
   - **⚠ `spot_bot_state.interest`/`hype`/`fair`(관심도, 2026-09-23)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE spot_bot_state ADD COLUMN interest REAL NOT NULL DEFAULT 0"` 및 동일 형식으로 `hype REAL NOT NULL DEFAULT 0` / `fair REAL NOT NULL DEFAULT 0`. **코드 배포 전에 먼저 적용돼야 한다** — 봇 커밋 UPDATE 와 유저 체결의 기준가 upsert(`INTEREST_BUMP_SQL`)가 참조하므로 없으면 봇 틱과 OX/EW 체결 batch 가 통째로 롤백된다. 전부 DEFAULT 0(=미초기화)이라 첫 틱에 스스로 초기화. 적용 직후 1회 `UPDATE spot_bot_state SET drift = drift * 0.2, peak = ref_price, trough = ref_price, anchor = ref_price`(예전 진폭 기준 상태를 새 게이지로 보면 공포 100% 로 시작한다). prod·로컬 적용 완료.
+  - **⚠ `users.krw_balance`(원화 지갑, 2026-09-24)**: `npx wrangler d1 execute ox64 --remote --command "ALTER TABLE users ADD COLUMN krw_balance REAL NOT NULL DEFAULT 0"`. **코드 배포 전에 먼저 적용돼야 한다** — 강제청산 판정·loadState 가 매 폴링 SELECT 하므로 없으면 `/api/state` 부터 500(= 거래 전체 정지). prod·로컬 적용 완료. **cron 워커도 재배포**(sweep 이 `_trading.ts` 를 공유한다).
   - **⚠ `crate_stats`(상자깡, §10, 2026-09-10)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용으로 만들 수 있다(ALTER 불필요). **단 이 테이블만은 `loadRow` 가 "없으면 그 자리에서 만든다"** — prod 적용 당시 wrangler OAuth 토큰에 `d1` 스코프가 없어 CLI 로 마이그레이션을 돌릴 수 없었고(`code: 7403`), 완전히 격리된 신규 테이블이라 자동 생성이 안전했다. 정상 경로에선 catch 가 안 타므로 쿼리·비용 증가 0. ⚠ **컬럼을 더할 땐 이 자동 생성에 기대지 말 것** — `IF NOT EXISTS` 는 컬럼을 추가해주지 않고, 그때는 평소대로 ALTER 를 코드 배포보다 먼저 돌려야 한다. 그리고 `crate.ts` 의 `CREATE_TABLE_SQL` 과 `schema.sql` 의 정의는 **항상 같아야 한다**.
   - **⚠ `dungeon_stats`/`dungeon_rooms`/`dungeon_players`(5분 던전, §8, 2026-07-27)**: 신규 테이블이라 `CREATE TABLE IF NOT EXISTS` — `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 자동 생성된다(ALTER 불필요). **`/api/dungeon` 코드가 이 테이블들을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩·퍼즐 라우트와 완전히 분리돼 있어 없어도 그쪽엔 영향 없고 `/api/dungeon` 만 500 이 된다(방어적 try/catch 없음 — 격리돼 있어 불필요 판단).
 - **Secret**: `SESSION_SECRET` = `wrangler pages secret put SESSION_SECRET --project-name ox64` 로 production 에 설정됨(랜덤 32B hex). wrangler.toml 엔 두지 않음.
@@ -482,6 +500,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
          — 조용한 후퇴라 로그가 없으면 "봇이 왜 멈췄지?"를 알 방법이 없다.
        - 현재 페이스(하루 3~5만)면 이 선에 닿지 않는다 — **닿았다는 건 어딘가 새 폭주 경로가 생겼다는
          신호**이므로, 차단이 걸리면 임계값을 올리는 게 아니라 `npm run d1:budget` 으로 원인을 찾을 것.
+  - **원화 마켓(빗썸)의 비용**: 차트·호가·체결·mark·심볼 선택기는 **브라우저 직결이라 Cloudflare 요청·D1 0**. 서버는 원화 심볼이 걸린 요청마다 외부 호출 **+1**(원화 심볼 수와 무관하게 한 요청, invocation당 subrequest 50 에 여유). D1 행은 실제 코인 체결과 같다. ⚠ 서버에서 `/public/ticker/ALL_KRW`(171KB) 같은 전종목 조회를 하지 말 것 — CPU 10ms 를 파싱에 태운다.
   - **⚠ 폴링 경로 전수 점검 결과(2026-08-01)** — 클라의 모든 주기 요청 중 **D1 에 쓰기를 만드는 건 둘뿐**이고
     둘 다 위 계량·차단 아래에 있다. 새 폴링을 추가할 땐 이 표에 한 줄을 더할 수 있는지부터 확인할 것.
     | 폴링 | 주기 | D1 쓰기 | 요청 수(§ 10만/일) |
@@ -728,5 +747,6 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - [ ] 가상 코인 3종 이상 추가 — 페어 파라미터화·봇 재고 분리는 끝났고(`VIRTUAL_PAIRS`/`bot_inventory`) `VIRTUAL_SYMBOLS`+`spot_bot_state` 시작가 행만 추가하면 된다. 틱 예산은 코인 수로 나눠 쓰므로 비용은 안 늘지만 코인당 움직임이 성겨진다
 - [ ] 미니 RTS 확장(종족 추가, 유닛 다양화, 난이도 선택, 리플레이)
 - [ ] 상자깡(§10) 확장 — 재료 카테고리 추가, 상자 Lv4 이상, 도감 완성 보상. ⚠ 무엇을 얹든 `npm run sim:crate` 로 naive 70%/optimal 110% 를 다시 맞출 것
+- [ ] 원화 마켓 — 상장폐지 정산 규칙(마지막 가격으로 정산) · 예비 시세 소스(업비트, Cloudflare 에서 미검증) · 거래량 적은 코인의 레버리지 상한 · 심볼 추가(§4 원화 마켓)
 - [ ] 펀딩비 반영
 - [ ] 랭킹 새로고침 최적화(현재 5초 폴링 → 서버 캐시/집계)

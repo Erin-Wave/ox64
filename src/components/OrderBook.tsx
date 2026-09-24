@@ -3,7 +3,8 @@ import { orderbookStream, type OrderBookLevel, type OrderBookSnapshot } from '@/
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useChartStore } from '@/store/useChartStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { isVirtualSymbol } from '@/symbols';
+import { baseOf, isVirtualSymbol, quoteOf } from '@/symbols';
+import { bithumbOrderbookStream } from '@/services/bithumb';
 import { fmtPct, fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
 
@@ -162,7 +163,9 @@ export default function OrderBook() {
     if (virtual) return; // 가상 심볼은 useSpotPoll 이 채우는 store.spotBook 을 대신 사용
     setBook(null);
     setGroupIdx(0); // 심볼마다 tick 단위가 달라서 배수 선택을 리셋
-    const sub = orderbookStream(symbol, 20).subscribe({ next: setBook });
+    // 원화 심볼은 빗썸 호가(30단계, 브라우저 직결), 나머지 실제 코인은 바이낸스 부분 호가(최대 20단계).
+    const stream = quoteOf(symbol) === 'KRW' ? bithumbOrderbookStream(symbol) : orderbookStream(symbol, 20);
+    const sub = stream.subscribe({ next: setBook });
     return () => sub.unsubscribe();
   }, [symbol, virtual]);
 
@@ -240,7 +243,8 @@ export default function OrderBook() {
   const sectionTitle = (label: string) => <span className="px-2 py-0.5 text-[11px] font-semibold text-text">{label}</span>;
 
   // 필터가 걸려 있으면 체결 탭에 뱃지로 알린다(목록이 비어도 "왜 비었는지"가 보이게). 누르면 즉시 해제.
-  const unit = filterBasis === 'qty' ? symbol.replace('USDT', '') : 'USDT';
+  // ⚠ 거래대금 기준 필터 값은 **그 심볼의 결제통화** 단위다(원화 심볼이면 원).
+  const unit = filterBasis === 'qty' ? baseOf(symbol) : quoteOf(symbol);
   // 수량 기준이면 수량 포맷(소수 트림), 거래대금이면 금액 포맷 — 뱃지가 "1,000.00 BTC" 처럼 안 보이게.
   const fmtBound = (v: number | null) => (filterBasis === 'qty' ? fmtQtyShort(v, 9) : fmtUsdShort(v, 9));
   const filterText =
@@ -381,7 +385,7 @@ export default function OrderBook() {
                 <span className={`relative block truncate text-right ${color}`}>{fmtPriceShort(t.price, prec, 9)}</span>
               </span>
               {/* 수량도 같은 방향 색으로 — 가격만 칠하면 목록을 훑을 때 매수/매도 흐름이 한눈에 안 읽힌다. */}
-              <span className={`truncate text-right ${color}`} title={`거래대금 ${fmtUsd(t.price * t.qty)} USDT`}>
+              <span className={`truncate text-right ${color}`} title={`거래대금 ${fmtUsd(t.price * t.qty)} ${quoteOf(symbol)}`}>
                 {fmtQty(t.qty)}
               </span>
             </div>

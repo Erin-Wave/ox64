@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtUsd, fmtUsdShort, fmtNumInput, unfmtNum, fmtFeeRate } from '@/format';
+import { fmtMoney, fmtMoneyShort, fmtNumInput, unfmtNum, fmtFeeRate } from '@/format';
+import { baseOf, quoteOf } from '@/symbols';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit' | 'conditional';
@@ -34,6 +35,7 @@ export default function OrderPanel() {
   const limitOpen = useTradingStore((s) => s.limitOpen);
   const conditionalOpen = useTradingStore((s) => s.conditionalOpen);
   const balance = useTradingStore((s) => s.balance);
+  const krwBalance = useTradingStore((s) => s.krwBalance);
   const busy = useTradingStore((s) => s.busy);
   const error = useTradingStore((s) => s.error);
   const positions = useTradingStore((s) => s.positions);
@@ -94,7 +96,10 @@ export default function OrderPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartClickNonce]);
 
-  const coin = symbol.replace('USDT', '');
+  const coin = baseOf(symbol);
+  // 결제통화 — 원화 심볼은 **원화 지갑**으로 거래한다(증거금·수수료·가용 전부 원). 금액 표기 단위도 이것.
+  const quote = quoteOf(symbol);
+  const quoteDigits = quote === 'KRW' ? 0 : 2; // 금액 입력칸 소수 자릿수(원은 정수)
   const refPrice =
     effectiveTab === 'limit'
       ? Number(limitPrice) || lastPrice
@@ -150,10 +155,12 @@ export default function OrderPanel() {
 
   // 크로스 마진 가용 증거금 = 여유잔고 + 전 포지션 미실현손익(서버 markPrices 기준 — 서버 가용 판정과
   // 동일 시세). 이익 중이면 그 미실현이익까지 새 주문에 쓸 수 있고, 손실 중이면 가용이 줄어든다.
+  // ⚠ 지갑별 크로스 — 이 심볼과 **같은 통화**의 잔고·포지션만 담보다(서버 unrealizedTotal(…, quote) 와 같은 식).
   const available = Math.max(
     0,
-    balance +
+    (quote === 'KRW' ? krwBalance : balance) +
       positions.reduce((a, p) => {
+        if (quoteOf(p.symbol) !== quote) return a;
         const mark = markPrices[p.symbol];
         if (mark == null) return a;
         return a + (mark - p.entryPrice) * p.size * (p.side === 'long' ? 1 : -1);
@@ -180,7 +187,7 @@ export default function OrderPanel() {
     const costPerNotional = 1 / leverage + feeRate;
     const szCoin = (available * fraction * SAFETY) / costPerNotional / refPrice; // 코인 수량
     // 슬라이더는 현재 unit 에 맞는 값으로 입력칸에 채운다(USDT 모드면 명목가로).
-    setAmtInput(unit === 'coin' ? trimNum(szCoin, 6) : trimNum(szCoin * refPrice, 2));
+    setAmtInput(unit === 'coin' ? trimNum(szCoin, 6) : trimNum(szCoin * refPrice, quoteDigits));
   };
 
   // 입력칸 표시값(콤마 포함) — amtInput 을 그대로 보여준다(왕복 재계산 안 함 → USDT 입력이 안 깨진다).
@@ -191,7 +198,7 @@ export default function OrderPanel() {
     const next: Unit = unit === 'coin' ? 'usdt' : 'coin';
     if (refPrice && amtNum > 0) {
       const converted = unit === 'coin' ? amtNum * refPrice : amtNum / refPrice;
-      setAmtInput(next === 'usdt' ? trimNum(converted, 2) : trimNum(converted, 6));
+      setAmtInput(next === 'usdt' ? trimNum(converted, quoteDigits) : trimNum(converted, 6));
     }
     setUnit(next);
   };
@@ -244,7 +251,7 @@ export default function OrderPanel() {
               inputMode="decimal"
               className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none"
             />
-            <span className="px-3 text-xs text-muted">USDT</span>
+            <span className="px-3 text-xs text-muted">{quote}</span>
           </div>
         </div>
       )}
@@ -280,7 +287,7 @@ export default function OrderPanel() {
               placeholder="트리거 가격"
               className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none placeholder:text-muted"
             />
-            <span className="px-3 text-xs text-muted">USDT</span>
+            <span className="px-3 text-xs text-muted">{quote}</span>
           </div>
           {/* 무한(반복) 조건부 — 체결돼도 주문이 남아 재무장 후 다시 트리거될 때마다 실행 */}
           <label className="mt-2 flex cursor-pointer items-center gap-2 text-xs text-muted">
@@ -434,7 +441,7 @@ export default function OrderPanel() {
                 title="단위 전환"
                 className="mr-1 rounded px-2 py-1 text-xs font-semibold text-muted transition hover:bg-elevated hover:text-text disabled:opacity-40"
               >
-                {unit === 'coin' ? coin : 'USDT'} ⇄
+                {unit === 'coin' ? coin : quote} ⇄
               </button>
             </div>
           </>
@@ -503,31 +510,31 @@ export default function OrderPanel() {
             정확한 값은 title 툴팁으로 남긴다(§format.fmtUsdShort). */}
         <div className="flex justify-between gap-2">
           <span className="shrink-0 text-muted">가용 (크로스)</span>
-          <span className="truncate text-text" title={`${fmtUsd(available)} USDT`}>
-            {fmtUsdShort(available, 9)} USDT
+          <span className="truncate text-text" title={`${fmtMoney(available, quote)} ${quote}`}>
+            {fmtMoneyShort(available, quote, 9)} {quote}
           </span>
         </div>
         <div className="flex justify-between gap-2">
           <span className="shrink-0 text-muted">명목가</span>
-          <span className="truncate text-text" title={notional ? `${fmtUsd(notional)} USDT` : undefined}>
-            {notional ? fmtUsdShort(notional, 9) : '—'} USDT
+          <span className="truncate text-text" title={notional ? `${fmtMoney(notional, quote)} ${quote}` : undefined}>
+            {notional ? fmtMoneyShort(notional, quote, 9) : '—'} {quote}
           </span>
         </div>
         <div className="flex justify-between gap-2">
           <span className="shrink-0 text-muted">증거금</span>
           <span
             className={`truncate ${margin + fee > available ? 'text-down' : 'text-text'}`}
-            title={margin ? `${fmtUsd(margin)} USDT` : undefined}
+            title={margin ? `${fmtMoney(margin, quote)} ${quote}` : undefined}
           >
-            {margin ? fmtUsdShort(margin, 9) : '—'} USDT
+            {margin ? fmtMoneyShort(margin, quote, 9) : '—'} {quote}
           </span>
         </div>
         <div className="flex justify-between gap-2">
           <span className="shrink-0 text-muted">
             수수료 <span className="text-[10px] text-muted">VIP{vipTier} · {fmtFeeRate(feeRate)}%</span>
           </span>
-          <span className="truncate text-text" title={fee ? `${fmtUsd(fee)} USDT` : undefined}>
-            {fee ? fmtUsdShort(fee, 9) : '—'} USDT
+          <span className="truncate text-text" title={fee ? `${fmtMoney(fee, quote)} ${quote}` : undefined}>
+            {fee ? fmtMoneyShort(fee, quote, 9) : '—'} {quote}
           </span>
         </div>
       </div>

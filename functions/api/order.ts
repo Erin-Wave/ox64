@@ -18,10 +18,11 @@ import {
   clampOrderSize,
   sizeEps,
   roundVirtual,
+  quoteOf,
+  balColOf,
   type Env,
   type PositionRow,
   type PendingRow,
-  type UserRow,
   type ConditionalRow,
 } from '../_shared';
 import { checkTriggers } from '../_trading';
@@ -201,7 +202,8 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       const ref = marks[symbol] ?? (await fetchPrice(env, symbol));
       if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
       // 크로스: 여유잔고 + 전 포지션 미실현손익까지 증거금으로 walking 체결에 쓸 수 있게 uPnL 을 넘긴다.
-      const uPnL = await unrealizedTotal(env, uid, marks);
+      // (가상 코인은 USDT 지갑 — 원화 포지션 손익은 섞지 않는다)
+      const uPnL = await unrealizedTotal(env, uid, marks, 'USDT');
       const { filled, avgPrice, reason } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
       // 사유를 구분해서 답한다 — 잔고 레이스로 못 넣은 걸 "호가 물량이 없다"로 답하면 원인을 오해한다.
       if (!(filled > 0)) return bad(reason === 'margin' ? '증거금이 부족합니다 (잔고가 방금 바뀌었을 수 있습니다)' : '체결 가능한 호가 물량이 없습니다');
@@ -213,16 +215,18 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 둘 다 끝난 뒤에야 잔고/기존포지션을 읽으므로(아래) 원자성 문제는 없다.
     const [marks, price] = await Promise.all([checkTriggers(env, uid), fetchPrice(env, symbol)]);
 
-    const user = await env.DB.prepare('SELECT id, name, balance FROM users WHERE id = ?')
+    // ⚠ 원화 심볼은 원화 지갑에서 증거금·수수료가 나간다(§ _shared quoteOf) — 컬럼을 하드코딩하지 말 것.
+    const col = balColOf(symbol);
+    const user = await env.DB.prepare(`SELECT id, name, ${col} AS bal FROM users WHERE id = ?`)
       .bind(uid)
-      .first<UserRow>();
+      .first<{ bal: number }>();
     if (!user) return bad('unauthorized', 401);
 
     // 크로스 마진 가용 증거금 = 여유잔고 + 전 포지션 미실현손익. 이익 중이면 그 미실현이익까지 새
     // 주문 증거금으로 쓸 수 있고(그때 balance 는 -uPnL 까지 음수 허용), 손실 중이면 가용이 줄어든다.
     // 잔고 차감 가드는 balance - margin >= -uPnL (⟺ available >= margin) 로 원자적으로 막는다.
-    const uPnL = await unrealizedTotal(env, uid, marks);
-    const available = user.balance + uPnL;
+    const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(symbol));
+    const available = (user.bal ?? 0) + uPnL;
     // 수수료 = 명목금액(체결가×수량) × VIP 등급 수수료율. 진입 시엔 증거금과 **함께** 차감해야
     // 원자 가드가 성립한다(따로 빼면 증거금은 통과하고 수수료만 실패하는 틈이 생긴다).
     const feeRate = await feeRateOf(env, uid);
@@ -254,7 +258,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       }
 
       const res = await env.DB.batch([
-        env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?').bind(
+        env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(
           addMargin + fee,
           uid,
           addMargin + fee,
@@ -282,7 +286,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const posId = crypto.randomUUID();
     // 잔고 차감은 조건부 UPDATE 로 원자적 가드(balance - margin >= -uPnL ⟺ available >= margin, 크로스)
     const res = await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?').bind(
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(
         margin + fee,
         uid,
         margin + fee,
@@ -341,8 +345,9 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const closeNotional = price * closeSize;
     const closeFee = closeNotional * closeRate;
 
+    const col = balColOf(pos.symbol);
     await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnl - closeFee, uid),
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(marginReleased + pnl - closeFee, uid),
       ...feeAccrualStmts(env, uid, pos.symbol, 'close', closeNotional, closeRate, closeFee, now),
       isPartial
         ? env.DB
@@ -424,19 +429,20 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!validSlTp(side, limitPrice, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
 
     const margin = (limitPrice * size) / leverage;
-    const user = await env.DB.prepare('SELECT id, name, balance FROM users WHERE id = ?')
+    const col = balColOf(symbol);
+    const user = await env.DB.prepare(`SELECT id, name, ${col} AS bal FROM users WHERE id = ?`)
       .bind(uid)
-      .first<UserRow>();
+      .first<{ bal: number }>();
     if (!user) return bad('unauthorized', 401);
-    // 크로스: 가용 = 여유잔고 + 전 포지션 미실현손익. 지정가도 이 가용 안에서 증거금을 잠근다.
-    const uPnL = await unrealizedTotal(env, uid, marks);
-    const available = user.balance + uPnL;
+    // 크로스: 가용 = 여유잔고 + 그 지갑 포지션 미실현손익. 지정가도 이 가용 안에서 증거금을 잠근다.
+    const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(symbol));
+    const available = (user.bal ?? 0) + uPnL;
     if (margin > available) return bad(noMarginMsg(available, limitPrice, leverage, 0));
 
     const now = Date.now();
     const pendingId = crypto.randomUUID();
     const res = await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?').bind(
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(
         margin,
         uid,
         margin,
@@ -466,8 +472,9 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .first<PendingRow>();
     if (!pending) return bad('주문을 찾을 수 없음', 404);
 
+    const col = balColOf(pending.symbol);
     await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(pending.margin, uid),
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(pending.margin, uid),
       env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(pendingId, uid),
     ]);
 
@@ -521,8 +528,9 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 그대로 커밋돼 "증거금 없이 주문만 커지는" 상태가 된다(D1 batch 는 조건부 UPDATE 0행을 실패로 보지 않음).
     const newMargin = (newLimit * newSize) / pending.leverage;
     const delta = newMargin - pending.margin; // >0: 추가 잠금 / <0: 환불(가드 항상 통과)
-    const uPnL = await unrealizedTotal(env, uid, marks);
-    const charge = await env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?')
+    const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(pending.symbol));
+    const col = balColOf(pending.symbol);
+    const charge = await env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`)
       .bind(delta, uid, delta, -uPnL)
       .run();
     if (charge.meta.changes !== 1) return bad('증거금이 부족합니다');

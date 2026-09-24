@@ -32,7 +32,8 @@ import { useMarketStore } from '@/store/useMarketStore';
 import { useChartStore, type IndicatorConfig, type ChartColorScheme } from '@/store/useChartStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol } from '@/symbols';
+import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol, quoteOf, pairLabel } from '@/symbols';
+import { bithumbKlineStream, bithumbSupports, fetchBithumbKlines } from '@/services/bithumb';
 import { fmtPrice, fmtPriceShort, fmtQtyShort, virtualPrecision } from '@/format';
 import Clock from '@/components/Clock';
 import type { Candle } from '@/types';
@@ -151,6 +152,7 @@ export default function Chart() {
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
   const cancelConditional = useTradingStore((s) => s.cancelConditional);
   const balance = useTradingStore((s) => s.balance);
+  const krwBalance = useTradingStore((s) => s.krwBalance);
   const prices = useMarketStore((s) => s.prices);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -685,20 +687,36 @@ export default function Chart() {
       };
     }
 
-    // 심볼별 가격 정밀도 적용(우측 축·크로스헤어·레전드) — 소수점 2자리 고정 버그 수정
-    fetchPricePrecision(symbol)
-      .then(({ precision, minMove }) => {
-        if (cancelled) return;
-        setPrec(precision);
-        setPrecision(symbol, precision);
-        candle.applyOptions({ priceFormat: { type: 'price', precision, minMove } });
-      })
-      .catch(() => {});
+    // ── 원화 심볼(빗썸): 바이낸스와 같은 흐름(REST 과거봉 + 실시간), 데이터 소스만 빗썸(브라우저 직결) ──
+    const krw = quoteOf(symbol) === 'KRW';
+    // 빗썸엔 1초봉이 없다 — 1초봉을 보다가 원화 심볼로 오면 1분봉으로 옮긴다(인터벌 목록에서도 뺀다).
+    if (krw && !bithumbSupports(interval)) {
+      setIntervalCode('1m');
+      return;
+    }
+    const loadKlines = (limit: number, endTimeMs?: number) =>
+      krw ? fetchBithumbKlines(symbol, interval, limit, endTimeMs) : fetchKlines(symbol, interval, limit, endTimeMs);
+
+    // 심볼별 가격 정밀도 적용(우측 축·크로스헤어·레전드) — 소수점 2자리 고정 버그 수정.
+    // 원화 심볼은 받아올 tickSize 가 없어 가격에서 파생한다(유효숫자 4자리 = 빗썸 호가 단위, § useMarketStore.setPrice).
+    const applyPrecision = (precision: number, minMove = Math.pow(10, -precision)) => {
+      setPrec(precision);
+      setPrecision(symbol, precision);
+      candle.applyOptions({ priceFormat: { type: 'price', precision, minMove } });
+    };
+    if (!krw) {
+      fetchPricePrecision(symbol)
+        .then(({ precision, minMove }) => {
+          if (!cancelled) applyPrecision(precision, minMove);
+        })
+        .catch(() => {});
+    }
 
     (async () => {
       try {
-        const candles = await fetchKlines(symbol, interval, 500);
+        const candles = await loadKlines(500);
         if (cancelled) return;
+        if (krw && candles.length) applyPrecision(virtualPrecision(candles[candles.length - 1].close));
         candlesRef.current = candles;
         for (const c of candles) volMap.current.set(c.time, c.volume ?? 0);
         candle.setData(
@@ -729,7 +747,8 @@ export default function Chart() {
       loadingMore = true;
       try {
         const oldest = arr[0].time; // sec
-        const older = await fetchKlines(symbol, interval, 500, oldest * 1000 - 1);
+        // 빗썸 `to` 는 그 시각 미만(배타), 바이낸스 endTime 은 이하(포함)라 1ms 를 빼 둔다 — 어느 쪽이든 아래 filter 가 거른다.
+        const older = await loadKlines(500, krw ? oldest * 1000 : oldest * 1000 - 1);
         if (cancelled) return;
         const fresh = older.filter((c) => c.time < oldest);
         if (fresh.length === 0) {
@@ -746,7 +765,9 @@ export default function Chart() {
         syncIndicatorsRef.current();
         // 프리펜드로 인덱스가 fresh.length 만큼 밀리므로 보이던 구간 그대로 유지
         if (before) ts.setVisibleLogicalRange({ from: before.from + fresh.length, to: before.to + fresh.length });
-        if (fresh.length < 450) noMore = true; // 더 받을 게 거의 없음(과거 데이터 끝 근처)
+        // 더 받을 게 거의 없음(과거 데이터 끝 근처). ⚠ 빗썸 롤업 인터벌(6h 등)은 한 번에 500봉을 못 채우므로
+        // 개수로 판단하지 않는다(빈 응답일 때만 끝 — 위 fresh.length === 0).
+        if (!krw && fresh.length < 450) noMore = true;
       } catch {
         /* 다음 시도 때 재시도 */
       } finally {
@@ -773,7 +794,8 @@ export default function Chart() {
     const tsApi = chartRef.current?.timeScale();
     tsApi?.subscribeVisibleLogicalRangeChange(onRange);
 
-    const sub = klineStream(symbol, interval).subscribe({
+    const live$ = krw ? bithumbKlineStream(symbol, interval, () => candlesRef.current.at(-1)) : klineStream(symbol, interval);
+    const sub = live$.subscribe({
       next: (tick) => {
         setConnected(true);
         // ⚠ 실제 코인의 mark(현재가/PnL 기준)는 바이낸스 WS 가 아니라 OKX(useMarkPrices)로 온다 —
@@ -871,14 +893,18 @@ export default function Chart() {
         const d = p.side === 'long' ? 1 : -1;
         return (lv - p.entryPrice) * p.size * d;
       };
-      if (positions.every((p) => unrealizedOf(p) != null)) {
-        const totalU = positions.reduce((a, p) => a + (unrealizedOf(p) ?? 0), 0);
+      // ⚠ 크로스 담보는 **지갑(결제통화)별**이다 — 이 심볼과 같은 통화의 포지션·잔고만 본다(서버 강제청산과 같은 식).
+      const q = quoteOf(symbol);
+      const walletPos = positions.filter((p) => quoteOf(p.symbol) === q);
+      const walletBal = q === 'KRW' ? krwBalance : balance;
+      if (walletPos.every((p) => unrealizedOf(p) != null)) {
+        const totalU = walletPos.reduce((a, p) => a + (unrealizedOf(p) ?? 0), 0);
         // 평가자산 = 여유잔고 + Σ(잠긴 증거금 + 미실현손익). PositionsPanel/서버와 동일한 산식(증거금 항 포함).
-        const totalMargin = positions.reduce((a, p) => a + (p.entryPrice * p.size) / p.leverage, 0);
+        const totalMargin = walletPos.reduce((a, p) => a + (p.entryPrice * p.size) / p.leverage, 0);
         for (const p of mine) {
           const others = totalU - (unrealizedOf(p) ?? 0);
           const d = p.side === 'long' ? 1 : -1;
-          const liq = p.entryPrice - (balance + totalMargin + others) / (p.size * d);
+          const liq = p.entryPrice - (walletBal + totalMargin + others) / (p.size * d);
           if (liq > 0) {
             priceLines.current.push(
               c.createPriceLine({
@@ -970,7 +996,7 @@ export default function Chart() {
       }
     }
     repositionPendBtnsRef.current(); // 주문선이 바뀌면 취소(X) 버튼 위치도 즉시 갱신
-  }, [positions, pendingOrders, conditionalOrders, prices, balance, symbol, opts.positionLine, opts.slTpLines, opts.pendingLine]);
+  }, [positions, pendingOrders, conditionalOrders, prices, balance, krwBalance, symbol, opts.positionLine, opts.slTpLines, opts.pendingLine]);
 
   // ── 다음 봉 카운트다운 ───────────────────────────────────────
   useEffect(() => {
@@ -1004,15 +1030,20 @@ export default function Chart() {
           onChange={(e) => setIntervalCode(e.target.value)}
           className="cursor-pointer rounded bg-panel2 px-2 py-1 text-xs font-semibold text-text outline-none ring-1 ring-border"
         >
-          {INTERVAL_GROUPS.map((g) => (
-            <optgroup key={g.name} label={g.name}>
-              {g.items.map((it) => (
-                <option key={it.code} value={it.code}>
-                  {it.label}
-                </option>
-              ))}
-            </optgroup>
-          ))}
+          {/* 원화 심볼(빗썸)은 1초봉이 없어 목록에서 뺀다 */}
+          {INTERVAL_GROUPS.map((g) => {
+            const items = quoteOf(symbol) === 'KRW' ? g.items.filter((it) => bithumbSupports(it.code)) : g.items;
+            if (items.length === 0) return null;
+            return (
+              <optgroup key={g.name} label={g.name}>
+                {items.map((it) => (
+                  <option key={it.code} value={it.code}>
+                    {it.label}
+                  </option>
+                ))}
+              </optgroup>
+            );
+          })}
         </select>
 
         <div className="relative">
@@ -1147,7 +1178,7 @@ export default function Chart() {
         {/* OHLCV 레전드 */}
         {legend && (
           <div className="pointer-events-none absolute left-2 top-1.5 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px]">
-            <span className="font-semibold text-text">{symbol.replace('USDT', '')}</span>
+            <span className="font-semibold text-text">{pairLabel(symbol)}</span>
             <span className="text-muted">{fmtKst(legend.time, subMinute)}</span>
             {/* 레전드도 축약 — 좁은 한 줄에 OHLCV + 인디케이터가 다 들어가서 한 값만 길어도 줄이 깨진다 */}
             <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.open, prec, 9)}</span></span>

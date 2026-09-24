@@ -2,7 +2,8 @@ import { useEffect } from 'react';
 import { aggTradeStream } from '@/services/binanceWs';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { isVirtualSymbol } from '@/symbols';
+import { isVirtualSymbol, quoteOf } from '@/symbols';
+import { bithumbTradeStream } from '@/services/bithumb';
 
 /**
  * 현재 심볼의 체결 테이프를 useMarketStore.recentTrades 에 채운다 — OrderBook.tsx 의 "체결" 탭과
@@ -19,7 +20,9 @@ export function useTradeTape() {
 
   useEffect(() => {
     if (virtual) return; // 가상 심볼은 아래 spotTrades 이펙트가 대신 채움
-    const sub = aggTradeStream(symbol).subscribe({
+    // 원화 심볼은 빗썸 체결 스트림(브라우저 직결), 나머지 실제 코인은 바이낸스 aggTrade.
+    const stream = quoteOf(symbol) === 'KRW' ? bithumbTradeStream(symbol) : aggTradeStream(symbol);
+    const sub = stream.subscribe({
       next: (t) => pushTrade(symbol, { price: t.price, qty: t.qty, takerSide: t.takerSide, time: t.time }),
     });
     return () => sub.unsubscribe();

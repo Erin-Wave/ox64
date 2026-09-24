@@ -1,8 +1,22 @@
-import { type Ctx, bad, json, safe, missingEnv, getSession, fetchPrices, BOT_USER_IDS, vipOf, type PositionRow } from '../_shared';
+import {
+  type Ctx,
+  bad,
+  json,
+  safe,
+  missingEnv,
+  getSession,
+  fetchPrices,
+  BOT_USER_IDS,
+  vipOf,
+  quoteOf,
+  krwPerUsdt,
+  USDT_KRW,
+  type PositionRow,
+} from '../_shared';
 
 /**
  * GET /api/leaderboard — 친구들 자산 순위.
- * equity = 잔고(balance) + 열린 포지션의 미실현 손익(서버 시세 기준).
+ * equity = 잔고(balance) + 열린 포지션의 미실현 손익(서버 시세 기준). 원화 지갑은 USDT 로 환산해 합산한다.
  * 로그인 필요(친구 전용, 공개 스크래핑 방지).
  */
 export function onRequestGet({ request, env }: Ctx): Promise<Response> {
@@ -17,13 +31,14 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
   const users = (
     await env.DB.prepare(
-      `SELECT id, name, balance, total_volume FROM users WHERE id NOT IN (${BOT_USER_IDS.map(() => '?').join(',')})`,
+      `SELECT id, name, balance, krw_balance, total_volume FROM users WHERE id NOT IN (${BOT_USER_IDS.map(() => '?').join(',')})`,
     )
       .bind(...BOT_USER_IDS)
       .all<{
         id: string;
         name: string;
         balance: number;
+        krw_balance: number;
         total_volume: number;
       }>()
   ).results;
@@ -47,16 +62,22 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   const feeTotal = rev?.total ?? 0;
   const feeFromBots = rev?.fromBots ?? 0;
 
-  const prices = await fetchPrices(env, positions.map((p) => p.symbol));
+  // 원화 노출(잔고나 포지션)이 있는 유저가 하나라도 있으면 환율도 받는다 — 빗썸 한 요청에 같이 실려 공짜다.
+  const anyKrw = users.some((u) => (u.krw_balance ?? 0) !== 0) || positions.some((p) => quoteOf(p.symbol) === 'KRW');
+  const prices = await fetchPrices(env, [...positions.map((p) => p.symbol), ...(anyKrw ? [USDT_KRW] : [])]);
+  // 환율을 못 받으면 이 isolate 가 최근에 본 값으로, 그것도 없으면 원화분은 빼고 센다(0 으로 두면 ÷0).
+  const rate = prices[USDT_KRW] ?? krwPerUsdt();
+  const toUsdt = (symbol: string, v: number) => (quoteOf(symbol) === 'KRW' ? (rate ? v / rate : 0) : v);
 
+  // ⚠ 아래 셋은 전부 **USDT 환산** 값이다(원화 포지션은 ÷환율) — 순위는 두 지갑을 합친 자산으로 매긴다.
   const unrealizedByUser: Record<string, number> = {};
   const marginByUser: Record<string, number> = {};
   const openCountByUser: Record<string, number> = {};
   for (const p of positions) {
     const mark = prices[p.symbol] ?? p.entry_price;
     const dir = p.side === 'long' ? 1 : -1;
-    unrealizedByUser[p.user_id] = (unrealizedByUser[p.user_id] ?? 0) + (mark - p.entry_price) * p.size * dir;
-    marginByUser[p.user_id] = (marginByUser[p.user_id] ?? 0) + p.margin;
+    unrealizedByUser[p.user_id] = (unrealizedByUser[p.user_id] ?? 0) + toUsdt(p.symbol, (mark - p.entry_price) * p.size * dir);
+    marginByUser[p.user_id] = (marginByUser[p.user_id] ?? 0) + toUsdt(p.symbol, p.margin);
     openCountByUser[p.user_id] = (openCountByUser[p.user_id] ?? 0) + 1;
   }
 
@@ -65,10 +86,11 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       const unrealized = unrealizedByUser[u.id] ?? 0;
       // 순자산 = 여유잔고 + Σ(잠긴 증거금 + 미실현손익). 진입 시 잔고에서 빠진 증거금도 담보라 포함해야
       // "포지션을 열면 순위 자산이 증거금만큼 깎이는" 오류가 없다(강제청산/평가자산 판정과 동일한 정의).
+      const krwInUsdt = rate ? (u.krw_balance ?? 0) / rate : 0;
       return {
         name: u.name,
-        balance: u.balance,
-        equity: u.balance + (marginByUser[u.id] ?? 0) + unrealized,
+        balance: u.balance + krwInUsdt,
+        equity: u.balance + krwInUsdt + (marginByUser[u.id] ?? 0) + unrealized,
         unrealized,
         openCount: openCountByUser[u.id] ?? 0,
         vipTier: vipOf(u.total_volume ?? 0).tier,

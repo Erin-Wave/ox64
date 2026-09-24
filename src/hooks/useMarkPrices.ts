@@ -1,10 +1,11 @@
 import { useEffect } from 'react';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { isVirtualSymbol } from '@/symbols';
+import { isVirtualSymbol, quoteOf, USDT_KRW } from '@/symbols';
 import { fetchPricePrecision } from '@/services/binanceRest';
 import { virtualPrecision } from '@/format';
 import { fetchOkxPrices } from '@/services/okxRest';
+import { fetchBithumbPrices } from '@/services/bithumb';
 
 // 가상 심볼은 거래소 tickSize 조회 대상이 아니다. 호가 단위가 **유효숫자 4자리**라 소수 자릿수가
 // 가격대에 따라 바뀌므로(1.057→3, 0.002434→6), 가격을 알면 거기서 파생하고 아직 모르면 4로 둔다
@@ -26,19 +27,41 @@ export function useMarkPrices() {
   const setPrecision = useMarketStore((s) => s.setPrecision);
   const positions = useTradingStore((s) => s.positions);
   const pendingOrders = useTradingStore((s) => s.pendingOrders);
+  const krwBalance = useTradingStore((s) => s.krwBalance);
+  const authed = useTradingStore((s) => s.authed);
 
   // 필요한 심볼 집합을 문자열 키로 만들어 의존성에 사용
   const posSymbols = positions.map((p) => p.symbol).join(',');
   const pendSymbols = pendingOrders.map((o) => o.symbol).join(',');
 
   // ── 가격 폴링 (현재 + 보유 포지션 심볼) ──
+  // 원화 심볼이 하나라도 걸려 있거나 원화 잔고가 있으면 환율(USDT/KRW)도 받는다 — 합산 평가자산·환전 미리보기·
+  // 파산 판정이 전부 이 값을 쓴다. 빗썸 한 요청에 같이 실려 추가 비용이 없다(브라우저 직결, Cloudflare 0).
+  const needRate = authed && (krwBalance !== 0 || quoteOf(symbol) === 'KRW' || posSymbols.split(',').some((s) => s && quoteOf(s) === 'KRW'));
+
   useEffect(() => {
     // 가상 심볼(OXUSDT)은 바이낸스에 없는 심볼이라 배치 요청에 섞이면 전체가 실패한다 — 제외.
-    const symbols = [...new Set([symbol, ...positions.map((p) => p.symbol)])].filter((s) => !isVirtualSymbol(s));
-    if (symbols.length === 0) return;
+    // 원화 심볼은 빗썸에서 따로(서버 체결가도 빗썸 — 같은 소스라 진입 손익 ~0 에서 시작).
+    const all = [...new Set([symbol, ...positions.map((p) => p.symbol)])].filter((s) => !isVirtualSymbol(s));
+    const krw = [...all.filter((s) => quoteOf(s) === 'KRW'), ...(needRate ? [USDT_KRW] : [])];
+    const symbols = all.filter((s) => quoteOf(s) !== 'KRW');
+    if (symbols.length === 0 && krw.length === 0) return;
     let alive = true;
 
+    const pollKrw = async () => {
+      if (krw.length === 0) return;
+      try {
+        const prices = await fetchBithumbPrices(krw);
+        if (!alive) return;
+        for (const [sym, p] of Object.entries(prices)) setPrice(sym, p);
+      } catch {
+        /* 다음 주기 재시도 */
+      }
+    };
+
     const poll = async () => {
+      pollKrw();
+      if (symbols.length === 0) return;
       try {
         // 1순위: OKX(서버 체결 소스와 동일 → 진입 손익 ~0). 전부 실패(지역 차단 등)면 바이낸스 폴백.
         let prices = await fetchOkxPrices(symbols);
@@ -68,7 +91,7 @@ export function useMarkPrices() {
       clearInterval(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, posSymbols, setPrice]);
+  }, [symbol, posSymbols, setPrice, needRate]);
 
   // ── 가격 정밀도 확보 (현재 + 보유 + 미체결 심볼, 없는 것만 1회 조회) ──
   useEffect(() => {
@@ -76,7 +99,8 @@ export function useMarkPrices() {
     const have = useMarketStore.getState().precisions;
     for (const s of syms) {
       if (have[s] != null) continue;
-      if (isVirtualSymbol(s)) {
+      // 가상·원화 심볼은 거래소 tickSize 조회 대상이 아니다 — 가격에서 파생(setPrice 가 매 갱신 계산).
+      if (isVirtualSymbol(s) || quoteOf(s) === 'KRW') {
         const px = useMarketStore.getState().prices[s];
         setPrecision(s, px ? virtualPrecision(px) : 4);
         continue;

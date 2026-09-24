@@ -23,6 +23,10 @@ import {
   repeatModeOf,
   effectiveCooldownMs,
   sizeEps,
+  quoteOf,
+  balCol,
+  balColOf,
+  type Quote,
 } from './_shared';
 import { autoWritesBlocked } from './_budget';
 import {
@@ -46,9 +50,11 @@ async function reflectVirtualFill(env: Env, symbol: string, uid: string, price: 
   }
 }
 
-/** 평가자산(잔고+미실현손익 합) < 0 이면 그 유저의 전 포지션을 강제청산 + 미체결 취소 + 잔고 0.
- * 심볼 가격을 하나라도 못 받아왔으면(allPriced=false) 이번 라운드는 건너뛴다 — 불완전한
- * 데이터로 잘못 청산시키는 것보다 다음 평가에서 다시 보는 게 안전. 청산이 실행됐으면 true. */
+/** 평가자산(잔고+미실현손익 합) < 0 이면 **그 지갑의** 전 포지션을 강제청산 + 미체결 취소 + 잔고 0.
+ * ⚠ 지갑(결제통화)별로 따로 판정한다 — 원화 지갑이 파산해도 USDT 포지션은 건드리지 않는다(§ _shared quoteOf).
+ * 그 지갑의 심볼 가격을 하나라도 못 받아왔으면(allPriced=false) 그 지갑은 이번 라운드를 건너뛴다 — 불완전한
+ * 데이터로 잘못 청산시키는 것보다 다음 평가에서 다시 보는 게 안전. 빗썸이 멈춰도 USDT 지갑 판정은 계속 돈다.
+ * 청산이 하나라도 실행됐으면 true. */
 async function liquidateIfBankrupt(
   env: Env,
   uid: string,
@@ -57,59 +63,70 @@ async function liquidateIfBankrupt(
   prices: Record<string, number>,
 ): Promise<boolean> {
   if (positions.length === 0) return false;
-  const user = await env.DB.prepare('SELECT balance FROM users WHERE id = ?').bind(uid).first<{ balance: number }>();
+  const user = await env.DB.prepare('SELECT balance, krw_balance FROM users WHERE id = ?')
+    .bind(uid)
+    .first<{ balance: number; krw_balance: number }>();
   if (!user) return false;
 
-  // 계좌 순자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익).
-  // ⚠ 예전엔 증거금 항을 빠뜨리고 "잔고 + 미실현손익"으로만 계산했다 — 진입 시 증거금은 잔고에서
-  // 이미 빠져나갔는데(그게 곧 담보다) 그걸 순자산에서 또 제외한 꼴이라, 증거금 비중을 크게 잡으면
-  // (슬라이더 100% 등) 진입 즉시 equity 가 0 근처가 돼 아주 작은 역행 틱에도 강제청산되던 치명적 버그.
-  let equity = user.balance;
-  let allPriced = true;
-  for (const pos of positions) {
-    const mark = prices[pos.symbol];
-    if (mark == null) {
-      allPriced = false;
-      continue;
+  let any = false;
+  for (const q of ['USDT', 'KRW'] as Quote[]) {
+    const qPos = positions.filter((p) => quoteOf(p.symbol) === q);
+    if (qPos.length === 0) continue;
+
+    // 계좌 순자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익).
+    // ⚠ 예전엔 증거금 항을 빠뜨리고 "잔고 + 미실현손익"으로만 계산했다 — 진입 시 증거금은 잔고에서
+    // 이미 빠져나갔는데(그게 곧 담보다) 그걸 순자산에서 또 제외한 꼴이라, 증거금 비중을 크게 잡으면
+    // (슬라이더 100% 등) 진입 즉시 equity 가 0 근처가 돼 아주 작은 역행 틱에도 강제청산되던 치명적 버그.
+    let equity = q === 'KRW' ? (user.krw_balance ?? 0) : user.balance;
+    let allPriced = true;
+    for (const pos of qPos) {
+      const mark = prices[pos.symbol];
+      if (mark == null) {
+        allPriced = false;
+        continue;
+      }
+      const dir = pos.side === 'long' ? 1 : -1;
+      equity += pos.margin + (mark - pos.entry_price) * pos.size * dir;
     }
-    const dir = pos.side === 'long' ? 1 : -1;
-    equity += pos.margin + (mark - pos.entry_price) * pos.size * dir;
-  }
-  if (!allPriced || equity >= 0) return false;
+    if (!allPriced || equity >= 0) continue;
 
-  const now = Date.now();
-  const stmts: D1PreparedStatement[] = [];
-  for (const pos of positions) {
-    const mark = prices[pos.symbol]!;
-    const dir = pos.side === 'long' ? 1 : -1;
-    const pnl = (mark - pos.entry_price) * pos.size * dir;
-    stmts.push(env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid));
-    stmts.push(
-      env.DB.prepare(
-        'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, mark, pos.size, pos.leverage, 'liquidation', pnl, now),
-    );
-    // ⚠ 강제청산은 **수수료를 걷지 않는다**(바로 아래에서 잔고를 0 으로 리셋하므로 실제로 걷을 수
-    // 없는 돈이다 — 부과하면 원장에 걷지도 못한 수익이 잡힌다). 다만 실제로 체결된 거래이므로
-    // 거래대금은 누적한다(VIP 등급 산정에 반영). fee=0 인 'liquidation' 원장 행이 남아 나중에
-    // "강제청산으로 얼마가 돌았는지"도 집계할 수 있다.
-    stmts.push(...feeAccrualStmts(env, uid, pos.symbol, 'liquidation', mark * pos.size, 0, 0, now));
-  }
-  for (const p of pendings) {
-    stmts.push(env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid));
-  }
-  stmts.push(env.DB.prepare('UPDATE users SET balance = 0 WHERE id = ?').bind(uid));
-  await env.DB.batch(stmts);
+    const now = Date.now();
+    const stmts: D1PreparedStatement[] = [];
+    for (const pos of qPos) {
+      const mark = prices[pos.symbol]!;
+      const dir = pos.side === 'long' ? 1 : -1;
+      const pnl = (mark - pos.entry_price) * pos.size * dir;
+      stmts.push(env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid));
+      stmts.push(
+        env.DB.prepare(
+          'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, mark, pos.size, pos.leverage, 'liquidation', pnl, now),
+      );
+      // ⚠ 강제청산은 **수수료를 걷지 않는다**(바로 아래에서 잔고를 0 으로 리셋하므로 실제로 걷을 수
+      // 없는 돈이다 — 부과하면 원장에 걷지도 못한 수익이 잡힌다). 다만 실제로 체결된 거래이므로
+      // 거래대금은 누적한다(VIP 등급 산정에 반영). fee=0 인 'liquidation' 원장 행이 남아 나중에
+      // "강제청산으로 얼마가 돌았는지"도 집계할 수 있다.
+      stmts.push(...feeAccrualStmts(env, uid, pos.symbol, 'liquidation', mark * pos.size, 0, 0, now));
+    }
+    // 이 지갑에서 증거금을 잠근 미체결만 취소한다(다른 통화 주문은 그 지갑 담보라 그대로 둔다).
+    for (const p of pendings) {
+      if (quoteOf(p.symbol) !== q) continue;
+      stmts.push(env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(p.id, uid));
+    }
+    stmts.push(env.DB.prepare(`UPDATE users SET ${balCol(q)} = 0 WHERE id = ?`).bind(uid));
+    await env.DB.batch(stmts);
 
-  // ⚠ OX 강제청산도 상대편(봇)에겐 실제 체결이다 — 진입 때 봇이 팔았던 물량을 여기서 되사줘야
-  // 봇 재고가 "유저 전체 순포지션의 거울"로 유지된다. 이걸 빼면 유저가 청산될 때마다 봇 재고가
-  // 한쪽으로 영구히 어긋난다(진입 −수량은 기록되는데 청산 +수량이 영영 안 들어옴). 겸사겸사
-  // 청산 물량이 체결 테이프/차트에도 찍혀 실제 거래소처럼 "청산이 시장에 나온" 흔적이 남는다.
-  // 유저는 수수료를 안 내지만(위 참고) 봇은 낸다 — 봇 잔고는 무한 풀이라 실제로 걷히는 돈이다.
-  for (const pos of positions) {
-    await reflectVirtualFill(env, pos.symbol, uid, prices[pos.symbol]!, pos.side === 'long' ? 'sell' : 'buy', pos.size);
+    // ⚠ OX 강제청산도 상대편(봇)에겐 실제 체결이다 — 진입 때 봇이 팔았던 물량을 여기서 되사줘야
+    // 봇 재고가 "유저 전체 순포지션의 거울"로 유지된다. 이걸 빼면 유저가 청산될 때마다 봇 재고가
+    // 한쪽으로 영구히 어긋난다(진입 −수량은 기록되는데 청산 +수량이 영영 안 들어옴). 겸사겸사
+    // 청산 물량이 체결 테이프/차트에도 찍혀 실제 거래소처럼 "청산이 시장에 나온" 흔적이 남는다.
+    // 유저는 수수료를 안 내지만(위 참고) 봇은 낸다 — 봇 잔고는 무한 풀이라 실제로 걷히는 돈이다.
+    for (const pos of qPos) {
+      await reflectVirtualFill(env, pos.symbol, uid, prices[pos.symbol]!, pos.side === 'long' ? 'sell' : 'buy', pos.size);
+    }
+    any = true;
   }
-  return true;
+  return any;
 }
 
 /** 조건부(스탑) 주문 로드 — 신규 테이블이라 마이그레이션 전이면 아직 없을 수 있어 방어적으로 감싼다
@@ -244,8 +261,9 @@ async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark:
   const rate = await feeRateOf(env, uid);
   const notional = p.limit_price * closeSize;
   const fee = notional * rate;
+  const col = balColOf(p.symbol);
   await env.DB.batch([
-    env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnl - fee, uid),
+    env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(marginReleased + pnl - fee, uid),
     ...feeAccrualStmts(env, uid, p.symbol, 'close', notional, rate, fee, now),
     fullyClosed
       ? env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid)
@@ -342,7 +360,7 @@ async function settleConditionalOrder(
   // OX/USDT — 봇 호가창을 walking 하며 있는 물량만 실제 호가 가격에 체결(내부에서 잔고/증거금/수수료/봇
   // 재고·체결테이프·캔들까지 전부 정산). 부분 체결이면 filled 만큼만 나가고 잔량은 아래에서 조건 유지.
   if (isVirtualSymbol(c.symbol)) {
-    const uPnL = await unrealizedTotal(env, uid, marks);
+    const uPnL = await unrealizedTotal(env, uid, marks, 'USDT');
     const { filled } = await matchMarketOxOrder(env, c.symbol, uid, c.side, c.size, c.leverage, null, null, uPnL);
     // filled==0(감당 못 함/유동성 없음): 아무것도 안 건드림 → 조건(및 무장 상태) 그대로 유지, 다음 폴링 재시도.
     // ⚠ 여기서 예산 계량을 따로 하지 않는다 — matchMarketOxOrder 안의 feeAccrualStmts 가 이미 계량했다
@@ -354,14 +372,15 @@ async function settleConditionalOrder(
   // 실제 코인 — 외부 시세(mark)로 즉시 체결(무한 유동성). 단, 감당 가능한 만큼만 체결하고 잔량은 유지.
   const price = mark;
   const feeRate = await feeRateOf(env, uid);
-  const uPnL = await unrealizedTotal(env, uid, marks);
-  const user = await env.DB.prepare('SELECT balance FROM users WHERE id = ?').bind(uid).first<{ balance: number }>();
+  const col = balColOf(c.symbol); // 원화 심볼이면 원화 지갑(§ _shared quoteOf)
+  const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(c.symbol));
+  const user = await env.DB.prepare(`SELECT ${col} AS bal FROM users WHERE id = ?`).bind(uid).first<{ bal: number }>();
   if (!user) return;
   const existing = await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? AND symbol = ? AND side = ?')
     .bind(uid, c.symbol, c.side)
     .first<PositionRow>();
   const effLev = existing ? existing.leverage : c.leverage; // 물타기 시 기존 포지션 레버리지 고정
-  const available = user.balance + uPnL;
+  const available = (user.bal ?? 0) + uPnL;
   const perUnit = price / effLev + price * feeRate; // 1코인당 드는 돈(증거금+수수료)
   const affordable = perUnit > 0 ? (available * 0.999) / perUnit : 0;
   const fillSize = Math.min(c.size, Math.max(0, affordable));
@@ -376,7 +395,7 @@ async function settleConditionalOrder(
   // ⚠ 잔고 차감을 **먼저** 원자 가드로 확정하고, 성공했을 때만 포지션/원장을 기록한다 — batch 로 묶으면
   // 잔고 가드가 0행이어도 포지션 INSERT 가 그대로 커밋돼 "증거금 없이 포지션만 생기는" 상태가 된다
   // (D1 batch 는 조건부 UPDATE 0행을 실패로 안 봄 — editLimit 과 동일한 함정).
-  const charge = await env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance - ? >= ?')
+  const charge = await env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`)
     .bind(margin + fee, uid, margin + fee, -uPnL)
     .run();
   if (charge.meta.changes !== 1) return; // 레이스로 가용 부족 → 조건 유지
@@ -535,8 +554,9 @@ async function runTriggers(
     const feeRate = await feeRateOf(env, uid);
     const notional = p.limit_price * p.size;
     const fee = notional * feeRate;
+    const col = balColOf(p.symbol);
     const feeStmts = [
-      env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').bind(fee, uid),
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ?`).bind(fee, uid),
       ...feeAccrualStmts(env, uid, p.symbol, 'open', notional, feeRate, fee, now),
     ];
 
@@ -627,8 +647,9 @@ async function runTriggers(
     const slRate = await feeRateOf(env, uid);
     const slNotional = trigger * pos.size;
     const slFee = slNotional * slRate;
+    const col = balColOf(pos.symbol);
     await env.DB.batch([
-      env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(pos.margin + pnl - slFee, uid),
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(pos.margin + pnl - slFee, uid),
       ...feeAccrualStmts(env, uid, pos.symbol, 'close', slNotional, slRate, slFee, now),
       env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(pos.id, uid),
       env.DB.prepare(

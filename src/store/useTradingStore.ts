@@ -26,6 +26,8 @@ interface TradingState {
   authed: boolean;
   name: string | null;
   balance: number;
+  /** 원화 지갑 — 원화 심볼(BTCKRW 등)의 크로스 담보. USDT 지갑과 분리돼 있고 환전으로만 오간다. */
+  krwBalance: number;
   refillsLeft: number;
   // VIP 등급(누적 거래대금에서 서버가 파생) + 그 등급의 수수료율. 헤더 뱃지·주문 수수료 예상액 표시용.
   vipTier: number;
@@ -119,6 +121,8 @@ interface TradingState {
   ) => Promise<void>;
   cancelConditional: (conditionalId: string) => Promise<void>;
   refill: () => Promise<void>;
+  /** USDT ↔ 원화 지갑 환전. 성공하면 true(모달이 닫을지 판단). 실패 사유는 `error`. */
+  convert: (from: 'USDT' | 'KRW', amount: number) => Promise<boolean>;
 
   spotRefresh: (pair: string) => Promise<void>;
   /** 호가·체결·캔들(+주기적으로 계정 상태)을 **한 요청**으로 갱신한다(§ api.spotTick). */
@@ -146,6 +150,7 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     authed: true,
     name: st.name,
     balance: st.balance,
+    krwBalance: st.krwBalance ?? 0,
     refillsLeft: st.refillsLeft,
     vipTier: st.vipTier ?? 0,
     feeRate: st.feeRate ?? 0.0003,
@@ -242,6 +247,7 @@ export const useTradingStore = create<TradingState>((set) => ({
   authed: false,
   name: null,
   balance: 0,
+  krwBalance: 0,
   refillsLeft: 3,
   vipTier: 0,
   feeRate: 0.0003,
@@ -314,6 +320,7 @@ export const useTradingStore = create<TradingState>((set) => ({
       authed: false,
       name: null,
       balance: 0,
+      krwBalance: 0,
       refillsLeft: 3,
       vipTier: 0,
       feeRate: 0.0003,
@@ -463,6 +470,19 @@ export const useTradingStore = create<TradingState>((set) => ({
       apply(set, await api.refill());
     } catch (e) {
       set({ error: (e as Error).message });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  convert: async (from, amount) => {
+    set({ busy: true, error: null });
+    try {
+      apply(set, await api.convert(from, amount));
+      return true;
+    } catch (e) {
+      set({ error: (e as Error).message });
+      return false;
     } finally {
       set({ busy: false });
     }

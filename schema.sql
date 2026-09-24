@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS users (
   refill_date   TEXT,                         -- refill_count 가 적용되는 날짜(KST, YYYY-MM-DD). 날짜 바뀌면 0으로 취급
   ox_balance    REAL NOT NULL DEFAULT 100,   -- 가상 코인 OX 현물 보유량(가입 시 정해진 물량 지급, 유저간 매매로만 이동)
   total_volume  REAL NOT NULL DEFAULT 0,     -- 누적 거래대금(notional = 체결가 × 수량, 레버리지 포함) → VIP 등급 산정 기준
-  total_fees    REAL NOT NULL DEFAULT 0      -- 이 유저가 지금까지 낸 거래 수수료 합계(표시용)
+  total_fees    REAL NOT NULL DEFAULT 0,     -- 이 유저가 지금까지 낸 거래 수수료 합계(표시용, USDT 환산)
+  krw_balance   REAL NOT NULL DEFAULT 0      -- 원화 지갑(빗썸 원화 마켓 BTCKRW 등의 담보). USDT 지갑(balance)과 분리된
+                                             -- 크로스 담보이고 /api/convert 로만 오간다. 시작 0(환전해서 쓴다)
 );
 
 CREATE TABLE IF NOT EXISTS positions (
@@ -600,3 +602,8 @@ CREATE TABLE IF NOT EXISTS crate_stats (
 -- `npx wrangler d1 execute ox64 --remote --file=./schema.sql` 재적용만으로 생성된다(ALTER 불필요).
 -- **`/api/crate` 코드가 이 테이블을 참조하므로 코드 배포 전에 먼저 생성돼 있어야 한다** — 트레이딩·
 -- 퍼즐·던전 라우트와 완전히 분리돼 있어 없어도 그쪽엔 영향이 없고 `/api/crate` 만 500 이 된다.
+
+-- ⚠ 일회성 마이그레이션 (2026-09-24 추가, 원화 지갑): 기존 prod users 테이블엔 이 컬럼이 없다.
+-- **코드 배포 전에 먼저 적용해야 한다** — 강제청산 판정(_trading.ts)·loadState 가 매 폴링 이 컬럼을 SELECT 하므로
+-- 없으면 /api/state 부터 500 이 된다(= 거래 전체 정지). DEFAULT 0 이라 기존 행도 그대로 동작.
+-- ALTER TABLE users ADD COLUMN krw_balance REAL NOT NULL DEFAULT 0;
