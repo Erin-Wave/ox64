@@ -79,7 +79,10 @@ export function isVirtualSymbol(s: string): boolean {
 // 그래서 **잔고 컬럼을 하드코딩하지 말고 항상 `balColOf(symbol)`** 로 고를 것 — `balance` 를 그대로 쓰면
 // 원화 포지션의 증거금이 USDT 지갑에서 빠져나간다(단위가 1,400배 다른 돈이 섞인다).
 // 목록은 화이트리스트다(빗썸 원화 마켓 480개를 다 열지 않는다). src/symbols.ts KRW_SYMBOLS 와 같은 값.
-const KRW_SYMBOLS = ['BTCKRW', 'ETHKRW', 'SOLKRW', 'FKRW'] as const;
+const KRW_SYMBOLS = [
+  'BTCKRW', 'ETHKRW', 'SOLKRW', 'FKRW',
+  'MERLKRW', 'GHXKRW', 'BOBAKRW', 'MOVEKRW', 'HFTKRW', 'BMTKRW', 'WAXPKRW', 'BREVKRW', 'OSMOKRW', 'TAIKOKRW', 'ROAKRW',
+] as const;
 export type Quote = 'USDT' | 'KRW';
 /** 결제통화. ⚠ 'FKRW' 처럼 기준통화가 한 글자인 심볼도 있어서 길이가 아니라 접미사로 가른다. */
 export const quoteOf = (s: string): Quote => (s.endsWith('KRW') ? 'KRW' : 'USDT');

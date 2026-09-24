@@ -20,9 +20,28 @@ export const isVirtualSymbol = (s: string): boolean => (VIRTUAL_SYMBOLS as reado
 // 체결가는 서버가 빗썸에서 받는다(functions/_shared.ts fromBithumb). **원화 지갑**으로 거래한다(USDT 지갑과
 // 분리된 크로스 담보, 환전으로만 오간다). ⚠ 서버 사본 functions/_shared.ts KRW_SYMBOLS 와 같은 목록이어야 한다
 // (서버는 화이트리스트라 여기만 늘리면 "알 수 없는 심볼"로 거부된다).
-export const KRW_SYMBOLS = ['BTCKRW', 'ETHKRW', 'SOLKRW', 'FKRW'] as const;
+export const KRW_SYMBOLS = [
+  'BTCKRW', 'ETHKRW', 'SOLKRW', 'FKRW',
+  'MERLKRW', 'GHXKRW', 'BOBAKRW', 'MOVEKRW', 'HFTKRW', 'BMTKRW', 'WAXPKRW', 'BREVKRW', 'OSMOKRW', 'TAIKOKRW', 'ROAKRW',
+] as const;
 /** 빗썸 한글명 — 심볼 검색이 "비트", "솔라나" 로도 걸리게. */
-export const KRW_NAMES: Record<string, string> = { BTCKRW: '비트코인', ETHKRW: '이더리움', SOLKRW: '솔라나', FKRW: '신퓨처스' };
+export const KRW_NAMES: Record<string, string> = {
+  BTCKRW: '비트코인',
+  ETHKRW: '이더리움',
+  SOLKRW: '솔라나',
+  FKRW: '신퓨처스',
+  MERLKRW: '멀린체인',
+  GHXKRW: '게이머코인',
+  BOBAKRW: '보바토큰',
+  MOVEKRW: '무브먼트',
+  HFTKRW: '해시플로우',
+  BMTKRW: '버블맵스',
+  WAXPKRW: '왁스',
+  BREVKRW: '브레비스',
+  OSMOKRW: '오스모시스',
+  TAIKOKRW: '타이코',
+  ROAKRW: '로아코어',
+};
 export const isKrwSymbol = (s: string): boolean => (KRW_SYMBOLS as readonly string[]).includes(s);
 export type Quote = 'USDT' | 'KRW';
 /** 결제통화. ⚠ 'FKRW' 처럼 기준통화가 한 글자인 심볼이 있어서 접미사로 가른다. */
@@ -35,6 +54,8 @@ export const pairLabel = (s: string): string => `${baseOf(s)}/${quoteOf(s)}`;
 export const USDT_KRW = 'USDTKRW';
 /** 심볼 선택기 분류 필터. */
 export type SymbolCategory = 'KRW' | 'USDT' | 'VIRTUAL';
+/** 분류 표시 순서 — USDT · KRW · 가상(심볼 선택기 필터 버튼과 목록 묶음 순서). */
+export const CATEGORY_ORDER: SymbolCategory[] = ['USDT', 'KRW', 'VIRTUAL'];
 export const categoryOf = (s: string): SymbolCategory =>
   isVirtualSymbol(s) ? 'VIRTUAL' : quoteOf(s) === 'KRW' ? 'KRW' : 'USDT';
 

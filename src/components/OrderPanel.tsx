@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
@@ -147,6 +147,23 @@ export default function OrderPanel() {
       openMarket({ symbol, side, size: sz, leverage, stopLoss: sl, takeProfit: tp });
     }
   };
+
+  // ⌨️ F9 = 롱·Buy / F10 = 숏·Sell — 버튼을 누른 것과 **똑같이**(같은 submit — 탭·수량·레버리지·SL/TP 그대로,
+  // 처리 중이면 무시). 입력칸에 커서가 있어도 동작한다(수량을 치고 바로 누르는 용도). 누르고 있어도 한 번만.
+  // ⚠ 리스너는 한 번만 달고 최신 submit 은 ref 로 읽는다(렌더마다 새 클로저라 그대로 쓰면 옛 입력값으로 주문된다).
+  // ⚠ OrderPanel 이 화면에 두 번 마운트되면 주문이 두 번 나간다 — 지금은 App.tsx 에 하나뿐이다.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'F9' && e.key !== 'F10') return;
+      e.preventDefault(); // F10 은 일부 브라우저(윈도우 파이어폭스 등)에서 메뉴 막대를 연다
+      if (e.repeat) return;
+      submitRef.current(e.key === 'F9' ? 'long' : 'short');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const notional = refPrice ? refPrice * sizeCoin : 0;
   const margin = notional / leverage;
@@ -548,16 +565,18 @@ export default function OrderPanel() {
         <button
           onClick={() => submit('long')}
           disabled={busy}
+          title="단축키 F9"
           className="rounded-md bg-up py-2 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
         >
-          롱 · Buy
+          롱 · Buy <span className="ml-1 text-[10px] font-semibold opacity-70">F9</span>
         </button>
         <button
           onClick={() => submit('short')}
           disabled={busy}
+          title="단축키 F10"
           className="rounded-md bg-down py-2 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
         >
-          숏 · Sell
+          숏 · Sell <span className="ml-1 text-[10px] font-semibold opacity-70">F10</span>
         </button>
       </div>
     </div>

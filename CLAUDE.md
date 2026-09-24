@@ -68,7 +68,7 @@ ox64/
     ├── main.tsx            pathname 으로 트레이딩·퍼즐(/b)·던전(/5m)·RTS(/s1)·상자깡(/c) 분기(라우터 없음, 동적 import). useSettingsStore 먼저 import(FOUC 방지). ⚠ /s1 만 StrictMode 안 씌움(이펙트 2회 실행이 rAF 루프를 두 벌 만든다)
     ├── index.css           Tailwind + 테마 CSS 변수 + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position/PendingOrder/Side)
-    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + KRW_SYMBOLS(빗썸 원화 4종)/quoteOf/baseOf/**pairLabel**(화면 표기 'BTC/KRW' — `replace('USDT','')` 금지)/categoryOf + INTERVAL_GROUPS + KST_OFFSET(+9h)
+    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + KRW_SYMBOLS(빗썸 원화 15종)/quoteOf/baseOf/**pairLabel**(화면 표기 'BTC/KRW' — `replace('USDT','')` 금지)/categoryOf + INTERVAL_GROUPS + KST_OFFSET(+9h)
     ├── format.ts           fmtPrice/fmtVol/precisionFromTick + 축약 헬퍼(§6)
     ├── services/
     │   ├── binanceRest.ts  초기 과거봉(스팟 REST)
@@ -96,13 +96,13 @@ ox64/
         ├── Logo.tsx            워드마크 — 15×3 픽셀아트 인라인 SVG(currentColor). 높이 3의 배수, 폭 w-auto(§6)
         ├── Login.tsx           이름+패스코드 로그인/가입
         ├── Header.tsx          심볼/현재가/평가자산/리필(평가자산≤0 일 때만)/랭킹/설정/로그아웃. 모바일은 "⋯" 더보기
-        ├── SymbolSelect.tsx    실제 38종 + 가상 + 원화를 **같은 목록·같은 정렬**로 + 검색(심볼·'BTC/KRW'·한글명) + 분류 필터(전체/KRW/USDT/가상, localStorage). OX 가격=`/api/spot`, 원화=빗썸 직결, 24h변동=`?candles=1&interval=1h&limit=24`. `statOf(sym)` 이 소스만 분기. 가격 정렬은 원화를 뒤로 모은다(단위가 달라 섞으면 무의미)
+        ├── SymbolSelect.tsx    실제 38종 + 가상 + 원화를 **같은 목록·같은 정렬**로 + 검색(심볼·'BTC/KRW'·한글명) + 분류 필터(전체/USDT/KRW/가상, localStorage). 이름·가격 정렬은 **분류(USDT→KRW→가상)로 먼저 묶고** 그 안에서 정렬(24h% 는 분류 무관). OX 가격=`/api/spot`, 원화=빗썸 직결, 24h변동=`?candles=1&interval=1h&limit=24`. `statOf(sym)` 이 소스만 분기. 가격 정렬은 원화를 뒤로 모은다(단위가 달라 섞으면 무의미)
         ├── OrderBook.tsx       호가/체결 탭. 배치는 `bookLayout`(좌우 = 매수 좌·매도 우 / **상하 = 매도 위(최우선매도가 가운데 쪽, 뒤집어 아래 정렬)·현재가 줄·매수 아래**, 높이 = 행 수×2 + 22px). 수치는 `bookUnit`(코인 수량 ⇄ 총금액, 호가·체결 헤더 단위 버튼 — **체결 목록도 같은 단위**) — 묶을 때 총금액은 Σ가격×수량으로 따로 합산(묶음가×수량 근사 금지). **호가 목록 높이 = 실제 단계 수**(묶어보기·거래소 단계 상한으로 생긴 빈칸은 압축, `useStickyCount` — 늘 땐 즉시, 줄 땐 1.5초 유지, 심볼·묶음·행 수·배치가 바뀌면 즉시). 체결 목록은 여전히 고정 높이. 내 미체결 가격대 강조(서버 `mine`). 체결 행은 가격·수량 모두 테이커 방향 색. Standard+옵션(orderBook) 둘 다 켜야 표시. PC(md≥768)에서 `bookTogether` 면 호가·체결 상하 함께 — `useIsDesktop` 은 App.tsx 2열 분기와 **같은 경계**. ⚠ 훅을 `옵션 && useIsDesktop()` 처럼 단축 평가 뒤에 두면 훅 개수가 바뀌어 터진다. 높이=`행 수 × ROW_PX(16)` — ⚠ 체결은 **maxHeight 가 아니라 height 고정**(체결이 흘러들 때 패널이 오르내림), 호가는 실제 단계 수만큼이되 줄어들 땐 1.5초 기다린다(단계 수가 틱마다 흔들려도 안 오르내리게). 행 높이를 바꾸면 ROW_PX 도 같이. 강세/약세 레벨(tradeStrength): ⚠ 틱 방향이 아니라 **"이 가격이 싼가/비싼가"** — `strengthAt` 이 그 체결 **직전 120건의 중앙값/MAD(robust)** 대비 z(평균은 스윕 프린트가 잣대를 부풀림), z→레벨은 **꺾은선**(z=2.5 까지 선형 30, 위는 로그 압축으로 z=600 에서 50), 가격 칸 배경에 **왼쪽에서 자라는** 바. 기준은 **trailing**(행마다 자기 시점), **표시할 행에 대해서만**, 창은 **필터 이전 원본 테이프**에서
         ├── Settings.tsx        **탭 3개**(화면: 테마·차트 색·폰트 / 호가·체결: 행 수·배치(좌우/상하)·PC 함께 보기·체결 필터·강세/약세 / 거래: 거래모드). 마지막 탭은 localStorage. 모달 `max-h-[90dvh] overflow-y-auto`, 탭 바는 sticky
         ├── Clock.tsx           KST 시계(자체 상태만 갱신). Chart 툴바 우측
         ├── IntervalPicker.tsx  타임프레임(트레이딩뷰식) — 즐겨찾기만 가로 바(좁으면 가로 스크롤, `.no-scrollbar`) + ▾ 그룹 목록에서 선택·★ 토글. 즐겨찾기 아닌 현재 인터벌은 바에 점선으로 임시 표시. `supports` 로 심볼별 불가 인터벌(원화=1s) 제외. ⚠ 드롭다운은 overflow 바 **밖**에 둔다(안에 두면 잘린다)
         ├── Chart.tsx           **⚠ 캔들을 직접 폴링하지 않는다** — 통합 폴링이 스토어에 넣은 봉을 구독만(과거봉 lazy 로드만 자기 요청). 연결 표시는 **신선도**(8초). LWC v4: KST+9·OHLCV 레전드·카운트다운(우측 가격축 현재가 라벨 아래, `priceToCoordinate`+`priceScale('right').width()`)·B/S/L 마커·평단선+청산가선·SL/TP선·지정가/조건부 주문선(X 버튼)·차트 클릭→지정가·테마 재도색. 인디케이터는 레지스트리(indicatorDefs) 기반 — 선마다 시리즈 1개(`Map<id, Map<lineKey, series>>`), own 패널 지표는 `priceScaleId=ind.id` 로 하단에 자동 스택([캔들]/[패널들]/[거래량], 높이는 개수로 나눔), 숨김은 `series.applyOptions({visible:false})`(삭제 아님, 레전드·패널 배치에서도 제외). null 은 whitespace 로 넣어 선이 끊긴다(SuperTrend 국면 전환·워밍업). 옵션 패널: 지표 행마다 👁 토글·파라미터 입력(def.params 자동 생성)·삭제, 추가는 오버레이/오실레이터 optgroup 셀렉트. 가상 심볼 표시범위는 최초 로드 때만(매 폴링 재설정하면 줌 리셋)
-        ├── OrderPanel.tsx      Easy=슬라이더+롱/숏 / Standard=시장가·지정가·조건부 탭+SL/TP+수량(코인/USDT). **⚠ 수량 진실원본은 입력칸 문자열(`amtInput`)이고 코인 수량은 `sizeCoin` 파생**(반대로 두면 왕복 정밀도가 깨져 USDT 입력이 튄다). OXUSDT 도 같은 컴포넌트
+        ├── OrderPanel.tsx      **F9=롱·Buy / F10=숏·Sell**(버튼과 같은 submit, window keydown, 반복 무시, F10 기본동작 차단 — ⚠ OrderPanel 을 두 번 마운트하면 주문이 두 번 나간다) · Easy=슬라이더+롱/숏 / Standard=시장가·지정가·조건부 탭+SL/TP+수량(코인/USDT). **⚠ 수량 진실원본은 입력칸 문자열(`amtInput`)이고 코인 수량은 `sizeCoin` 파생**(반대로 두면 왕복 정밀도가 깨져 USDT 입력이 튄다). OXUSDT 도 같은 컴포넌트
         ├── PositionsPanel.tsx  포지션(행 아무 데나 누르면 그 심볼로 이동 — 행 안의 버튼·입력·슬라이더는 제외, 보고 있는 심볼 행은 옅게 강조 ·청산가 `fmtPriceShort`·부분청산 입력+비중 슬라이더(진실원본은 입력칸, 슬라이더는 `closePctOf` 파생; 빈칸=전량)·지정가 청산 입력(비우면 시장가, 포커스 시 차트 클릭 가격 수신)·SL/TP 편집) / 미체결(reduce-only 뱃지) / 조건부 / 주문내역
         └── Leaderboard.tsx     자산 순위 모달(5초 폴링) + 거래소 수수료 수익(유저분/봇분)
     └── puzzle/                 ── 퍼즐게임(/b, §7) ── api.ts(별도 번들) · usePuzzleStore.ts(open() 은 로컬 보드에 결과만 이어붙임 — 끝난 판이 안 사라지게) · PuzzleLogin · Board(연 칸만 그림) · PuzzleApp
@@ -214,7 +214,7 @@ ox64/
   - **⚠ 큰 금액 표시는 `fmtKor`(만/억/조), 반올림이 아니라 내림** — 999,999 를 "100만"으로 올려 보이면 기준선을 넘은 것처럼 읽힌다.
 - **아직 없음**: 펀딩비.
 
-### 원화 마켓 — BTC/KRW · ETH/KRW · SOL/KRW · F/KRW (빗썸, 원화 지갑, 2026-09-24)
+### 원화 마켓 — 빗썸 15종(BTC·ETH·SOL·F + MERL·GHX·BOBA·MOVE·HFT·BMT·WAXP·BREV·OSMO·TAIKO·ROA, 원화 지갑, 2026-09-24)
 
 - **⚠⚠ 지갑이 둘이고 크로스 담보는 지갑별이다.** 원화 심볼은 `users.krw_balance`, 나머지(가상 포함)는 `users.balance`. 증거금·손익·수수료·지정가 잠금/환불·강제청산이 전부 **그 심볼의 결제통화 지갑 안에서만** 일어난다. 그래서 **잔고 SQL 에 컬럼을 하드코딩하지 말고 `balColOf(symbol)`**(`_shared.ts`, 고정 매핑이라 인젝션 없음), **미실현 합은 `unrealizedTotal(env, uid, marks, quote)`**(quote 필수 인자 — 빠뜨리면 원화 손익(원)이 USDT 가용에 섞인다). 새 체결 경로를 추가할 때 이 둘을 안 거치면 원화 포지션의 증거금이 USDT 지갑에서 빠져나간다.
 - **강제청산 = 지갑별**(`liquidateIfBankrupt` 가 통화마다 따로 판정·청산·그 통화 미체결 취소·그 컬럼 0). 한 지갑의 시세가 비면 그 지갑만 건너뛴다(빗썸이 멈춰도 USDT 판정은 돈다). 클라 청산가(`PositionsPanel`/`Chart`)도 같은 통화의 포지션·잔고만.

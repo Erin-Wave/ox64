@@ -9,6 +9,7 @@ import {
   quoteOf,
   pairLabel,
   categoryOf,
+  CATEGORY_ORDER,
   type SymbolCategory,
 } from '@/symbols';
 import { api } from '@/services/api';
@@ -25,11 +26,13 @@ type Filter = 'ALL' | SymbolCategory;
 
 const FILTERS: { key: Filter; label: string }[] = [
   { key: 'ALL', label: '전체' },
-  { key: 'KRW', label: 'KRW' },
   { key: 'USDT', label: 'USDT' },
+  { key: 'KRW', label: 'KRW' },
   { key: 'VIRTUAL', label: '가상' },
 ];
-const ALL_SYMBOLS: string[] = [...VIRTUAL_SYMBOLS, ...SYMBOLS, ...KRW_SYMBOLS];
+const ALL_SYMBOLS: string[] = [...SYMBOLS, ...KRW_SYMBOLS, ...VIRTUAL_SYMBOLS];
+/** 분류 순위(USDT → KRW → 가상) — 이름·가격 정렬은 분류끼리 묶은 뒤 그 안에서 정렬한다. */
+const catRank = (s: string) => CATEGORY_ORDER.indexOf(categoryOf(s));
 
 // 마지막으로 고른 분류 필터는 이 브라우저에만 기억한다(열 때마다 다시 누르지 않게). 실패해도 '전체'.
 const FILTER_KEY = 'ox64_symbol_filter_v1';
@@ -188,17 +191,18 @@ export default function SymbolSelect() {
 
   const visible = ALL_SYMBOLS.filter((s) => (filter === 'ALL' || categoryOf(s) === filter) && matches(s, query));
   const sorted = visible.sort((a, b) => {
+    // 이름·가격 정렬은 **분류(USDT → KRW → 가상)로 먼저 묶는다** — 원화와 USDT 가격은 단위가 달라 섞으면 무의미하고,
+    // '전체'로 볼 때도 마켓별로 모여 있어야 찾기 쉽다. 24h 변동률(%)은 단위가 같아 분류를 넘어 비교한다.
+    if (sortKey !== 'change') {
+      const r = catRank(a) - catRank(b);
+      if (r !== 0) return r;
+    }
     let av: number | string;
     let bv: number | string;
     if (sortKey === 'symbol') {
       av = pairLabel(a);
       bv = pairLabel(b);
     } else if (sortKey === 'price') {
-      // ⚠ 원화와 USDT 가격을 그대로 비교하면 원화가 전부 위로 몰린다 — 가격 정렬은 결제통화가 같은 것끼리만
-      // 의미가 있으므로 원화는 원화끼리 뒤에 모은다(필터로 한쪽만 보면 자연스럽게 정렬된다).
-      const qa = quoteOf(a) === 'KRW' ? 1 : 0;
-      const qb = quoteOf(b) === 'KRW' ? 1 : 0;
-      if (qa !== qb) return qa - qb;
       av = statOf(a)?.price ?? -Infinity;
       bv = statOf(b)?.price ?? -Infinity;
     } else {
