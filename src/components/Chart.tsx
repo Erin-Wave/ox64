@@ -32,10 +32,11 @@ import { useMarketStore } from '@/store/useMarketStore';
 import { useChartStore, type IndicatorConfig, type ChartColorScheme } from '@/store/useChartStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { INTERVAL_GROUPS, intervalSec, KST_OFFSET, isVirtualSymbol, quoteOf, pairLabel } from '@/symbols';
+import { intervalSec, KST_OFFSET, isVirtualSymbol, quoteOf, pairLabel } from '@/symbols';
 import { bithumbKlineStream, bithumbSupports, fetchBithumbKlines } from '@/services/bithumb';
 import { fmtPrice, fmtPriceShort, fmtQtyShort, virtualPrecision } from '@/format';
 import Clock from '@/components/Clock';
+import IntervalPicker from '@/components/IntervalPicker';
 import type { Candle } from '@/types';
 
 const IND_COLORS = ['#f0b90b', '#4a90e2', '#c77dff', '#00c076', '#ff6b6b', '#3bb2d0', '#e08fd6'];
@@ -1025,26 +1026,12 @@ export default function Chart() {
     <div className="flex h-full flex-col">
       {/* 툴바 */}
       <div className="flex items-center gap-2 border-b border-border bg-panel px-2 py-1.5">
-        <select
+        {/* 타임프레임 — 즐겨찾기(★)만 가로로, 나머지는 ▾ 목록(트레이딩뷰식). 원화 심볼(빗썸)은 1초봉이 없어 뺀다 */}
+        <IntervalPicker
           value={interval}
-          onChange={(e) => setIntervalCode(e.target.value)}
-          className="cursor-pointer rounded bg-panel2 px-2 py-1 text-xs font-semibold text-text outline-none ring-1 ring-border"
-        >
-          {/* 원화 심볼(빗썸)은 1초봉이 없어 목록에서 뺀다 */}
-          {INTERVAL_GROUPS.map((g) => {
-            const items = quoteOf(symbol) === 'KRW' ? g.items.filter((it) => bithumbSupports(it.code)) : g.items;
-            if (items.length === 0) return null;
-            return (
-              <optgroup key={g.name} label={g.name}>
-                {items.map((it) => (
-                  <option key={it.code} value={it.code}>
-                    {it.label}
-                  </option>
-                ))}
-              </optgroup>
-            );
-          })}
-        </select>
+          onChange={setIntervalCode}
+          supports={(code) => quoteOf(symbol) !== 'KRW' || bithumbSupports(code)}
+        />
 
         <div className="relative">
           <button

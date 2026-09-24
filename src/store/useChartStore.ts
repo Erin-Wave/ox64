@@ -8,6 +8,8 @@ import {
   type IndicatorType,
 } from '@/services/indicatorDefs';
 
+import { ALL_INTERVALS } from '@/symbols';
+
 export type { IndicatorType, IndicatorParams } from '@/services/indicatorDefs';
 // 캔들/배경 등 차트 전용 색상 프리셋 — 사이트 다크/라이트/고대비 테마와는 별개(차트만 독립적으로 색을 바꿈).
 export type ChartColorScheme = 'binance' | 'okx' | 'tradingview';
@@ -79,7 +81,10 @@ interface ChartState {
   visibleBars: number; // 처음 로드 시 보여줄 봉 개수 — 마지막으로 사용자가 확대/축소한 값을 기억
   colorScheme: ChartColorScheme;
   indicators: IndicatorConfig[];
+  // 차트 툴바에 가로로 늘어놓을 즐겨찾기 타임프레임(트레이딩뷰식) — 나머지는 ▾ 목록에서 고르고 ★ 로 고정한다.
+  favIntervals: string[];
   toggle: (k: BoolFlag) => void;
+  toggleFavInterval: (code: string) => void;
   setBookRows: (n: number) => void;
   setTradeFilter: (patch: Partial<TradeFilter>) => void;
   setVisibleBars: (n: number) => void;
@@ -106,20 +111,29 @@ function load(): Partial<ChartState> {
 }
 function persist(s: ChartState) {
   const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook } = s;
-  const { bookRows, bookTogether, visibleBars, colorScheme, indicators } = s;
+  const { bookRows, bookTogether, visibleBars, colorScheme, indicators, favIntervals } = s;
   const { tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength } = s;
   try {
     localStorage.setItem(
       KEY,
       JSON.stringify({
         showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook,
-        bookRows, bookTogether, visibleBars, colorScheme, indicators,
+        bookRows, bookTogether, visibleBars, colorScheme, indicators, favIntervals,
         tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength,
       }),
     );
   } catch {
     /* ignore */
   }
+}
+
+export const DEFAULT_FAV_INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
+/** 저장된 즐겨찾기 정리 — 모르는 코드는 버리고 **짧은 봉부터**(추가한 순서가 아니라 길이 순으로 늘어놓는다).
+ * 저장값이 없을 때만 기본값이고, 빈 배열은 "다 뺐다"는 뜻이라 그대로 둔다. */
+function cleanFavs(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return DEFAULT_FAV_INTERVALS;
+  const set = new Set(raw.filter((x): x is string => typeof x === 'string'));
+  return ALL_INTERVALS.map((i) => i.code).filter((c) => set.has(c));
 }
 
 /** 저장값이 손으로 바뀌었거나(localStorage) 범위 밖이면 안전한 값으로 되돌린다 — 0/NaN 이 들어오면
@@ -182,6 +196,13 @@ export const useChartStore = create<ChartState>((set, get) => ({
   visibleBars: saved.visibleBars ?? 38,
   colorScheme: saved.colorScheme ?? 'binance',
   indicators: migrateIndicators(saved.indicators),
+  favIntervals: cleanFavs(saved.favIntervals),
+  toggleFavInterval: (code) => {
+    set((s) => ({
+      favIntervals: cleanFavs(s.favIntervals.includes(code) ? s.favIntervals.filter((c) => c !== code) : [...s.favIntervals, code]),
+    }));
+    persist(get());
+  },
   toggle: (k) => {
     set((s) => ({ [k]: !s[k] }) as Partial<ChartState>);
     persist(get());

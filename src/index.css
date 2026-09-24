@@ -119,6 +119,13 @@ body {
 *::-webkit-scrollbar-track {
   background: transparent;
 }
+/* 가로로 스크롤되지만 스크롤바는 안 보이는 줄(차트 타임프레임 즐겨찾기 바 — 모바일에서 넘치면 밀어서 본다) */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
 ::selection {
   background: rgba(0, 192, 118, 0.28);
 }
