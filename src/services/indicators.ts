@@ -279,6 +279,33 @@ export function obv(candles: Candle[]): Series {
   return out;
 }
 
+/** OBV 국면(매집/분산 사이클). 두 질문의 조합이다:
+ *  - **돈이 들어오나** — OBV 가 자기 기준선(`base` = OBV 의 EMA) 위면 최근 순매수 유입, 아래면 순매도.
+ *  - **가격이 올라가 있나** — 종가가 같은 기간의 가격 EMA 위인가.
+ *  → 0 매집(유입 · 가격 아직 아래) / 1 끌어올림(유입 · 가격 위) / 2 정리(유출 · 가격 아직 위) / 3 하락(유출 · 가격 아래).
+ *  사이클 순서가 곧 번호 순서다(매집 → 끌어올림 → 정리 → 하락 → 매집).
+ * ⚠ 기준을 0(절대 수준)이 아니라 **OBV 자신의 이동평균**으로 잡는 이유: OBV 는 불러온 첫 봉에서 0 으로 시작하는
+ *   누적값이라 절대 수준은 "어디서부터 셌나"(과거봉을 더 불러오면 통째로 이동)에 달려 있다 — 기준선과의 차이는
+ *   그 상수 이동에 영향을 받지 않는다.
+ * ⚠ 같으면(거래 없는 한산한 봉이 이어져 OBV 가 평평해지고 기준선이 따라붙은 자리) **직전 판정을 잇는다** —
+ *   `>` 로만 가르면 평평한 구간이 전부 "유출"로 칠해진다. */
+export function obvPhase(closes: number[], obvS: Series, base: Series, period: number): Series {
+  const pma = emaOf(closes, period);
+  const out = nulls(closes.length);
+  let flowUp: boolean | null = null;
+  let priceUp: boolean | null = null;
+  for (let i = 0; i < closes.length; i++) {
+    const v = obvS[i];
+    const b = base[i];
+    const m = pma[i];
+    if (v == null || b == null || m == null) continue;
+    if (v !== b || flowUp == null) flowUp = v > b;
+    if (closes[i] !== m || priceUp == null) priceUp = closes[i] > m;
+    out[i] = flowUp ? (priceUp ? 1 : 0) : priceUp ? 2 : 3;
+  }
+  return out;
+}
+
 /** Williams %R = (최고 − 종가)/(최고 − 최저) × −100 (0 ~ −100). */
 export function willr(candles: Candle[], period = 14): Series {
   const n = candles.length;

@@ -69,8 +69,12 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   priceTarget: '',
   recentTrades: {},
 
+  // ⚠ 심볼을 바꾸면 체결 테이프를 비운다. 심볼별로 버퍼를 남겨두면 되돌아왔을 때 몇 분 전 체결 위에
+  // 새 체결이 얹혀 **시간이 끊긴 테이프**가 되고(강세/약세 레벨은 직전 120건을 잣대로 쓰므로 그 잣대까지
+  // 옛 가격으로 오염된다), 오염된 버퍼가 한 번 생기면 스스로 빠지지 않는다. 새 체결은 1초 안에 다시 찬다.
   setSymbol: (symbol) => {
-    set({ symbol });
+    if (symbol === get().symbol) return;
+    set({ symbol, recentTrades: {} });
     persist(get());
   },
   setInterval: (interval) => {

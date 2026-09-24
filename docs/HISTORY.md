@@ -237,3 +237,20 @@ RangeError 로 화면이 통째로 죽는다 — `virtualPrecision(1e-12)=15` �
 
 - [x] **인디케이터 레지스트리화 + 12종 추가 + 표시/숨김 토글** — `src/services/indicatorDefs.ts`(INDICATOR_DEFS) 한 표로 Chart 가 그림(타입 분기 제거). SMA/VWAP(롤링)/Ichimoku/PSAR/SuperTrend/MACD/Stoch/ATR/ADX/CCI/OBV/W%R 추가, own 패널은 개수로 높이 분배, null 은 whitespace 로 넣어 선이 끊김(SuperTrend·후행스팬), Ichimoku 선행스팬은 시간 연장. `IndicatorConfig{params,visible}` 로 저장 형식 변경(구 `{period,mult}` 마이그레이션), `toggleIndicator` = 시리즈 `visible:false`(삭제 아님).
 - [x] **CLAUDE.md 272KB → 135KB** — §1~4·§7~11 압축, 가상 코인 절(564줄)은 docs/VIRTUAL_COIN.md 로 통째 이동(규칙 진실원본은 그 파일, 본문엔 요약+포인터). §5~6 은 원문 유지.
+
+## 체결내역 심볼 누수 수정 + OBV 기준선·국면 — 2026-09-24
+
+- [x] **심볼을 바꾸면 체결내역에 이전 코인 체결이 남던 버그** — 원인 셋. ①`useTradeTape` 가 심볼 전환 직후 첫 렌더에서
+  아직 이전 코인 것인 `spotTrades` 를 **새 심볼 버퍼로 `mergeTrades`**(폴링의 `spotClear` 는 이 이펙트보다 늦게 돈다).
+  OX→BTC→EW 처럼 실제 코인을 거치면 OX 목록이 스토어에 그대로 남아 있어 더 확실히 재현. 병합은 시각 기준이라 새 코인
+  체결이 위에 쌓일 뿐 **옛 줄은 영영 안 빠졌다**. ②전환 직전에 보낸 폴링 응답이 전환 뒤 도착하면 `applySpot` 이 비운 자리에
+  이전 코인의 호가·체결을 다시 채웠다. ③심볼별 버퍼를 남겨둬 되돌아오면 몇 분 전 체결 위에 새 체결이 얹혔다(시간이 끊긴
+  테이프, 강세/약세 잣대 오염). 수정: `spotPair`(호가·체결의 소유 코인) 태그 — `useTradeTape`·`OrderBook` 은 현재 심볼과
+  같을 때만 사용, `applySpot` 은 현재 심볼이 아닌 응답을 폐기(캔들은 `tickKey` 대조), `setSymbol` 은 테이프를 비운다.
+  요청·D1 변화 0(순수 클라).
+- [x] **OBV 기준선 + 매집/분산 국면** — OBV 는 누적값이라 고정 기준선(0)이 무의미(과거봉 로드마다 통째 이동)하므로 기준선 =
+  OBV 의 EMA(기본 20, 점선). 국면 = OBV vs 기준선(유입/유출) × 종가 vs 같은 기간 가격 EMA(위/아래) → 매집(유입·가격 아래) ·
+  끌어올림(유입·위) · 정리(유출·위) · 하락(유출·아래). OBV 선을 점마다 국면 색으로 칠하고 레전드에 라벨, 설정 패널에 색 칩
+  (마우스 올리면 설명). 레지스트리에 범용 `states`/`colorByState` 추가(Chart 에 타입 분기 없음). 동률(한산해 OBV 가 평평한
+  구간)은 직전 판정 유지. 검증: 합성 4구간 캔들에서 각 구간 후반 20봉 전부 정확 판정, 앞에 봉 하나를 더 붙여 OBV 를 이동시켜도
+  판정 차이 0.

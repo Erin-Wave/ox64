@@ -87,8 +87,28 @@ const fmtKst = (realSec: number, withSeconds = false) => {
 // (SuperTrend 국면 전환, Ichimoku 후행스팬 끝, 워밍업). 건너뛰면 LWC 가 앞뒤 점을 이어 있지도 않은 선을 그린다.
 const line = (arr: Series, times: number[]): (LineData | WhitespaceData)[] =>
   arr.map((v, i) => (v == null ? { time: toChart(times[i]) } : { time: toChart(times[i]), value: v }));
+/** 점마다 국면 색을 입힌 선(indicatorDefs 의 colorByState). 판정이 없는 점은 시리즈 기본색. */
+const stateLine = (arr: Series, times: number[], state: Series, colors: string[]): (LineData | WhitespaceData)[] =>
+  arr.map((v, i) => {
+    if (v == null) return { time: toChart(times[i]) };
+    const c = state[i] == null ? undefined : colors[state[i] as number];
+    return c ? { time: toChart(times[i]), value: v, color: c } : { time: toChart(times[i]), value: v };
+  });
 const histData = (arr: Series, times: number[], up: string, down: string): (HistogramData | WhitespaceData)[] =>
   arr.map((v, i) => (v == null ? { time: toChart(times[i]) } : { time: toChart(times[i]), value: v, color: v >= 0 ? up : down }));
+/** 시간(초)으로 봉 인덱스를 찾는다(오름차순 이진 탐색, 없으면 −1). */
+const barIndexAt = (candles: Candle[], time: number): number => {
+  let lo = 0;
+  let hi = candles.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const t = candles[mid].time;
+    if (t === time) return mid;
+    if (t < time) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+};
 /** 선 길이가 봉 수를 넘으면(Ichimoku 선행스팬 = n+kijun) 마지막 봉 뒤로 인터벌만큼 시간을 늘려 붙인다. */
 const extendTimes = (times: number[], extra: number, stepSec: number): number[] => {
   const out = times.slice();
@@ -321,6 +341,7 @@ export default function Chart() {
       // 인디케이터 값 — 각 시리즈에 그 시점 데이터가 있으면 param.seriesData 에서 바로 조회.
       // whitespace 점(값 없음 = 선이 끊긴 자리)은 건너뛴다.
       const nextInd: Record<string, IndLegendValue> = {};
+      let barIdx: number | undefined; // 필요할 때 한 번만 찾는다
       for (const [id, m] of indSeriesRef.current) {
         const rec: IndLegendValue = {};
         let any = false;
@@ -329,6 +350,17 @@ export default function Chart() {
           if (v && typeof v.value === 'number') {
             rec[key] = v.value;
             any = true;
+          }
+        }
+        // 선으로 안 그리는 값(국면 판정 등, indicatorDefs 의 states)은 시리즈가 없어 seriesData 로 못 찾는다 —
+        // 계산 결과에서 그 봉의 인덱스로 직접 읽는다.
+        const vals = any ? indValuesRef.current.get(id) : undefined;
+        if (vals) {
+          for (const key in vals) {
+            if (m.has(key)) continue;
+            if (barIdx === undefined) barIdx = barIndexAt(candlesRef.current, real);
+            const v = barIdx < 0 ? null : vals[key][barIdx];
+            if (v != null) rec[key] = v;
           }
         }
         if (any) nextInd[id] = rec;
@@ -446,6 +478,10 @@ export default function Chart() {
         const t = arr.length > times.length ? extendTimes(times, arr.length - times.length, stepSec) : times;
         if (ln.kind === 'hist') {
           (s as ISeriesApi<'Histogram'>).setData(histData(arr, t, histUp, histDown));
+        } else if (ln.colorByState && def.states) {
+          const colors = def.states.labels.map((l) => l.color);
+          (s as ISeriesApi<'Line'>).setData(stateLine(arr, t, vals[def.states.key] ?? [], colors));
+          (s as ISeriesApi<'Line'>).applyOptions({ color });
         } else {
           (s as ISeriesApi<'Line'>).setData(line(arr, t));
           // 앞의 지표가 지워지면 배정색(idx)이 바뀌므로 매번 맞춘다 — 레전드 점 색과 어긋나지 않게
@@ -1015,45 +1051,55 @@ export default function Chart() {
                 {opts.indicators.map((ind, idx) => {
                   const def = INDICATOR_DEFS[ind.type];
                   return (
-                    <div
-                      key={ind.id}
-                      className={`flex items-center gap-1 rounded px-2 py-1 text-xs text-text hover:bg-panel2 ${ind.visible ? '' : 'opacity-50'}`}
-                    >
-                      <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: IND_COLORS[idx % IND_COLORS.length] }} />
-                      <span className="w-[4.6rem] shrink-0 truncate" title={`${def.name}${def.pane === 'own' ? ' · 별도 패널' : ''}`}>
-                        {def.label}
-                      </span>
-                      <span className="flex flex-1 items-center justify-end gap-1">
-                        {def.params.map((p) => (
-                          <input
-                            key={p.key}
-                            type="number"
-                            min={p.min}
-                            max={p.max}
-                            step={p.step ?? 1}
-                            value={ind.params[p.key] ?? p.def}
-                            onChange={(e) => opts.updateIndicator(ind.id, { [p.key]: Number(e.target.value) })}
-                            className="w-12 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
-                            title={p.label}
-                          />
-                        ))}
-                      </span>
-                      {/* 숨김/표시 — 삭제와 별개. 설정을 지우지 않고 잠시 끈다(시리즈 visible 만 토글) */}
-                      <button
-                        onClick={() => opts.toggleIndicator(ind.id)}
-                        className={`shrink-0 rounded p-0.5 hover:bg-elevated ${ind.visible ? 'text-text' : 'text-muted'}`}
-                        title={ind.visible ? '숨기기' : '보이기'}
-                        aria-pressed={ind.visible}
-                      >
-                        <EyeIcon off={!ind.visible} />
-                      </button>
-                      <button
-                        onClick={() => opts.removeIndicator(ind.id)}
-                        className="shrink-0 rounded px-1 text-muted hover:bg-elevated hover:text-down"
-                        title="삭제"
-                      >
-                        ✕
-                      </button>
+                    <div key={ind.id} className={`rounded hover:bg-panel2 ${ind.visible ? '' : 'opacity-50'}`}>
+                      <div className="flex items-center gap-1 px-2 py-1 text-xs text-text">
+                        <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: IND_COLORS[idx % IND_COLORS.length] }} />
+                        <span className="w-[4.6rem] shrink-0 truncate" title={`${def.name}${def.pane === 'own' ? ' · 별도 패널' : ''}`}>
+                          {def.label}
+                        </span>
+                        <span className="flex flex-1 items-center justify-end gap-1">
+                          {def.params.map((p) => (
+                            <input
+                              key={p.key}
+                              type="number"
+                              min={p.min}
+                              max={p.max}
+                              step={p.step ?? 1}
+                              value={ind.params[p.key] ?? p.def}
+                              onChange={(e) => opts.updateIndicator(ind.id, { [p.key]: Number(e.target.value) })}
+                              className="w-12 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
+                              title={p.label}
+                            />
+                          ))}
+                        </span>
+                        {/* 숨김/표시 — 삭제와 별개. 설정을 지우지 않고 잠시 끈다(시리즈 visible 만 토글) */}
+                        <button
+                          onClick={() => opts.toggleIndicator(ind.id)}
+                          className={`shrink-0 rounded p-0.5 hover:bg-elevated ${ind.visible ? 'text-text' : 'text-muted'}`}
+                          title={ind.visible ? '숨기기' : '보이기'}
+                          aria-pressed={ind.visible}
+                        >
+                          <EyeIcon off={!ind.visible} />
+                        </button>
+                        <button
+                          onClick={() => opts.removeIndicator(ind.id)}
+                          className="shrink-0 rounded px-1 text-muted hover:bg-elevated hover:text-down"
+                          title="삭제"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      {/* 국면 판정이 있는 지표(OBV)는 선 색이 무슨 뜻인지 바로 아래에 — 칩에 올리면 설명 */}
+                      {def.states && (
+                        <div className="flex flex-wrap gap-x-2 gap-y-0.5 px-2 pb-1 pl-5 text-[10px] text-muted">
+                          {def.states.labels.map((l) => (
+                            <span key={l.text} className="inline-flex cursor-help items-center gap-1" title={l.hint}>
+                              <span className="h-1.5 w-3 rounded-sm" style={{ backgroundColor: l.color }} />
+                              {l.text}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1124,9 +1170,12 @@ export default function Chart() {
                 parts.push(ln.label ? `${ln.label} ${txt}` : txt);
               }
               if (parts.length === 0) return null;
+              const st = def.states ? val[def.states.key] : undefined;
+              const stLabel = st != null ? def.states?.labels[st] : undefined;
               return (
                 <span key={ind.id} style={{ color: IND_COLORS[idx % IND_COLORS.length] }}>
                   {indicatorTitle(ind.type, ind.params)} {parts.join(' ')}
+                  {stLabel && <span className="font-semibold" style={{ color: stLabel.color }}> · {stLabel.text}</span>}
                 </span>
               );
             })}

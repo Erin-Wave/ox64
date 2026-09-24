@@ -5,6 +5,8 @@
 //  - lines: 선 스펙(compute 결과의 키 하나 = 시리즈 하나). color 가 없으면 지표에 배정된 팔레트 색
 //  - levels: own 패널의 기준선(RSI 70/30 등) — 첫 선(lines[0])에 붙인다
 //  - format: 레전드 값 표기(price=심볼 자릿수 / fixed1·fixed2 / volume=수량 축약)
+//  - states: 봉마다의 "국면" 판정(OBV 매집/분산 등). compute 결과의 `states.key` 칸에 라벨 인덱스(0,1,…)를 담으면
+//    레전드에 그 시점 라벨이 붙고, `colorByState` 선은 점마다 라벨 색으로 칠해진다. 이 칸은 선으로 그리지 않는다
 
 import type { Candle } from '@/types';
 import * as I from './indicators';
@@ -47,6 +49,19 @@ export interface IndicatorLineDef {
   width?: 1 | 2;
   /** 고정색(없으면 지표 배정색). 여러 선이 있는 지표에서 보조선을 구분할 때만 */
   color?: string;
+  /** 점마다 def.states 의 라벨 색으로 칠한다(판정이 없는 워밍업 구간은 배정색) */
+  colorByState?: boolean;
+}
+export interface IndicatorStateLabel {
+  text: string;
+  color: string;
+  /** 설정 패널 칩에 마우스를 올리면 뜨는 설명 */
+  hint: string;
+}
+export interface IndicatorStates {
+  /** compute 결과에서 라벨 인덱스가 담긴 키 */
+  key: string;
+  labels: IndicatorStateLabel[];
 }
 export type IndicatorFormat = 'price' | 'fixed1' | 'fixed2' | 'volume';
 export interface IndicatorDef {
@@ -56,6 +71,7 @@ export interface IndicatorDef {
   params: IndicatorParamDef[];
   lines: IndicatorLineDef[];
   levels?: { value: number; color?: string }[];
+  states?: IndicatorStates;
   format: IndicatorFormat;
   compute: (candles: Candle[], p: IndicatorParams) => Record<string, I.Series>;
 }
@@ -248,14 +264,32 @@ export const INDICATOR_DEFS: Record<IndicatorType, IndicatorDef> = {
     format: 'fixed1',
     compute: (c, p) => ({ v: I.cci(c, p.period) }),
   },
+  // OBV 는 고정 기준선(RSI 70/30 같은)이 없다 — 누적값이라 절대 수준은 "어디서부터 셌나"에 달려 있다.
+  // 그래서 기준선 = OBV 자신의 EMA(점선), 선 색 = 그 기준선과 가격 추세로 가른 국면(I.obvPhase).
   obv: {
     label: 'OBV',
-    name: '누적 거래량(On-Balance Volume)',
+    name: '누적 거래량(OBV) · 매집/분산 국면',
     pane: 'own',
-    params: [],
-    lines: [{ key: 'v', label: '' }],
+    params: [{ key: 'period', label: '기준선 기간', def: 20, min: 2, max: 500 }], // 1 이면 기준선 = OBV 라 판정이 안 된다
+    lines: [
+      { key: 'v', label: '', width: 2, colorByState: true },
+      { key: 'base', label: '기준', style: 'dashed', color: '#8a94a6' },
+    ],
+    states: {
+      key: 'phase',
+      labels: [
+        { text: '매집', color: '#42a5f5', hint: 'OBV 가 기준선 위(순매수 유입)인데 가격은 아직 평균 아래 — 조용히 모으는 중' },
+        { text: '끌어올림', color: UP, hint: 'OBV·가격 둘 다 평균 위 — 모은 물량을 바탕으로 가격을 올리는 중' },
+        { text: '정리', color: SIGNAL_COLOR, hint: 'OBV 가 기준선 아래(순매도)인데 가격은 아직 평균 위 — 높은 가격에 물량을 넘기는 중' },
+        { text: '하락', color: DOWN, hint: 'OBV·가격 둘 다 평균 아래 — 매도세가 가격을 끌어내리는 중' },
+      ],
+    },
     format: 'volume',
-    compute: (c) => ({ v: I.obv(c) }),
+    compute: (c, p) => {
+      const v = I.obv(c);
+      const base = I.emaOf(v, p.period);
+      return { v, base, phase: I.obvPhase(closesOf(c), v, base, p.period) };
+    },
   },
   wr: {
     label: 'W%R',

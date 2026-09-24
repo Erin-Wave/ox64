@@ -49,6 +49,10 @@ interface TradingState {
   // 호가창·체결내역 "표시용" 시장 데이터일 뿐(유저 개인 데이터 아님, 봇이 만든 합성 시장).
   spotBook: { bids: SpotBookLevel[]; asks: SpotBookLevel[] };
   spotTrades: SpotTrade[];
+  /** 위 호가·체결이 **어느 가상 코인의 것인지**('' = 비어 있음). ⚠ 받는 쪽(useTradeTape·OrderBook)이 이걸
+   * 현재 심볼과 대조하지 않으면, 심볼을 바꾼 직후 첫 렌더에서 **이전 코인의 체결이 새 코인의 체결 버퍼로
+   * 병합**되어 영영 남는다(OX→EW, OX→BTC→EW — spotTrades 는 폴링이 멈춰도 그대로 남아 있다). */
+  spotPair: string;
   /** 통합 폴링이 받아온 **최근 N봉**(§ spotTick). 차트가 자기 배열에 병합해 그린다 — 전체 목록이 아니다. */
   spotCandles: Candle[];
   /** 위 봉들이 갱신된 시각(ms). 차트가 "새 데이터인가"를 이걸로 판단한다(배열 비교 대신). */
@@ -221,7 +225,14 @@ function dripTrades(set: (s: Partial<TradingState>) => void, incoming: SpotTrade
   dripTimer = window.setTimeout(step, gap);
 }
 
-function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState) {
+function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState, pair: string) {
+  // ⚠ 늦게 도착한 **이전 코인의 응답**은 버린다 — 심볼을 바꾸기 직전에 보낸 폴링이 전환 뒤에 돌아오면
+  // spotClear 로 비운 자리에 이전 코인의 호가·체결이 다시 들어앉는다(체결은 곧장 새 코인 버퍼로 병합된다).
+  if (useMarketStore.getState().symbol !== pair) return;
+  if (useTradingStore.getState().spotPair !== pair) {
+    clearDrip();
+    set({ spotTrades: [], spotPair: pair }); // 다른 코인의 목록을 기준으로 "새 체결"을 가리지 않게
+  }
   set({ spotBook: st.book });
   dripTrades(set, st.trades);
 }
@@ -250,6 +261,7 @@ export const useTradingStore = create<TradingState>((set) => ({
 
   spotBook: { bids: [], asks: [] },
   spotTrades: [],
+  spotPair: '',
   spotCandles: [],
   spotCandlesAt: 0,
   spotCandlesKey: '',
@@ -318,6 +330,7 @@ export const useTradingStore = create<TradingState>((set) => ({
       markPrices: {},
       spotBook: { bids: [], asks: [] },
       spotTrades: [],
+      spotPair: '',
     });
   },
 
@@ -461,12 +474,12 @@ export const useTradingStore = create<TradingState>((set) => ({
   // (통합 폴링 응답이 오기 전까지). 차트는 spotCandlesAt 이 0 이면 아무것도 안 그린다.
   spotClear: () => {
     clearDrip(); // 코인이 바뀌었다 — 이전 코인의 남은 슬라이스가 새 목록에 섞이지 않게
-    set({ spotBook: { bids: [], asks: [] }, spotTrades: [], spotCandles: [], spotCandlesAt: 0, spotCandlesKey: '' });
+    set({ spotBook: { bids: [], asks: [] }, spotTrades: [], spotPair: '', spotCandles: [], spotCandlesAt: 0, spotCandlesKey: '' });
   },
 
   spotRefresh: async (pair: string) => {
     try {
-      applySpot(set, await api.spotState(pair));
+      applySpot(set, await api.spotState(pair), pair);
     } catch {
       /* 다음 폴링에서 재시도 — 마지막 알려진 값 유지 */
     }
@@ -500,8 +513,9 @@ export const useTradingStore = create<TradingState>((set) => ({
         state: wantState,
         ordersSince: st.orders[0]?.createdAt,
       });
-      applySpot(set, r.market);
-      if (r.candles.length) set({ spotCandles: r.candles, spotCandlesAt: Date.now(), spotCandlesKey: key });
+      applySpot(set, r.market, pair);
+      // 응답이 오는 사이 심볼·인터벌이 바뀌었으면(tickKey 가 이미 새 조합) 이 봉들은 이전 조합의 것이다
+      if (r.candles.length && tickKey === key) set({ spotCandles: r.candles, spotCandlesAt: Date.now(), spotCandlesKey: key });
       // ⚠ 가상 코인의 현재가 = 서버 mark(봇 공정가) — 차트는 가상 코인에서 setPrice 를 하지 않는다(Chart.tsx).
       // 봉 종가(마지막 체결가)는 매수면 매도호가·매도면 매수호가에 찍혀 공정가와 반 스프레드쯤 다르고, 그걸
       // 헤더에 넣으면 3초마다 오는 markPrices 와 번갈아 **숫자가 깜빡인다**(고배율이면 손익도 같이 튄다).

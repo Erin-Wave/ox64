@@ -73,19 +73,19 @@ ox64/
     │   ├── binanceWs.ts    kline + orderbookStream(`@depth<N>@100ms` 를 `BOOK_THROTTLE_MS`=200ms 로 솎음) + aggTradeStream. ⚠ **브라우저↔바이낸스 직결**이라 요청·D1 을 안 쓴다 — 갱신 주기를 예산과 무관하게 당길 수 있다(가상 코인은 반대, §6)
     │   ├── okxRest.ts      OKX 시세(실제 코인 mark — 서버 체결가와 같은 소스)
     │   ├── indicators.ts   차트 보조지표 순수 계산 15종(EMA/SMA/BB/RSI/VWAP(롤링)/MACD/Stochastic/ATR/ADX(+DI/−DI)/CCI/OBV/Williams %R/Ichimoku/Parabolic SAR/SuperTrend). 입력=Candle[] 시간 오름차순, 출력=같은 인덱스 정렬(워밍업 null). Ichimoku 선행스팬은 길이가 n+kijun 이라 Chart 가 시간을 연장해 그린다
-    │   ├── indicatorDefs.ts 인디케이터 레지스트리(`INDICATOR_DEFS`): 타입별 라벨·패널(overlay=캔들 위 / own=하단 별도 패널)·파라미터 정의(key/label/기본값/범위)·선 스펙(kind line/hist/dots, 스타일, 고정색)·기준선(RSI 70/30 등)·값 포맷·compute. **Chart 는 이 표만 보고 그리므로 지표 추가 = 여기 한 항목 + indicators.ts 계산 함수**(Chart/스토어에 타입 분기를 새로 넣지 말 것)
+    │   ├── indicatorDefs.ts 인디케이터 레지스트리(`INDICATOR_DEFS`): 타입별 라벨·패널(overlay=캔들 위 / own=하단 별도 패널)·파라미터 정의(key/label/기본값/범위)·선 스펙(kind line/hist/dots, 스타일, 고정색)·기준선(RSI 70/30 등)·국면 판정(`states` — 봉마다 라벨 인덱스, `colorByState` 선은 점마다 라벨 색 + 레전드에 라벨. OBV = 기준선(OBV 의 EMA, 점선) 대비 유입/유출 × 가격 EMA 대비 위/아래 → 매집·끌어올림·정리·하락, ⚠ OBV 는 누적값이라 0 을 기준선으로 쓰지 말 것 — 과거봉 로드마다 통째로 이동한다)·값 포맷·compute. **Chart 는 이 표만 보고 그리므로 지표 추가 = 여기 한 항목 + indicators.ts 계산 함수**(Chart/스토어에 타입 분기를 새로 넣지 말 것)
     │   └── api.ts          백엔드 클라이언트(/api/*, credentials 포함)
     ├── hooks/
     │   ├── useMarkPrices.ts   현재+포지션 심볼 가격 1.2초 폴링. **소스=OKX**(서버 체결가와 동일), 실패 시 바이낸스 폴백. 가상 심볼 제외. 보유·미체결·현재 심볼의 precision 도 없으면 1회 조회(가상 심볼은 가격에서 파생)
     │   ├── useTriggerPoll.ts  로그인 시 **항상 2.5초** /api/state 재조회 = 서버 checkTriggers 클럭. in-flight 가드
-    │   ├── useTradeTape.ts    체결 테이프 → recentTrades. ⚠ 가상 코인은 교체 아닌 **`mergeTrades`**(서버가 최근 50건만 주므로 통째로 갈아끼우면 버퍼가 영영 50건). `MAX_TRADES`=400 은 클라 메모리(비용 0)
+    │   ├── useTradeTape.ts    체결 테이프 → recentTrades. ⚠ 가상 코인은 교체 아닌 **`mergeTrades`**(서버가 최근 50건만 주므로 통째로 갈아끼우면 버퍼가 영영 50건). `MAX_TRADES`=400 은 클라 메모리(비용 0). ⚠⚠ **`spotPair === symbol` 일 때만 병합** — 심볼 전환 직후 첫 렌더엔 spotTrades 가 아직 이전 코인 것이라 대조 없이 병합하면 이전 코인 체결이 새 코인 버퍼에 영구히 남았다. `setSymbol` 은 테이프를 통째로 비운다(되돌아왔을 때 시간이 끊긴 테이프 방지)
     │   ├── useEquity.ts       평가자산(= 여유잔고 + Σ(증거금 + 미실현)) + 파산 여부 — 서버와 **같은 식**을 클라 한 곳에만(Header·RefillModal 공유)
     │   └── useSpotPoll.ts     현재 심볼이 가상일 때만 1초 **통합 폴링**(`?tick=`, 3틱에 한 번 `&state=1`). 이 폴링이 곧 봇 클럭. **탭 백그라운드면 정지**(§6)
     ├── store/
     │   ├── useMarketStore.ts   symbol/interval/prices/precisions/connected/chartClickPrice+Nonce+priceTarget(클릭 가격을 받을 칸: ''=주문패널, 'close:<positionId>')
     │   ├── useChartStore.ts    차트 옵션(localStorage) — visibleBars, 토글류, bookRows(5~50/기본 10, `clampRows`), bookTogether, 체결 필터(`cleanLimit` 이 0/음수/NaN→null), tradeStrength. `indicators: IndicatorConfig[]`(`{id,type,params:Record<string,number>,visible}`) — 예전 `{period,mult}` 저장값은 load 시 params 로 마이그레이션. `addIndicator/removeIndicator/updateIndicator(id, params 패치)/toggleIndicator(id)`(visibility on/off — 삭제와 별개)
     │   ├── useSettingsStore.ts 테마+거래모드(easy/standard), setTheme 이 `dataset.theme` 도 갱신
-    │   └── useTradingStore.ts  서버 상태 캐시 + 액션 + spotBook/spotTrades(표시용). **체결 목록은 `dripTrades` 가 0.1~0.25초 간격으로 한 건씩** 흘려보낸다(§6, 비용 0). ⚠ 새 체결 식별은 **`createdAt`**(테이프 `id` 는 폴링마다 바뀜). 코인 전환 시 `spotClear` 가 타이머를 지울 것
+    │   └── useTradingStore.ts  서버 상태 캐시 + 액션 + spotBook/spotTrades(표시용). **체결 목록은 `dripTrades` 가 0.1~0.25초 간격으로 한 건씩** 흘려보낸다(§6, 비용 0). ⚠ 새 체결 식별은 **`createdAt`**(테이프 `id` 는 폴링마다 바뀜). 코인 전환 시 `spotClear` 가 타이머를 지울 것. `spotPair` = 호가·체결이 어느 코인 것인지 — `applySpot` 은 현재 심볼이 아닌 응답(전환 직전에 보낸 폴링)을 버린다
     └── components/
         ├── RefillModal.tsx      파산 팝업 — 평가자산 ≤0 이면 자동. 판정은 `useEquity` 하나만. 닫으면 **0 을 벗어날 때까지** 다시 안 뜸
         ├── VipModal.tsx · VipBadge.tsx  VIP 진행도·뱃지 — 기준표는 서버(loadState.vipTiers)

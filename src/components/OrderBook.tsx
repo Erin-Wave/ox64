@@ -140,6 +140,7 @@ export default function OrderBook() {
   const trades = useMarketStore((s) => s.recentTrades[s.symbol] ?? EMPTY_TRADES);
   const virtual = isVirtualSymbol(symbol);
   const spotBook = useTradingStore((s) => s.spotBook);
+  const spotPair = useTradingStore((s) => s.spotPair);
   // 한 화면에 보여줄 행 수(설정 → 5~50). 호가는 각 열마다, 체결은 목록 전체에 같은 값을 쓴다.
   const rows = useChartStore((s) => s.bookRows);
   // PC 에서 호가·체결 동시 표시(설정). 모바일은 폭이 좁아 항상 탭 — 그래서 화면 폭도 같이 본다.
@@ -166,11 +167,14 @@ export default function OrderBook() {
   }, [symbol, virtual]);
 
   // 가상 심볼은 spot_orders 호가(price/size)를 OrderBookLevel(price/qty) 형태로 매핑해 재사용
+  // ⚠ 다른 코인의 호가면 그리지 않는다 — 심볼 전환 직후 폴링이 비우기 전 한 프레임(§ spotPair)
   const activeBook: OrderBookSnapshot | null = virtual
-    ? {
-        bids: spotBook.bids.map((b) => ({ price: b.price, qty: b.size, mine: b.mine ?? 0 })),
-        asks: spotBook.asks.map((a) => ({ price: a.price, qty: a.size, mine: a.mine ?? 0 })),
-      }
+    ? spotPair !== symbol
+      ? null
+      : {
+          bids: spotBook.bids.map((b) => ({ price: b.price, qty: b.size, mine: b.mine ?? 0 })),
+          asks: spotBook.asks.map((a) => ({ price: a.price, qty: a.size, mine: a.mine ?? 0 })),
+        }
     : book;
 
   const prec = precisionOf(precisions, symbol);
