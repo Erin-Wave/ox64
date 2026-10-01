@@ -90,7 +90,8 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
       const interval = url.searchParams.get('interval') || '1m';
       const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit')) || 500));
       const endTime = Number(url.searchParams.get('endTime')) || undefined;
-      return json({ candles: await loadSpotCandles(env, reqPair, interval, limit, endTime) });
+      // `more` = 더 오래된 봉이 있을 수 있다(과거 페이지가 원본 행 상한에 닿았다 — § SRC_ROW_CAP). 클라가 "끝"을 판정하는 근거.
+      return json(await loadSpotCandlesPage(env, reqPair, interval, limit, endTime));
     }
 
     return json(await loadSpotMarket(env, sess.uid, reqPair, tickCtx));
@@ -347,6 +348,11 @@ async function bucketTradesToCandles(env: Env, pair: string, bucketMs: number, l
 /** OX 캔들 로드. 1m 이상은 영속 테이블(spot_candles)에서 읽어 히스토리가 시간이 지나도 사라지지 않게
  * 한다. 1s(및 <60s)는 단기 조회라 최신 거래 버킷팅. 영속 테이블이 아직 빈 인터벌(신규 배포 직후,
  * 거래가 아직 안 쌓인 상태)은 거래 버킷팅으로 폴백해 차트가 비지 않게 한다. */
+/** 요청 하나가 읽는 원본 봉 행의 상한(2026-10-01). 롤업 인터벌은 목표 봉 하나에 원본이 ratio 개 들어서(30m ← 1m 30개), 봉 1000개 요청
+ * 하나가 3만 행을 읽었다 — **회원가입만 하면 누구나** 170번 요청으로 하루 D1 읽기 한도(500만)를 끝내 사이트 전체를 멈출 수 있었다(감사).
+ * 상한을 넘는 만큼은 목표 봉 수를 줄여 돌려주고(30m 이면 페이지당 100봉), 과거 페이지는 `more` 로 "더 있음"을 알린다. */
+const SRC_ROW_CAP = 3000;
+
 export async function loadSpotCandles(
   env: Env,
   pair: string,
@@ -355,17 +361,35 @@ export async function loadSpotCandles(
   endTimeMs?: number,
   liveCtx?: LiveBars | null,
 ) {
+  return (await loadSpotCandlesPage(env, pair, intervalCode, limit, endTimeMs, liveCtx)).candles;
+}
+
+export async function loadSpotCandlesPage(
+  env: Env,
+  pair: string,
+  intervalCode: string,
+  limit: number,
+  endTimeMs?: number,
+  liveCtx?: LiveBars | null,
+): Promise<{ candles: { time: number; open: number; high: number; low: number; close: number; volume: number }[]; more: boolean }> {
   const sec = intervalSecFromCode(intervalCode);
   const bucketMs = sec * 1000;
   // ⚠ 1s 등 <60s 는 영속 테이블이 없어(최신 거래 버킷팅) 과거 페이지가 존재하지 않는다 —
   // endTime 이 오면 빈 배열을 돌려줘서 클라가 "더 없음"으로 확정하게 한다(무한 재시도 방지).
-  if (sec < 60) return endTimeMs ? [] : bucketTradesToCandles(env, pair, bucketMs, limit);
+  if (sec < 60) return { candles: endTimeMs ? [] : await bucketTradesToCandles(env, pair, bucketMs, limit), more: false };
 
   // 저장하지 않는 인터벌은 **정수배가 되는 가장 큰 저장 인터벌**에서 굴려 만든다(§ PERSIST_INTERVALS).
   // 예: 15m ← 1m 15개, 4h ← 1h 4개, 1w ← 1d 7개. 그만큼 원본 봉을 더 읽어야 하므로 limit 에 배수를 건다.
   const src = [...PERSIST_INTERVALS].reverse().find(([, s]) => sec % s === 0) ?? PERSIST_INTERVALS[0];
   const [srcCode, srcSec] = src;
   const ratio = Math.max(1, Math.round(sec / srcSec));
+  // 원본 행 상한(§ SRC_ROW_CAP) 안에 들어가게 목표 봉 수를 줄인다.
+  limit = Math.max(1, Math.min(limit, Math.floor(SRC_ROW_CAP / ratio)));
+  const srcLimit = limit * ratio;
+  // ⚠ 최신 페이지는 **요청한 목표 봉들이 걸친 구간만** 읽는다(2026-10-01) — LIMIT 만 걸면 진행 중인 봉이 막 시작했어도 원본 ratio×봉 수를
+  // 다 읽었다(30m 차트를 띄워 두면 1초마다 90행 = 한 사람이 14시간이면 하루 읽기 한도). 구간 하한을 두면 진행 중 봉은 지금까지 닫힌
+  // 원본만큼만 읽는다(평균 절반 이하, 클라는 평소 1봉만 요청한다 — useTradingStore spotTick).
+  const windowStart = (Math.floor(Date.now() / bucketMs) - (limit - 1)) * bucketMs;
 
   // endTimeMs 가 오면 그 시각 "이전" 봉만 — 차트에서 왼쪽으로 스크롤할 때 과거 구간을 이어 받는다.
   // ⚠ 진행 중(아직 안 닫힌) 봉은 테이블이 아니라 봇 상태 행에 있다(§ live_json) → 최신 페이지일 때만
@@ -374,9 +398,9 @@ export async function loadSpotCandles(
     env.DB.prepare(
       endTimeMs
         ? 'SELECT bucket, open, high, low, close, volume, open_at, close_at FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
-        : 'SELECT bucket, open, high, low, close, volume, open_at, close_at FROM spot_candles WHERE pair = ? AND interval = ? ORDER BY bucket DESC LIMIT ?',
+        : 'SELECT bucket, open, high, low, close, volume, open_at, close_at FROM spot_candles WHERE pair = ? AND interval = ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?',
     )
-      .bind(...(endTimeMs ? [pair, srcCode, endTimeMs, limit * ratio] : [pair, srcCode, limit * ratio]))
+      .bind(...(endTimeMs ? [pair, srcCode, endTimeMs, srcLimit] : [pair, srcCode, windowStart, srcLimit]))
       .all<CandleRow>(),
     // ⚠ 통합 폴링(`?tick=`)에선 봇 틱이 방금 읽고 쓴 값을 그대로 받는다(§ TickCtx) — 같은 요청 안에서
     // 같은 행을 두 번 읽지 않는다. 과거 페이지(endTimeMs)엔 진행 중 봉이 아예 관계없다.
@@ -385,12 +409,16 @@ export async function loadSpotCandles(
       : env.DB.prepare('SELECT live_json FROM spot_bot_state WHERE id = ?').bind(pair).first<{ live_json: string | null }>(),
   ]);
   const live = endTimeMs ? undefined : (liveCtx ?? parseLive(liveRow?.live_json))[srcCode];
+  const more = endTimeMs ? rowsRes.results.length >= srcLimit : true;
   const asc = mergeLiveBar(rowsRes.results.reverse(), live);
   // 과거 페이지 요청인데 결과가 없으면 진짜로 더 없는 것 — 거래 버킷팅 폴백으로 최신 구간을
   // 돌려주면 클라가 "받았다"고 착각해 같은 구간을 무한히 다시 붙인다.
-  if (asc.length === 0) return endTimeMs ? [] : bucketTradesToCandles(env, pair, bucketMs, limit);
+  if (asc.length === 0) return { candles: endTimeMs ? [] : await bucketTradesToCandles(env, pair, bucketMs, limit), more: false };
   if (ratio === 1) {
-    return asc.map((r) => ({ time: Math.floor(r.bucket / 1000), open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
+    return {
+      candles: asc.map((r) => ({ time: Math.floor(r.bucket / 1000), open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume })),
+      more,
+    };
   }
   // 롤업 — 원본 봉을 목표 버킷으로 묶는다(open=첫 봉, close=마지막 봉, high/low=극값, volume=합).
   // 원본이 시간순(asc)이라 open/close 가 자연히 맞는다.
@@ -407,10 +435,13 @@ export async function loadSpotCandles(
       cur.volume += r.volume;
     }
   }
-  return [...merged.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .slice(-limit)
-    .map(([t, c]) => ({ time: Math.floor(t / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+  return {
+    candles: [...merged.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .slice(-limit)
+      .map(([t, c]) => ({ time: Math.floor(t / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })),
+    more,
+  };
 }
 
 // ── 봇 호가 사다리 = spot_bot_state 의 JSON 한 칸(예전엔 spot_orders 44행) ──────────────────

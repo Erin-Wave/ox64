@@ -624,7 +624,7 @@ export default function Chart() {
         loadingMore = true;
         try {
           const oldest = candlesRef.current[0].time; // sec
-          const { candles: older } = await api.spotCandles(symbol, interval, 500, oldest * 1000);
+          const { candles: older, more } = await api.spotCandles(symbol, interval, 500, oldest * 1000);
           if (cancelled) return;
           // await 사이에 폴링이 배열을 갱신했을 수 있으므로 최신 상태를 다시 읽는다.
           const cur = candlesRef.current;
@@ -641,7 +641,8 @@ export default function Chart() {
           draw(candlesRef.current);
           // 프리펜드로 인덱스가 fresh.length 만큼 밀리므로 보이던 구간 그대로 유지
           if (before && ts) ts.setVisibleLogicalRange({ from: before.from + fresh.length, to: before.to + fresh.length });
-          if (fresh.length < 450) noMore = true; // 과거 데이터 끝 근처
+          // 과거 데이터 끝 — 서버가 알려 주면 그걸 따른다(롤업 인터벌은 원본 행 상한 때문에 페이지가 500봉보다 작다, § api.spotCandles)
+          if (more === false || (more === undefined && fresh.length < 450)) noMore = true;
         } catch {
           /* 다음 스크롤 때 재시도 */
         } finally {

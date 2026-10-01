@@ -267,8 +267,10 @@ export const api = {
         (o.state && o.ordersSince ? `&ordersSince=${o.ordersSince}` : ''),
     ),
   /** OX 캔들. endTimeMs 를 주면 그 시각 "이전" 봉만 — 차트 왼쪽 스크롤 시 과거 구간 이어받기용. */
+  // `more` = 더 오래된 봉이 있을 수 있다(서버가 원본 행 상한으로 페이지를 줄였을 때 — 롤업 인터벌은 페이지가 500봉보다 작다).
+  // 구버전 서버는 안 보내므로 undefined 면 예전 판정(450봉 미만 = 끝)을 쓴다.
   spotCandles: (pair: string, interval: string, limit = 500, endTimeMs?: number) =>
-    req<{ candles: Candle[] }>(
+    req<{ candles: Candle[]; more?: boolean }>(
       `/spot?pair=${encodeURIComponent(pair)}&candles=1&interval=${encodeURIComponent(interval)}&limit=${limit}${endTimeMs ? `&endTime=${endTimeMs}` : ''}`,
     ),
 };

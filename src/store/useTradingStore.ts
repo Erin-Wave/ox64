@@ -477,9 +477,11 @@ export const useTradingStore = create<TradingState>((set) => ({
       tickCount = 0;
     }
     const sec = intervalSec(interval);
-    const bars = fresh || st.spotCandlesAt === 0
-      ? FULL_BARS
-      : Math.min(FULL_BARS, Math.max(POLL_MIN_BARS, Math.ceil((Date.now() - st.spotCandlesAt) / 1000 / sec) + 2));
+    // ⚠ 평소엔 **진행 중인 봉 1개만**, 봉 경계를 넘었으면 그만큼 더(2026-10-01) — 예전엔 항상 3봉 이상이라 롤업 인터벌(30m ← 1m 30개)에서
+    // 1초마다 원본 90행을 읽었다(한 사람이 14시간 켜 두면 하루 읽기 한도). 서버도 목표 봉 구간만 읽는다(§ spot.ts loadSpotCandlesPage).
+    const nowSec = Date.now() / 1000;
+    const crossed = Math.floor(nowSec / sec) - Math.floor(st.spotCandlesAt / 1000 / sec);
+    const bars = fresh || st.spotCandlesAt === 0 ? FULL_BARS : Math.min(FULL_BARS, Math.max(POLL_MIN_BARS, crossed + 1));
     const wantState = tickCount % STATE_EVERY === 0;
     tickCount++;
     const sentAt = Date.now();
@@ -510,5 +512,5 @@ export const useTradingStore = create<TradingState>((set) => ({
 let tickKey = '';
 let tickCount = 0;
 const FULL_BARS = 500; // 최초 로드 폭(차트가 왼쪽으로 스크롤하면 loadOlder 가 더 붙인다)
-const POLL_MIN_BARS = 2; // 진행 중인 봉 + 방금 닫힌 봉이면 갱신엔 충분하다
+const POLL_MIN_BARS = 1; // 같은 봉 안이면 진행 중인 봉 하나로 충분하다(경계를 넘으면 위에서 늘어난다)
 const STATE_EVERY = 3; // 3틱(≈3초)마다 계정 상태를 함께 받는다 — 예전 /api/state 폴링(2.5초)과 비슷
