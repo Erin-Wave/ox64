@@ -17,7 +17,7 @@ import {
 } from 'lightweight-charts';
 import { fetchKlines, fetchPricePrecision } from '@/services/binanceRest';
 import { klineStream } from '@/services/binanceWs';
-import type { Series } from '@/services/indicators';
+import { profileValues, type Series } from '@/services/indicators';
 import {
   INDICATOR_DEFS,
   OVERLAY_TYPES,
@@ -26,7 +26,9 @@ import {
   type IndicatorFormat,
   type IndicatorType,
   type LineStyleName,
+  type ProfileDraw,
 } from '@/services/indicatorDefs';
+import { ProfilePrimitive, type ProfileLayer } from '@/services/profilePrimitive';
 import { api } from '@/services/api';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useChartStore, type IndicatorConfig, type ChartColorScheme } from '@/store/useChartStore';
@@ -125,7 +127,15 @@ const extendTimes = (times: number[], extra: number, stepSec: number): number[] 
 };
 const LWC_STYLE: Record<LineStyleName, LineStyle> = { solid: LineStyle.Solid, dotted: LineStyle.Dotted, dashed: LineStyle.Dashed };
 const fmtIndValue = (fmt: IndicatorFormat, v: number, prec: number): string =>
-  fmt === 'price' ? fmtPriceShort(v, prec, 9) : fmt === 'fixed1' ? v.toFixed(1) : fmt === 'fixed2' ? v.toFixed(2) : fmtQtyShort(v, 9);
+  fmt === 'price'
+    ? fmtPriceShort(v, prec, 9)
+    : fmt === 'fixed1'
+      ? v.toFixed(1)
+      : fmt === 'fixed2'
+        ? v.toFixed(2)
+        : fmt === 'pct'
+          ? `${v.toFixed(0)}%`
+          : fmtQtyShort(v, 9);
 
 /** 인디케이터 표시/숨김 아이콘(눈 / 빗금 친 눈). 이모지는 폰트에 따라 깨져서 인라인 SVG 로. */
 function EyeIcon({ off }: { off: boolean }) {
@@ -164,6 +174,11 @@ export default function Chart() {
   // syncIndicators() 가 candlesRef 와 나란한 인덱스로 채워두는 원본 계산값(선 키별) —
   // 크로스헤어가 벗어났을 때(마지막 값) 또는 hover 시점 조회에 사용.
   const indValuesRef = useRef<Map<string, Record<string, Series>>>(new Map());
+  // 매물대(indicatorDefs 의 profile 지표) — 보이는 구간을 다시 셀 때마다(refreshProfiles) 바뀌는 결과와, 그걸 그리는 프리미티브
+  const profilesRef = useRef<Map<string, ProfileDraw>>(new Map());
+  const profilePrimRef = useRef<ProfilePrimitive | null>(null);
+  const profileSigRef = useRef('');
+  const refreshProfilesRef = useRef<() => void>(() => {});
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const volMap = useRef<Map<number, number>>(new Map());
@@ -216,6 +231,8 @@ export default function Chart() {
       }
       if (any) out[id] = rec;
     }
+    // 매물대는 봉마다의 값이 없다 — 보이는 구간 전체의 POC·VAH·VAL
+    for (const [id, pr] of profilesRef.current) out[id] = profileValues(pr);
     return out;
   };
 
@@ -332,6 +349,20 @@ export default function Chart() {
     });
     chartRef.current = chart;
     candleRef.current = candle;
+    // 매물대 막대는 캔들 시리즈에 붙인 프리미티브 하나가 전부 그린다(지표가 없으면 아무것도 안 그린다)
+    const profilePrim = new ProfilePrimitive();
+    candle.attachPrimitive(profilePrim);
+    profilePrimRef.current = profilePrim;
+    // 팬·줌으로 보이는 구간이 바뀌면 매물대를 다시 센다 — 이벤트가 한 프레임에 여러 번 와도 한 번만
+    let profileRaf = 0;
+    const onProfileRange = () => {
+      if (profileRaf) return;
+      profileRaf = requestAnimationFrame(() => {
+        profileRaf = 0;
+        refreshProfilesRef.current();
+      });
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange(onProfileRange);
 
     chart.subscribeCrosshairMove((param) => {
       repositionCountdownRef.current(); // 마우스 이동(팬/줌 포함) 시 축 라벨 따라 위치 갱신
@@ -376,6 +407,11 @@ export default function Chart() {
         }
         if (any) nextInd[id] = rec;
       }
+      // 매물대 — 구간 전체 값(POC 등) + 커서가 가리키는 가격대의 거래량·매수 비중
+      if (profilesRef.current.size) {
+        const cursor = param.point ? c.coordinateToPrice(param.point.y) : null;
+        for (const [id, pr] of profilesRef.current) nextInd[id] = profileValues(pr, cursor);
+      }
       setIndLegend(nextInd);
     });
 
@@ -389,9 +425,14 @@ export default function Chart() {
     });
 
     return () => {
+      if (profileRaf) cancelAnimationFrame(profileRaf);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onProfileRange);
       chart.remove();
       chartRef.current = null;
       candleRef.current = null;
+      profilePrimRef.current = null;
+      profilesRef.current.clear();
+      profileSigRef.current = '';
       indSeriesRef.current.clear();
       volRef.current = null;
     };
@@ -421,6 +462,52 @@ export default function Chart() {
   useEffect(() => {
     chartRef.current?.applyOptions({ timeScale: { secondsVisible: subMinute } });
   }, [subMinute]);
+
+  // ── 매물대(가격대별 거래량) — 보이는 봉 구간을 다시 세어 프리미티브에 넘긴다 ──────────
+  // indicatorDefs 에 profile 이 있는 지표만(타입 분기 없음). 새 봉·지표 설정(syncIndicators 끝)과 팬·줌(보이는 구간 변화)에서 부른다.
+  const refreshProfiles = () => {
+    const chart = chartRef.current;
+    const prim = profilePrimRef.current;
+    if (!chart || !prim) return;
+    const o = optsRef.current;
+    const candles = candlesRef.current;
+    const range = chart.timeScale().getVisibleLogicalRange();
+    const next = new Map<string, ProfileDraw>();
+    const layers: ProfileLayer[] = [];
+    if (range && candles.length) {
+      const th = chartColors(useSettingsStore.getState().theme, o.colorScheme);
+      // 반쯤 걸친 양 끝 봉까지(봉 i 는 논리 좌표 i−0.5 ~ i+0.5 를 차지한다). 범위 밖은 volumeProfile 이 잘라낸다
+      const from = Math.round(range.from);
+      const to = Math.round(range.to);
+      o.indicators.forEach((ind, idx) => {
+        const def = INDICATOR_DEFS[ind.type];
+        if (!def.profile || !ind.visible) return;
+        const prof = def.profile(candles, from, to, ind.params);
+        if (!prof) return;
+        next.set(ind.id, prof);
+        layers.push({
+          prof,
+          width: prof.width,
+          upIn: withAlpha(th.up, 0.42),
+          upOut: withAlpha(th.up, 0.16),
+          downIn: withAlpha(th.down, 0.42),
+          downOut: withAlpha(th.down, 0.16),
+          line: IND_COLORS[idx % IND_COLORS.length],
+        });
+      });
+    }
+    const had = profilesRef.current.size > 0;
+    profilesRef.current = next;
+    if (!had && next.size === 0) return; // 매물대를 안 쓰면 아무것도 안 한다(다른 지표만 쓸 때 비용 0)
+    prim.setLayers(layers);
+    // 레전드(POC·VAH·VAL)는 값이 바뀌었을 때만 갱신 — 팬하는 동안 프레임마다 Chart 를 다시 렌더하지 않게
+    const sig = [...next].map(([id, p]) => `${id}:${p.lo}:${p.step}:${p.poc}:${p.vaLo}:${p.vaHi}`).join('|');
+    if (sig !== profileSigRef.current) {
+      profileSigRef.current = sig;
+      if (!hovering.current) setIndLegend(lastIndLegend());
+    }
+  };
+  refreshProfilesRef.current = refreshProfiles;
 
   // ── 인디케이터 동기화 (candlesRef 기준 재계산) ────────────────
   // opts 를 직접 클로징하지 않고 optsRef 로 항상 최신 값을 읽는다.
@@ -461,6 +548,7 @@ export default function Chart() {
       const vals = def.compute(candles, ind.params);
       indValuesRef.current.set(ind.id, vals);
       def.lines.forEach((ln, li) => {
+        if (ln.kind === 'value') return; // 레전드 값만 찍는 칸(매물대 POC 등) — 선을 만들지 않는다
         const color = ln.color ?? base;
         let s = series.get(ln.key);
         if (!s) {
@@ -535,6 +623,7 @@ export default function Chart() {
       });
     });
     if (o.volume) chart.priceScale('vol').applyOptions({ scaleMargins: { top: 1 - volH, bottom: 0 } });
+    refreshProfiles(); // 봉·설정·색이 바뀌었다 — 매물대도 다시 센다
   };
   syncIndicatorsRef.current = syncIndicators;
 
@@ -1251,7 +1340,7 @@ export default function Chart() {
                 if (ln.legend === false) continue;
                 const v = val[ln.key];
                 if (v == null) continue;
-                const txt = fmtIndValue(def.format, v, prec);
+                const txt = fmtIndValue(ln.format ?? def.format, v, prec);
                 parts.push(ln.label ? `${ln.label} ${txt}` : txt);
               }
               if (parts.length === 0) return null;

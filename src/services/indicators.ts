@@ -479,3 +479,116 @@ export function supertrend(candles: Candle[], period = 10, mult = 3): SuperTrend
   }
   return { up, down };
 }
+
+/** 매물대(볼륨 프로파일) 한 장 — 봉마다의 값이 아니라 **봉 구간 전체**를 가격대별로 모은 결과. 칸 0 = 가장 낮은 가격대. */
+export interface PriceProfile {
+  /** 맨 아래 칸의 하단 가격과 칸 높이 — k 번 칸 = [lo + k·step, lo + (k+1)·step) */
+  lo: number;
+  step: number;
+  /** 칸별 거래량 — 양봉(종가 ≥ 시가)의 거래량은 매수(up), 음봉은 매도(down) 쪽에 센다 */
+  up: number[];
+  down: number[];
+  /** 거래량이 가장 많이 쌓인 칸(POC)과 가치 영역(VA)의 칸 범위 [vaLo, vaHi] */
+  poc: number;
+  vaLo: number;
+  vaHi: number;
+  /** 가장 큰 칸의 거래량(막대 길이의 기준)과 전체 거래량 */
+  max: number;
+  total: number;
+}
+
+/** candles[from..to] 의 거래량을 rows 개 가격대로 나눠 담는다(트레이딩뷰 VPVR 과 같은 셈법).
+ * 봉 하나의 거래량은 그 봉의 저가~고가에 **고르게** 퍼졌다고 보고 겹치는 길이만큼 나눠 담는다 — 봉 안에서 어느 가격에 얼마나
+ * 체결됐는지는 캔들에 없다(트레이딩뷰도 하위 봉을 못 쓰면 같은 가정). 그래서 봉이 굵을수록(1d 를 몇 개만 보면) 칸이 뭉개진다.
+ * 가치 영역 = POC 에서 시작해 위·아래 이웃 칸 중 거래량이 큰 쪽을 한 칸씩 붙여 전체의 vaPct% 에 닿을 때까지.
+ * 보이는 봉에 거래량이 하나도 없으면 null. */
+export function volumeProfile(candles: Candle[], from: number, to: number, rows = 24, vaPct = 70): PriceProfile | null {
+  const a = Math.max(0, Math.floor(from));
+  const b = Math.min(candles.length - 1, Math.floor(to));
+  if (b < a) return null;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = a; i <= b; i++) {
+    const c = candles[i];
+    if (c.low < lo) lo = c.low;
+    if (c.high > hi) hi = c.high;
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) return null;
+  let n = Math.max(1, Math.round(rows));
+  let step = (hi - lo) / n;
+  // 보이는 봉이 전부 한 가격이면(봉 하나·호가 정지) 그 가격을 가운데 둔 한 칸으로
+  if (!(step > 0)) {
+    n = 1;
+    step = Math.max(Math.abs(lo) * 1e-4, 1e-12);
+    lo -= step / 2;
+  }
+  const up = new Array<number>(n).fill(0);
+  const down = new Array<number>(n).fill(0);
+  const binOf = (p: number) => Math.min(n - 1, Math.max(0, Math.floor((p - lo) / step)));
+  let total = 0;
+  for (let i = a; i <= b; i++) {
+    const c = candles[i];
+    const v = c.volume ?? 0;
+    if (!(v > 0)) continue;
+    total += v;
+    const dst = c.close >= c.open ? up : down;
+    const h = c.high - c.low;
+    if (!(h > 0)) {
+      dst[binOf(c.close)] += v;
+      continue;
+    }
+    const last = binOf(c.high);
+    for (let k = binOf(c.low); k <= last; k++) {
+      // 맨 위·맨 아래 칸은 끝을 열어 둔다 — lo + n·step 이 부동소수로 고가에 살짝 못 미쳐 거래량이 새지 않게
+      const top = k === n - 1 ? Infinity : lo + (k + 1) * step;
+      const bot = k === 0 ? -Infinity : lo + k * step;
+      const ov = Math.min(top, c.high) - Math.max(bot, c.low);
+      if (ov > 0) dst[k] += (v * ov) / h;
+    }
+  }
+  if (!(total > 0)) return null;
+  let poc = 0;
+  let max = 0;
+  for (let k = 0; k < n; k++) {
+    const t = up[k] + down[k];
+    if (t > max) {
+      max = t;
+      poc = k;
+    }
+  }
+  const target = (total * Math.min(100, Math.max(0, vaPct))) / 100;
+  let vaLo = poc;
+  let vaHi = poc;
+  let acc = max;
+  while (acc < target && (vaLo > 0 || vaHi < n - 1)) {
+    const below = vaLo > 0 ? up[vaLo - 1] + down[vaLo - 1] : -1;
+    const above = vaHi < n - 1 ? up[vaHi + 1] + down[vaHi + 1] : -1;
+    if (above >= below) {
+      vaHi++;
+      acc += above;
+    } else {
+      vaLo--;
+      acc += below;
+    }
+  }
+  return { lo, step, up, down, poc, vaLo, vaHi, max, total };
+}
+
+/** 매물대 레전드 값 — POC(칸 가운데)·VAH(가치 영역 위 끝)·VAL(아래 끝) 가격. price 를 주면 그 가격이 든 칸의 거래량(at)과
+ * 그중 매수 비중(atBuy, %)도. at 은 봉 거래량을 고르게 퍼뜨린 **추정치**라 유효숫자 4자리로 자른다(31.38102415 같은 가짜 정밀도 방지). */
+export function profileValues(p: PriceProfile, price?: number | null): Record<string, number> {
+  const out: Record<string, number> = {
+    poc: p.lo + (p.poc + 0.5) * p.step,
+    vah: p.lo + (p.vaHi + 1) * p.step,
+    val: p.lo + p.vaLo * p.step,
+  };
+  if (price != null && Number.isFinite(price)) {
+    const k = Math.floor((price - p.lo) / p.step);
+    if (k >= 0 && k < p.up.length) {
+      const t = p.up[k] + p.down[k];
+      out.at = t > 0 ? Number(t.toPrecision(4)) : 0;
+      if (t > 0) out.atBuy = (p.up[k] / t) * 100;
+    }
+  }
+  return out;
+}

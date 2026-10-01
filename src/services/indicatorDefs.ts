@@ -7,6 +7,9 @@
 //  - format: 레전드 값 표기(price=심볼 자릿수 / fixed1·fixed2 / volume=수량 축약)
 //  - states: 봉마다의 "국면" 판정(OBV 매집/분산 등). compute 결과의 `states.key` 칸에 라벨 인덱스(0,1,…)를 담으면
 //    레전드에 그 시점 라벨이 붙고, `colorByState` 선은 점마다 라벨 색으로 칠해진다. 이 칸은 선으로 그리지 않는다
+//  - profile: 봉마다의 선이 아니라 **지금 화면에 보이는 봉 구간 전체**를 가격대별로 모아 가로 막대로 그리는 지표(매물대).
+//    Chart 가 보이는 구간이 바뀔 때마다(팬·줌·새 봉) 그 구간 인덱스로 다시 부른다. 이런 지표의 lines 는 전부 kind 'value'
+//    (선을 만들지 않고 레전드 값만 — 값은 I.profileValues 의 키: poc/vah/val, 커서 가격대의 at/atBuy)
 
 import type { Candle } from '@/types';
 import * as I from './indicators';
@@ -19,6 +22,7 @@ export type IndicatorType =
   | 'ichimoku'
   | 'psar'
   | 'supertrend'
+  | 'vp'
   | 'rsi'
   | 'macd'
   | 'stoch'
@@ -38,7 +42,8 @@ export interface IndicatorParamDef {
   max: number;
   step?: number;
 }
-export type LineKind = 'line' | 'hist' | 'dots';
+/** 'value' = 선으로 그리지 않고 레전드에 값만 찍는다(매물대의 POC 처럼 봉마다의 값이 아닌 것) */
+export type LineKind = 'line' | 'hist' | 'dots' | 'value';
 export type LineStyleName = 'solid' | 'dotted' | 'dashed';
 export interface IndicatorLineDef {
   key: string;
@@ -53,6 +58,8 @@ export interface IndicatorLineDef {
   colorByState?: boolean;
   /** false 면 레전드에 값을 안 찍는다(밴드 경계처럼 보조로만 그리는 선) */
   legend?: boolean;
+  /** 이 값만 다른 표기(없으면 지표의 format) — 가격 지표 안의 거래량·비중 값 */
+  format?: IndicatorFormat;
 }
 export interface IndicatorStateLabel {
   text: string;
@@ -65,7 +72,11 @@ export interface IndicatorStates {
   key: string;
   labels: IndicatorStateLabel[];
 }
-export type IndicatorFormat = 'price' | 'fixed1' | 'fixed2' | 'volume';
+export type IndicatorFormat = 'price' | 'fixed1' | 'fixed2' | 'volume' | 'pct';
+/** 가로 막대로 그릴 매물대 한 장 + 막대 최대 폭(차트 폭 대비 0~1) */
+export interface ProfileDraw extends I.PriceProfile {
+  width: number;
+}
 export interface IndicatorDef {
   label: string;
   name: string;
@@ -76,6 +87,8 @@ export interface IndicatorDef {
   states?: IndicatorStates;
   format: IndicatorFormat;
   compute: (candles: Candle[], p: IndicatorParams) => Record<string, I.Series>;
+  /** 보이는 구간 [from, to](봉 인덱스) 전체를 가격대별로 모은다 — 있으면 Chart 가 가로 막대로 그린다(위 머리말 profile) */
+  profile?: (candles: Candle[], from: number, to: number, p: IndicatorParams) => ProfileDraw | null;
 }
 
 const PERIOD = (def: number, label = '기간'): IndicatorParamDef => ({ key: 'period', label, def, min: 1, max: 500 });
@@ -176,6 +189,32 @@ export const INDICATOR_DEFS: Record<IndicatorType, IndicatorDef> = {
     compute: (c, p) => {
       const r = I.supertrend(c, p.period, p.mult);
       return { up: r.up, down: r.down };
+    },
+  },
+  // 매물대 — **지금 화면에 보이는 봉 전체**의 거래량을 가격대별로 모아 차트 오른쪽에 가로 막대로(트레이딩뷰 VPVR). 팬·줌으로
+  // 보이는 구간이 바뀌면 다시 센다. 막대 = 매수(양봉 거래량, 가격축 쪽)+매도(음봉), 진한 칸 = 가치 영역(VA, 거래의 va% 가 몰린
+  // 가격대), 가로 실선 = POC(가장 많이 거래된 가격), 막대 위 점선 = VA 위·아래 끝(VAH/VAL).
+  vp: {
+    label: '매물대',
+    name: '거래량 프로파일 (VPVR · 보이는 구간)',
+    pane: 'overlay',
+    params: [
+      { key: 'rows', label: '가격 구간 수', def: 24, min: 6, max: 100 },
+      { key: 'va', label: '가치 영역 %', def: 70, min: 10, max: 100 },
+      { key: 'width', label: '막대 폭 (차트 폭 %)', def: 30, min: 5, max: 80 },
+    ],
+    lines: [
+      { key: 'poc', label: 'POC', kind: 'value' },
+      { key: 'vah', label: 'VAH', kind: 'value' },
+      { key: 'val', label: 'VAL', kind: 'value' },
+      { key: 'at', label: '이 가격대', kind: 'value', format: 'volume' },
+      { key: 'atBuy', label: '매수', kind: 'value', format: 'pct' },
+    ],
+    format: 'price',
+    compute: () => ({}),
+    profile: (c, from, to, p) => {
+      const r = I.volumeProfile(c, from, to, p.rows, p.va);
+      return r && { ...r, width: p.width / 100 };
     },
   },
   // ── 오실레이터(하단 별도 패널) ─────────────────────────────
