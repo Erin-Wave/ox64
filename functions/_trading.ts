@@ -63,6 +63,12 @@ export interface FillBudget {
 }
 const HEAVY_FILL_Q = 25; // 가상 코인 호가창 체결(지정가·지정가 청산·SL/TP·조건부)
 const LIGHT_FILL_Q = 10; // 실제 코인 체결(외부 시세 정산)
+/** 가상 코인 매칭을 시도했는데 하나도 못 채웠을 때 실제로 든 몫(읽기 ~5). ⚠ 몫은 **시도 전에 확인하고 결과에 따라 뗀다** — 잔고가
+ * 없어 영영 못 채우는 크로스 주문(예: 증거금 없는 초저가 숏 지정가)이 매번 25 를 먼저 떼면 cron 의 공유 몫을 혼자 다 써서 다른
+ * 유저의 SL·지정가가 밀렸다(로컬 재현). */
+const PROBE_Q = 5;
+/** 몫이 cost 만큼 남았나(떼지는 않는다). */
+const hasRoom = (b: FillBudget, cost: number) => b.q >= cost;
 /** 폴링 한 번의 몫 — 가상 코인 체결 하나 또는 실제 코인 체결 셋. */
 export const POLL_FILL_Q = 30;
 /** 통합 폴링(`?tick=`)의 몫 — 봇 커밋·호가창·캔들을 함께 하므로 가상 코인 체결 하나까지만. */
@@ -579,7 +585,8 @@ async function settleConditionalOrder(
   // 1회성 주문은 총량이 유한하므로 막지 않는다(막으면 걸어둔 스탑이 안 걸리는 게 더 큰 사고다).
   if (c.repeating && (await autoWritesBlocked(env, 'repeat'))) return;
   // 이 요청의 체결 몫이 바닥났으면 다음 평가에서(조건은 그대로 살아 있다, § FillBudget).
-  if (!spend(budget, isVirtualSymbol(c.symbol) ? HEAVY_FILL_Q : LIGHT_FILL_Q)) return;
+  // (가상 코인은 시도 결과에 따라 뗀다 — § PROBE_Q)
+  if (isVirtualSymbol(c.symbol) ? !hasRoom(budget, HEAVY_FILL_Q) : !spend(budget, LIGHT_FILL_Q)) return;
 
   // 크로스 가용 = 여유잔고 + 그 지갑 미실현손익. 시세 모르는 포지션이 있으면 이번엔 쉰다(§ unrealizedTotal).
   const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(c.symbol));
@@ -591,9 +598,10 @@ async function settleConditionalOrder(
   // 다른 평가가 먼저 처리했으면 batch 전체가 되돌려진다. 못 채웠으면(감당 불가·유동성 없음) 아무것도 안 바뀌고 다음 평가에서 재시도.
   // ⚠ 여기서 예산 계량을 따로 하지 않는다 — matchMarketOxOrder 안의 feeAccrualStmts 가 이미 계량한다(§ _budget.ts).
   if (isVirtualSymbol(c.symbol)) {
-    await matchMarketOxOrder(env, c.symbol, uid, c.side, c.size, c.leverage, null, null, uPnL, (filled) =>
-      conditionalFillStmts(env, uid, c, filled, now),
+    const { filled } = await matchMarketOxOrder(env, c.symbol, uid, c.side, c.size, c.leverage, null, null, uPnL, (f) =>
+      conditionalFillStmts(env, uid, c, f, now),
     );
+    budget.q -= filled > EPS ? HEAVY_FILL_Q : PROBE_Q;
     return;
   }
 
@@ -754,11 +762,11 @@ async function runTriggers(
       // sweepRestingOxPendings 와 **같은 주문을 각자** 매칭하므로, 여기만 빠뜨리면 하한이 통째로 무력화된다.
       // 첫 체결(last_fill_at == null)은 그대로 즉시 처리한다.
       if (p.last_fill_at != null && (refillBlocked || Date.now() - p.last_fill_at < PARTIAL_FILL_COOLDOWN_MS)) continue;
-      if (!spend(budget, HEAVY_FILL_Q)) continue; // 이 요청의 체결 몫이 바닥났다 — 다음 평가에서(§ FillBudget)
+      if (!hasRoom(budget, HEAVY_FILL_Q)) continue; // 이 요청의 체결 몫이 바닥났다 — 다음 평가에서(§ FillBudget)
       // 여기 오는 주문도 **걸려 있던** 지정가라 taker 는 봇이다(§ spot.ts Aggressor) — 체결내역 라벨은
       // 유저 방향의 반대로 찍힌다. 장부(포지션·잔고·상대방)는 영향 없다.
-      if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id, 'bot');
-      else await matchLimitPendingAgainstBook(env, p.id, 'bot');
+      const got = p.reduce_only ? await matchReduceOnlyOxPending(env, p.id, 'bot') : await matchLimitPendingAgainstBook(env, p.id, 'bot');
+      budget.q -= got > EPS ? HEAVY_FILL_Q : PROBE_Q;
       continue;
     }
 

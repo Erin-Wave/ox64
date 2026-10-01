@@ -2954,15 +2954,24 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
   //        claim + 포지션 SELECT + batch 를 최대 500회 왕복해서, 체결 하나가 D1 쿼리 수백 개를 먹었다
   //        (invocation당 1,000 한도를 혼자 태울 수 있었다). 지금은 시장가 경로와 같은 "스냅샷 → 메모리
   //        walking → 단일 batch" 패턴이다. 포지션은 레버리지만 본다(합치기는 SQL 이 한다). ──
-  const [existing, limitFeeRate, bookRow] = await Promise.all([
+  const [existing, me, bookRow] = await Promise.all([
     env.DB.prepare('SELECT leverage FROM positions WHERE user_id=? AND symbol=? AND side=? ORDER BY opened_at LIMIT 1')
       .bind(p.user_id, pair, p.side)
       .first<{ leverage: number }>(),
-    feeRateOf(env, p.user_id), // 이 주문 전체에 한 번만 확정(청크마다 읽으면 도중에 등급이 바뀐다)
+    // 잔고(추가 증거금 한도)와 요율은 같은 users 행 — 한 번에(요율은 이 주문 전체에 한 번만 확정, 청크마다 읽으면 도중에 등급이 바뀐다)
+    env.DB.prepare('SELECT balance, total_volume FROM users WHERE id=?').bind(p.user_id).first<{ balance: number; total_volume: number }>(),
     env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id=?`).bind(pair).first<BookRow>(),
   ]);
+  const limitFeeRate = vipOf(me?.total_volume ?? 0).rate;
   const effLev = existing ? existing.leverage : p.leverage; // 물타기 시 기존 레버리지 고정
   const book = parseBook(bookRow?.book_json);
+  // ⚠⚠ 증거금은 **실제 체결가 기준**이어야 한다(2026-10-01). 주문 때는 지정가 기준으로 잠갔으므로, 지정가보다 유리하게 체결되면
+  // (숏을 더 비싸게 · 레버리지가 더 낮은 기존 포지션에 합침) 잠근 것보다 더 든다. 그 차이를 안 걷으면 **레버리지 상한이 뚫린다** —
+  // 1e-12 에 숏 지정가를 걸면 잠그는 돈이 ≈0 인데 매수호가 전부(~1.0)에 체결돼 증거금 없는 포지션이 생겼다(감사). 그래서 추가분은
+  // 지금 잔고(현금, 보수적으로 미실현이익 제외) 안에서만 걷고, 모자라면 **감당되는 만큼만** 체결한다(나머지는 대기).
+  const lockedPerUnit = p.limit_price / p.leverage;
+  const extraBudget = Math.max(0, me?.balance ?? 0) * (1 - 1e-9);
+  let marginDelta = 0; // 잠근 증거금 − 실제 증거금(+ 환불 / − 추가로 걷을 돈)
 
   // ── 2) 지정가를 크로스하는 레벨만, 있는 물량만 메모리에서 walking(최우선호가보다 유리하게는 안 삼). ──
   let filled = 0;
@@ -2975,8 +2984,16 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
   const walked: { price: number; size: number }[] = []; // 체결 테이프에 찍을 실제 체결들(가격대별)
   for (const level of makerLevels(book, makerSide, p.limit_price)) {
     if (remaining <= EPS) break;
-    const take = Math.min(remaining, level.size);
+    let take = Math.min(remaining, level.size);
     if (take <= EPS) continue;
+    const dPerUnit = lockedPerUnit - level.price / effLev; // 이 레벨 1개당 증거금 차이(+ 환불 / − 추가)
+    let capped = false;
+    if (dPerUnit < 0 && marginDelta + take * dPerUnit < -extraBudget) {
+      take = (marginDelta + extraBudget) / -dPerUnit; // 추가 증거금이 감당되는 만큼만
+      capped = true;
+      if (!(take > EPS)) break;
+    }
+    marginDelta += take * dPerUnit;
     level.size -= take;
     remaining -= take;
     filled += take;
@@ -2986,19 +3003,16 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
     high = Math.max(high, level.price);
     low = Math.min(low, level.price);
     lastPx = level.price;
+    if (capped) break;
   }
-  if (filled <= EPS) return 0; // 크로스되는 봇 호가 없음 → 잔량은 그대로 대기
+  if (filled <= EPS) return 0; // 크로스되는 봇 호가 없음(또는 추가 증거금을 하나도 감당 못 함) → 잔량은 그대로 대기
 
-  // ── 3) 증거금 정산 — 잠근 금액(지정가 기준)과 실제 체결가 기준 증거금의 차액을 돌려준다.
-  //        ⚠ 포지션 증거금은 실제 체결가 기준이되 **잠가 둔 금액을 넘지 않는다**. 숏을 지정가보다 비싸게 팔았거나(명목금액이
-  //        커짐) 물타기 대상의 레버리지가 더 낮으면 체결가 기준 증거금이 잠근 금액보다 커지는데, 예전엔 그 차이를 추가로
-  //        걷으려다 못 걷으면 전량을 지정가로 바꿔 정산했다(실제로 먹은 호가와 장부 가격이 달라졌다). 담보는 잠근 그대로 두고
-  //        가격은 실제 체결가로 — 그 몫만큼 실효 레버리지가 살짝 높아질 뿐이다(크로스 강제청산은 평가자산으로 판정한다). ──
-  const locked = (p.limit_price * filled) / p.leverage; // 이 체결분에 대해 주문 시점에 잠가둔 증거금
+  // ── 3) 증거금 정산 — 포지션 증거금 = 실제 체결가 기준(cost/effLev). 잠근 금액과의 차액(marginDelta)은 환불하거나(+) 추가로
+  //        걷는다(−, 아래 가드). 예전엔 추가분을 못 걷으면 전량을 지정가로 바꿔 정산했다(실제로 먹은 호가와 장부 가격이 달랐다). ──
+  const locked = lockedPerUnit * filled; // 이 체결분에 대해 주문 시점에 잠가둔 증거금
   const fillAvg = cost / filled;
-  const posMargin = Math.min(cost / effLev, locked);
+  const posMargin = cost / effLev;
   const feeTotal = cost * limitFeeRate;
-  const refund = locked - posMargin; // ≥ 0
 
   // ── 4) 선점 + 나머지를 **한 batch** 로. 주문을 읽은 그대로일 때만(수량·증거금·지정가 CAS) 줄이거나 지우고, 가드가 그걸
   //        확인한다 — 유저 폴링과 cron sweep 이 같은 주문을 동시에 집었거나 그 사이 수정·취소됐으면 batch 전체가 되돌려진다. ──
@@ -3050,10 +3064,16 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
     ),
     ...feeAccrualStmts(env, p.user_id, pair, 'open', cost, limitFeeRate, feeTotal, now, prints.length),
   ];
-  // 지정가도 체결 시점에 수수료를 뗀다. 증거금 환불(refund)과 상계해 한 번의 잔고 조정으로 처리 —
-  // 두 문장으로 나누면 배치 안에서 순서에 따라 음수 잔고가 잠깐 보이거나 문장이 늘어날 뿐이다.
-  const net = refund - feeTotal;
-  if (Math.abs(net) > EPS) {
+  // 지정가도 체결 시점에 수수료를 뗀다. 증거금 차액과 상계해 한 번의 잔고 조정으로 처리한다.
+  // ⚠ 추가 증거금이 필요하면(marginDelta < 0) **그 몫만** 가드한다 — 지금 잔고가 그만큼 있어야 하고(읽은 뒤 바뀌었으면 batch 전체가
+  // 되돌려진다), 수수료는 가드하지 않는다(실제 코인 지정가와 같다 — 잔고를 다 잠근 주문도 체결은 돼야 한다, 모자라면 강제청산이 처리).
+  const net = marginDelta - feeTotal;
+  if (marginDelta < -EPS) {
+    stmts.push(
+      env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=? AND balance+? >= 0').bind(net, p.user_id, marginDelta),
+      guardStmt(env),
+    );
+  } else if (Math.abs(net) > EPS) {
     stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(net, p.user_id));
   }
   // 유저가 롱(매수)이면 봇이 판 쪽(sell) — 봇 현금 +, 재고 −.
