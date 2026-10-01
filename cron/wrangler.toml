@@ -15,3 +15,14 @@ crons = ["* * * * *"]  # 매 1분 — OX 봇이 접속자 없어도 활발하게
 binding = "DB"
 database_name = "ox64"
 database_id = "f32f600e-49ad-4026-843f-84f34a62df3c"
+
+# ⚠ 매 분의 실제 일(봇 버스트 → 트리거 sweep)은 이 Durable Object 안에서 돈다(index.ts MarketClock) — cron 은
+# 무료 플랜 CPU 10ms 가 엄격히 적용되고, DO 요청은 CPU 를 따로·넉넉히(요청당 30초) 받는다(2026-10-01).
+# 무료 플랜은 SQLite 백엔드 DO 만 쓸 수 있다(저장소는 안 쓴다 — 데이터는 전부 D1).
+[[durable_objects.bindings]]
+name = "CLOCK"
+class_name = "MarketClock"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MarketClock"]

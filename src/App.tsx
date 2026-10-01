@@ -17,6 +17,7 @@ import { useTriggerPoll } from '@/hooks/useTriggerPoll';
 import { useSpotPoll } from '@/hooks/useSpotPoll';
 import { useTradeTape } from '@/hooks/useTradeTape';
 import { useEquity } from '@/hooks/useEquity';
+import { usePanelSplit } from '@/hooks/usePanelSplit';
 
 export default function App() {
   const init = useTradingStore((s) => s.init);
@@ -47,6 +48,9 @@ export default function App() {
     if (!broke) setRefillDismissed(false);
   }, [broke]);
 
+  // 데스크톱: 차트 ↔ 포지션 패널 사이 가로줄을 끌어 높이 조절(§ usePanelSplit — 높이는 브라우저에 저장)
+  const split = usePanelSplit();
+
   // 앱 시작 시 세션(쿠키) 확인 (1회)
   useEffect(() => {
     init();
@@ -69,8 +73,13 @@ export default function App() {
       {/*
         모바일(기본): 세로 스크롤 스택 — 차트(45vh) → 주문 → 포지션.
         데스크톱(md+): 2열 그리드 — 좌(차트 위 / 포지션 아래) · 우(주문, 세로 전체).
+        행 높이는 분할선이 정한다(style 의 gridTemplateRows — 모바일은 flex 라 무시된다).
       */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto md:grid md:grid-cols-[minmax(0,1fr)_18rem] md:grid-rows-[minmax(0,1fr)_14rem] md:overflow-hidden">
+      <div
+        ref={split.gridRef}
+        style={{ gridTemplateRows: split.gridRows }}
+        className="flex min-h-0 flex-1 flex-col overflow-y-auto md:grid md:grid-cols-[minmax(0,1fr)_18rem] md:overflow-hidden"
+      >
         <div className="h-[45vh] w-full shrink-0 md:col-start-1 md:row-start-1 md:h-auto md:min-h-0 md:shrink">
           <Chart />
         </div>
@@ -82,6 +91,19 @@ export default function App() {
 
         <div className="min-h-0 shrink-0 border-t border-border bg-panel md:col-start-1 md:row-start-2 md:overflow-auto">
           <PositionsPanel />
+        </div>
+
+        {/* 분할선 — 포지션 패널 윗변(가로줄)에 겹쳐 놓은 별도 그리드 칸. 패널 안에 넣으면 패널을 스크롤할 때 같이
+            밀려 올라간다. 줄 위아래 4px 씩이 잡히는 영역이고, 마우스를 올리거나 끄는 동안만 줄이 강조된다. */}
+        <div
+          {...split.handleProps}
+          className="group relative z-10 -mt-1 hidden h-2 cursor-row-resize touch-none self-start outline-none md:col-start-1 md:row-start-2 md:block"
+        >
+          <div
+            className={`pointer-events-none absolute inset-x-0 top-1/2 h-0.5 -translate-y-1/2 transition-colors ${
+              split.dragging ? 'bg-accent' : 'bg-transparent group-hover:bg-accent/60 group-focus-visible:bg-accent/60'
+            }`}
+          />
         </div>
       </div>
 

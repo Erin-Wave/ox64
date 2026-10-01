@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
@@ -74,12 +74,53 @@ export default function PositionsPanel() {
   // 화면에 보일 일도 없다(상태는 포지션 id 키라 서로 섞이지 않는다).
   // 지정가 청산은 수량을 비우면 "청산 가능 수량"(보유 − 이미 예약된 지정가 청산)을 기본값으로 — 전량(posSize)을
   // 보내면 이미 예약분이 있을 때 서버가 초과로 거부한다. 시장가 청산(px 없음)은 비우면 전량(서버가 보유량으로 캡).
+  // ⚠ 청산도 주문처럼 **처리 중이어도 눌린다** — 스토어가 줄을 세워 차례로 보낸다(§ useTradingStore enqueue). 다만
+  // **전량 시장가 청산**이 이미 줄에 있는 포지션을 또 전량 청산하면 서버가 "포지션 없음"으로 거부할 뿐이라 거른다
+  // (더블클릭·F8 연타). 부분 청산·지정가 청산은 누른 만큼 나간다(같은 수량으로 여러 번 나눠 터는 용도).
+  const fullClosing = useRef(new Set<string>());
+  const closeAll = (id: string) => {
+    if (fullClosing.current.has(id)) return;
+    fullClosing.current.add(id);
+    void closePosition(id).finally(() => fullClosing.current.delete(id));
+  };
   const doClose = (id: string, closable: number) => {
     const amt = closeAmt[id] ? Number(closeAmt[id]) : NaN;
     const px = closePx[id] ? Number(closePx[id]) : NaN;
-    if (px > 0) limitClose(id, amt > 0 ? amt : closable, px);
-    else closePosition(id, amt > 0 ? amt : undefined);
+    if (px > 0) void limitClose(id, amt > 0 ? amt : closable, px);
+    else if (amt > 0) void closePosition(id, amt);
+    else closeAll(id);
   };
+
+  // 청산 가능 수량 = 보유수량 − 이미 걸어둔 지정가 청산(reduce-only) 합. 초과 예약 방지(서버도 검증).
+  const closableOf = (p: (typeof positions)[number]) => {
+    const closeSide = p.side === 'long' ? 'short' : 'long';
+    const reserved = pendingOrders
+      .filter((o) => o.reduceOnly && o.symbol === p.symbol && o.side === closeSide)
+      .reduce((a, o) => a + o.size, 0);
+    return { reserved, closable: Math.max(0, p.size - reserved) };
+  };
+  /** 행의 "청산" 버튼과 같은 동작 — Standard 는 입력해 둔 수량·지정가를 따르고, Easy 는 전량 시장가. */
+  const pressClose = (p: (typeof positions)[number]) => (standard ? doClose(p.id, closableOf(p).closable) : closeAll(p.id));
+
+  // ⌨️ F8 = **보고 있는 심볼**의 포지션 청산 — 그 행의 "청산" 버튼을 누른 것과 똑같다(입력해 둔 청산 수량·지정가 그대로).
+  // 같은 심볼에 롱·숏이 함께 있으면(포지션은 심볼+방향마다 따로) 둘 다 — 스토어가 줄을 세워 차례로 보낸다(§ enqueue).
+  // 보고 있는 심볼에 포지션이 없으면 아무것도 안 한다. 탭이 "주문내역"이어도 동작한다(F9/F10 처럼 화면 어디서나).
+  // ⚠ 리스너는 한 번만 달고 최신 상태는 ref 로 읽는다(OrderPanel F9/F10 과 같은 이유 — 렌더마다 새 클로저).
+  // ⚠ 꾹 누르고 있는 건 한 번(키 반복 무시) — 부분 청산을 여러 번 하려면 여러 번 누른다.
+  const f8Ref = useRef<() => void>(() => {});
+  f8Ref.current = () => {
+    for (const p of positions) if (p.symbol === symbol) pressClose(p);
+  };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'F8') return;
+      e.preventDefault();
+      if (e.repeat) return;
+      f8Ref.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // 차트/호가창 클릭 → 포커스해뒀던 "청산 지정가" 칸에 그 가격을 채운다(OrderPanel 지정가와 동일한 흐름).
   // ⚠ 클릭 대상은 하나뿐이라(useMarketStore.priceTarget) 주문 지정가와 동시에 바뀌지 않는다.
@@ -248,12 +289,8 @@ export default function PositionsPanel() {
                   const prec = precisionOf(precisions, p.symbol);
                   const editing = editingId === p.id;
                   const liq = liqPriceOf(p);
-                  // 청산 가능 수량 = 보유수량 − 이미 걸어둔 지정가 청산(reduce-only) 합. 초과 예약 방지(서버도 검증).
-                  const closeSide = p.side === 'long' ? 'short' : 'long';
-                  const reservedClose = pendingOrders
-                    .filter((o) => o.reduceOnly && o.symbol === p.symbol && o.side === closeSide)
-                    .reduce((a, o) => a + o.size, 0);
-                  const closable = Math.max(0, p.size - reservedClose);
+                  const { reserved: reservedClose, closable } = closableOf(p);
+                  const onScreen = p.symbol === symbol; // F8 이 누르는 행(§ f8Ref)
                   return (
                     // 행 아무 데나 눌러도 그 심볼 차트로 — 단 행 안의 조작(청산 수량·지정가 입력, 슬라이더, 청산·SL/TP
                     // 버튼)은 제 할 일만 한다(청산 누르다 차트가 바뀌면 안 된다). 텍스트를 드래그해 복사할 때도 이동 안 함.
@@ -265,7 +302,7 @@ export default function PositionsPanel() {
                         setSymbol(p.symbol);
                       }}
                       className={`cursor-pointer border-b border-border/60 transition hover:bg-panel2 ${
-                        p.symbol === symbol ? 'bg-panel2/50' : ''
+                        onScreen ? 'bg-panel2/50' : ''
                       }`}
                     >
                       <td className="px-3 py-2.5 font-medium text-text">
@@ -405,12 +442,15 @@ export default function PositionsPanel() {
                             </>
                           )}
                           <button
-                            onClick={() => (standard ? doClose(p.id, closable) : closePosition(p.id))}
-                            disabled={busy}
-                            title={standard ? '지정가 입력 시 지정가 청산, 비우면 시장가 청산' : '전량 시장가 청산'}
-                            className="rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
+                            onClick={() => pressClose(p)}
+                            title={
+                              (standard ? '지정가 입력 시 지정가 청산, 비우면 시장가 청산' : '전량 시장가 청산') +
+                              (onScreen ? ' · 단축키 F8' : '')
+                            }
+                            className="whitespace-nowrap rounded border border-border px-2.5 py-1 text-muted transition hover:border-down hover:text-down disabled:opacity-40"
                           >
                             청산
+                            {onScreen && <span className="ml-1 text-[10px] font-semibold opacity-70">F8</span>}
                           </button>
                         </div>
                         {/* 청산 수량 슬라이더 — 숫자를 직접 치지 않고 비중으로 정한다(주문 패널 슬라이더와 같은 감각).

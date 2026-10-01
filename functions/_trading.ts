@@ -50,29 +50,18 @@ async function reflectVirtualFill(env: Env, symbol: string, uid: string, price: 
   }
 }
 
-/** 평가자산(잔고+미실현손익 합) < 0 이면 **그 지갑의** 전 포지션을 강제청산 + 미체결 취소 + 잔고 0.
- * ⚠ 지갑(결제통화)별로 따로 판정한다 — 원화 지갑이 파산해도 USDT 포지션은 건드리지 않는다(§ _shared quoteOf).
- * 그 지갑의 심볼 가격을 하나라도 못 받아왔으면(allPriced=false) 그 지갑은 이번 라운드를 건너뛴다 — 불완전한
- * 데이터로 잘못 청산시키는 것보다 다음 평가에서 다시 보는 게 안전. 빗썸이 멈춰도 USDT 지갑 판정은 계속 돈다.
- * 청산이 하나라도 실행됐으면 true. */
-async function liquidateIfBankrupt(
-  env: Env,
-  uid: string,
-  positions: PositionRow[],
-  pendings: PendingRow[],
-  prices: Record<string, number>,
-): Promise<boolean> {
-  if (positions.length === 0) return false;
-  const user = await env.DB.prepare('SELECT balance, krw_balance FROM users WHERE id = ?')
-    .bind(uid)
-    .first<{ balance: number; krw_balance: number }>();
-  if (!user) return false;
+type WalletBalances = { balance: number; krw_balance: number };
 
-  let any = false;
+/** 강제청산 대상 지갑들 — 순수 계산(D1 없음). `liquidateIfBankrupt` 의 판정과 cron 의 사전 점검(§ sweepTriggers)이
+ * **이 함수 하나**를 쓴다(두 곳에 식을 따로 적으면 한쪽만 고쳐져 "점검은 통과했는데 실제론 파산"이 생긴다).
+ * ⚠ 지갑(결제통화)별로 따로 판정한다 — 원화 지갑이 파산해도 USDT 포지션은 건드리지 않는다(§ _shared quoteOf).
+ * 그 지갑의 심볼 가격을 하나라도 못 받아왔으면 그 지갑은 대상에서 뺀다 — 불완전한 데이터로 잘못 청산시키는 것보다
+ * 다음 평가에서 다시 보는 게 안전. 빗썸이 멈춰도 USDT 지갑 판정은 계속 돈다. */
+function bankruptWallets(user: WalletBalances, positions: PositionRow[], prices: Record<string, number>): Quote[] {
+  const out: Quote[] = [];
   for (const q of ['USDT', 'KRW'] as Quote[]) {
     const qPos = positions.filter((p) => quoteOf(p.symbol) === q);
     if (qPos.length === 0) continue;
-
     // 계좌 순자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익).
     // ⚠ 예전엔 증거금 항을 빠뜨리고 "잔고 + 미실현손익"으로만 계산했다 — 진입 시 증거금은 잔고에서
     // 이미 빠져나갔는데(그게 곧 담보다) 그걸 순자산에서 또 제외한 꼴이라, 증거금 비중을 크게 잡으면
@@ -88,8 +77,31 @@ async function liquidateIfBankrupt(
       const dir = pos.side === 'long' ? 1 : -1;
       equity += pos.margin + (mark - pos.entry_price) * pos.size * dir;
     }
-    if (!allPriced || equity >= 0) continue;
+    if (allPriced && equity < 0) out.push(q);
+  }
+  return out;
+}
 
+/** 평가자산(잔고+미실현손익 합) < 0 이면 **그 지갑의** 전 포지션을 강제청산 + 미체결 취소 + 잔고 0.
+ * 판정은 `bankruptWallets`(지갑별, 시세가 빈 지갑은 건너뜀). ⚠ 잔고는 **여기서 새로 읽는다** — 되돌릴 수 없는
+ * 동작이라 미리 읽어 둔 값으로 결정하지 않는다(cron 의 사전 점검은 "할 일이 없는 유저"를 거르는 데만 쓴다).
+ * 청산이 하나라도 실행됐으면 true. */
+async function liquidateIfBankrupt(
+  env: Env,
+  uid: string,
+  positions: PositionRow[],
+  pendings: PendingRow[],
+  prices: Record<string, number>,
+): Promise<boolean> {
+  if (positions.length === 0) return false;
+  const user = await env.DB.prepare('SELECT balance, krw_balance FROM users WHERE id = ?')
+    .bind(uid)
+    .first<WalletBalances>();
+  if (!user) return false;
+
+  let any = false;
+  for (const q of bankruptWallets(user, positions, prices)) {
+    const qPos = positions.filter((p) => quoteOf(p.symbol) === q);
     const now = Date.now();
     const stmts: D1PreparedStatement[] = [];
     for (const pos of qPos) {
@@ -178,10 +190,32 @@ export async function sweepTriggers(
   env: Env,
   cachedPrices?: Record<string, number>,
   ranges?: PriceRanges,
+  seed?: Record<string, number>, // 이 실행이 이미 아는 시세(cron: 방금 커밋한 가상 코인 기준가) — 다시 읽지 않는다
 ): Promise<{ checked: number; liquidated: number; prices: Record<string, number> }> {
-  const positions = (await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()).results;
-  const pendings = (await env.DB.prepare('SELECT * FROM pending_orders').all<PendingRow>()).results;
-  const conditionals = await loadConditionals(env);
+  // ⚠⚠ 읽기 넷(포지션·대기·조건부·잔고)을 **batch 하나로**(2026-10-01, cron CPU 초과 수정). 무료 플랜 CPU 10ms 에서
+  // D1 호출 1회가 isolate CPU ~0.45ms 라(실측), 예전처럼 테이블마다 + 유저마다 따로 읽으면 sweep 혼자 4~5ms 를 썼다.
+  // 잔고는 **포지션이 있는 유저만**(강제청산 판정에만 쓴다). batch 가 깨지면(예: 조건부 테이블 마이그레이션 전)
+  // 예전처럼 하나씩 읽는다 — 그때는 잔고를 미리 못 읽으므로 사전 점검 없이 전원을 평가한다(무회귀).
+  let positions: PositionRow[];
+  let pendings: PendingRow[];
+  let conditionals: ConditionalRow[];
+  let balances: Map<string, WalletBalances> | null = null;
+  try {
+    const [pos, pend, cond, bal] = await env.DB.batch([
+      env.DB.prepare('SELECT * FROM positions'),
+      env.DB.prepare('SELECT * FROM pending_orders'),
+      env.DB.prepare('SELECT * FROM conditional_orders'),
+      env.DB.prepare('SELECT id, balance, krw_balance FROM users WHERE id IN (SELECT user_id FROM positions)'),
+    ]);
+    positions = pos.results as PositionRow[];
+    pendings = pend.results as PendingRow[];
+    conditionals = cond.results as ConditionalRow[];
+    balances = new Map((bal.results as (WalletBalances & { id: string })[]).map((u) => [u.id, u]));
+  } catch {
+    positions = (await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()).results;
+    pendings = (await env.DB.prepare('SELECT * FROM pending_orders').all<PendingRow>()).results;
+    conditionals = await loadConditionals(env);
+  }
   if (positions.length === 0 && pendings.length === 0 && conditionals.length === 0) {
     return { checked: 0, liquidated: 0, prices: cachedPrices ?? {} };
   }
@@ -205,7 +239,7 @@ export async function sweepTriggers(
     ...new Set([...positions.map((p) => p.symbol), ...pendings.map((p) => p.symbol), ...conditionals.map((c) => c.symbol)]),
   ];
   const stale = symbols.filter((s) => isVirtualSymbol(s) || cachedPrices?.[s] == null);
-  const prices = { ...cachedPrices, ...(await fetchPrices(env, stale)) };
+  const prices = { ...cachedPrices, ...(await fetchPrices(env, stale, seed)) };
 
   // ⚠⚠ **한 invocation 에서 훑는 유저 수에 상한**을 둔다(2026-08-14, 무료 플랜). Workers/D1 무료 플랜은
   // **invocation당 D1 쿼리 50개**가 한도이고, 넘으면 그 요청이 통째로 실패한다(= 그 분의 청산·체결이
@@ -223,6 +257,15 @@ export async function sweepTriggers(
   let liquidated = 0;
   for (const uid of slice) {
     const w = byUser.get(uid)!;
+    // ⚠ **할 일이 없는 유저는 건너뛴다** — 걸어둔 게 없고(대기·조건부·SL/TP 0) 미리 읽은 잔고로 봐도 파산이 아니면
+    // runTriggers 가 할 수 있는 일이 없다(강제청산 판정용 잔고 조회 1회만 하고 끝난다). 가장 흔한 유저(포지션만 들고
+    // 있는 사람)가 여기 해당해 유저마다 나가던 D1 왕복이 사라진다. 파산 후보이거나 걸어둔 게 있으면 예전과 똑같이
+    // 평가하고, **강제청산 여부는 runTriggers 가 잔고를 새로 읽어 다시 판정**한다(§ liquidateIfBankrupt).
+    const armed = w.pendings.length > 0 || w.conditionals.length > 0 || w.positions.some((p) => p.stop_loss != null || p.take_profit != null);
+    if (!armed && balances) {
+      const bal = balances.get(uid);
+      if (!bal || bankruptWallets(bal, w.positions, prices).length === 0) continue;
+    }
     // 한 유저가 터져도 나머지는 계속 평가한다(다음 라운드/다음 cron 에서 재시도).
     try {
       if (await runTriggers(env, uid, w.pendings, w.positions, w.conditionals, prices, ranges)) liquidated++;

@@ -230,6 +230,36 @@ function dripTrades(set: (s: Partial<TradingState>) => void, incoming: SpotTrade
   dripTimer = window.setTimeout(step, gap);
 }
 
+// ── 거래 액션은 한 줄로 세워 **차례로** 보낸다(2026-10-01, "F9 연타가 쿨타임 때문에 씹힌다") ─────────────
+// ⚠⚠ 예전엔 요청이 가는 동안(`busy`) 들어온 주문을 **버렸다**(OrderPanel 의 `busy` 가드 + 버튼 disabled) — F9 를 다섯 번
+// 치면 두세 건만 들어갔다. 그렇다고 막지 않고 **동시에** 보내면 안 된다: 서버의 물타기 병합은 "포지션을 읽고 → 새 평단·
+// 수량·증거금을 계산해 그 값으로 덮어쓰기"라(order.ts open), 같은 포지션에 두 요청이 겹치면 **증거금은 두 번 빠지고
+// 수량은 한 번만 늘어나는** 경합이 된다. 그래서 누른 만큼 전부 받되 서버에는 **하나씩** 보낸다(각 요청은 차례가 왔을 때
+// 그 시점의 주문 커서로 나간다 — § setOrdersCursor). `busy` = 줄에 남은 액션이 있다(처리 중 포함).
+// ⚠ 주문 내용(수량·레버리지·가격)은 **누른 순간**의 값이다 — 호출하는 쪽이 그때 인자를 만들어 넘긴다.
+let actionChain: Promise<unknown> = Promise.resolve();
+let actionsQueued = 0;
+function enqueue<T>(set: (s: Partial<TradingState>) => void, run: () => Promise<T>): Promise<T> {
+  actionsQueued++;
+  set({ busy: true });
+  const p = actionChain.then(run);
+  actionChain = p.catch(() => undefined); // 한 액션이 실패해도 뒤의 줄은 계속 간다
+  return p.finally(() => {
+    if (--actionsQueued === 0) set({ busy: false });
+  });
+}
+/** 서버에 상태를 바꾸는 요청 하나 — 응답(새 계정 상태)을 반영하고, 실패하면 사유를 `error` 에 남긴다. */
+function action(set: (s: Partial<TradingState>) => void, call: () => Promise<AppState>): Promise<void> {
+  return enqueue(set, async () => {
+    set({ error: null });
+    try {
+      apply(set, await call());
+    } catch (e) {
+      set({ error: (e as Error).message });
+    }
+  });
+}
+
 function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState, pair: string) {
   // ⚠ 늦게 도착한 **이전 코인의 응답**은 버린다 — 심볼을 바꾸기 직전에 보낸 폴링이 전환 뒤에 돌아오면
   // spotClear 로 비운 자리에 이전 코인의 호가·체결이 다시 들어앉는다(체결은 곧장 새 코인 버퍼로 병합된다).
@@ -353,140 +383,43 @@ export const useTradingStore = create<TradingState>((set) => ({
     }
   },
 
-  openMarket: async ({ symbol, side, size, leverage, stopLoss, takeProfit }) => {
-    set({ busy: true, error: null });
-    try {
-      // 가격은 보내지 않는다 — 서버가 체결가를 직접 받아 쓴다.
-      apply(set, await api.open({ symbol, side, size, leverage, stopLoss, takeProfit }));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  // ⚠ 아래 거래 액션은 전부 한 줄(§ enqueue)로 차례로 나간다 — 눌린 건 버리지 않고, 서버엔 동시에 도착하지 않는다.
+  // 가격은 보내지 않는다 — 서버가 체결가를 직접 받아 쓴다.
+  openMarket: ({ symbol, side, size, leverage, stopLoss, takeProfit }) =>
+    action(set, () => api.open({ symbol, side, size, leverage, stopLoss, takeProfit })),
 
-  closePosition: async (id, size) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.close(id, size));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  closePosition: (id, size) => action(set, () => api.close(id, size)),
 
-  limitClose: async (positionId, size, limitPrice) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.limitClose(positionId, size, limitPrice));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  limitClose: (positionId, size, limitPrice) => action(set, () => api.limitClose(positionId, size, limitPrice)),
 
-  limitOpen: async ({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit }) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.limitOpen({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit }));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  limitOpen: ({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit }) =>
+    action(set, () => api.limitOpen({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit })),
 
-  cancelLimit: async (pendingId) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.cancelLimit(pendingId));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  cancelLimit: (pendingId) => action(set, () => api.cancelLimit(pendingId)),
 
-  editLimit: async (pendingId, p) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.editLimit(pendingId, p));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  editLimit: (pendingId, p) => action(set, () => api.editLimit(pendingId, p)),
 
-  setSlTp: async (positionId, p) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.setSlTp(positionId, p));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  setSlTp: (positionId, p) => action(set, () => api.setSlTp(positionId, p)),
 
-  conditionalOpen: async (p) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.conditionalOpen(p));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  conditionalOpen: (p) => action(set, () => api.conditionalOpen(p)),
 
-  editConditional: async (conditionalId, p) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.editConditional(conditionalId, p));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  editConditional: (conditionalId, p) => action(set, () => api.editConditional(conditionalId, p)),
 
-  cancelConditional: async (conditionalId) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.cancelConditional(conditionalId));
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  cancelConditional: (conditionalId) => action(set, () => api.cancelConditional(conditionalId)),
 
-  refill: async () => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.refill());
-    } catch (e) {
-      set({ error: (e as Error).message });
-    } finally {
-      set({ busy: false });
-    }
-  },
+  refill: () => action(set, () => api.refill()),
 
-  convert: async (from, amount) => {
-    set({ busy: true, error: null });
-    try {
-      apply(set, await api.convert(from, amount));
-      return true;
-    } catch (e) {
-      set({ error: (e as Error).message });
-      return false;
-    } finally {
-      set({ busy: false });
-    }
-  },
+  convert: (from, amount) =>
+    enqueue(set, async () => {
+      set({ error: null });
+      try {
+        apply(set, await api.convert(from, amount));
+        return true;
+      } catch (e) {
+        set({ error: (e as Error).message });
+        return false;
+      }
+    }),
 
   // ⚠ 가상 코인이 둘 이상이면 심볼을 바꾼 직후 첫 폴링 응답이 오기 전까지 **이전 코인의 호가창이
   // 그대로 보인다**(EW 를 눌렀는데 OX 호가가 잠깐 보이는 식). 값이 아예 없는 게 틀린 값보다 낫다.

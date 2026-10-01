@@ -22,7 +22,7 @@ import {
   VIRTUAL_PRICE_MIN,
   VIRTUAL_PRICE_MAX,
 } from '../_shared';
-import { autoWritesBlocked, meterStmt } from '../_budget';
+import { autoWritesBlocked, meterStmt, meterReadStmt, primeMeter } from '../_budget';
 
 /**
  * 가상 코인(OX/USDT · EW/USDT) — 외부 시세가 없어 이 파일의 봇이 체결가를 만든다. 그 외에는 실제 38종과
@@ -507,7 +507,7 @@ export interface TapeTrade {
 const TAPE_MAX = 700;
 
 /** JSON → 테이프. 컬럼이 비었거나(마이그레이션 직후) 깨졌으면 빈 배열 — 봇이 다음 틱부터 다시 채운다. */
-function parseTape(json: string | null | undefined): TapeTrade[] {
+export function parseTape(json: string | null | undefined): TapeTrade[] {
   if (!json) return [];
   try {
     const arr = JSON.parse(json) as [number, number, number, number][];
@@ -524,10 +524,48 @@ function parseTape(json: string | null | undefined): TapeTrade[] {
 }
 
 /** 테이프 → JSON(최근 TAPE_MAX 건만). 배열의 배열로 담아 키 이름이 매 건 반복되지 않게 한다. */
-function serializeTape(trades: TapeTrade[]): string {
+export function serializeTape(trades: TapeTrade[]): string {
   return JSON.stringify(
     trades.slice(-TAPE_MAX).map((t) => [t.price, t.size, t.takerSide === 'buy' ? 1 : t.takerSide === 'sell' ? 0 : -1, t.createdAt]),
   );
+}
+
+/** 호가창 "체결" 목록에 싣는 최근 건수(클라 표시 상한과 같은 값 — CLAUDE.md §6 호가창·체결 표시 개수 ②). */
+const TRADES_SHOWN = 50;
+
+// ── 테이프는 문자열 그대로 다룬다(2026-10-01, cron CPU 초과 수정) ─────────────────────────────
+// ⚠⚠ 예전엔 커밋마다 **700건 전체를 객체로 풀었다가(parseTape) 다시 문자열로(serializeTape)** 만들었다 — 새로
+// 붙는 건 몇 건뿐인데. 그게 cron 1회 CPU 의 ~1/4 이었고(무료 플랜 10ms, § LadderDebt 와 함께 cron 이 통째로
+// 죽던 원인), 폴링도 매번 700건을 풀어 그중 50건만 썼다. 형식이 `[[가격,수량,방향,시각],…]` 라 항목 경계는 항상
+// `],[` 다(값이 전부 숫자라 괄호·쉼표가 끼지 않는다 — serializeTape 만 이 칸을 쓴다). 그래서 뒤에서부터 경계를
+// 세어 필요한 꼬리만 자르거나 푼다. ⚠ 이 칸에 다른 형식(공백·객체)을 쓰는 코드를 넣지 말 것.
+/** 테이프 JSON 에서 "마지막 n 건"이 시작하는 위치(그 첫 항목의 `[`). 항목이 n 건 이하면 1(맨 앞 항목). */
+function tapeTailStart(json: string, n: number): number {
+  let from = json.length;
+  for (let k = 0; k < n; k++) {
+    const b = json.lastIndexOf('],[', from - 1);
+    if (b < 0) return 1;
+    from = b;
+  }
+  return from + 2;
+}
+const isTapeJson = (json: string | null | undefined): json is string =>
+  !!json && json.length >= 4 && json.startsWith('[[') && json.endsWith(']]');
+
+/** 테이프의 **마지막 n 건만** 객체로 푼다(체결 목록·틱 시각 출발점용 — 700건을 다 풀 이유가 없다). */
+export function tapeTail(json: string | null | undefined, n: number): TapeTrade[] {
+  if (!json || n <= 0) return [];
+  if (!isTapeJson(json)) return parseTape(json).slice(-n); // "[]" 또는 예상 밖 형식 — 통째로 풀어 본다
+  return parseTape(`[${json.slice(tapeTailStart(json, n), -1)}]`);
+}
+
+/** 새 체결을 테이프 JSON 끝에 이어 붙이고 앞쪽(오래된 쪽)을 잘라 최근 TAPE_MAX 건을 남긴다 — **기존 항목은
+ * 풀지 않는다**. 형식이 깨진 값이면 버리고 새 체결로만 시작한다(parseTape 가 깨진 값을 빈 테이프로 보는 것과 같다). */
+export function appendTape(json: string | null | undefined, fresh: TapeTrade[]): string {
+  const keep = TAPE_MAX - Math.min(fresh.length, TAPE_MAX);
+  const kept = isTapeJson(json) && keep > 0 ? json.slice(tapeTailStart(json, keep), -1) : '';
+  const add = fresh.length ? serializeTape(fresh).slice(1, -1) : ''; // serializeTape 가 이미 TAPE_MAX 건으로 자른다
+  return `[${kept}${kept && add ? ',' : ''}${add}]`;
 }
 
 // ── 유저 체결은 "한 줄"이 아니라 walking 한 만큼 여러 줄로 찍는다(2026-09-03) ─────────────
@@ -680,6 +718,7 @@ export interface PendingLite {
  * 되돌려야 한다 — 낡은 스냅샷을 그대로 그리면 호가창에 이미 체결된 물량이 1초 더 남는다. */
 export interface TickCtx {
   book: BotBook | null;
+  /** 테이프의 **최근 TRADES_SHOWN 건만**(호가창 체결 목록용 — § tapeTail). 전체가 필요한 곳(<60s 캔들)은 따로 읽는다. */
   tape: TapeTrade[] | null;
   pendings: PendingLite[] | null;
   // ⚠ 아래 둘도 **같은 상태 행에서 나온다**(2026-09-02, 4차 다이어트). 예전엔 `?tick=` 요청 하나가
@@ -782,7 +821,7 @@ export async function loadSpotMarket(env: Env, uid: string, pair: string, ctx?: 
     // (클라 표시 개수 상한과 동일). ⚠ 위 SQL 의 `LIMIT 30` 은 일부러 그대로 둔다 — 테이프는 상태 행 안의
     // JSON 이라 몇 건을 쓰든 읽기가 안 늘지만, 테이블 쪽을 늘리면 그만큼 D1 읽기가 늘어난다(1초 폴링).
     // 한 시간 안에 유저 체결이 30건을 넘는 드문 경우에만 그 뒤쪽이 목록에서 빠진다.
-    trades: mergeRecentTrades(ctx?.tape ?? parseTape(stateRow?.tape_json), tradeRows.results, 50),
+    trades: mergeRecentTrades(ctx?.tape ?? tapeTail(stateRow?.tape_json, TRADES_SHOWN), tradeRows.results, TRADES_SHOWN),
   };
 }
 
@@ -922,16 +961,14 @@ const POLL_ACTIVE_MS = 20_000;
 const BURST_MIN_TICKS = 4; // 폴링이 돌고 있을 때 cron 이 얹는 최소 틱(cron 라운드당 1틱)
 
 /**
- * cron 이 이번 실행에서 마켓메이커에 쓸 총 틱 수 — 유저 폴링이 이미 클럭 역할을 하고 있으면 최소치로.
- * ⚠⚠ 이 판정은 **cron 실행당 정확히 한 번만** 해야 한다. 예전엔 `runMarketMakerBurst` 안에서 라운드마다
- * 했는데, 그 함수는 끝날 때 `last_run` 을 찍으므로 **다음 라운드가 "방금 누가 폴링했네"로 오판**해서
- * cron 이 아무도 없을 때도 스스로 물러났다(실측: 분당 12틱이어야 할 것이 4~9틱). 라운드 사이 간격이
- * 밀리초라 시각만으로는 "cron 자신"과 "유저 폴링"을 구분할 수 없다 — 그래서 루프 밖에서 한 번 정한다.
+ * cron 버스트가 이번에 돌 틱 수 — 유저 폴링이 이미 클럭 역할을 하고 있으면 최소치로.
+ * ⚠⚠ 판정에 쓰는 `last_run` 은 **이 버스트가 커밋하기 전에 읽은 값**이어야 한다. 예전엔 cron 이 버스트를 여러
+ * 라운드 돌았고, 라운드마다 판정하면 직전 라운드가 찍은 자기 `last_run` 을 보고 "방금 누가 폴링했네"로 오판해
+ * 아무도 없을 때도 물러났다(실측: 분당 12틱이어야 할 것이 4~9틱). 지금은 실행당 한 라운드이고, 판정을 버스트가
+ * 어차피 읽는 상태 행으로 한다 — 예전처럼 `last_run` 만 읽는 쿼리를 페어마다 따로 날릴 이유가 없다(2026-10-01).
  */
-export async function marketMakerTickBudget(env: Env, pair: string, budget: number): Promise<number> {
-  const row = await env.DB.prepare('SELECT last_run FROM spot_bot_state WHERE id = ?').bind(pair).first<{ last_run: number }>();
-  const idleMs = Date.now() - (row?.last_run ?? 0);
-  return idleMs < POLL_ACTIVE_MS ? Math.min(budget, BURST_MIN_TICKS) : budget;
+function burstTicks(lastRun: number, budget: number): number {
+  return Date.now() - lastRun < POLL_ACTIVE_MS ? Math.min(budget, BURST_MIN_TICKS) : budget;
 }
 
 // ⚠ 봇이 시장을 만드는 가상 페어 목록 — **여기가 유일한 진실원본**이다. 새 가상 코인을 추가하려면
@@ -1925,6 +1962,26 @@ interface TickResult {
   /** 합성 체결 명목금액 합(봇 수수료 산정용). */
   notional: number;
   actor: string;
+  /** 사다리를 건너뛴 틱이면 그 몫(§ LadderDebt) — 다음 틱에 넘긴다. 사다리를 만든 틱은 `null`(다 갚았다). */
+  debt: LadderDebt | null;
+}
+
+/** 버스트에서 **사다리를 건너뛴 틱들이 남긴 몫**(2026-10-01, cron CPU 초과 수정 — § runBotTicks).
+ *
+ * ⚠⚠ cron 은 1분치를 12틱으로 몰아 도는데, 예전엔 **매 틱 사다리(44슬롯)를 새로 만들었다**. 그런데 중간 틱의
+ * 사다리는 아무도 보지 않고 다음 틱으로 넘겨질 뿐이며, 체결(테이프·캔들)은 사다리와 무관하게 mid·스프레드로
+ * 찍힌다 — 즉 커밋되는 결과를 바꾸는 건 **마지막 사다리 하나**뿐이다. 그 쓸모없는 재구성이 cron 1회 CPU 의
+ * 절반 남짓이었고, 무료 플랜 10ms 를 계속 넘겨 **cron 이 통째로 죽었다**(prod: 7회 연속 exceededCpu — 차트에
+ * 10~30분 공백, 같은 실행의 트리거 sweep 도 함께 증발). 그래서 중간 틱은 사다리를 건너뛰고 아래 셋만 쌓아 두었다가
+ * 마지막 틱이 한 번에 갚는다. 셋 다 **틱마다 굴린 것과 같은 결과**가 되는 양이다:
+ *   · passLow/passHigh — 규칙 ①(가격이 지나간 자리는 체결됐다)은 "어느 틱에서든 지나갔으면"이라 구간의 합집합
+ *   · pace — 규칙 ②(취소·재호가)는 틱마다 독립인 `1−(1−p)^pace` 라 거듭 곱하면 지수가 더해진다
+ * (깊이·스프레드 배수는 마지막 틱 것을 쓴다 — 사다리를 그 순간의 시장에 맞춰 까는 것이니 그게 맞다.)
+ * ⚠ 폴링(1초 1틱)은 늘 마지막 틱이라 예전과 완전히 같다. */
+export interface LadderDebt {
+  passLow: number;
+  passHigh: number;
+  pace: number;
 }
 
 /**
@@ -1944,6 +2001,8 @@ interface TickResult {
  * 호가는 "체결된 것"이라 사라져야 하고, 그걸 알려면 이번 틱의 고가·저가가 먼저 있어야 한다.
  * ⚠ 그래서 `prevBook` 을 받는다. 호출자는 직전 틱이 만든 사다리(첫 틱이면 D1 의 `book_json`)를
  * 그대로 넘겨야 한다 — **유저 체결이 파먹은 자리가 그 안에 남아 있어야** 시장충격이 호가창에 남는다.
+ * ⚠ `opts.skipBook` 이면 사다리를 만들지 않고 `prevBook` 을 그대로 돌려주며 그 몫을 `debt` 로 넘긴다
+ * (§ LadderDebt — 버스트의 중간 틱). 다음 틱은 받은 `debt` 를 `opts.debt` 로 넘겨야 한다.
  */
 export function simulateTick(
   prev: BotState,
@@ -1952,6 +2011,7 @@ export function simulateTick(
   wallRows: WallRow[],
   now: number,
   dtSec: number = TICK_REF_SEC,
+  opts: { skipBook?: boolean; debt?: LadderDebt | null } = {},
 ): TickResult {
   // ⚠ 벽시계와 **이 틱이 덮는 초**를 심리 모델에 넘긴다 — 하루 리듬과 관심도(§ 관심도)가 이 값으로 결정된다.
   const step = nextMarketState(prev, now, dtSec);
@@ -2152,6 +2212,24 @@ export function simulateTick(
     tape.push({ price, size: sz, takerSide, createdAt: now + Math.round((i * (TICK_PRINT_SPAN_MS - 1)) / Math.max(1, nTrades - 1)) });
   }
 
+  const next: BotState = { ...step.next, ref };
+  const bar = nTrades > 0 ? { open, high, low, close, volume } : null;
+  // 규칙 ①의 "지나간 범위" — 체결 범위에 새 공정가를 더한다(체결이 0건이면 공정가 한 점). 호가가 새 공정가를
+  // 넘어 교차된 채 남지 않게 하는 것이 곧 역전 방지다. 버스트에서 사다리를 건너뛴 틱들의 범위·교체 속도도
+  // 여기서 합친다(§ LadderDebt).
+  const debt = opts.debt;
+  const passLow = Math.min(low, ref, debt ? debt.passLow : Infinity);
+  const passHigh = Math.max(high, ref, debt ? debt.passHigh : -Infinity);
+  // ⚠⚠ 호가 교체도 **business time** 으로 흐른다(2026-09-23, § 관심도) — 확률은 "단위당 확률"을 이 틱의 교체
+  // 속도(bookPace = h, 하한 있음)만큼 거듭제곱한다. 한산하면 호가창이 몇 초씩 그대로 있고 물량도 거의 안
+  // 바뀌며, 거래가 몰리면 매 초 수십 줄이 바뀐다("관심도가 떨어지면 호가창 변하는 빈도·수량이 적게").
+  // 예전엔 틱당 확률이라 사람이 보고 있으면(초당 1틱) 안 볼 때보다 호가가 5배 자주 바뀌었다.
+  const pace = step.bookPace + (debt ? debt.pace : 0);
+  if (opts.skipBook) {
+    // 버스트의 중간 틱 — 사다리는 마지막 틱이 이 몫까지 합쳐 한 번에 만든다(§ LadderDebt).
+    return { next, tape, book: prevBook, bar, notional: notionalSum, actor, debt: { passLow, passHigh, pace } };
+  }
+
   // ── 사다리는 매 틱 다시 태어나지 않는다 — 살아남은 주문 위에 새 호가를 얹는다(2026-09-08) ──────
   // ⚠⚠ 예전엔 매 틱 44개 레벨의 **가격과 물량을 전부 새로 뽑았다**(그 전엔 "spot_orders 전 행 DELETE +
   // 44행 INSERT" 였고, 사다리를 book_json 한 칸으로 옮겨 비용은 0 이 됐지만 **내용은 여전히 매 틱
@@ -2186,19 +2264,11 @@ export function simulateTick(
   const maxSpread = (SPREAD_BASE + (BOT_LEVELS_PER_SIDE - 1) * LEVEL_STEP + LEVEL_JITTER) * step.spreadMult;
   // 거친 국면일수록 호가를 전반적으로 더 자주 넣고 뺀다(마켓메이커가 리스크를 피해 물러났다 들어온다).
   const churnMult = clamp(step.spreadMult, 0.7, 2.2);
-  // ⚠⚠ 호가 교체도 **business time** 으로 흐른다(2026-09-23, § 관심도) — 확률은 "단위당 확률"을 이 틱의 교체
-  // 속도(bookPace = h, 하한 있음)만큼 거듭제곱한다. 한산하면 호가창이 몇 초씩 그대로 있고 물량도 거의 안
-  // 바뀌며, 거래가 몰리면 매 초 수십 줄이 바뀐다("관심도가 떨어지면 호가창 변하는 빈도·수량이 적게").
-  // 예전엔 틱당 확률이라 사람이 보고 있으면(초당 1틱) 안 볼 때보다 호가가 5배 자주 바뀌었다.
-  const pace = step.bookPace;
+  // 교체 속도(pace)·지나간 범위(passLow/passHigh)는 위에서 버스트 몫까지 합쳐 정했다(§ LadderDebt).
   const perPace = (p: number) => 1 - (1 - Math.min(0.95, p)) ** pace;
   const resizeChance = perPace(QUOTE_RESIZE_CHANCE);
   // 새로 까는 호가의 두께 — 한산하면 얇고(대기 주문을 거는 사람이 적다) 붐비면 두껍다. 관심도의 완만한 함수.
   const liqMult = clamp(step.interest ** 0.3, 0.5, 1.7);
-  // 규칙 ①의 "지나간 범위" — 체결 범위에 새 공정가를 더한다(체결이 0건이면 공정가 한 점). 호가가 새 공정가를
-  // 넘어 교차된 채 남지 않게 하는 것이 곧 역전 방지다.
-  const passLow = Math.min(low, ref);
-  const passHigh = Math.max(high, ref);
   /** 규칙 ①② — 이전 사다리에서 "아직 살아있는" 주문만 골라 남긴다(가격 우선순위 순서 유지). */
   const survivors = (side: 'buy' | 'sell'): BookLevel[] => {
     const out: BookLevel[] = [];
@@ -2304,15 +2374,7 @@ export function simulateTick(
   // 가격 우선순위대로 정렬해 둔다 — 매칭(makerLevels)도 호가창 표시도 이 순서를 그대로 쓴다.
   book.bids.sort((a, b) => b.price - a.price);
   book.asks.sort((a, b) => a.price - b.price);
-  const next: BotState = { ...step.next, ref };
-  return {
-    next,
-    tape,
-    book,
-    bar: nTrades > 0 ? { open, high, low, close, volume } : null,
-    notional: notionalSum,
-    actor,
-  };
+  return { next, tape, book, bar, notional: notionalSum, actor, debt: null };
 }
 
 // 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
@@ -2401,6 +2463,12 @@ const ROWS_PER_BOT_ACCRUAL = 4; // 정산 시 usage_meter 1 + 봇 2명 카운터
  * 그 틱의 "벽"인지는 기준가에 따라 달라지므로 판정 자체는 simulateTick 이 매 틱 다시 한다.
  * ⚠ 체결 시각은 절대 과거로 소급하지 않는다(마감된 봉이 변하던 버그) — 각 틱의 시각은 그 틱을 실제로
  * 실행하는 시점(단조 증가)이고, `TICK_SPACING_MS` 는 틱 내부 체결끼리 겹치지 않게 하는 최소 간격이다.
+ *
+ * ⚠⚠ **CPU 가 진짜 한도다(2026-10-01).** 쿼리·쓰기는 틱 수와 무관해졌지만 무료 플랜은 invocation당 CPU 10ms 이고,
+ * cron 은 "한가한 머신"에서 돌아 거의 매번 콜드 isolate(JIT 전)라 같은 계산이 몇 배 비싸다. 그래서 두 가지를
+ * 하지 않는다: ① 중간 틱의 사다리 재구성(§ LadderDebt — 마지막 틱만 만든다) ② 테이프 700건 전체 풀기·다시 쓰기
+ * (§ appendTape — 새 체결만 문자열 끝에 붙인다). 새 계산을 틱 루프에 넣을 땐 "콜드 isolate 에서 × 24틱"으로 셀 것.
+ * `wantCtx=false`(cron) 면 호출자가 안 쓰는 체결 목록 꼬리를 풀지 않는다.
  */
 async function runBotTicks(
   env: Env,
@@ -2408,6 +2476,8 @@ async function runBotTicks(
   row: BotStateRow | null,
   ref0: number,
   ticks: number,
+  wantCtx = true,
+  preloaded?: PendingLite[], // 호출자가 이미 읽은 이 페어의 대기 주문(§ runMarketMakerBursts) — 있으면 다시 안 읽는다
 ): Promise<{ path: number[]; ctx: TickCtx }> {
   const nothing: TickCtx = { book: null, tape: null, pendings: null, live: null, ref: null, mark: null };
   if (ticks <= 0) return { path: [], ctx: nothing };
@@ -2425,17 +2495,20 @@ async function runBotTicks(
   // 예전엔 셋이 각자 `pending_orders WHERE symbol=?` 를 읽어 `?tick=` 요청 하나가 같은 테이블을 세 번
   // 스캔했다. 집계(GROUP BY)를 메모리로 옮겨도 **읽는 행 수는 같다** — SQLite 는 집계하려고 어차피
   // 그 행들을 다 훑기 때문(§6 과금 모델). 즉 순수하게 쿼리 2개와 스캔 2번이 사라진다.
-  const pendings = (
-    await env.DB.prepare(
-      'SELECT id, user_id, side, limit_price AS price, size, reduce_only, last_fill_at FROM pending_orders WHERE symbol=?',
-    )
-      .bind(pair)
-      .all<PendingLite>()
-  ).results;
+  const pendings =
+    preloaded ??
+    (
+      await env.DB.prepare(
+        'SELECT id, user_id, side, limit_price AS price, size, reduce_only, last_fill_at FROM pending_orders WHERE symbol=?',
+      )
+        .bind(pair)
+        .all<PendingLite>()
+    ).results;
   const wallRows = wallsOf(pendings);
 
   let state = toBotState(row, ref0);
-  let tape = parseTape(row?.tape_json);
+  // 이 실행이 새로 찍은 체결만 모은다 — 기존 테이프는 풀지 않고 커밋 때 문자열 끝에 붙인다(§ appendTape).
+  const fresh: TapeTrade[] = [];
   const live = parseLive(row?.live_json);
   // ⚠ 이전 사다리를 읽어 첫 틱에 물려준다(2026-09-08) — 봇 호가는 매 틱 새로 태어나는 게 아니라
   // **살아남은 주문 위에 새 호가가 얹히기** 때문이다(§ simulateTick keepResting). 이 값에는 그 사이
@@ -2443,6 +2516,7 @@ async function runBotTicks(
   // 추가 읽기는 없다 — `book_json` 은 어차피 이 행에서 같이 읽어온 컬럼이다(§ BOT_STATE_COLS).
   let carried: BotBook = parseBook(row?.book_json);
   let book: BotBook | null = null;
+  let debt: LadderDebt | null = null; // 사다리를 건너뛴 중간 틱들의 몫(§ LadderDebt) — 마지막 틱이 갚는다
   let notional = 0;
   const closed: { code: string; bar: LiveBar }[] = [];
   const path: number[] = []; // 이 실행이 지나온 기준가들 — 트리거를 여러 지점에서 평가하는 데 쓴다
@@ -2453,7 +2527,7 @@ async function runBotTicks(
   // (prod 실측 700건 중 14건 — 목록 순서가 어긋나고 클라의 새 체결 식별(dripTrades)이 몇 건을 놓친다).
   // 마지막 체결 시각에서 이어 붙이면 전역 단조가 보장된다. ⚠ 미래로 폭주하지 않게 상한을 둔다 —
   // 어떤 이유로든 먼 미래 시각이 한 번 들어오면 그 뒤 모든 틱이 거기에 묶여버린다.
-  let prevTs = Math.min(tape[tape.length - 1]?.createdAt ?? 0, Date.now() + TS_SEED_MAX_AHEAD_MS);
+  let prevTs = Math.min(tapeTail(row?.tape_json, 1)[0]?.createdAt ?? 0, Date.now() + TS_SEED_MAX_AHEAD_MS);
   let lastTs = Date.now();
   // ⚠⚠ 이 실행이 따라잡을 **벽시계 시간**(2026-09-23, § 관심도). 틱 하나가 덮는 초 = 경과 ÷ 틱 수 — 폴링은
   // ~1초 1틱, cron 은 ~60초를 12틱(5초씩)으로. 틱 시각(ts)은 여전히 10ms 간격으로 앞당겨 찍지만(과거로
@@ -2466,11 +2540,17 @@ async function runBotTicks(
     const ts = Math.max(Date.now(), prevTs + TICK_SPACING_MS);
     prevTs = ts;
     lastTs = ts;
-    const r = simulateTick(state, tape, carried, wallRows, ts, dtSec);
+    // 사다리는 마지막 틱만 만든다(§ LadderDebt) — 중간 틱은 `carried`(첫 틱이 받은 D1 사다리)를 그대로 둔 채 몫만 넘긴다.
+    // 테이프도 빈 배열을 넘겨 이번 틱 체결만 받는다(§ appendTape).
+    const lastTick = i === ticks - 1;
+    const r = simulateTick(state, [], carried, wallRows, ts, dtSec, { skipBook: !lastTick, debt });
     state = r.next;
-    tape = r.tape;
-    carried = r.book;
-    book = r.book;
+    for (const t of r.tape) fresh.push(t);
+    debt = r.debt;
+    if (lastTick) {
+      carried = r.book;
+      book = r.book;
+    }
     notional += r.notional;
     if (r.bar) closed.push(...accrueLive(live, r.bar, ts)); // 체결이 없던 틱은 캔들을 건드리지 않는다
     path.push(roundOx(r.next.ref)); // 트리거는 D1 의 ref_price 와 같은 반올림 값으로 판정한다
@@ -2526,6 +2606,7 @@ async function runBotTicks(
   //     같은 몫이 나중에 한 번 더 계량된다). 예산 계량은 과소평가만 위험하고 과대평가는 안전한 방향이며,
   //     확률도 "경합 × 120틱마다 1회" 라 무시할 수준이다. 가드를 붙이면 문장이 복잡해지는 값이 아니다.
   //   · DELETE: 같은 조건을 두 번 실행해도 결과가 같다(멱등).
+  const tapeJson = appendTape(row?.tape_json, fresh);
   stmts.push(
     env.DB.prepare(
       'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, interest=?, hype=?, fair=?, book_version=book_version+1 WHERE id=? AND last_run=?',
@@ -2541,7 +2622,7 @@ async function runBotTicks(
       state.peak,
       state.trough,
       serializeBook(book),
-      serializeTape(tape),
+      tapeJson,
       JSON.stringify(live),
       pendNotional,
       pendRows,
@@ -2569,11 +2650,12 @@ async function runBotTicks(
   // ⚠ sweep 이 체결을 냈으면 사다리·대기목록은 이미 낡았고(호출자가 다시 읽는다) 기준가도 그 체결로
   // 옮겨갔다 → 둘 다 버린다. **진행 중 캔들(live)만은 그대로 유효하다** — 체결은 `spot_candles` 에
   // 직접 쓰지 이 칸을 건드리지 않고, 그 테이블 쪽은 어차피 조회할 때 새로 읽기 때문이다.
+  if (!wantCtx) return { path, ctx: nothing }; // cron — 호가창을 그릴 사람이 없다
   return {
     path,
     ctx: touched
       ? { book: null, tape: null, pendings: null, live, ref: null, mark: roundOx(state.ref) }
-      : { book, tape, pendings, live, ref: roundOx(state.ref), mark: roundOx(state.ref) },
+      : { book, tape: tapeTail(tapeJson, TRADES_SHOWN), pendings, live, ref: roundOx(state.ref), mark: roundOx(state.ref) },
   };
 }
 
@@ -2590,26 +2672,28 @@ export async function runMarketMaker(env: Env, pair: string): Promise<TickCtx> {
   const last = row?.last_run ?? 0;
 
   // 게이트에 막혔거나 예산이 걸렸으면 틱은 없지만 **방금 읽은 행이 곧 현재 시장**이라 그대로 넘긴다
-  // (대기 주문은 안 읽었으므로 pendings=null → 호가창 쪽에서만 읽는다).
-  const asRead: TickCtx = {
+  // (대기 주문은 안 읽었으므로 pendings=null → 호가창 쪽에서만 읽는다). 틱을 도는 경우엔 runBotTicks 가 같은 행을
+  // 다시 푸므로 여기선 필요할 때만 푼다(CPU — § runBotTicks).
+  const asRead = (): TickCtx => ({
     book: parseBook(row?.book_json),
-    tape: parseTape(row?.tape_json),
+    tape: tapeTail(row?.tape_json, TRADES_SHOWN), // 체결 목록에 쓰는 꼬리만(§ tapeTail)
     pendings: null,
     live: parseLive(row?.live_json),
     ref: row?.ref_price ?? null,
     mark: row?.ref_price ?? null,
-  };
+  });
   const gate = BOT_TICK_MIN_MS + Math.random() * (BOT_TICK_MAX_MS - BOT_TICK_MIN_MS);
-  if (now - last < gate) return asRead; // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
+  if (now - last < gate) return asRead(); // 재호가 주기 전 — 아무것도 안 함(가장 흔한 경로: state read 1회뿐)
   // ⚠ 이번 달 D1 쓰기 예산을 넘겼으면 봇을 돌리지 않는다(§ _budget.ts) — 시장이 멈추는 건 아프지만
   // 예상 못 한 청구서보다는 낫다. 게이트를 통과한 틱에서만 물어보므로 조회가 폴링마다 늘지 않는다.
-  if (await autoWritesBlocked(env, 'bot')) return asRead;
+  if (await autoWritesBlocked(env, 'bot')) return asRead();
 
   // ⚠ 선점(claim)용 UPDATE 는 없다 — 커밋 자체가 `last_run` 가드로 선점을 겸한다(§ runBotTicks 커밋).
   // 예전엔 여기서 last_run 만 찍는 조건부 upsert 를 한 번 더 날렸고, 그게 하루 4,688행이었다.
   // 틱 수는 경과 시간으로 정한다 — 평소(1초 폴링)엔 1틱이지만, 한동안 아무도 안 보다가 처음 들어온 폴링은
   // 그 사이를 기준 간격(3초) 틱 여러 개로 나눠 따라잡는다(한 틱에 몇십 초를 몰아 먹으면 봉 안이 직선이 된다).
-  // 틱은 메모리에서 돌고 커밋은 한 번이라 **D1 쿼리·쓰기는 틱 수와 무관**하다(CPU 만 틱당 ~0.15ms).
+  // 틱은 메모리에서 돌고 커밋은 한 번이라 **D1 쿼리·쓰기는 틱 수와 무관**하다. CPU 는 틱 수에 비례하지만
+  // 따라잡는 중간 틱은 사다리를 건너뛰어 가볍다(§ LadderDebt — 무료 플랜 10ms 는 Pages Functions 에도 걸린다).
   const ticks = last > 0 ? clamp(Math.ceil((now - last) / (TICK_REF_SEC * 1000)), 1, POLL_CATCHUP_MAX_TICKS) : 1;
   return (await runBotTicks(env, pair, row, await resolveRef(env, pair, row), ticks)).ctx;
 }
@@ -2621,8 +2705,9 @@ export async function runMarketMaker(env: Env, pair: string): Promise<TickCtx> {
  *
  * 반환값 = 이 버스트가 지나온 **기준가 경로**. cron 이 이걸 트리거 평가에 넘겨 그 1분 안의 딥/스파이크를
  * 조건부가 놓치지 않게 한다(§ cron: 가격 경로 샘플링).
+ * `budget` = 이 페어에 쓸 수 있는 틱 수(cron 이 코인 수로 나눈 몫). 유저가 보고 있으면 그보다 적게 돈다(§ burstTicks).
  */
-export async function runMarketMakerBurst(env: Env, pair: string, ticks: number = BOT_BURST_TICKS): Promise<number[]> {
+export async function runMarketMakerBurst(env: Env, pair: string, budget: number = BOT_BURST_TICKS): Promise<number[]> {
   // 예산 초과면 이번 버스트는 통째로 건너뛴다(§ _budget.ts) — 버스트당 1회만 판정하면 되므로
   // 틱마다 조회가 붙지 않는다. 트리거 sweep(강제청산·지정가·SL/TP)은 **막지 않는다**: 그건 돈이 걸린
   // 기능이라 멈추면 유저 손실로 이어지고, 애초에 폭주하지도 않는다.
@@ -2630,7 +2715,70 @@ export async function runMarketMakerBurst(env: Env, pair: string, ticks: number 
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BotStateRow>();
   // ⚠ 상태 행이 없을 때의 부트스트랩은 runBotTicks 안으로 옮겼다 — 폴링 경로도 커밋이 가드 UPDATE 가
   // 되면서 같은 처리가 필요해졌고, 두 곳에 두면 한쪽만 고쳐질 여지가 생긴다.
-  return (await runBotTicks(env, pair, row, await resolveRef(env, pair, row), ticks)).path;
+  const ticks = burstTicks(row?.last_run ?? 0, budget);
+  return (await runBotTicks(env, pair, row, await resolveRef(env, pair, row), ticks, false)).path;
+}
+
+/** 한 번의 cron 버스트가 페어마다 남긴 것 — 지나온 기준가 경로(트리거 범위 판정용)와 마지막 기준가(시세 시드). */
+export interface BurstResult {
+  path: number[];
+  ref: number | null; // 커밋에 성공했을 때만(경합에서 졌거나 실패면 null — 호출자가 D1 에서 다시 읽는다)
+}
+
+/**
+ * cron 전용 — **모든 가상 페어**의 버스트를 돈다. `runMarketMakerBurst` 를 페어마다 부르는 것과 결과가 같지만
+ * **읽기를 batch 하나로 묶는다**(2026-10-01, cron CPU 초과 수정).
+ *
+ * ⚠⚠ 무료 플랜 CPU 10ms 에서 D1 호출은 공짜가 아니다 — 실측 **호출 1회 ≈ isolate CPU 0.45ms**(20회 순차 = 9ms,
+ * 같은 20문장 batch 1회 = 0~2ms). 예전엔 페어마다 계량기·상태 행·대기 주문을 따로 읽어 이것만 7회였다. 지금은
+ * 계량기 + 전 페어 상태 행 + 전 페어 대기 주문이 **한 번**이고, 페어마다 커밋 batch 1회씩만 남는다.
+ * ⚠ batch 가 실패하면(테이블·컬럼 누락 등) 예전 경로(`runMarketMakerBurst`)로 돌아간다 — 한 번에 묶은 읽기가
+ * 깨졌다고 시장이 통째로 서면 안 된다. 페어 하나가 터져도 나머지는 계속 돈다.
+ */
+export async function runMarketMakerBursts(env: Env, budgetPerPair: number): Promise<Record<string, BurstResult>> {
+  const out: Record<string, BurstResult> = {};
+  let rows: (BotStateRow | null)[];
+  let pendings: (PendingLite & { symbol: string })[];
+  try {
+    const res = await env.DB.batch([
+      meterReadStmt(env),
+      ...VIRTUAL_PAIRS.map((p) => env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(p)),
+      env.DB.prepare(
+        `SELECT symbol, id, user_id, side, limit_price AS price, size, reduce_only, last_fill_at FROM pending_orders WHERE symbol IN (${VIRTUAL_PAIRS.map(() => '?').join(',')})`,
+      ).bind(...VIRTUAL_PAIRS),
+    ]);
+    primeMeter((res[0].results[0] as { rows_est?: number } | undefined)?.rows_est);
+    rows = VIRTUAL_PAIRS.map((_, i) => (res[1 + i].results[0] as BotStateRow | undefined) ?? null);
+    pendings = res[1 + VIRTUAL_PAIRS.length].results as (PendingLite & { symbol: string })[];
+  } catch (e) {
+    console.error('[ox64] runMarketMakerBursts batch read failed — 페어별 경로로:', e instanceof Error ? e.message : e);
+    for (const p of VIRTUAL_PAIRS) {
+      try {
+        const path = await runMarketMakerBurst(env, p, budgetPerPair);
+        out[p] = { path, ref: null }; // 이 경로는 대기 주문 유무를 모른다 — 시세는 호출자가 다시 읽는다
+      } catch (err) {
+        console.error(`[ox64] marketMaker(${p}) failed:`, err instanceof Error ? err.message : err);
+      }
+    }
+    return out;
+  }
+  // 예산 초과면 버스트를 통째로 건너뛴다(§ runMarketMakerBurst) — 계량값은 위 batch 가 이미 캐시에 넣었다.
+  if (await autoWritesBlocked(env, 'bot')) return out;
+  for (let i = 0; i < VIRTUAL_PAIRS.length; i++) {
+    const pair = VIRTUAL_PAIRS[i];
+    const row = rows[i];
+    try {
+      const ticks = burstTicks(row?.last_run ?? 0, budgetPerPair);
+      const mine = pendings.filter((p) => p.symbol === pair);
+      const { path } = await runBotTicks(env, pair, row, await resolveRef(env, pair, row), ticks, false, mine);
+      // ⚠ 대기 지정가가 있었으면 커밋 직후 sweep(sweepRestingOxPendings)이 체결로 기준가를 옮겼을 수 있다 → 시드로
+      // 쓰지 않고 호출자가 다시 읽게 한다(대기 주문이 없는 가장 흔한 경우만 D1 왕복 하나를 아낀다).
+      out[pair] = { path, ref: path.length && mine.length === 0 ? path[path.length - 1] : null };
+    } catch (e) {
+      console.error(`[ox64] marketMaker(${pair}) failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+  return out;
 }
 
 /** 유저가 OX 를 실제로 레버리지 거래(order.ts open/close)할 때 그 체결을 합성 시장에도 반영한다.

@@ -39,7 +39,7 @@ ox64/
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조 — 실제 값은 src/index.css 테마 블록
 ├── cron/                   ── 접속자 없이도 돌아야 하는 백그라운드 전용 Cron Worker(메인 Pages 와 별도 배포) ──
 │   ├── wrangler.toml       name="ox64-liquidation-cron", 같은 D1 바인딩, crons=["* * * * *"]
-│   └── index.ts            매 1분 "페어별 봇 버스트(runMarketMakerBurst) → sweepTriggers **1회**". ⚠ 4라운드 반복은 invocation당 쿼리 한도(50)를 넘겼다 → 버스트의 **기준가 경로**(rangeOfPath) 최저/최고로 한 번에 판정. fetch() 는 CRON_SECRET 수동 트리거
+│   └── index.ts            매 1분 "전 페어 봇 버스트(runMarketMakerBursts) → sweepTriggers **1회**" — ⚠⚠ **이 일은 cron 이 아니라 Durable Object `MarketClock` 안에서 돈다**(cron 은 깨우기만, CPU ~1ms). scheduled invocation 은 무료 CPU 10ms 가 **엄격**해서(2026-10-01 연속 exceededCpu → EW 1분봉 10~30분 공백 + sweep 증발) 최적화 후에도 10~14ms 로 넘쳤고, DO 요청은 CPU 를 따로·요청당 30초 받는다(§6). DO 저장소는 안 쓴다(D1 만). 읽기는 batch 로 묶고(D1 호출 1회 ≈ CPU 0.45ms), 버스트 중간 틱은 사다리를 안 만든다. 손댔으면 `npx wrangler tail ox64-liquidation-cron --format json` 의 scheduled·durableObject 이벤트 `cpuTime` 을 볼 것. ⚠ 4라운드 반복은 invocation당 쿼리 한도(50)를 넘겼다 → 버스트의 **기준가 경로**(rangeOfPath) 최저/최고로 한 번에 판정. fetch() 는 CRON_SECRET 수동 트리거
 ├── functions/              ── 백엔드 (Cloudflare Pages Functions, /api/*) ──
 │   ├── _middleware.ts      Host 가 ox64.app/localhost 가 아니면(*.pages.dev 포함) ox64.app 으로 301
 │   ├── _shared.ts          인증(HMAC/PBKDF2)·서버측 시세·D1 타입·loadState
@@ -64,7 +64,7 @@ ox64/
 │   ├── _redirects          `/* /index.html 200` — SPA 폴백(/api/* 는 Functions 가 먼저). /b,/5m,/s1,/c 직접 진입용
 │   └── ads.txt             애드센스 판매자 선언(없으면 경고). 정적 파일이 `_redirects` 보다 먼저 매칭
 └── src/                    ── 프론트 ──
-    ├── App.tsx             세션확인 → Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달
+    ├── App.tsx             세션확인 → Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달. PC 2열 그리드의 차트↔포지션 행 높이는 분할선(`hooks/usePanelSplit.ts` — 드래그·더블클릭 원복·↑/↓, localStorage). ⚠ 드래그 중엔 리렌더 없이 그리드 style 만 직접 바꾼다(App 이 다시 그려지면 전 패널이 렌더된다). 분할선은 포지션 패널 **밖**의 별도 그리드 칸(안에 두면 패널 스크롤에 같이 밀린다)
     ├── main.tsx            pathname 으로 트레이딩·퍼즐(/b)·던전(/5m)·RTS(/s1)·상자깡(/c) 분기(라우터 없음, 동적 import). useSettingsStore 먼저 import(FOUC 방지). ⚠ /s1 만 StrictMode 안 씌움(이펙트 2회 실행이 rAF 루프를 두 벌 만든다)
     ├── index.css           Tailwind + 테마 CSS 변수 + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position/PendingOrder/Side)
@@ -88,7 +88,7 @@ ox64/
     │   ├── useMarketStore.ts   symbol/interval/prices/precisions/connected/chartClickPrice+Nonce+priceTarget(클릭 가격을 받을 칸: ''=주문패널, 'close:<positionId>')
     │   ├── useChartStore.ts    차트 옵션(localStorage) — visibleBars, 토글류, bookRows(5~50/기본 10, `clampRows`), bookTogether, 체결 필터(`cleanLimit` 이 0/음수/NaN→null), tradeStrength. `indicators: IndicatorConfig[]`(`{id,type,params:Record<string,number>,visible}`) — 예전 `{period,mult}` 저장값은 load 시 params 로 마이그레이션. `addIndicator/removeIndicator/updateIndicator(id, params 패치)/toggleIndicator(id)`(visibility on/off — 삭제와 별개). `bookUnit`('qty'|'notional')·`bookLayout`('horizontal'|'vertical'). `favIntervals`(툴바 즐겨찾기 타임프레임, 기본 1m·5m·15m·1h·4h·1d, 저장 순서와 무관하게 짧은 봉부터 — `cleanFavs`, 빈 배열은 "다 뺐다"라 기본값으로 되돌리지 않는다)
     │   ├── useSettingsStore.ts 테마+거래모드(easy/standard), setTheme 이 `dataset.theme` 도 갱신
-    │   └── useTradingStore.ts  서버 상태 캐시 + 액션 + spotBook/spotTrades(표시용). **체결 목록은 `dripTrades` 가 0.1~0.25초 간격으로 한 건씩** 흘려보낸다(§6, 비용 0). ⚠ 새 체결 식별은 **`createdAt`**(테이프 `id` 는 폴링마다 바뀜). 코인 전환 시 `spotClear` 가 타이머를 지울 것. `spotPair` = 호가·체결이 어느 코인 것인지 — `applySpot` 은 현재 심볼이 아닌 응답(전환 직전에 보낸 폴링)을 버린다
+    │   └── useTradingStore.ts  서버 상태 캐시 + 액션 + spotBook/spotTrades(표시용). **⚠⚠ 거래 액션은 전부 한 줄 큐(`enqueue`/`action`)로 차례로 나간다** — 눌린 건 버리지 않고 서버엔 동시에 안 보낸다(동시면 물타기 병합 "읽고→덮어쓰기"가 경합해 증거금은 두 번·수량은 한 번). `busy` = 줄에 남은 액션 있음. 새 거래 액션도 반드시 `action()` 으로. **체결 목록은 `dripTrades` 가 0.1~0.25초 간격으로 한 건씩** 흘려보낸다(§6, 비용 0). ⚠ 새 체결 식별은 **`createdAt`**(테이프 `id` 는 폴링마다 바뀜). 코인 전환 시 `spotClear` 가 타이머를 지울 것. `spotPair` = 호가·체결이 어느 코인 것인지 — `applySpot` 은 현재 심볼이 아닌 응답(전환 직전에 보낸 폴링)을 버린다
     └── components/
         ├── RefillModal.tsx      파산 팝업 — 평가자산 ≤0 이면 자동. 판정은 `useEquity` 하나만(**두 지갑 합산**). 닫으면 **0 을 벗어날 때까지** 다시 안 뜸
         ├── ConvertModal.tsx     USDT↔원화 환전(헤더 "⇄ 환전"). 환율·수령액은 미리보기, 열려 있는 동안 환율을 직접 받는다
@@ -102,8 +102,8 @@ ox64/
         ├── Clock.tsx           KST 시계(자체 상태만 갱신). Chart 툴바 우측
         ├── IntervalPicker.tsx  타임프레임(트레이딩뷰식) — 즐겨찾기만 가로 바(좁으면 가로 스크롤, `.no-scrollbar`) + ▾ 그룹 목록에서 선택·★ 토글. 즐겨찾기 아닌 현재 인터벌은 바에 점선으로 임시 표시. `supports` 로 심볼별 불가 인터벌(원화=1s) 제외. ⚠ 드롭다운은 overflow 바 **밖**에 둔다(안에 두면 잘린다)
         ├── Chart.tsx           **⚠ 캔들을 직접 폴링하지 않는다** — 통합 폴링이 스토어에 넣은 봉을 구독만(과거봉 lazy 로드만 자기 요청). 연결 표시는 **신선도**(8초). LWC v4: KST+9·OHLCV 레전드·카운트다운(우측 가격축 현재가 라벨 아래, `priceToCoordinate`+`priceScale('right').width()`)·B/S/L 마커·평단선+청산가선·SL/TP선·지정가/조건부 주문선(X 버튼)·차트 클릭→지정가·테마 재도색. 인디케이터는 레지스트리(indicatorDefs) 기반 — 선마다 시리즈 1개(`Map<id, Map<lineKey, series>>`), own 패널 지표는 `priceScaleId=ind.id` 로 하단에 자동 스택([캔들]/[패널들]/[거래량], 높이는 개수로 나눔), 숨김은 `series.applyOptions({visible:false})`(삭제 아님, 레전드·패널 배치에서도 제외). null 은 whitespace 로 넣어 선이 끊긴다(SuperTrend 국면 전환·워밍업). 옵션 패널: 지표 행마다 👁 토글·파라미터 입력(def.params 자동 생성)·삭제, 추가는 오버레이/오실레이터 optgroup 셀렉트. 가상 심볼 표시범위는 최초 로드 때만(매 폴링 재설정하면 줌 리셋)
-        ├── OrderPanel.tsx      **F9=롱·Buy / F10=숏·Sell**(버튼과 같은 submit, window keydown, 반복 무시, F10 기본동작 차단 — ⚠ OrderPanel 을 두 번 마운트하면 주문이 두 번 나간다) · Easy=슬라이더+롱/숏 / Standard=시장가·지정가·조건부 탭+SL/TP+수량(코인/USDT). **⚠ 수량 진실원본은 입력칸 문자열(`amtInput`)이고 코인 수량은 `sizeCoin` 파생**(반대로 두면 왕복 정밀도가 깨져 USDT 입력이 튄다). OXUSDT 도 같은 컴포넌트
-        ├── PositionsPanel.tsx  포지션(행 아무 데나 누르면 그 심볼로 이동 — 행 안의 버튼·입력·슬라이더는 제외, 보고 있는 심볼 행은 옅게 강조 ·청산가 `fmtPriceShort`·부분청산 입력+비중 슬라이더(진실원본은 입력칸, 슬라이더는 `closePctOf` 파생; 빈칸=전량)·지정가 청산 입력(비우면 시장가, 포커스 시 차트 클릭 가격 수신)·SL/TP 편집) / 미체결(reduce-only 뱃지) / 조건부 / 주문내역
+        ├── OrderPanel.tsx      **F9=롱·Buy / F10=숏·Sell**(버튼과 같은 submit, window keydown, 반복 무시, F10 기본동작 차단 — ⚠ OrderPanel 을 두 번 마운트하면 주문이 두 번 나간다). **연타 = 누른 횟수만큼 주문**: ⚠ `busy` 로 막지 말 것(예전엔 처리 중 입력을 버려 연타가 씹혔다) — 스토어 큐가 차례로 보낸다(useTradingStore `enqueue`) · Easy=슬라이더+롱/숏 / Standard=시장가·지정가·조건부 탭+SL/TP+수량(코인/USDT). **⚠ 수량 진실원본은 입력칸 문자열(`amtInput`)이고 코인 수량은 `sizeCoin` 파생**(반대로 두면 왕복 정밀도가 깨져 USDT 입력이 튄다). OXUSDT 도 같은 컴포넌트
+        ├── PositionsPanel.tsx  **F8 = 보고 있는 심볼의 포지션 청산**(그 행 "청산" 버튼과 같은 `pressClose` — 입력해 둔 수량·지정가 그대로, 롱·숏 둘 다면 둘 다, 리스너 1개+ref). 청산도 처리 중에 눌린다(큐) — 단 **같은 포지션의 전량 시장가 청산이 이미 줄에 있으면 거른다**(`fullClosing` — 두 번째는 "포지션 없음" 에러일 뿐) · 포지션(행 아무 데나 누르면 그 심볼로 이동 — 행 안의 버튼·입력·슬라이더는 제외, 보고 있는 심볼 행은 옅게 강조 ·청산가 `fmtPriceShort`·부분청산 입력+비중 슬라이더(진실원본은 입력칸, 슬라이더는 `closePctOf` 파생; 빈칸=전량)·지정가 청산 입력(비우면 시장가, 포커스 시 차트 클릭 가격 수신)·SL/TP 편집) / 미체결(reduce-only 뱃지) / 조건부 / 주문내역
         └── Leaderboard.tsx     자산 순위 모달(5초 폴링) + 거래소 수수료 수익(유저분/봇분)
     └── puzzle/                 ── 퍼즐게임(/b, §7) ── api.ts(별도 번들) · usePuzzleStore.ts(open() 은 로컬 보드에 결과만 이어붙임 — 끝난 판이 안 사라지게) · PuzzleLogin · Board(연 칸만 그림) · PuzzleApp
     └── sc/                     ── 미니 RTS(/s1, §9) — **서버·로그인 없이 전부 클라이언트** ── types(타일 24px·맵 64×64·틱 30Hz) · data(유닛 4·건물 5, 밸런스는 여기만) · map(180° 대칭·연결성 보장·안개) · pathfind(A*, 유닛은 장애물 아님) · game · ai(0.5초 판단, owner 인자로 AI 대 AI) · render(전부 도형) · Hud · ScApp(rAF 루프, HUD 8Hz)
@@ -179,8 +179,8 @@ ox64/
 - **리필(`functions/api/refill.ts`)**: **평가자산 ≤ 0 일 때만 지급** — 포지션이 있으면 서버가 시세 fetch 로 판정(하나라도 못 받으면 거부). `users.refill_count`/`refill_date`(KST) 로 **1일 최대 3회, 1회 +10,000 USDT**, 날짜가 바뀌면 `refill_date !== 오늘` 이라 카운트 0 취급(리셋 cron 불필요 — "폴링 시점에 계산" 패턴). `loadState` 가 `refillsLeft` 포함, `Header.tsx` 도 같은 식으로 버튼을 미리 비활성화. **⚠ 자산이 0 이면 팝업이 자동으로 뜬다(`RefillModal.tsx`)** — 헤더 구석 버튼만으로는 강제청산당한 사람에게 게임이 끝난 것처럼 보였다. 판정은 `useEquity` 하나만(헤더 버튼과 어긋나지 않게), 닫으면 **평가자산이 0 을 벗어날 때까지** 다시 안 뜬다(리필 성공 시 자동 초기화), 스토어 공용 `error` 는 **이 팝업에서 눌러본 뒤에만** 표시.
 - **체결 체크 = 접속 폴링(빠른 경로) + cron sweep(접속 무관, 느린 경로)**: Pages Functions 는 정기 실행이 없어 `functions/_trading.ts checkTriggers(env,uid)` 를 `state.ts`(GET, `useTriggerPoll` 2.5초)와 `order.ts`(POST 액션 직후, 수동 조작과 레이스 방지)에서 호출해 **그 유저의 요청 시점에** 강제청산/지정가/SL·TP/조건부를 평가·체결한다(체결가는 지정가/SL/TP 값 그대로, 슬리피지 모델링 없음). 아무도 접속하지 않아도 `cron/` 워커(Pages 는 Cron 미지원이라 별도 배포, 같은 D1 바인딩)가 매 1분 `sweepTriggers(env)` 로 **포지션·미체결·조건부가 있는 전 유저**를 훑는다 — **주기만 다르고 기능 차이는 없다**. 배포·시크릿은 §5(⚠ cron 워커는 수동 재배포).
   - 평가 본체는 `runTriggers(env,uid,pendings,positions,conditionals,prices)` 하나를 `checkTriggers`(1인분)와 `sweepTriggers`(전 유저)가 **공유** — 새 트리거 기능을 추가해도 자동으로 양쪽에서 돈다(sweep 이 강제청산만이던 시절엔 앱을 닫으면 조건부가 멈췼다 — 유저 요청이 유일한 클럭이었기 때문).
-  - **⚠ 마켓메이커 틱 예산은 총량 고정, 코인들이 나눠 쓴다**(`cron/index.ts` `MM_TICK_BUDGET`=24, `MM_BUDGET_PER_PAIR = MM_TICK_BUDGET / VIRTUAL_PAIRS.length`, 현재 2코인 × 12틱). 틱은 순수 계산이고 커밋이 페어당 1회라 틱 수가 쿼리·쓰기를 거의 안 늘린다 — 상한을 정하는 건 **CPU(무료 10ms/invocation, 실측 24틱 ≈ 3.5ms)**. 코인을 늘려도 총량은 그대로(코인당 틱만 줄어 움직임이 성겨진다).
-  - **⚠ 유저가 보고 있으면 cron 은 물러난다**(`marketMakerTickBudget`, `POLL_ACTIVE_MS`=20s, `BURST_MIN_TICKS`=4): `/api/spot` 폴링이 이미 초당 재호가를 돌리는데 cron 이 12틱을 더 얹는 건 쓰기만 배로 나가는 중복. `last_run` 이 방금이면 폴링이 클럭이라 최소치만(cron 이 찍은 `last_run` 은 다음 실행 때 60초 전이라 안 섞인다). **⚠⚠ 이 판정은 라운드 루프 밖에서 실행당 한 번만** — 안에서 라운드마다 하면 직전 라운드의 자기 `last_run` 을 보고 "누가 폴링 중"이라 오판해 물러난다.
+  - **⚠ 마켓메이커 틱 예산은 총량 고정, 코인들이 나눠 쓴다**(`cron/index.ts` `MM_TICK_BUDGET`=24, `MM_BUDGET_PER_PAIR = MM_TICK_BUDGET / VIRTUAL_PAIRS.length`, 현재 2코인 × 12틱). 틱은 순수 계산이고 커밋이 페어당 1회라 틱 수가 쿼리·쓰기를 거의 안 늘린다 — 상한을 정하는 건 **CPU(무료 10ms/invocation)**. ⚠⚠ 옛 "24틱 ≈ 3.5ms" 는 로컬·관심도 이전 값이었다 — prod cron 은 콜드 isolate 라 **로컬의 2~4배**(2026-10-01 실측: 개선 전 매번 10ms 초과로 강제 종료, 개선 후 봇만 ~6ms). 코인을 늘려도 총량은 그대로(코인당 틱만 줄어 움직임이 성겨진다).
+  - **⚠ 유저가 보고 있으면 cron 은 물러난다**(`burstTicks`, `POLL_ACTIVE_MS`=20s, `BURST_MIN_TICKS`=4 — 판정은 버스트가 batch 로 미리 읽은 상태 행의 `last_run`): `/api/spot` 폴링이 이미 초당 재호가를 돌리는데 cron 이 12틱을 더 얹는 건 쓰기만 배로 나가는 중복. `last_run` 이 방금이면 폴링이 클럭이라 최소치만(cron 이 찍은 `last_run` 은 다음 실행 때 60초 전이라 안 섞인다). **⚠⚠ 이 판정은 라운드 루프 밖에서 실행당 한 번만** — 안에서 라운드마다 하면 직전 라운드의 자기 `last_run` 을 보고 "누가 폴링 중"이라 오판해 물러난다.
   - **⚠ 트리거는 "현재가 한 점"이 아니라 "지나온 가격 범위"로 판정**(`_trading.ts` `PriceRanges`/`rangeOfPath`): OX 가격은 봇 틱이 돌 때만 움직이고 cron 은 1분치 틱을 몰아 돌리므로, 끝난 뒤 한 점만 보면 그 사이 딥/스파이크를 놓친다. 버스트가 돌려준 경로의 **최저/최고**로 조건부(발동·재무장)·SL/TP·지정가 크로스를 한 번에 판정(거래소의 구간 고저 스탑 판정과 같고 점 샘플링보다 정확). **강제청산만은 현재가**(스쳐간 저가로 파산시키면 되돌릴 수 없다). ⚠ 예전의 "sweep 4라운드 반복"은 sweep 1회가 D1 ~18쿼리라 무료 한도(50)를 넘겼다 — 되돌리지 말 것.
   - **⚠ `MAX_SWEEP_USERS`(8)**: 한 invocation 이 훑는 유저 수 상한. 유저가 늘어도 쿼리 수가 늘지 않게 분 단위로 회전(접속 유저는 자기 폴링이 즉시 처리하므로 늦어지는 건 앱을 닫아둔 유저만).
   - 실제 코인 시세는 한 cron 안에서 재사용(`sweepTriggers(env, cachedPrices?)` → 반환 `prices` 를 다음 라운드에), OX 는 매 라운드 새로 읽는다(`spot_bot_state.ref_price` 가 라운드마다 실제로 바뀐다).
@@ -235,6 +235,7 @@ ox64/
 - **봇은 무한 유동성 공급자** — 호가 에스크로·잔고 가드를 절대 붙이지 않는다(음수 재고 정상). 체결 뒤 재고/현금 정산만 `botFillStmts` 로 합계 batch 1회. 봇은 `fee_ledger` 에 행을 남기지 않는다(카운터만).
 - **봇 경로에 "행을 남기는" 설계 금지** — 매 틱 교체되는 스냅샷(사다리·테이프·진행 중 캔들)은 상태 행의 JSON 칸(`book_json`/`tape_json`/`live_json`)에 담는다(쓰기 비용 0). 새 INSERT 를 넣을 땐 "누가 언제 지우나"를 반드시 같이 정할 것. 봇이 만든 것은 테이프에, 유저 것은 `spot_trades` 테이블에.
 - 틱은 순수 계산(`simulateTick`), N틱 메모리 → 커밋 1회 = 1행(`runBotTicks`). 커밋은 `last_run` 가드가 선점을 겸하고, 진 쪽은 가격 경로를 빈 배열로 반환한다. 닫힌 캔들 flush 도 같은 가드.
+- **⚠⚠ 버스트(여러 틱)의 중간 틱은 사다리를 만들지 않는다**(`simulateTick(…, { skipBook, debt })` → `LadderDebt`, 2026-10-01) — 체결·캔들은 사다리와 무관하고 커밋되는 건 마지막 사다리뿐이라, 지나간 범위(합집합)·교체 속도(pace 합)만 넘겨 마지막 틱이 한 번에 만든다(폴링 1틱은 예전과 동일). **테이프는 700건을 풀지 않고 문자열로 다룬다**(`appendTape`/`tapeTail` — 항목 경계 `],[` 에 기댄다. ⚠ `tape_json` 에 serializeTape 아닌 형식을 쓰지 말 것). 둘 다 cron CPU 초과 수정의 핵심이다(§6).
 - **⚠⚠ 관심도 = 시장 시간이 흐르는 속도(2026-09-23)**. 가격·국면·심리·호가 교체는 전부 business time `h = (이 틱이 덮는 벽시계 초/3) × 관심도` 로 진행한다 — 한산하면 체결 0~1건·호가 정지, 거래가 몰리면 1초에 몇 틱치 시장. 틱이 덮는 초(`dtSec`)는 `runBotTicks` 가 `last_run` 에서 잰다 → **폴링(1초 틱)과 cron(5초 틱)이 벽시계 기준 같은 시장**(예전엔 보고 있으면 5배 빨랐다). 새 항을 넣을 땐 **AR 계수는 `^h`, 사건은 `1−e^(−율×h)`, 이동은 `×h`, 노이즈는 `×√h`** — 틱당 상수 금지. 관심도의 자기 흥분(사건→관심)은 **포화(`BUZZ_SAT`) 필수**(없으면 상한에 고착), 뉴스 도착률은 화제성에 √ 로만.
 - **⚠⚠ 기준선(1 USDT) tether 는 없다** — 그게 국면 bias 의 상승 편향(+27e-6/틱)을 가리며 "1 위면 무조건 하락, 아래면 상승"을 만들었다. 편향은 rally·euphoria bias 보정 + `DRIFT_TRIM` 으로 직접 0 에 맞춘다. **되돌려줄 힘이 없으므로 남은 편향은 그대로 추세**(단위당 1e-6 ≈ 하루 1%) — 국면·심리·관심도를 건드렸으면 로그드리프트를 **1초·5초 틱 둘 다** 재서 다시 맞출 것(사건 조건처럼 이산화에 의존하는 항은 한쪽만 재면 안 보인다).
 - 진폭은 `MOVE_SCALE`(0.2) 하나 — 가격 단위 상수엔 ×, 가격 거리에 곱하는 심리 계수엔 ÷, 3차 되돌림엔 ÷². 공정가(`fair`)는 틱에 스냅하지 않고 `ref_price` 에만 반올림값(유저 체결이 ref_price 를 바꾸면 `roundOx(fair)≠ref_price` 로 감지해 ref_price 에서 재시작). 틱의 마지막 체결을 ref 에 강제하지 않는다(모든 체결은 bid/ask). 한산한 시장의 봉은 곧 스프레드 폭이라 미세구조도 진폭에 맞췄다(스프레드 0.035%×배수, 격자 스냅은 반 스프레드 안에서만, 파고들기 ×√MOVE_SCALE). **호가는 틱에도 바깥쪽으로**(매수 내림·매도 올림) — 가장 가까운 틱으로 반올림하면 무반올림 공정가를 넘어 역전된다. **모듈 상수는 위에 정의된 상수만 참조**(아래 것을 쓰면 TDZ/NaN).
@@ -293,6 +294,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 - Cloudflare Pages 프로젝트는 Cron Trigger 를 지원하지 않는다(Durable Objects 도 Pages 안에서 새로 정의 불가 — 둘 다 별도 Worker 배포가 필요). 그래서 `cron/` 를 **완전히 별개의 Workers 프로젝트**로 배포했다(Git 연동 Pages 배포로는 자동 적용되지 않음 — Pages 를 재배포해도 이 Worker 는 그대로 유지됨).
 - 배포 URL: `https://ox64-liquidation-cron.erinwaveofficial.workers.dev` (스케줄만 쓰고 fetch 는 수동 트리거 용도라 사람이 직접 방문할 일은 없음).
 - 코드/스케줄 변경 시 재배포: `cd cron && npx wrangler deploy` (Pages 처럼 Git 연동 자동배포 아님 — 수동, `CRON_SECRET` 시크릿은 최초 1회만 설정하면 재배포해도 유지됨).
+- **Durable Object `MarketClock`**(2026-10-01, `cron/wrangler.toml` 의 `[[durable_objects.bindings]]` + `[[migrations]] tag="v1" new_sqlite_classes`) — 매 분의 일이 여기서 돈다(§2 cron). 마이그레이션은 deploy 때 자동 적용된다. ⚠ 이미 적용된 `[[migrations]]` 블록은 고치거나 지우지 말 것(새 변경은 `v2` 블록을 **추가**) — 무료 플랜은 SQLite 백엔드 DO 만 된다. 로컬 `wrangler dev` 도 DO 를 띄운다(`env.CLOCK` 바인딩이 없으면 runTick 을 직접 돈다).
 - 수동 재실행/점검: `curl -X POST https://ox64-liquidation-cron.erinwaveofficial.workers.dev/ -H "x-cron-secret: <값>"` → `{"sweep":{"rounds":4,"checked":N,"liquidated":M}}` (`checked`=이번에 훑은 유저 수, 마켓메이커는 결과를 반환하지 않고 그냥 실행만 됨). 이름은 `ox64-liquidation-cron` 이지만 하는 일은 강제청산만이 아니다(트리거 전체 sweep + 마켓메이커).
 - 주기는 `cron/wrangler.toml` 의 `[triggers] crons`(현재 매 1분) — 트리거 sweep(강제청산·지정가·SL/TP·조건부)·OX 마켓메이커 봇(버스트) 둘 다 이 한 스케줄로 처리(§3 "봇 거래량", §4 "접속 여부와 무관하게 매 1분 자동 실행" 참고). ⚠ 스케줄/코드를 바꾸면 `cd cron && npx wrangler deploy` 로 수동 재배포해야 반영된다(Git 자동배포 아님). 로컬 검증은 `cd cron && npx wrangler dev` 뒤 `curl http://127.0.0.1:8787/cdn-cgi/handler/scheduled`(스케줄은 로컬에서 자동 발화 안 됨, 수동 트리거만) — 로컬 D1 은 `wrangler dev` 와 `wrangler d1 execute --local` 이 별도 프로세스로 뜬 채 겹치면 데이터가 안 보일 수 있으니(포트 점유), 테스트 전 `netstat`/`tasklist` 로 이전 `wrangler dev` 잔여 프로세스가 없는지 확인할 것.
 
@@ -337,7 +339,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   | 일 rows read | **500만/일** | **약 30만/일** (전환 전 1억 1,000만) |
   | **Worker invocation 1회당 D1 쿼리** | **50** ⚠ Paid 는 1,000 | cron 1회 ≈ 25~35 (전환 전 ~400) |
   | 요청 수(Pages Functions 포함) | **10만/일** | 약 1.5~2만/일 |
-  | CPU / invocation | **10 ms** ⚠ Paid 는 30초 | cron 실측 ~3.5ms(봇 24틱 순수 연산) |
+  | CPU / invocation | **10 ms** ⚠ Paid 는 30초 | ⚠ **실제로 닿은 벽**(아래 2026-10-01) — `wrangler tail` 의 `cpuTime` |
   | DB당 최대 크기 | **500 MB** ⚠ Paid 는 10GB | 18 MB |
   - **⚠ invocation당 쿼리 50 이 새로 생긴 진짜 벽이다.** `DB.batch([...])` 는 **문장 하나하나가 1쿼리로**
     계산되고, 바인딩 호출도 subrequest 한도(50)에 함께 잡힌다. 전환 전 cron 1회가 ~400쿼리였던 이유는
@@ -358,6 +360,27 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
     ⚠ 이 한도를 넘겨 batch 가 던져지면 **그 앞의 조건부 잔고 차감은 이미 커밋돼 있다**(charge-first 는
     D1 batch 의 "0행 UPDATE 도 성공" 함정을 피하려고 일부러 그렇게 둔 것이다, §4) — 즉 한도 초과는
     표시 오류가 아니라 **증거금만 빠지고 포지션이 안 생기는 사고**다. 문장 수를 세는 걸 게을리하지 말 것.
+  - **⚠⚠⚠ CPU 10ms 가 실제로 터졌다(2026-10-01).** cron 이 매 실행 `exceededCpu`(cpuTime 10)로 강제 종료돼, 끊기기 전에
+    커밋된 것만 남았다 → 뒤에 도는 **EW 1분봉이 하루 수십 번 4~30분씩 비고**, 맨 끝의 **트리거 sweep(접속 안 한 유저의
+    강제청산·SL/TP·조건부)이 거의 매번 증발**했다. Cloudflare 는 "가끔 넘는 건 봐주고 계속 넘으면 끊는다"라 공백이 몰려서
+    나온다. prod 실측(임시 측정 워커):
+    | 작업 | CPU |
+    | --- | --- |
+    | **D1 호출 1회**(순차 20회 = 9ms) | **~0.45ms** |
+    | 같은 20문장을 `DB.batch` 1회로 | 0~2ms |
+    | 봇 상태 행(40KB) 읽기 1회 | ~1.5ms |
+    | 봇 2페어 × 12틱 순수 계산(개선 후) | 5~11ms(로컬 콜드의 2~4배) |
+    규칙: ①**읽기는 batch 로 묶는다**(cron 은 봇 읽기 1회 + 페어별 커밋 + sweep 읽기 1회) ②루프 안 D1 왕복 금지 — 유저마다
+    읽던 잔고는 batch 로 미리 읽어 **할 일 없는 유저를 거르는 데만** 쓰고, 되돌릴 수 없는 강제청산은 여전히 새로 읽어 판정
+    (`bankruptWallets` 한 식 공유) ③버스트 중간 틱은 사다리 생략·테이프 문자열 처리(§4 가상 코인) ④바꾼 뒤엔 반드시
+    `npx wrangler tail ox64-liquidation-cron --format json` 으로 `outcome`/`cpuTime` 확인. **⚠⚠ 그래도 scheduled invocation 하나로는
+    10~14ms 였다**(콜드 isolate 의 봇 코드 첫 컴파일이 틱 수와 거의 무관하게 대부분 — 로컬 실측 틱 1개든 12개든 ~4ms).
+    그래서 **일을 cron 워커 안의 Durable Object(`MarketClock`)로 옮겼다** — DO 요청은 CPU 를 호출자와 따로 계산하고
+    한도가 요청당 30초다(DO 한도표; prod 실측: DO 안에서 70~120ms 를 연속 13회 써도 정상, 호출자 CPU 0~2ms). cron 은
+    깨우기만 한다. ⚠ 다른 탈출구는 막혀 있었다: 서비스 바인딩은 호출 체인 CPU 를 **합산**하고(요금 문서), cron 트리거를
+    같은 주기의 다른 표기로 늘리면(`*/1`, `0-59`) 등록은 되지만 5분 동안 한 번도 발동하지 않았다. 참고로 일반 HTTP 요청은
+    100ms 를 25회 연속 써도 끊기지 않았다 — **엄격한 건 scheduled 쪽**이다(그렇다고 Pages Functions 에 기대지 말 것,
+    문서상 한도는 같은 10ms 다).
   - **⚠ 실사용 천장은 "동시 접속자"가 아니라 "하루 총 시청 시간(user-hour)"이다.** 폴링 3개가 각자
     요청을 보내므로 **OX 화면 1인 = 시간당 8,640요청**(호가 1s=3,600 + 캔들 1s=3,600 + state 2.5s=1,440,
     탭 숨기면 전부 정지)이고, 읽기는 인터벌에 따라 시간당 23만~48만 행이다(캔들 롤업 배수 때문 —
@@ -549,7 +572,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   - **정말 0.2초가 필요하면 폴링이 아니라 스트리밍(SSE)이다** — 한 요청으로 연결을 유지하며 서버가
     메모리에서 틱을 굴려 push 하면 요청·읽기·쓰기가 **오히려 줄어든다**(연결 1개가 수십 틱을 커버하고
     커밋은 마지막에 1회 = 지금의 "N틱 메모리 → 커밋 1회" 구조를 그대로 늘린 것). 걸리는 건 D1 이 아니라
-    다른 두 한도다: **invocation당 D1 쿼리 50** 과 **CPU 10ms**(실측 24틱 ≈ 3.5ms → 한 연결에 ~50틱이 상한)
+    다른 두 한도다: **invocation당 D1 쿼리 50** 과 **CPU 10ms**(prod 콜드 isolate 에선 24틱 버스트만으로 ~6ms — 한 연결에 넣을 수 있는 틱이 생각보다 훨씬 적다)
     → 연결을 5~10초로 끊어 재연결하는 설계가 필요하고, 봇 틱 레이트가 5배가 되므로 **`npm run sim:bot`
     재보정이 선행**돼야 한다(1분봉 폭·국면 점유율이 틱 수에 직접 걸려 있다).
 

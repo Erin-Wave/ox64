@@ -139,6 +139,17 @@ export async function meterRows(env: Env): Promise<{ day: number }> {
   return { day: cache.day };
 }
 
+/** 오늘 계량값을 읽는 문장 — **다른 읽기와 한 batch 로 묶을 때** 쓴다(cron, § spot.ts runMarketMakerBursts).
+ * 결과는 `primeMeter` 로 넘겨 캐시를 채운다. ⚠ D1 호출 하나가 isolate CPU ~0.45ms 라(2026-10-01 실측) 무료 플랜
+ * 10ms 안에서 따로 왕복할 여유가 없다. */
+export function meterReadStmt(env: Env): D1PreparedStatement {
+  return env.DB.prepare('SELECT rows_est FROM usage_meter WHERE day = ?').bind(todayKst());
+}
+/** batch 로 미리 읽은 오늘 계량값을 캐시에 넣는다 — 이후 `autoWritesBlocked` 는 D1 을 다시 읽지 않는다. */
+export function primeMeter(rowsEst: number | null | undefined): void {
+  cache = { at: Date.now(), day: rowsEst ?? 0 };
+}
+
 const BLOCK_AT: Record<'nibble' | 'repeat' | 'bot', number> = {
   nibble: NIBBLE_BLOCK_DAY_ROWS,
   repeat: REPEAT_BLOCK_DAY_ROWS,

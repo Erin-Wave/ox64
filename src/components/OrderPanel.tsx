@@ -36,7 +36,6 @@ export default function OrderPanel() {
   const conditionalOpen = useTradingStore((s) => s.conditionalOpen);
   const balance = useTradingStore((s) => s.balance);
   const krwBalance = useTradingStore((s) => s.krwBalance);
-  const busy = useTradingStore((s) => s.busy);
   const error = useTradingStore((s) => s.error);
   const positions = useTradingStore((s) => s.positions);
   const markPrices = useTradingStore((s) => s.markPrices);
@@ -116,9 +115,11 @@ export default function OrderPanel() {
     takeProfit: useSlTp && takeProfit ? Number(takeProfit) : null,
   });
 
+  // ⚠ 앞 주문이 처리 중이어도(`busy`) 버리지 않는다 — 스토어가 줄을 세워 차례로 보낸다(§ useTradingStore enqueue).
+  // 예전엔 여기서 `busy` 면 return 해서 F9·버튼 연타가 두세 번에 한 번씩 씹혔다. 인자는 **지금** 값으로 만든다.
   const submit = (side: Side) => {
     const sz = sizeCoin;
-    if (!sz || sz <= 0 || busy) return;
+    if (!sz || sz <= 0) return;
     if (effectiveTab === 'conditional') {
       const tpx = Number(triggerPrice);
       if (!tpx || tpx <= 0) return;
@@ -148,8 +149,9 @@ export default function OrderPanel() {
     }
   };
 
-  // ⌨️ F9 = 롱·Buy / F10 = 숏·Sell — 버튼을 누른 것과 **똑같이**(같은 submit — 탭·수량·레버리지·SL/TP 그대로,
-  // 처리 중이면 무시). 입력칸에 커서가 있어도 동작한다(수량을 치고 바로 누르는 용도). 누르고 있어도 한 번만.
+  // ⌨️ F9 = 롱·Buy / F10 = 숏·Sell — 버튼을 누른 것과 **똑같이**(같은 submit — 탭·수량·레버리지·SL/TP 그대로).
+  // **연타하면 누른 횟수만큼** 주문이 나간다(앞 주문이 처리 중이면 그 뒤에 줄을 선다 — § submit). 입력칸에 커서가
+  // 있어도 동작한다(수량을 치고 바로 누르는 용도). ⚠ 꾹 누르고 있는 건 한 번이다(키 반복 무시 — 실수로 수십 건 방지).
   // ⚠ 리스너는 한 번만 달고 최신 submit 은 ref 로 읽는다(렌더마다 새 클로저라 그대로 쓰면 옛 입력값으로 주문된다).
   // ⚠ OrderPanel 이 화면에 두 번 마운트되면 주문이 두 번 나간다 — 지금은 App.tsx 에 하나뿐이다.
   const submitRef = useRef(submit);
@@ -560,21 +562,19 @@ export default function OrderPanel() {
         <p className="rounded-md bg-downDim px-2.5 py-1.5 text-xs text-down">{error}</p>
       )}
 
-      {/* 롱/숏 */}
+      {/* 롱/숏 — 처리 중에도 눌린다(누른 만큼 차례로 나간다, § submit) */}
       <div className="mt-auto grid grid-cols-2 gap-2">
         <button
           onClick={() => submit('long')}
-          disabled={busy}
-          title="단축키 F9"
-          className="rounded-md bg-up py-2 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
+          title="단축키 F9 (연타하면 누른 횟수만큼 주문)"
+          className="rounded-md bg-up py-2 text-sm font-bold text-white transition hover:brightness-110 active:brightness-95"
         >
           롱 · Buy <span className="ml-1 text-[10px] font-semibold opacity-70">F9</span>
         </button>
         <button
           onClick={() => submit('short')}
-          disabled={busy}
-          title="단축키 F10"
-          className="rounded-md bg-down py-2 text-sm font-bold text-white transition hover:brightness-110 disabled:opacity-40"
+          title="단축키 F10 (연타하면 누른 횟수만큼 주문)"
+          className="rounded-md bg-down py-2 text-sm font-bold text-white transition hover:brightness-110 active:brightness-95"
         >
           숏 · Sell <span className="ml-1 text-[10px] font-semibold opacity-70">F10</span>
         </button>
