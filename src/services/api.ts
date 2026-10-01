@@ -10,6 +10,8 @@ export interface ApiPosition {
   entryPrice: number;
   size: number;
   leverage: number;
+  /** 실제로 잠긴 증거금(없으면 진입가×수량÷레버리지로 근사 — 배포 직후 옛 응답) */
+  margin?: number;
   openedAt: number;
   stopLoss: number | null;
   takeProfit: number | null;
@@ -32,6 +34,8 @@ export interface ApiPendingOrder {
   size: number;
   leverage: number;
   limitPrice: number;
+  /** 이 주문에 잠긴 증거금(지정가 청산은 0). 없으면 지정가×수량÷레버리지로 근사 */
+  margin?: number;
   stopLoss: number | null;
   takeProfit: number | null;
   createdAt: number;

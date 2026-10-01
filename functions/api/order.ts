@@ -20,32 +20,27 @@ import {
   roundVirtual,
   quoteOf,
   balColOf,
+  NO_MARK_MSG,
+  positionAddStmts,
+  positionClaimStmt,
+  claimThenSettle,
+  guardStmt,
+  guardedBatch,
   type Env,
   type PositionRow,
   type PendingRow,
   type ConditionalRow,
 } from '../_shared';
-import { checkTriggers } from '../_trading';
-import {
-  matchLimitPendingAgainstBook,
-  matchMarketOxOrder,
-  marketCloseOxPosition,
-  matchReduceOnlyOxPending,
-  recordVirtualFill,
-} from './spot';
 
-// OX/USDT 는 진짜 상대 거래자가 없으니, 유저가 레버리지로 체결시킨 걸 합성 시장(호가창·체결내역·
-// 다음 봇 기준가)에도 반영해준다 — 안 그러면 포지션 수량만 조용히 바뀌고 화면엔 아무 흔적도 안 남아
-// "내 체결이 반영이 안 된다"는 혼란이 생긴다. 실패해도 유저의 실제 거래(잔고/포지션)는 이미
-// 끝난 뒤라 조용히 무시한다(표시용 부가효과일 뿐).
-async function reflectVirtualFill(env: Env, symbol: string, uid: string, price: number, takerSide: 'buy' | 'sell', size: number) {
-  if (!isVirtualSymbol(symbol)) return;
-  try {
-    await recordVirtualFill(env, symbol, uid, price, takerSide, size);
-  } catch {
-    /* 표시용 부가효과 — 실패해도 무시 */
-  }
-}
+import { checkTriggers, POLL_FILL_Q } from '../_trading';
+import { matchLimitPendingAgainstBook, matchMarketOxOrder, marketCloseOxPosition, matchReduceOnlyOxPending } from './spot';
+
+const SLTP_MSG = 'SL/TP 값이 올바르지 않습니다 (롱: 손절가 < 현재가 < 익절가, 숏은 반대)';
+/** 선점(compare-and-swap)이 빗나갔을 때 — 그 사이 다른 체결·청산·수정이 같은 행을 바꿨다. 최신 상태를 보고 다시 하면 된다. */
+const CHANGED_MSG = '방금 다른 체결·청산과 겹쳤습니다 — 최신 상태를 확인하고 다시 시도해 주세요';
+/** 유저 한 명의 대기 지정가·조건부 주문 상한(각각). 매 평가가 걸린 주문 수만큼 일을 하므로(요청당 D1 쿼리 50 — §6)
+ * 끝없이 쌓이면 그 유저의 폴링·주문이 통째로 실패하고 cron sweep 까지 끌고 내려간다(감사). */
+const MAX_OPEN_ORDERS = 20;
 
 /**
  * POST /api/order
@@ -200,10 +195,11 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       // 두 번 읽던 자리다. 무료 플랜은 invocation 당 D1 쿼리가 50 뿐이라(§6) 대량 시장가에선 이 한 개가
       // 한도를 넘기는 마지막 한 개가 될 수 있다(§ spot.ts userTradeStmts).
       const ref = marks[symbol] ?? (await fetchPrice(env, symbol));
-      if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
+      if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad(SLTP_MSG);
       // 크로스: 여유잔고 + 전 포지션 미실현손익까지 증거금으로 walking 체결에 쓸 수 있게 uPnL 을 넘긴다.
       // (가상 코인은 USDT 지갑 — 원화 포지션 손익은 섞지 않는다)
       const uPnL = await unrealizedTotal(env, uid, marks, 'USDT');
+      if (!isFinite(uPnL)) return bad(NO_MARK_MSG);
       const { filled, avgPrice, reason } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
       // 사유를 구분해서 답한다 — 잔고 레이스로 못 넣은 걸 "호가 물량이 없다"로 답하면 원인을 오해한다.
       if (!(filled > 0)) return bad(reason === 'margin' ? '증거금이 부족합니다 (잔고가 방금 바뀌었을 수 있습니다)' : '체결 가능한 호가 물량이 없습니다');
@@ -226,6 +222,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 주문 증거금으로 쓸 수 있고(그때 balance 는 -uPnL 까지 음수 허용), 손실 중이면 가용이 줄어든다.
     // 잔고 차감 가드는 balance - margin >= -uPnL (⟺ available >= margin) 로 원자적으로 막는다.
     const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(symbol));
+    if (!isFinite(uPnL)) return bad(NO_MARK_MSG); // 시세 모르는 포지션의 손실을 0 으로 치고 새 위험을 받지 않는다
     const available = (user.bal ?? 0) + uPnL;
     // 수수료 = 명목금액(체결가×수량) × VIP 등급 수수료율. 진입 시엔 증거금과 **함께** 차감해야
     // 원자 가드가 성립한다(따로 빼면 증거금은 통과하고 수수료만 실패하는 틈이 생긴다).
@@ -236,72 +233,33 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 같은 심볼·같은 방향으로 이미 보유 중인 포지션이 있으면 새 행을 또 만들지 않고 그 포지션에
     // 물타기/불타기 방식으로 합친다(평단가 재계산) — 거래소들의 "원웨이 모드"와 동일한 동작.
     // 레버리지는 최초 진입 때 값으로 고정(포지션 하나에 레버리지가 섞이면 증거금 계산이 불가능해짐).
+    // ⚠ 여기서 읽는 건 레버리지뿐이다 — 합치기 자체는 SQL 이 상대값으로 한다(§ _shared positionAddStmts).
     const existing = await env.DB.prepare(
-      'SELECT * FROM positions WHERE user_id = ? AND symbol = ? AND side = ?',
+      'SELECT leverage FROM positions WHERE user_id = ? AND symbol = ? AND side = ? ORDER BY opened_at LIMIT 1',
     )
       .bind(uid, symbol, side)
-      .first<PositionRow>();
+      .first<{ leverage: number }>();
+    const effLev = existing ? existing.leverage : leverage;
+    // ⚠ SL/TP 는 **지금 가격** 기준(롱: 손절 < 현재가 < 익절). 물타기면 새로 준 값만 바뀌고 안 준 쪽은 기존 값이 남는다.
+    if (!validSlTp(side, price, stopLoss, takeProfit)) return bad(SLTP_MSG);
+    const margin = (price * size) / effLev;
+    if (margin + fee > available) return bad(noMarginMsg(available, price, effLev, feeRate));
 
     const now = Date.now();
-    const ordId = crypto.randomUUID();
-
-    if (existing) {
-      const addMargin = (price * size) / existing.leverage;
-      if (addMargin + fee > available) return bad(noMarginMsg(available, price, existing.leverage, feeRate));
-
-      const newSize = existing.size + size;
-      const newEntry = (existing.entry_price * existing.size + price * size) / newSize;
-      const finalSl = stopLoss != null ? stopLoss : existing.stop_loss;
-      const finalTp = takeProfit != null ? takeProfit : existing.take_profit;
-      if ((stopLoss != null || takeProfit != null) && !validSlTp(side, newEntry, finalSl, finalTp)) {
-        return bad('SL/TP 값이 올바르지 않습니다');
-      }
-
-      const res = await env.DB.batch([
-        env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(
-          addMargin + fee,
-          uid,
-          addMargin + fee,
-          -uPnL,
-        ),
-        ...feeAccrualStmts(env, uid, symbol, 'open', notional, feeRate, fee, now),
-        env.DB.prepare(
-          'UPDATE positions SET entry_price = ?, size = ?, margin = ?, stop_loss = ?, take_profit = ? WHERE id = ? AND user_id = ?',
-        ).bind(newEntry, newSize, existing.margin + addMargin, finalSl, finalTp, existing.id, uid),
-        env.DB.prepare(
-          'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-        ).bind(ordId, uid, symbol, side, price, size, existing.leverage, 'open', null, now),
-      ]);
-      if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
-      await reflectVirtualFill(env, symbol, uid, price, side === 'long' ? 'buy' : 'sell', size);
-
-      marks[symbol] = price;
-      return json(await loadState(env, uid, marks, since));
-    }
-
-    const margin = (price * size) / leverage;
-    if (!validSlTp(side, price, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
-    if (margin + fee > available) return bad(noMarginMsg(available, price, leverage, feeRate));
-
-    const posId = crypto.randomUUID();
-    // 잔고 차감은 조건부 UPDATE 로 원자적 가드(balance - margin >= -uPnL ⟺ available >= margin, 크로스)
-    const res = await env.DB.batch([
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(
-        margin + fee,
-        uid,
-        margin + fee,
-        -uPnL,
-      ),
+    // ⚠⚠ 잔고 차감(크로스 가드) + 가드 + 포지션·원장을 **한 batch** 로(2026-10-01). 예전엔 이 가드를 포지션 INSERT 와 같은
+    // batch 에 넣고 끝난 뒤에 `changes` 를 봤는데, D1 batch 는 0행 UPDATE 를 실패로 보지 않아서(§4) **가드가 실패해도
+    // 포지션이 그대로 생겼다** — 잔고만큼의 주문을 동시에 두 번 보내면 하나는 공짜 포지션이었다(감사: 돈이 생기는 구멍).
+    // 가드 문장(§ _shared guardStmt)이 차감 실패 시 batch 전체를 되돌린다.
+    const ok = await guardedBatch(env, [
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(margin + fee, uid, margin + fee, -uPnL),
+      guardStmt(env),
       ...feeAccrualStmts(env, uid, symbol, 'open', notional, feeRate, fee, now),
-      env.DB.prepare(
-        'INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-      ).bind(posId, uid, symbol, side, price, size, leverage, margin, now, stopLoss, takeProfit),
+      ...positionAddStmts(env, { uid, symbol, side, price, size, leverage: effLev, margin, stopLoss, takeProfit, now }),
       env.DB.prepare(
         'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(ordId, uid, symbol, side, price, size, leverage, 'open', null, now),
+      ).bind(crypto.randomUUID(), uid, symbol, side, price, size, effLev, 'open', null, now),
     ]);
-    if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
-    await reflectVirtualFill(env, symbol, uid, price, side === 'long' ? 'buy' : 'sell', size);
+    if (!ok) return bad(noMarginMsg(available, price, effLev, feeRate));
 
     marks[symbol] = price;
     return json(await loadState(env, uid, marks, since));
@@ -326,7 +284,8 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // OX/USDT 시장가 청산 = 봇 호가창을 walking 하며 "있는 물량만" 실제 호가 가격에 청산(매물 없으면 부분).
     // ⚠ 예전엔 호가창 무관하게 ref 한 값에 전량 청산돼 "매물 없어도 전량 청산"되던 버그 → 진입과 대칭으로 교체.
     if (isVirtualSymbol(pos.symbol)) {
-      const { filled, avgPrice } = await marketCloseOxPosition(env, uid, pos, closeSize);
+      const { filled, avgPrice, changed } = await marketCloseOxPosition(env, uid, pos, closeSize);
+      if (changed) return bad(CHANGED_MSG, 409); // 그 사이 다른 청산·체결이 이 포지션을 바꿨다(연타·두 탭·트리거)
       if (!(filled > 0)) return bad('청산할 수 있는 호가 물량이 없습니다');
       if (avgPrice > 0) marks[pos.symbol] = avgPrice;
       return json(await loadState(env, uid, marks, since));
@@ -336,30 +295,30 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const isPartial = closeSize < pos.size - sizeEps(pos.size);
     const price = await fetchPrice(env, pos.symbol); // 서버 청산가
     const dir = pos.side === 'long' ? 1 : -1;
-    const pnl = (price - pos.entry_price) * closeSize * dir;
-    const marginReleased = isPartial ? (pos.margin * closeSize) / pos.size : pos.margin;
+    const cut = { size: isPartial ? closeSize : pos.size, margin: isPartial ? (pos.margin * closeSize) / pos.size : pos.margin, full: !isPartial };
+    const pnl = (price - pos.entry_price) * cut.size * dir;
     const now = Date.now();
-    const ordId = crypto.randomUUID();
     // 청산 수수료는 환급액에서 뺀다(증거금 + 손익 − 수수료).
     const closeRate = await feeRateOf(env, uid);
-    const closeNotional = price * closeSize;
+    const closeNotional = price * cut.size;
     const closeFee = closeNotional * closeRate;
 
     const col = balColOf(pos.symbol);
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(marginReleased + pnl - closeFee, uid),
-      ...feeAccrualStmts(env, uid, pos.symbol, 'close', closeNotional, closeRate, closeFee, now),
-      isPartial
-        ? env.DB
-            .prepare('UPDATE positions SET size = ?, margin = ? WHERE id = ? AND user_id = ?')
-            .bind(pos.size - closeSize, pos.margin - marginReleased, positionId, uid)
-        : env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ?').bind(positionId, uid),
-      env.DB.prepare(
-        'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(ordId, uid, pos.symbol, pos.side, price, closeSize, pos.leverage, 'close', pnl, now),
-    ]);
-    // 청산은 원래 방향의 반대 액션(롱 청산=매도, 숏 청산=매수)으로 시장에 반영.
-    await reflectVirtualFill(env, pos.symbol, uid, price, pos.side === 'long' ? 'sell' : 'buy', closeSize);
+    // ⚠⚠ 포지션 선점(읽은 수량·증거금 그대로일 때만 줄이거나 지운다) + 가드 + 환급을 한 batch 로(2026-10-01).
+    // 예전엔 환급과 삭제를 한 batch 에 넣고 삭제가 실제로 지웠는지 보지 않아서, 같은 포지션을 동시에 N번 청산하면
+    // N번 환급됐다(감사). 위 fetchPrice 가 외부 요청이라 그 사이 창이 길었다.
+    const ok = await claimThenSettle(
+      env,
+      [positionClaimStmt(env, uid, pos, cut)],
+      [
+        env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(cut.margin + pnl - closeFee, uid),
+        ...feeAccrualStmts(env, uid, pos.symbol, 'close', closeNotional, closeRate, closeFee, now),
+        env.DB.prepare(
+          'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, price, cut.size, pos.leverage, 'close', pnl, now),
+      ],
+    );
+    if (!ok) return bad(CHANGED_MSG, 409);
 
     marks[pos.symbol] = price;
     return json(await loadState(env, uid, marks, since));
@@ -393,6 +352,8 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .first<{ reserved: number }>();
     const closable = pos.size - (reservedRow?.reserved ?? 0);
     if (size > closable + sizeEps(pos.size)) return bad('청산 가능 수량을 초과합니다 (이미 예약된 지정가 청산 포함)');
+    const openCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM pending_orders WHERE user_id = ?').bind(uid).first<{ n: number }>();
+    if ((openCount?.n ?? 0) >= MAX_OPEN_ORDERS) return bad(`대기 주문은 ${MAX_OPEN_ORDERS}개까지입니다`);
 
     const now = Date.now();
     const pendingId = crypto.randomUUID();
@@ -426,7 +387,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
-    if (!validSlTp(side, limitPrice, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
+    if (!validSlTp(side, limitPrice, stopLoss, takeProfit)) return bad(SLTP_MSG);
 
     const margin = (limitPrice * size) / leverage;
     const col = balColOf(symbol);
@@ -436,23 +397,25 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!user) return bad('unauthorized', 401);
     // 크로스: 가용 = 여유잔고 + 그 지갑 포지션 미실현손익. 지정가도 이 가용 안에서 증거금을 잠근다.
     const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(symbol));
+    if (!isFinite(uPnL)) return bad(NO_MARK_MSG);
     const available = (user.bal ?? 0) + uPnL;
     if (margin > available) return bad(noMarginMsg(available, limitPrice, leverage, 0));
+    // 대기 주문 개수 상한 — 한 유저가 수백 개를 걸면 매 평가가 그만큼 일을 한다(요청당 D1 쿼리 50, §6).
+    const openCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM pending_orders WHERE user_id = ?').bind(uid).first<{ n: number }>();
+    if ((openCount?.n ?? 0) >= MAX_OPEN_ORDERS) return bad(`대기 주문은 ${MAX_OPEN_ORDERS}개까지입니다`);
 
     const now = Date.now();
     const pendingId = crypto.randomUUID();
-    const res = await env.DB.batch([
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(
-        margin,
-        uid,
-        margin,
-        -uPnL,
-      ),
+    // ⚠⚠ 증거금 잠금(차감) + 가드 + 주문을 **한 batch** 로(2026-10-01). 예전엔 둘을 한 batch 에 넣고 가드 결과를 안 봐서
+    // 0행이어도 주문이 생겼다 — 동시에 여러 번 보내면 증거금 없는 주문이 생기고, **취소하면 안 낸 증거금이 환불**됐다.
+    const ok = await guardedBatch(env, [
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(margin, uid, margin, -uPnL),
+      guardStmt(env),
       env.DB.prepare(
         'INSERT INTO pending_orders (id, user_id, symbol, side, size, leverage, limit_price, margin, stop_loss, take_profit, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
       ).bind(pendingId, uid, symbol, side, size, leverage, limitPrice, margin, stopLoss, takeProfit, now),
     ]);
-    if (res[0].meta.changes !== 1) return bad('증거금이 부족합니다');
+    if (!ok) return bad(noMarginMsg(available, limitPrice, leverage, 0));
 
     // OX/USDT: 제출 즉시 봇 호가창에 walking 매칭한다 — 크로스되는 실제 물량만 실제 호가 가격에
     // 체결하고, 못 채운 잔량은 pending 에 그대로 남아 대기(다음 유동성/틱에서 이어서 체결). 실제
@@ -473,10 +436,16 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!pending) return bad('주문을 찾을 수 없음', 404);
 
     const col = balColOf(pending.symbol);
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(pending.margin, uid),
+    // ⚠⚠ 환불액은 **지워지는 그 순간의 행**에서 읽는다(한 batch = 한 트랜잭션, 2026-10-01). 예전엔 미리 읽어 둔 margin 을
+    // 무조건 더하고 삭제 결과를 안 봐서, 동시에 두 번 취소하면 두 번 환불됐고 부분 체결과 겹치면 이미 포지션으로 옮겨간
+    // 증거금까지 돌려줬다. 행이 이미 없으면 0 을 더하고(무해) 삭제도 0행이다.
+    const res = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE users SET ${col} = ${col} + COALESCE((SELECT margin FROM pending_orders WHERE id = ? AND user_id = ?), 0) WHERE id = ?`,
+      ).bind(pendingId, uid, uid),
       env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ?').bind(pendingId, uid),
     ]);
+    if (res[1].meta.changes !== 1) return bad('주문이 방금 체결되거나 취소됐습니다', 409);
 
     return json(await loadState(env, uid, marks, since));
   }
@@ -515,9 +484,13 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
         const closable = tgt.size - (othersRow?.reserved ?? 0);
         if (newSize > closable + sizeEps(tgt.size)) return bad('청산 가능 수량을 초과합니다 (이미 예약된 지정가 청산 포함)');
       }
-      await env.DB.prepare('UPDATE pending_orders SET limit_price = ?, size = ? WHERE id = ? AND user_id = ?')
-        .bind(newLimit, newSize, pendingId, uid)
+      // ⚠ 읽은 값이 그대로일 때만 바꾼다(compare-and-swap) — 그 사이 일부 체결됐으면 체결된 수량을 되살리지 않게.
+      const upd = await env.DB.prepare(
+        'UPDATE pending_orders SET limit_price = ?, size = ? WHERE id = ? AND user_id = ? AND size = ? AND limit_price = ?',
+      )
+        .bind(newLimit, newSize, pendingId, uid, pending.size, pending.limit_price)
         .run();
+      if (upd.meta.changes !== 1) return bad(CHANGED_MSG, 409);
       if (isVirtualSymbol(pending.symbol)) await matchReduceOnlyOxPending(env, pendingId);
       return json(await loadState(env, uid, marks, since));
     }
@@ -526,17 +499,40 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 가용(여유잔고+미실현손익)이 충분해야 한다. ⚠ 잔고 차감을 "먼저" 원자 가드로 확정하고, 성공했을
     // 때만 pending 을 수정한다 — batch 로 묶으면 잔고 가드가 0행 매칭(증거금 부족)이어도 pending UPDATE 는
     // 그대로 커밋돼 "증거금 없이 주문만 커지는" 상태가 된다(D1 batch 는 조건부 UPDATE 0행을 실패로 보지 않음).
+    // ⚠⚠ 그리고 주문 수정 자체도 **읽은 값이 그대로일 때만**(compare-and-swap, 2026-10-01). 예전엔 무조건 덮어써서
+    // (a)같은 수정을 동시에 두 번 보내면 델타 환불이 두 번 됐고 (b)부분 체결된 주문이 원래 수량으로 되살아나 같은 증거금으로
+    // 두 번 체결됐다(감사). 바뀌었으면 차감한 델타를 되돌리고 409 — 유저가 최신 주문을 보고 다시 고치면 된다.
+    // 주문 수정(CAS) + 가드 → 잔고 조정(추가 잠금이면 크로스 가드 + 가드, 환불이면 그냥 더하기)을 **한 batch** 로 — 둘 중
+    // 하나라도 걸리면 통째로 되돌려진다(§ _shared 가드 문장). 어느 쪽이었는지는 실패했을 때만 주문을 다시 읽어 가린다.
     const newMargin = (newLimit * newSize) / pending.leverage;
-    const delta = newMargin - pending.margin; // >0: 추가 잠금 / <0: 환불(가드 항상 통과)
-    const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(pending.symbol));
+    const delta = newMargin - pending.margin; // >0: 추가 잠금 / <0: 환불
     const col = balColOf(pending.symbol);
-    const charge = await env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`)
-      .bind(delta, uid, delta, -uPnL)
-      .run();
-    if (charge.meta.changes !== 1) return bad('증거금이 부족합니다');
-    await env.DB.prepare('UPDATE pending_orders SET limit_price = ?, size = ?, margin = ? WHERE id = ? AND user_id = ?')
-      .bind(newLimit, newSize, newMargin, pendingId, uid)
-      .run();
+    let uPnL = 0;
+    if (delta > 0) {
+      uPnL = await unrealizedTotal(env, uid, marks, quoteOf(pending.symbol));
+      if (!isFinite(uPnL)) return bad(NO_MARK_MSG);
+    }
+    const stmts = [
+      env.DB.prepare(
+        'UPDATE pending_orders SET limit_price = ?, size = ?, margin = ? WHERE id = ? AND user_id = ? AND size = ? AND margin = ? AND limit_price = ?',
+      ).bind(newLimit, newSize, newMargin, pendingId, uid, pending.size, pending.margin, pending.limit_price),
+      guardStmt(env),
+    ];
+    if (delta > 0) {
+      stmts.push(
+        env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(delta, uid, delta, -uPnL),
+        guardStmt(env),
+      );
+    } else if (delta < 0) {
+      stmts.push(env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(-delta, uid));
+    }
+    if (!(await guardedBatch(env, stmts))) {
+      const cur = await env.DB.prepare('SELECT size, margin, limit_price FROM pending_orders WHERE id = ? AND user_id = ?')
+        .bind(pendingId, uid)
+        .first<{ size: number; margin: number; limit_price: number }>();
+      const same = cur && cur.size === pending.size && cur.margin === pending.margin && cur.limit_price === pending.limit_price;
+      return same ? bad('증거금이 부족합니다') : bad(CHANGED_MSG, 409);
+    }
     if (isVirtualSymbol(pending.symbol)) await matchLimitPendingAgainstBook(env, pendingId);
 
     return json(await loadState(env, uid, marks, since));
@@ -563,6 +559,9 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const repeating = body.repeating === true || body.repeating === 1;
     const rep = parseRepeatOpts(body, triggerPrice, triggerDir, isVirtualSymbol(symbol));
     if (typeof rep === 'string') return bad(rep);
+    // 증거금을 안 잠그는 주문이라 개수 상한이 유일한 브레이크다(§ MAX_OPEN_ORDERS).
+    const condCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM conditional_orders WHERE user_id = ?').bind(uid).first<{ n: number }>();
+    if ((condCount?.n ?? 0) >= MAX_OPEN_ORDERS) return bad(`조건부 주문은 ${MAX_OPEN_ORDERS}개까지입니다`);
 
     const now = Date.now();
     await env.DB.prepare(
@@ -590,7 +589,8 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       .run();
 
     // 방금 넣은 조건부까지 포함해 평가(이미 트리거된 스탑이면 즉시 체결). marks 를 loadState 로 전달.
-    const marks = await checkTriggers(env, uid);
+    // 이 액션은 따로 무거운 일을 안 하므로 폴링과 같은 체결 몫을 준다(가상 코인 스탑도 그 자리에서 체결되게).
+    const marks = await checkTriggers(env, uid, undefined, { q: POLL_FILL_Q });
     return json(await loadState(env, uid, marks, since));
   }
 
@@ -648,7 +648,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (upd.meta.changes !== 1) return bad('주문을 찾을 수 없음', 404); // 그 사이 체결/취소됨
 
     // 수정 직후 재평가 — 새 조건을 이미 만족하면 그 자리에서 체결(conditionalOpen 과 동일).
-    const marks = await checkTriggers(env, uid);
+    const marks = await checkTriggers(env, uid, undefined, { q: POLL_FILL_Q });
     return json(await loadState(env, uid, marks, since));
   }
 
@@ -674,7 +674,12 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
-    if (!validSlTp(pos.side, pos.entry_price, stopLoss, takeProfit)) return bad('SL/TP 값이 올바르지 않습니다');
+    // ⚠⚠ **진입가가 아니라 지금 가격** 기준으로 검증한다(2026-10-01). 예전엔 진입가와만 비교해서, 손실 중인 롱(진입 100·
+    // 현재 90)에 손절 99.9 를 걸 수 있었다 — 다음 평가에서 즉시 발동해 **99.9 에 청산**됐다(손실 −10 이 −0.1 로, 화면
+    // 조작만으로 손실을 지우는 구멍). 거래소처럼 롱 손절은 현재가 아래·익절은 위여야 한다(숏은 반대). 현재가 위의 손절
+    // (수익을 잠그는 트레일링)은 이제 허용된다.
+    const mark = marks[pos.symbol] ?? (await fetchPrice(env, pos.symbol));
+    if (!validSlTp(pos.side, mark, stopLoss, takeProfit)) return bad(SLTP_MSG);
 
     await env.DB.prepare('UPDATE positions SET stop_loss = ?, take_profit = ? WHERE id = ? AND user_id = ?')
       .bind(stopLoss, takeProfit, positionId, uid)

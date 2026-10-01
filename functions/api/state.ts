@@ -1,5 +1,5 @@
 import { type Ctx, bad, json, safe, missingEnv, getSession, loadState } from '../_shared';
-import { scanTriggers } from '../_trading';
+import { scanTriggers, HEAVY_TICK_FILL_Q } from '../_trading';
 import { loadSpotMarket, loadSpotCandles, runMarketMaker, VIRTUAL_PAIRS, type TickCtx } from './spot';
 
 /** GET /api/state — 로그인 사용자의 잔고+포지션+주문
@@ -51,8 +51,12 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
         loadSpotCandles(env, pair, interval, bars, undefined, tickCtx?.live),
         // 계정 상태를 실을 때만 트리거 평가도 함께 돈다 = 이 요청이 체결 클럭이 된다.
         // 안 실을 땐 계정 데이터를 한 행도 읽지 않는다.
+        // ⚠ 체결 몫(§ _trading FillBudget): 이 요청은 봇 커밋·호가창·캔들까지 하므로 폴링 몫보다 작게, 방금 sweep 이 체결을
+        // 냈으면(사다리가 낡아 book 이 null, mark 는 있음) 이번엔 체결하지 않는다 — 둘을 합치면 요청당 쿼리 50 을 넘는다.
         wantState
-          ? scanTriggers(env, sess.uid, tickCtx?.ref != null ? { [pair]: tickCtx.ref } : undefined).then((scan) =>
+          ? scanTriggers(env, sess.uid, tickCtx?.ref != null ? { [pair]: tickCtx.ref } : undefined, {
+              q: tickCtx && tickCtx.book === null && tickCtx.mark != null ? 0 : HEAVY_TICK_FILL_Q,
+            }).then((scan) =>
               loadState(env, sess.uid, scan.prices, since, scan.fresh),
             )
           : Promise.resolve(null),

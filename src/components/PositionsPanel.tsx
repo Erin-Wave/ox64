@@ -5,6 +5,7 @@ import { useTradingStore } from '@/store/useTradingStore';
 import { fmtPrice, fmtPriceShort, fmtQty, fmtQtyShort, fmtMoney, fmtMoneyShort, fmtPct, fmtNumInput, unfmtNum, fmtKrw } from '@/format';
 import { baseOf, pairLabel, quoteOf } from '@/symbols';
 import type { ApiOrder } from '@/services/api';
+import { lockedMargin, positionMargin } from '@/hooks/useEquity';
 
 type Tab = 'positions' | 'pending' | 'conditional' | 'history';
 
@@ -231,7 +232,8 @@ export default function PositionsPanel() {
     const mine = unrealizedOf(p);
     if (mine == null) return null;
     const others = walletPos.reduce((a, x) => a + (unrealizedOf(x) ?? 0), 0) - mine;
-    const walletMargin = walletPos.reduce((a, x) => a + (x.entryPrice * x.size) / x.leverage, 0);
+    // 잠긴 증거금은 서버 값 그대로 + 그 지갑 대기 지정가에 잠긴 증거금(둘 다 순자산 — 서버 강제청산과 같은 식)
+    const walletMargin = walletPos.reduce((a, x) => a + positionMargin(x), 0) + lockedMargin(pendingOrders, q);
     const dir = p.side === 'long' ? 1 : -1;
     return p.entryPrice - ((q === 'KRW' ? krwBalance : balance) + walletMargin + others) / (p.size * dir);
   };

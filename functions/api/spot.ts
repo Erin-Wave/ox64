@@ -21,6 +21,11 @@ import {
   virtualTick,
   VIRTUAL_PRICE_MIN,
   VIRTUAL_PRICE_MAX,
+  positionAddStmts,
+  positionClaimStmt,
+  pendingClaimStmt,
+  guardStmt,
+  guardedBatch,
 } from '../_shared';
 import { autoWritesBlocked, meterStmt, meterReadStmt, primeMeter } from '../_budget';
 
@@ -229,22 +234,28 @@ function accrueLive(live: LiveBars, bar: { open: number; high: number; low: numb
 
 /** 닫힌 버킷을 영속 캔들 테이블로 넘기는 문장(버킷 시각을 그 버킷 것으로 그대로 쓴다).
  *
- * ⚠ `guardLastRun` 을 주면 "그 값이 아직 `spot_bot_state.last_run` 일 때만" 반영된다(§ runBotTicks 커밋).
+ * ⚠ `guard` 를 주면 "상태 행이 아직 우리가 읽은 그대로(last_run·ref_price·book_version)일 때만" 반영된다(§ runBotTicks 커밋).
  * 봇 커밋은 `last_run` 가드 하나로 선점과 커밋을 겸하는데, **D1 batch 는 조건부 UPDATE 가 0행이어도
  * 나머지 문장을 그대로 커밋한다**(§4 editLimit 교훈) — 가드를 커밋에만 달면 경합에서 진 쪽의 캔들이
  * 이겼을 쪽 위에 한 번 더 더해져 그 봉의 거래량이 부풀고, 1h/1d 버킷은 그 오차가 영구히 남는다.
  * volume 이 누적(합)이라 멱등이 아니기 때문이다. 그래서 같은 가드를 이 문장에도 건다.
  * ⚠ `INSERT ... SELECT ... ON CONFLICT` 는 파서가 ON 을 조인으로 볼 수 있어 **WHERE 절이 반드시**
  * 있어야 한다(SQLite 문서의 우회법) — 여기선 그 WHERE 가 곧 가드다. */
-function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar, guardLastRun?: number): D1PreparedStatement {
+/** 봇 커밋의 가드 값 — 읽은 상태 행이 그대로일 때만 커밋·캔들 flush 가 반영된다(§ runBotTicks). */
+interface BotCommitGuard {
+  lastRun: number;
+  ref: number;
+  version: number;
+}
+function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar, guard?: BotCommitGuard): D1PreparedStatement {
   const ot = b.ot ?? b.b;
   const ct = b.ct ?? b.b;
-  if (guardLastRun === undefined) return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct);
-  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, pair, guardLastRun);
+  if (guard === undefined) return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct);
+  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, pair, guard.lastRun, guard.ref, guard.version);
 }
 
 const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume, open_at, close_at)
-       SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ?)
+       SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ? AND ref_price = ? AND book_version = ?)
        ON CONFLICT(pair, interval, bucket) DO UPDATE SET
          open = CASE WHEN excluded.open_at < spot_candles.open_at THEN excluded.open ELSE spot_candles.open END,
          open_at = MIN(spot_candles.open_at, excluded.open_at),
@@ -2380,7 +2391,7 @@ export function simulateTick(
 // 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
 // 읽히고, 값이 비었거나(anchor=0=미초기화) 알 수 없는 regime 이면 안전한 기본값으로 떨어진다.
 const BOT_STATE_COLS =
-  'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, book_json, tape_json, live_json, pend_notional, pend_rows, pend_ticks, interest, hype, fair';
+  'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, book_json, book_version, tape_json, live_json, pend_notional, pend_rows, pend_ticks, interest, hype, fair';
 const REGIMES: readonly Regime[] = ['calm', 'rally', 'euphoria', 'pullback', 'panic', 'capitulation'];
 
 interface BotStateRow {
@@ -2395,6 +2406,7 @@ interface BotStateRow {
   peak: number;   // 최근 고점 기억(0=미초기화 → 현재가로 시작)
   trough: number; // 최근 저점 기억(0=미초기화)
   book_json: string | null; // 봇 호가 사다리(§ BotBook) — 게이트에 막힌 폴링도 이 값으로 호가창을 그린다
+  book_version: number;     // 사다리 낙관적 동시성 — 커밋 가드에도 쓴다(§ runBotTicks 커밋 = 선점)
   tape_json: string | null; // 봇 합성 체결 링 버퍼(§ 봇 합성 체결 테이프) — 틱이 이어받아 append 한다
   live_json: string | null; // 진행 중(안 닫힌) 캔들 버킷들(§ live_json) — 닫힐 때만 spot_candles 로 넘어간다
   pend_notional: number;    // 아직 봇 수수료 카운터에 안 넘긴 합성체결 명목금액
@@ -2488,9 +2500,12 @@ async function runBotTicks(
       .bind(pair, 0, ref0)
       .run();
   }
-  // 이 실행이 "선점"한 시점 = 우리가 읽은 last_run. 커밋이 이 값을 가드로 써서, 그 사이 다른 요청이
+  // 이 실행이 "선점"한 시점 = 우리가 읽은 상태 행. 커밋이 이 값을 가드로 써서, 그 사이 다른 요청이
   // 커밋했으면(값이 바뀌었으면) 이번 틱을 조용히 버린다(§ 커밋 = 선점).
-  const guard = row?.last_run ?? 0;
+  // ⚠⚠ last_run 만이 아니라 **기준가·사다리 버전까지** 본다(2026-10-01). 유저 체결은 last_run 을 안 건드리고 ref_price·
+  // anchor·사다리(book_version+1)만 바꾸므로, last_run 가드만으로는 "체결 전에 읽어 계산한 봇 틱"이 그 체결 뒤에 커밋돼
+  // 유저가 옮긴 가격과 먹은 호가를 옛 값으로 되돌렸다 — 방금 산 물량이 호가창에 되살아나고 시장충격이 지워진다(감사).
+  const guard: BotCommitGuard = { lastRun: row?.last_run ?? 0, ref: row ? row.ref_price : ref0, version: row?.book_version ?? 0 };
   // ⚠ 이 한 번의 조회가 **셋을 먹여 살린다**(2026-08-26): 벽 판정 · 아래 sweep · 호출자의 호가창 표시.
   // 예전엔 셋이 각자 `pending_orders WHERE symbol=?` 를 읽어 `?tick=` 요청 하나가 같은 테이블을 세 번
   // 스캔했다. 집계(GROUP BY)를 메모리로 옮겨도 **읽는 행 수는 같다** — SQLite 는 집계하려고 어차피
@@ -2534,7 +2549,7 @@ async function runBotTicks(
   // 소급하면 마감된 봉이 변한다), 시장이 "얼마나 흘렀나"는 이 값이 정한다 — 그래서 보고 있든 아니든 벽시계
   // 기준으로 같은 시장이 된다(예전엔 폴링이 cron 보다 5배 빨리 돌았다).
   // 처음 도는 페어(last_run=0)는 기준 간격으로, 봇이 오래 멈췄다 돌아온 경우는 ELAPSED_MAX_MS 까지만 따라잡는다.
-  const elapsedMs = guard > 0 ? clamp(Date.now() - guard, 0, ELAPSED_MAX_MS) : ticks * TICK_REF_SEC * 1000;
+  const elapsedMs = guard.lastRun > 0 ? clamp(Date.now() - guard.lastRun, 0, ELAPSED_MAX_MS) : ticks * TICK_REF_SEC * 1000;
   const dtSec = elapsedMs / 1000 / ticks;
   for (let i = 0; i < ticks; i++) {
     const ts = Math.max(Date.now(), prevTs + TICK_SPACING_MS);
@@ -2609,7 +2624,7 @@ async function runBotTicks(
   const tapeJson = appendTape(row?.tape_json, fresh);
   stmts.push(
     env.DB.prepare(
-      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, interest=?, hype=?, fair=?, book_version=book_version+1 WHERE id=? AND last_run=?',
+      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, interest=?, hype=?, fair=?, book_version=book_version+1 WHERE id=? AND last_run=? AND ref_price=? AND book_version=?',
     ).bind(
       lastTs,
       roundOx(state.ref), // 바깥(체결가·마크·트리거)은 틱 격자 위의 값만 본다(§ BotState.ref)
@@ -2631,7 +2646,9 @@ async function runBotTicks(
       state.hype,
       state.ref, // 반올림 전 공정가 — 다음 실행이 이어 쓴다(§ toBotState)
       pair,
-      guard,
+      guard.lastRun,
+      guard.ref,
+      guard.version,
     ),
   );
   const res = await env.DB.batch(stmts);
@@ -2645,7 +2662,9 @@ async function runBotTicks(
   // (예전엔 버스트 12틱이면 sweep 도 12번 돌아 쿼리를 그만큼 먹었다).
   // ⚠ 대기 주문이 하나도 없으면 sweep 자체를 건너뛴다 — 위 조회가 이미 "없다"를 알려줬으므로 예전처럼
   // 같은 테이블을 다시 읽어 빈 목록을 확인할 이유가 없다(가장 흔한 경로가 쿼리 0개가 된다).
-  const touched = pendings.length > 0 && (await sweepRestingOxPendings(env, pair, pendings));
+  // ⚠ cron(wantCtx=false)은 여기서 sweep 하지 않는다 — 같은 실행의 sweepTriggers 가 바로 뒤에 전 유저의 대기 주문을
+  // 이 사다리에 대해 평가하므로(§ _trading runTriggers) 두 번 할 이유가 없고, 그 실행의 쿼리 예산(50)을 아낀다.
+  const touched = wantCtx && pendings.length > 0 && (await sweepRestingOxPendings(env, pair, pendings, book));
   // sweep 이 실제로 체결을 냈으면 우리가 든 사다리·대기목록은 이미 낡았다 → 호출자가 다시 읽게 한다.
   // ⚠ sweep 이 체결을 냈으면 사다리·대기목록은 이미 낡았고(호출자가 다시 읽는다) 기준가도 그 체결로
   // 옮겨갔다 → 둘 다 버린다. **진행 중 캔들(live)만은 그대로 유효하다** — 체결은 `spot_candles` 에
@@ -2771,9 +2790,9 @@ export async function runMarketMakerBursts(env: Env, budgetPerPair: number): Pro
       const ticks = burstTicks(row?.last_run ?? 0, budgetPerPair);
       const mine = pendings.filter((p) => p.symbol === pair);
       const { path } = await runBotTicks(env, pair, row, await resolveRef(env, pair, row), ticks, false, mine);
-      // ⚠ 대기 지정가가 있었으면 커밋 직후 sweep(sweepRestingOxPendings)이 체결로 기준가를 옮겼을 수 있다 → 시드로
-      // 쓰지 않고 호출자가 다시 읽게 한다(대기 주문이 없는 가장 흔한 경우만 D1 왕복 하나를 아낀다).
-      out[pair] = { path, ref: path.length && mine.length === 0 ? path[path.length - 1] : null };
+      // 커밋된 마지막 기준가를 시드로 넘긴다 — cron 경로는 커밋 뒤 sweep 을 하지 않으므로(§ runBotTicks wantCtx) 대기 주문이
+      // 있어도 기준가가 그 사이 바뀌지 않는다. 커밋이 경합에서 졌으면 path 가 비어 null(호출자가 다시 읽는다).
+      out[pair] = { path, ref: path.length ? path[path.length - 1] : null };
     } catch (e) {
       console.error(`[ox64] marketMaker(${pair}) failed:`, e instanceof Error ? e.message : e);
     }
@@ -2842,38 +2861,16 @@ export async function recordVirtualFill(
 // 못 채운 잔량은 지정가면 호가창에 남아 대기(다음 유동성에 매칭), 시장가면 버린다.
 // 체결된 물량만큼 상대(봇)의 재고/현금도 정산한다(botFillStmts) — 잔고 가드는 없다(무한 유동성 풀).
 
-// 체결분을 유저 OX 레버리지 포지션에 반영하는 문장(positions 테이블만). 물타기면 병합.
-function oxPositionStmts(
-  env: Env,
-  pair: string,
-  existing: PositionRow | null,
-  uid: string,
-  side: string,
-  price: number,
-  size: number,
-  effLev: number,
-  margin: number,
-  sl: number | null,
-  tp: number | null,
-  now: number,
-): D1PreparedStatement[] {
-  if (existing) {
-    const newSize = existing.size + size;
-    const newEntry = (existing.entry_price * existing.size + price * size) / newSize;
-    const finalSl = sl != null ? sl : existing.stop_loss;
-    const finalTp = tp != null ? tp : existing.take_profit;
-    return [
-      env.DB.prepare(
-        'UPDATE positions SET entry_price=?, size=?, margin=?, stop_loss=?, take_profit=? WHERE id=? AND user_id=?',
-      ).bind(newEntry, newSize, existing.margin + margin, finalSl, finalTp, existing.id, uid),
-    ];
-  }
-  return [
-    env.DB.prepare(
-      'INSERT INTO positions (id,user_id,symbol,side,entry_price,size,leverage,margin,opened_at,stop_loss,take_profit) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), uid, pair, side, price, size, effLev, margin, now, sl, tp),
-  ];
-}
+// ⚠⚠ 체결 쓰기는 전부 **한 batch** 다(2026-10-01). 잔고 차감·주문/포지션 선점은 batch 안의 조건부 문장 + 가드(§ _shared
+// guardStmt)라, 그 사이 다른 요청이 무엇을 바꿨든·쿼리 한도에 걸렸든 "전부 아니면 전무"다. 예전엔 차감·선점을 단독으로 먼저
+// 하고 나머지를 batch 로 보내서, 두 번째가 실패하면 증거금만 빠지거나(진입) 환급이 두 번 되거나(동시 청산) 했다(감사).
+// 포지션 합치기는 읽어 둔 값이 아니라 SQL 상대값으로(§ _shared positionAddStmts) — 동시 물타기가 서로를 덮어쓰지 않는다.
+//
+// ⚠⚠ **유저 체결 뒤 기준가 = 그 체결의 가중평균가**(2026-10-01, 예전엔 마지막 체결가). 큰 주문은 사다리 + 합성 흡수를 지나며
+// 가격을 최대 3% 밀어 올리는데, 기준가를 그 꼭대기에 두면 다음 봇 호가가 꼭대기 근처에 깔려 **자기가 밀어 올린 가격에 바로
+// 되파는** 순환이 이익이 됐다(지정가 청산·SL/TP 로 꼭대기 근처 매수호가를 반복해서 먹는다). 평균가는 그 주문이 실제로 낸
+// 단가라 즉시 되팔아도 본전 − 수수료이고, 꼭대기까지의 나머지는 꼬리(wick)로만 남는다 — 실제 시장의 "일시 충격은 빠지고
+// 영구 충격만 남는다"와 같은 모양. 체결 테이프·캔들 종가는 그대로 마지막 체결가다(실제로 찍힌 가격).
 
 // ── 시장가 잔량 흡수용 합성 유동성(스냅샷 매칭) ─────────────────────────────
 // ⚠ 봇 호가창은 한 틱 스냅샷이라 22단계 × 2천~1만 = 최대 십수만 개뿐이다. 봇은 설계상 "무한 유동성
@@ -2907,20 +2904,46 @@ export type Aggressor = 'user' | 'bot';
 const takerSideOf = (userSide: 'buy' | 'sell', aggressor: Aggressor): 'buy' | 'sell' =>
   aggressor === 'user' ? userSide : userSide === 'buy' ? 'sell' : 'buy';
 
+/** 대기 지정가가 지금 사다리에서 **한 레벨이라도** 체결될 수 있나(메모리 판정, D1 없음). 진입·청산 공통 —
+ * 롱(매수) 주문은 매도호가 ≤ 지정가, 숏(매도) 주문은 매수호가 ≥ 지정가를 먹는다(청산 주문의 side 도 같은 규칙). */
+function crossesBook(book: BotBook, side: string, limitPrice: number): boolean {
+  return makerLevels(book, side === 'long' ? 'sell' : 'buy', limitPrice).some((l) => l.size > EPS);
+}
+
+/** 이 대기 주문들 중 **지금 호가창과 크로스하는 것**의 id(2026-10-01). 사다리는 페어마다 한 번에 읽는다(문장 1개).
+ * 트리거 평가(§ _trading runTriggers)가 안 걸릴 주문까지 매칭 함수(주문·포지션·요율·사다리를 각자 다시 읽는다)를
+ * 부르지 않게 거르는 용도다 — 대기 주문 몇 개로 요청당 쿼리 50 을 넘기던 경로. */
+export async function crossingOxPendings(env: Env, pendings: PendingRow[]): Promise<Set<string>> {
+  const out = new Set<string>();
+  const pairs = [...new Set(pendings.map((p) => p.symbol).filter((s) => isVirtualSymbol(s)))];
+  if (pairs.length === 0) return out;
+  const rows = (
+    await env.DB.prepare(`SELECT id, book_json FROM spot_bot_state WHERE id IN (${pairs.map(() => '?').join(',')})`)
+      .bind(...pairs)
+      .all<{ id: string; book_json: string | null }>()
+  ).results;
+  const books = new Map(rows.map((r) => [r.id, parseBook(r.book_json)]));
+  for (const p of pendings) {
+    const book = books.get(p.symbol);
+    if (book && crossesBook(book, p.side, p.limit_price)) out.add(p.id);
+  }
+  return out;
+}
+
 /**
  * 유저 지정가(pending_orders) 하나를 봇 호가창에 walking 매칭한다(신규 제출·대기 중 공용).
- * 증거금은 생성 시 limit_price 로 잠갔으므로 실제 체결가(더 유리)와의 차액을 환불(매수)하거나
- * 드물게 소량 추가징수(현재가 아래 매도 등, 잔고 부족 시 limit 가로 폴백)한다. 못 채운 잔량은
+ * 증거금은 생성 시 limit_price 로 잠갔으므로 실제 체결가(더 유리)와의 차액을 환불한다. 못 채운 잔량은
  * pending 에 그대로 남아 대기 → 다음 유동성/틱에서 이어서 체결(runMarketMaker·checkTriggers 가 호출).
+ * 반환 = 이번에 체결된 수량(0 = 크로스되는 호가가 없거나, 그 사이 다른 경로가 먼저 처리했다).
  */
-export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, aggressor: Aggressor = 'user'): Promise<void> {
+export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, aggressor: Aggressor = 'user'): Promise<number> {
   const p = await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
   // 페어는 주문 행에서 온다 — 호출부가 심볼을 따로 넘길 필요가 없고, 잘못된 페어로 매칭될 수도 없다.
-  if (!p || !isVirtualSymbol(p.symbol)) return;
+  if (!p || !isVirtualSymbol(p.symbol) || p.reduce_only) return 0;
   const pair = p.symbol;
   if (p.size <= EPS) {
-    await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run();
-    return;
+    await pendingClaimStmt(env, p).run();
+    return 0;
   }
   const isLong = p.side === 'long';
   const makerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'; // 봇이 잡는 쪽(롱이면 봇이 매도)
@@ -2930,11 +2953,11 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
   // ── 1) 필요한 값을 한 번에 확보. ⚠ 예전엔 **청크마다** pending 재조회 + 최우선호가 SELECT + 봇호가
   //        claim + 포지션 SELECT + batch 를 최대 500회 왕복해서, 체결 하나가 D1 쿼리 수백 개를 먹었다
   //        (invocation당 1,000 한도를 혼자 태울 수 있었다). 지금은 시장가 경로와 같은 "스냅샷 → 메모리
-  //        walking → 단일 batch" 패턴이다. ──
+  //        walking → 단일 batch" 패턴이다. 포지션은 레버리지만 본다(합치기는 SQL 이 한다). ──
   const [existing, limitFeeRate, bookRow] = await Promise.all([
-    env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
+    env.DB.prepare('SELECT leverage FROM positions WHERE user_id=? AND symbol=? AND side=? ORDER BY opened_at LIMIT 1')
       .bind(p.user_id, pair, p.side)
-      .first<PositionRow>(),
+      .first<{ leverage: number }>(),
     feeRateOf(env, p.user_id), // 이 주문 전체에 한 번만 확정(청크마다 읽으면 도중에 등급이 바뀐다)
     env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id=?`).bind(pair).first<BookRow>(),
   ]);
@@ -2949,7 +2972,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
   let low = Infinity;
   let lastPx = 0;
   let remaining = p.size;
-  let walked: { price: number; size: number }[] = []; // 체결 테이프에 찍을 실제 체결들(가격대별)
+  const walked: { price: number; size: number }[] = []; // 체결 테이프에 찍을 실제 체결들(가격대별)
   for (const level of makerLevels(book, makerSide, p.limit_price)) {
     if (remaining <= EPS) break;
     const take = Math.min(remaining, level.size);
@@ -2964,59 +2987,54 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
     low = Math.min(low, level.price);
     lastPx = level.price;
   }
-  if (filled <= EPS) return; // 크로스되는 봇 호가 없음 → 잔량은 그대로 대기
+  if (filled <= EPS) return 0; // 크로스되는 봇 호가 없음 → 잔량은 그대로 대기
 
-  // ── 3) 이 pending 을 **원자적으로 선점**(claim-first). 예전엔 청크마다 봇 호가를 claim 해서 이중체결이
-  //        간접적으로 막혔는데, 한 방에 체결하는 지금은 pending 쪽을 직접 잠가야 한다 — 안 그러면 유저
-  //        폴링과 cron sweep 이 같은 주문을 동시에 집어 두 번 체결한다. 실패하면 다른 경로가 이미
-  //        처리한 것이므로 조용히 빠진다(사다리는 아직 안 썼으므로 부작용 없음). ──
+  // ── 3) 증거금 정산 — 잠근 금액(지정가 기준)과 실제 체결가 기준 증거금의 차액을 돌려준다.
+  //        ⚠ 포지션 증거금은 실제 체결가 기준이되 **잠가 둔 금액을 넘지 않는다**. 숏을 지정가보다 비싸게 팔았거나(명목금액이
+  //        커짐) 물타기 대상의 레버리지가 더 낮으면 체결가 기준 증거금이 잠근 금액보다 커지는데, 예전엔 그 차이를 추가로
+  //        걷으려다 못 걷으면 전량을 지정가로 바꿔 정산했다(실제로 먹은 호가와 장부 가격이 달라졌다). 담보는 잠근 그대로 두고
+  //        가격은 실제 체결가로 — 그 몫만큼 실효 레버리지가 살짝 높아질 뿐이다(크로스 강제청산은 평가자산으로 판정한다). ──
   const locked = (p.limit_price * filled) / p.leverage; // 이 체결분에 대해 주문 시점에 잠가둔 증거금
+  const fillAvg = cost / filled;
+  const posMargin = Math.min(cost / effLev, locked);
+  const feeTotal = cost * limitFeeRate;
+  const refund = locked - posMargin; // ≥ 0
+
+  // ── 4) 선점 + 나머지를 **한 batch** 로. 주문을 읽은 그대로일 때만(수량·증거금·지정가 CAS) 줄이거나 지우고, 가드가 그걸
+  //        확인한다 — 유저 폴링과 cron sweep 이 같은 주문을 동시에 집었거나 그 사이 수정·취소됐으면 batch 전체가 되돌려진다. ──
+  const now = Date.now();
   const newPendingSize = p.size - filled;
   const claim =
     newPendingSize <= sizeEps(p.size) // 잔량 판정도 수량 비례(대량 주문의 먼지 잔량이 영원히 남지 않게)
-      ? await env.DB.prepare('DELETE FROM pending_orders WHERE id=? AND size=?').bind(pendingId, p.size).run()
+      ? pendingClaimStmt(env, p)
       : // ⚠ 부분 체결이면 시각도 같이 찍는다 — 재체결 간격 하한 판정용(§ PARTIAL_FILL_COOLDOWN_MS).
         // 어차피 쓰는 UPDATE 에 컬럼 하나가 붙을 뿐이라 쓰기 비용은 그대로 1행이다.
-        await env.DB.prepare('UPDATE pending_orders SET size=?, margin=?, last_fill_at=? WHERE id=? AND size=?')
-          .bind(newPendingSize, Math.max(0, p.margin - locked), Date.now(), pendingId, p.size)
-          .run();
-  if (claim.meta.changes !== 1) return; // 그 사이 다른 경로가 체결/취소함
-
-  // ── 4) 증거금 정산 — 잠근 금액(지정가 기준)과 실제 체결가 기준 증거금의 차액. 청크마다 하던 계산을
-  //        합계로 옮겼을 뿐 선형이라 결과는 같다. ──
-  let fillAvg = cost / filled;
-  let posMargin = cost / effLev;
-  let feeTotal = cost * limitFeeRate;
-  let refund = locked - posMargin; // 매수는 ≥0(체결가≤지정가) 환불 / 드물게 <0 이면 추가 증거금 필요
-  if (refund < -EPS) {
-    const extra = -refund;
-    const charged = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance>=?')
-      .bind(extra, p.user_id, extra)
-      .run();
-    if (charged.meta.changes !== 1) {
-      // 추가 증거금 감당 불가 → 지정가로 체결(정확히 잠근 만큼이라 항상 감당 가능)
-      fillAvg = p.limit_price;
-      cost = p.limit_price * filled;
-      posMargin = locked;
-      feeTotal = cost * limitFeeRate;
-      walked = [{ price: p.limit_price, size: filled }]; // 전량 지정가로 정산됐으니 테이프도 그 가격 한 줄
-    }
-    refund = 0;
-  }
-
-  // ── 5) 나머지를 단일 batch 로. ──
-  const now = Date.now();
-  const closePx = roundOx(lastPx);
+        env.DB.prepare(
+          'UPDATE pending_orders SET size=?, margin=?, last_fill_at=? WHERE id=? AND user_id=? AND size=? AND margin=? AND limit_price=?',
+        ).bind(newPendingSize, Math.max(0, p.margin - locked), now, p.id, p.user_id, p.size, p.margin, p.limit_price);
   const prints = splitPrints(walked);
   const stmts: D1PreparedStatement[] = [
+    claim,
+    guardStmt(env),
     bookWriteStmt(env, pair, book, bookRow?.book_version ?? 0),
-    ...oxPositionStmts(env, pair, existing, p.user_id, p.side, fillAvg, filled, effLev, posMargin, p.stop_loss, p.take_profit, now),
+    ...positionAddStmts(env, {
+      uid: p.user_id,
+      symbol: pair,
+      side: p.side,
+      price: fillAvg,
+      size: filled,
+      leverage: effLev,
+      margin: posMargin,
+      stopLoss: p.stop_loss,
+      takeProfit: p.take_profit,
+      now,
+    }),
     // 체결 테이프는 walking 한 가격대별로 여러 줄(상한 USER_PRINT_MAX), 캔들은 walking 구간의 OHLC.
     ...userTradeStmts(env, pair, prints, isLong ? p.user_id : book.owner, isLong ? book.owner : p.user_id, tapeSide, now),
     env.DB.prepare(
       `INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, ${INTEREST_BUMP_SQL}`,
-    ).bind(pair, now, closePx, interestBumpOf(filled)),
-    ...candleUpsertStmts(env, pair, { open: openPx, high, low, close: closePx, volume: filled }, now),
+    ).bind(pair, now, roundOx(fillAvg), interestBumpOf(filled)),
+    ...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled }, now),
     // 체결 이력(주문내역)엔 이번 호출의 총 체결을 가중평균가로 1건 기록.
     env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
       crypto.randomUUID(),
@@ -3042,12 +3060,14 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
   const limitMakerFills = new Map<string, BotFill>();
   addBotFill(limitMakerFills, book.owner, cost, filled);
   stmts.push(...(await botFillStmts(env, pair, limitMakerFills, makerSide, now)));
-  await env.DB.batch(stmts);
+  return (await guardedBatch(env, stmts)) ? filled : 0;
 }
 
 /**
  * OX 시장가 주문 — 봇 호가창을 가격 제한 없이 walking 하며 있는 만큼만 체결(잔량은 버림).
- * 증거금은 체결분마다 실제 체결가 기준으로 조건부 차감(잔고 부족하면 감당 가능한 만큼만). 체결 총량 반환.
+ * 증거금은 실제 체결가 기준으로 차감(잔고 부족하면 감당 가능한 만큼만). 체결 총량 반환.
+ * `extra(filled)` = 같은 batch 에 함께 실을 문장(조건부 주문의 체결 기록·선점 — § _trading conditionalFillStmts).
+ * 그 안의 가드가 걸리면 체결까지 통째로 되돌려진다.
  */
 export async function matchMarketOxOrder(
   env: Env,
@@ -3059,6 +3079,7 @@ export async function matchMarketOxOrder(
   sl: number | null,
   tp: number | null,
   floorPnL = 0, // 크로스 가용 = 여유잔고 + floorPnL(전 포지션 미실현손익). balance 는 -floorPnL 까지 허용.
+  extra?: (filled: number) => D1PreparedStatement[],
 ): Promise<{ filled: number; avgPrice: number; reason?: 'liquidity' | 'margin' }> {
   const isLong = side === 'long';
   const openMakerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'; // 봇이 잡는 쪽(롱 진입이면 봇이 매도)
@@ -3066,9 +3087,10 @@ export async function matchMarketOxOrder(
 
   // ── 1) 필요한 값을 몇 번의 read 로 한 번에 확보(예전엔 청크마다 read/batch 왕복이라 대량이 느리고
   //        리쿼트와 경합해 정체됐다). 수수료율은 주문 전체에 한 번만 확정(청크마다 등급이 바뀌지 않게). ──
-  const existing0 = await env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
+  // 포지션은 레버리지만 본다(합치기는 SQL 이 상대값으로 한다 — § _shared positionAddStmts).
+  const existing0 = await env.DB.prepare('SELECT leverage FROM positions WHERE user_id=? AND symbol=? AND side=? ORDER BY opened_at LIMIT 1')
     .bind(uid, pair, side)
-    .first<PositionRow>();
+    .first<{ leverage: number }>();
   const effLev = existing0 ? existing0.leverage : leverage; // 물타기 시 기존 레버리지 고정
   // ⚠ 잔고와 요율은 **같은 users 행**이라 한 번에 읽는다 — 예전엔 feeRateOf(total_volume) 와 balance 를
   // 따로 읽어 같은 행을 두 번 조회했다(§6 "같은 걸 한 요청 안에서 두 번 읽지 않는다"). 무료 플랜은
@@ -3121,7 +3143,7 @@ export async function matchMarketOxOrder(
 
   // ── 3) 가용 증거금 안에서 정밀 정산(사다리를 위로 갈수록 가격이 올라 실제 비용이 est 추정보다 크므로
   //        마지막 체결은 감당 가능한 만큼만 잘라낸다). 봇별 정산·소비할 실제 호가·OHLC 를 함께 누적.
-  //  ⚠ budget 은 가용의 딱 100% 가 아니라 아주 살짝 아래로 둔다 — 감당분에 정확히 맞추면 아래 charge 의
+  //  ⚠ budget 은 가용의 딱 100% 가 아니라 아주 살짝 아래로 둔다 — 감당분에 정확히 맞추면 아래 차감의
   //     원자 가드(balance - 총비용 >= -floorPnL)가 부동소수 오차로 실패해 체결이 통째로 0 이 된다. ──
   const avail = bal0 + floorPnL;
   const budget = avail * (1 - 1e-6);
@@ -3161,27 +3183,27 @@ export async function matchMarketOxOrder(
 
   const avgPrice = cost / filled;
   const totalMargin = cost / effLev; // Σ(price*size)/effLev
-  const newRef = roundOx(lastPx);
+  const newRef = roundOx(avgPrice); // ⚠ 기준가 = 가중평균가(§ 위 "유저 체결 뒤 기준가")
   const anchor0 = st?.anchor && st.anchor > 0 ? st.anchor : est;
   const newAnchor = roundOx(anchor0 + (newRef - anchor0) * ANCHOR_TRADE_PULL); // 유저 임팩트가 적정가를 끌어당김
   const now = Date.now();
 
-  // ── 4) 잔고를 **먼저** 원자 가드로 확정(charge-first) — batch 안에 조건부 UPDATE 를 넣으면 0행이어도
-  //        나머지가 커밋돼 "증거금 없이 포지션만" 생긴다(D1 batch 함정). target 을 이미 감당분으로 잘랐으니 통과. ──
-  const charge = await env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?')
-    .bind(totalMargin + feeTotal, uid, totalMargin + feeTotal, -floorPnL)
-    .run();
-  // ⚠ 여기서 0행이면 "호가가 없어서"가 아니라 **읽은 뒤 잔고가 바뀌어서**다(동시 폴링의 트리거 체결·
-  // 강제청산 등). 호출부가 "체결 가능한 호가 물량이 없습니다" 라고만 답하면 원인을 완전히 오해하게 되므로
-  // 사유를 구분해 돌려준다.
-  if (charge.meta.changes !== 1) return { filled: 0, avgPrice: 0, reason: 'margin' }; // 레이스로 가용 부족 → 다음 시도
-
-  // ── 5) 나머지를 단일 batch 로 적용(포지션 병합 + 소비한 실제 호가 + 체결테이프 + 기준가/적정가 + 캔들 + 부기). ──
-  const stmts: D1PreparedStatement[] = [];
-  // 소비한 사다리를 best-effort 로 되쓴다(그 사이 재호가가 있었으면 0행이어도 무방 — 봇은 무한 유동성이라
-  // 환불/재시도 없이 체결은 그대로 성립. 이 best-effort 가 예전 claim-실패-스핀 정체를 없앤 그 원칙이다).
-  stmts.push(bookWriteStmt(env, pair, book, st?.book_version ?? 0));
-  stmts.push(...oxPositionStmts(env, pair, existing0, uid, side, avgPrice, filled, effLev, totalMargin, sl, tp, now));
+  // ── 4) 한 batch 로 적용 — 잔고 차감(크로스 가드) + 가드가 맨 앞이다. 읽은 뒤 잔고가 바뀌어(동시 폴링의 트리거 체결·
+  //        강제청산 등) 가드에 걸리면 통째로 되돌려지고 'margin' 을 돌려준다 — 호출부가 "호가가 없어서"로 오해하지 않게
+  //        사유를 구분한다. target 을 이미 감당분으로 잘랐으니 보통은 통과한다. ──
+  const stmts: D1PreparedStatement[] = [
+    env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?').bind(
+      totalMargin + feeTotal,
+      uid,
+      totalMargin + feeTotal,
+      -floorPnL,
+    ),
+    guardStmt(env),
+    // 소비한 사다리를 best-effort 로 되쓴다(그 사이 재호가가 있었으면 0행이어도 무방 — 봇은 무한 유동성이라
+    // 환불/재시도 없이 체결은 그대로 성립. 이 best-effort 가 예전 claim-실패-스핀 정체를 없앤 그 원칙이다).
+    bookWriteStmt(env, pair, book, st?.book_version ?? 0),
+    ...positionAddStmts(env, { uid, symbol: pair, side, price: avgPrice, size: filled, leverage: effLev, margin: totalMargin, stopLoss: sl, takeProfit: tp, now }),
+  ];
   // 체결 테이프는 **walking 한 가격대별로 여러 줄**(§ userTradeStmts) — 예전엔 1건으로 집계해서 큰
   // 시장가가 "한 줄에 몇 백만 개"로 찍혔다. 봇 상대라 counterparty 는 표시용.
   const prints = splitPrints(settled);
@@ -3191,7 +3213,7 @@ export async function matchMarketOxOrder(
       `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, newRef, newAnchor, interestBumpOf(filled)),
   );
-  stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: newRef, volume: filled }, now));
+  stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled }, now));
   stmts.push(
     env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
       crypto.randomUUID(),
@@ -3208,19 +3230,22 @@ export async function matchMarketOxOrder(
   );
   stmts.push(...feeAccrualStmts(env, uid, pair, 'open', cost, feeRate, feeTotal, now, prints.length));
   stmts.push(...(await botFillStmts(env, pair, makerFills, openMakerSide, now)));
-  await env.DB.batch(stmts);
+  if (extra) stmts.push(...extra(filled));
+  if (!(await guardedBatch(env, stmts))) return { filled: 0, avgPrice: 0, reason: 'margin' };
   return { filled, avgPrice };
 }
 
 /**
- * OX 포지션을 봇 호가창에 walking 매칭해 청산한다(시장가 청산·지정가 청산 공용의 핵심).
+ * OX 포지션을 봇 호가창에 walking 매칭해 청산한다(시장가 청산·지정가 청산·SL/TP 공용의 핵심).
  * ⚠ 예전엔 OX 청산이 호가창을 무시하고 `fetchPrice`(ref) 한 값에 **전량** 정산돼, 매물이 없어도(호가창이
  * 얇아도) 전 물량이 즉시 청산되는 버그가 있었다. 이제 진입(matchMarketOxOrder)과 대칭으로 **있는 물량만**
  * 실제 호가 가격에 청산하고, 매물이 부족하면 그만큼만(부분) 청산하고 나머지는 포지션에 남긴다.
  * - limitPrice=null : 시장가 청산(가격 제한 없이 walking).
  * - limitPrice!=null: 지정가 청산(그 가격보다 불리하게는 체결 안 함 — 롱 청산은 ≥limit 매수호가만 소비).
- * - pendingId!=null : 지정가 청산의 대기 주문(pending_orders) — 체결분만큼 줄이거나(부분) 삭제(완료).
- * PnL·증거금 환급은 실제 체결가(가중평균) 기준으로 청크마다 정산한다. 반환: { filled, avgPrice }.
+ * - pending!=null   : 지정가 청산의 대기 주문(pending_orders) — 체결분만큼 줄이거나(부분) 삭제(완료).
+ * ⚠⚠ 포지션(과 대기 주문)을 **읽은 그대로일 때만** 줄이고 그때만 환급한다(batch 안의 선점 + 가드, 2026-10-01).
+ * 예전엔 환급을 조건 없이 batch 에 넣어서, 같은 포지션을 동시에 청산하면(폴링·cron·연타) 환급이 요청 수만큼 됐다(감사).
+ * PnL·증거금 환급은 실제 체결가(가중평균) 기준. 반환: { filled, avgPrice } — 0 이면 호가가 없거나 그 사이 바뀌었다(`changed`).
  */
 async function closePositionAgainstBook(
   env: Env,
@@ -3228,10 +3253,9 @@ async function closePositionAgainstBook(
   pos: PositionRow,
   closeSize: number,
   limitPrice: number | null,
-  pendingId: string | null,
-  pendingSize: number,
+  pending: PendingRow | null,
   aggressor: Aggressor = 'user',
-): Promise<{ filled: number; avgPrice: number }> {
+): Promise<{ filled: number; avgPrice: number; changed?: boolean }> {
   const pair = pos.symbol; // 페어는 포지션 행에서 온다(호출부가 따로 넘기지 않는다)
   const closeTaker = pos.side === 'long' ? 'short' : 'long'; // 청산 방향(롱 청산=매도=short, 봇 매수호가 소비)
   const userSide: 'buy' | 'sell' = pos.side === 'long' ? 'sell' : 'buy'; // 유저가 실제로 사고파는 방향(롱 청산=매도)
@@ -3309,20 +3333,29 @@ async function closePositionAgainstBook(
   // (비율 계산의 반올림 손실이 잔고에 남지 않게).
   const fullyClosed = filled >= pos.size - sizeEps(pos.size);
   const marginReleased = fullyClosed ? pos.margin : marginPerUnit * filled;
-  const newRef = roundOx(lastPx);
+  const newRef = roundOx(avgPrice); // ⚠ 기준가 = 가중평균가(§ 위 "유저 체결 뒤 기준가")
   const anchor0 = st?.anchor && st.anchor > 0 ? st.anchor : est;
   const newAnchor = roundOx(anchor0 + (newRef - anchor0) * ANCHOR_TRADE_PULL); // 유저 청산 임팩트도 적정가를 끌어당김
   const now = Date.now();
 
-  // ── 3) 단일 batch 로 적용(잔고 환급 + 포지션 축소/삭제 + 소비 호가 + 테이프 + 기준가/적정가 + 캔들 +
-  //        pending 갱신 + 주문기록 + 부기). 환급은 조건부가 아니라 batch 에 넣어도 안전. ──
-  const stmts: D1PreparedStatement[] = [];
+  // ── 3) 선점(포지션, 지정가 청산이면 대기 주문도) + 가드 → 환급 + 소비 호가 + 테이프 + 기준가/적정가 + 캔들 + 주문기록 +
+  //        부기를 **한 batch** 로. 선점이 빗나가면(그 사이 다른 청산·체결이 바꿨으면) 통째로 되돌려진다. ──
+  const stmts: D1PreparedStatement[] = [
+    positionClaimStmt(env, uid, pos, { size: fullyClosed ? pos.size : filled, margin: marginReleased, full: fullyClosed }),
+    guardStmt(env),
+  ];
+  if (pending) {
+    stmts.push(
+      filled >= pending.size - sizeEps(pending.size)
+        ? pendingClaimStmt(env, pending)
+        : // 부분 체결 시각도 함께(재체결 간격 하한 판정용, § PARTIAL_FILL_COOLDOWN_MS) — 같은 1행 UPDATE.
+          env.DB.prepare(
+            'UPDATE pending_orders SET size = size - ?, last_fill_at = ? WHERE id = ? AND user_id = ? AND size = ? AND limit_price = ?',
+          ).bind(filled, now, pending.id, pending.user_id, pending.size, pending.limit_price),
+      guardStmt(env),
+    );
+  }
   stmts.push(env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnlTotal - closeFeeTotal, uid));
-  stmts.push(
-    fullyClosed
-      ? env.DB.prepare('DELETE FROM positions WHERE id=? AND user_id=?').bind(pos.id, uid)
-      : env.DB.prepare('UPDATE positions SET size=?, margin=? WHERE id=? AND user_id=?').bind(pos.size - filled, pos.margin - marginReleased, pos.id, uid),
-  );
   // 소비한 사다리를 best-effort 로 되쓴다(재호가가 끼었으면 0행 — 봇은 무한 유동성이라 체결은 성립).
   stmts.push(bookWriteStmt(env, pair, book, st?.book_version ?? 0));
   // 청산도 walking 한 가격대별로 여러 줄(§ userTradeStmts) — 진입과 같은 규칙.
@@ -3333,15 +3366,7 @@ async function closePositionAgainstBook(
       `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, newRef, newAnchor, interestBumpOf(filled)),
   );
-  stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: newRef, volume: filled }, now));
-  if (pendingId) {
-    stmts.push(
-      filled >= pendingSize - sizeEps(pendingSize)
-        ? env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId)
-        : // 부분 체결 시각도 함께(재체결 간격 하한 판정용, § PARTIAL_FILL_COOLDOWN_MS) — 같은 1행 UPDATE.
-          env.DB.prepare('UPDATE pending_orders SET size=?, last_fill_at=? WHERE id=?').bind(pendingSize - filled, now, pendingId),
-    );
-  }
+  stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled }, now));
   stmts.push(
     env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
       crypto.randomUUID(),
@@ -3358,31 +3383,31 @@ async function closePositionAgainstBook(
   );
   stmts.push(...feeAccrualStmts(env, uid, pair, 'close', cost, closeFeeRate, closeFeeTotal, now, prints.length));
   stmts.push(...(await botFillStmts(env, pair, closeMakerFills, makerSide, now))); // 롱 청산이면 유저가 팔고 봇이 산다(makerSide='buy')
-  await env.DB.batch(stmts);
-
+  if (!(await guardedBatch(env, stmts))) return { filled: 0, avgPrice: 0, changed: true };
   return { filled, avgPrice };
 }
 
-/** OX 시장가 청산 — 봇 호가창을 walking 하며 있는 물량만큼만 청산(매물 없으면 부분). order.ts close 액션이 호출. */
+/** OX 시장가 청산 — 봇 호가창을 walking 하며 있는 물량만큼만 청산(매물 없으면 부분). order.ts close 액션과
+ * SL/TP 발동(§ _trading runTriggers — 스탑-마켓)이 호출한다. */
 export function marketCloseOxPosition(env: Env, uid: string, pos: PositionRow, closeSize: number) {
-  return closePositionAgainstBook(env, uid, pos, closeSize, null, null, 0);
+  return closePositionAgainstBook(env, uid, pos, closeSize, null, null);
 }
 
 /** OX 지정가 청산(reduce-only) 대기 주문 하나를 봇 호가창에 매칭한다(제출 직후·재호가 sweep·checkTriggers 공용).
- * 청산 대상 포지션이 이미 없으면(전량청산·강제청산됨) 고아 pending 을 정리한다. */
-export async function matchReduceOnlyOxPending(env: Env, pendingId: string, aggressor: Aggressor = 'user'): Promise<void> {
+ * 청산 대상 포지션이 이미 없으면(전량청산·강제청산됨) 고아 pending 을 정리한다. 반환 = 체결 수량. */
+export async function matchReduceOnlyOxPending(env: Env, pendingId: string, aggressor: Aggressor = 'user'): Promise<number> {
   const p = await env.DB.prepare('SELECT * FROM pending_orders WHERE id=?').bind(pendingId).first<PendingRow>();
-  if (!p || !isVirtualSymbol(p.symbol) || !p.reduce_only) return;
+  if (!p || !isVirtualSymbol(p.symbol) || !p.reduce_only) return 0;
   const pair = p.symbol;
   const posSide = p.side === 'short' ? 'long' : 'short'; // 청산 대상 포지션 방향(주문 side 의 반대)
   const pos = await env.DB.prepare('SELECT * FROM positions WHERE user_id=? AND symbol=? AND side=?')
     .bind(p.user_id, pair, posSide)
     .first<PositionRow>();
   if (!pos) {
-    await env.DB.prepare('DELETE FROM pending_orders WHERE id=?').bind(pendingId).run(); // 청산할 포지션 없음 → 정리
-    return;
+    await pendingClaimStmt(env, p).run(); // 청산할 포지션 없음 → 정리(읽은 그대로일 때만)
+    return 0;
   }
-  await closePositionAgainstBook(env, p.user_id, pos, Math.min(p.size, pos.size), p.limit_price, pendingId, p.size, aggressor);
+  return (await closePositionAgainstBook(env, p.user_id, pos, Math.min(p.size, pos.size), p.limit_price, p, aggressor)).filled;
 }
 
 /** 대기 중인 전 유저의 OX 지정가(진입·청산)를 봇 호가창에 매칭 — runMarketMaker 가 재호가 직후 호출하므로,
@@ -3399,24 +3424,27 @@ export async function matchReduceOnlyOxPending(env: Env, pendingId: string, aggr
  */
 export const PARTIAL_FILL_COOLDOWN_MS = 5_000;
 
-/** ⚠ 한 요청에서 이 sweep 이 실제로 체결시키는 대기 주문 수 상한(2026-09-08).
+/** ⚠ 한 요청에서 이 sweep 이 실제로 체결시키는 대기 주문 수 상한(2026-09-08, 2026-10-01 에 2 → 1).
  *
- * 체결 하나가 (포지션+주문+원장+체결테이프+캔들+봇정산) 문장 십수 개짜리 batch 라, 크로스된 지정가가
- * 여러 개면 **한 invocation 이 무료 플랜의 D1 쿼리 상한(50)을 그대로 넘긴다** — 넘는 순간 그 뒤 모든
- * 바인딩 호출이 던져지므로 봇 커밋도 응답 생성도 함께 죽어 `/api/state?tick=` 이 통째로 500 이 된다
- * (지금은 대기 주문이 없어 안 터졌을 뿐인 잠복 함정이다). 넘긴 주문은 다음 틱(≈1초 뒤)에 이어서
- * 체결되고, **첫 체결은 항상 우선**이라 "방금 낸 주문이 즉시 체결되는 체감"은 그대로 유지된다. */
-const MAX_SWEEP_FILLS = 2;
+ * 체결 하나가 읽기 4 + (선점·포지션·주문·원장·체결테이프·캔들·봇정산) 문장 ~18개짜리 batch 라, 둘이면 그것만으로
+ * 무료 플랜의 D1 쿼리 상한(50)에 닿는다 — 넘는 순간 그 뒤 모든 바인딩 호출이 던져지므로 봇 커밋도 응답 생성도 함께 죽어
+ * `/api/state?tick=` 이 통째로 500 이 된다. 넘긴 주문은 다음 틱(≈1초 뒤)에 이어서 체결되고, **첫 체결은 항상 우선**이라
+ * "방금 낸 주문이 즉시 체결되는 체감"은 그대로 유지된다. ⚠ 세는 건 **실제 체결**이다(예전엔 시도 횟수를 세서, 안 걸리는
+ * 주문 둘이 앞에 있으면 걸리는 주문이 영영 차례를 못 받았다) — 안 걸리는 주문은 사다리로 미리 걸러 쿼리도 안 쓴다. */
+const MAX_SWEEP_FILLS = 1;
 
-async function sweepRestingOxPendings(env: Env, pair: string, pendings: PendingLite[]): Promise<boolean> {
+async function sweepRestingOxPendings(env: Env, pair: string, pendings: PendingLite[], book: BotBook): Promise<boolean> {
   const now = Date.now();
+  // 지금 사다리에 걸리는 주문만(메모리 판정) — 안 걸리는 주문 때문에 매칭 함수가 주문·포지션·요율·사다리를 다시 읽지 않게.
+  const live = pendings.filter((p) => crossesBook(book, p.side, p.price));
+  if (live.length === 0) return false;
   let touched = false;
   let fills = 0;
   // 이미 부분 체결된 주문이 하나라도 있으면 예산을 확인한다(없으면 조회조차 안 한다 — 흔한 경로가 공짜).
-  const nibbling = pendings.some((p) => p.last_fill_at != null);
+  const nibbling = live.some((p) => p.last_fill_at != null);
   const throttled = nibbling && (await autoWritesBlocked(env, 'nibble'));
   // 첫 체결(아직 한 번도 안 채워진 주문)을 앞세운다 — 상한에 걸려 미뤄지는 건 "이미 조금씩 채워지는 중"인 쪽이어야 한다.
-  for (const p of [...pendings].sort((a, b) => (a.last_fill_at == null ? 0 : 1) - (b.last_fill_at == null ? 0 : 1))) {
+  for (const p of [...live].sort((a, b) => (a.last_fill_at == null ? 0 : 1) - (b.last_fill_at == null ? 0 : 1))) {
     if (fills >= MAX_SWEEP_FILLS) break; // 나머지는 다음 틱에서(§ MAX_SWEEP_FILLS)
     // ⚠ 첫 체결은 절대 늦추지 않는다(last_fill_at == null) — 유저가 방금 낸 주문이 즉시 체결되는 체감은
     // 이 사이트가 여러 번 튜닝해온 핵심이다. 하한은 **재체결**에만 건다.
@@ -3429,11 +3457,11 @@ async function sweepRestingOxPendings(env: Env, pair: string, pendings: PendingL
       // 호가이므로 taker 는 봇이고 유저는 maker 다. 그래서 체결내역 라벨은 유저 방향의 **반대**로 찍힌다
       // (실제 거래소도 그렇다: 내 매수 지정가가 시장가 매도에 채워지면 그 체결은 '매도'로 뜬다).
       touched = true; // 매칭을 시도한 순간부터 사다리·대기목록 스냅샷은 못 믿는다(호출자가 다시 읽는다)
-      fills++;
-      if (p.reduce_only) await matchReduceOnlyOxPending(env, p.id, 'bot');
-      else await matchLimitPendingAgainstBook(env, p.id, 'bot');
-    } catch {
-      /* 한 건 실패해도 나머지는 계속 — 다음 틱에서 재시도 */
+      const got = p.reduce_only ? await matchReduceOnlyOxPending(env, p.id, 'bot') : await matchLimitPendingAgainstBook(env, p.id, 'bot');
+      if (got > EPS) fills++;
+    } catch (e) {
+      // 한 건 실패해도 나머지는 계속 — 다음 틱에서 재시도. batch 는 통째로 롤백되므로 반쯤 반영된 상태는 없다.
+      console.error(`[sweep] ${pair} pending=${p.id}`, e instanceof Error ? e.message : e);
     }
   }
   return touched;

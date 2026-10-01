@@ -36,6 +36,7 @@ import { intervalSec, KST_OFFSET, isVirtualSymbol, quoteOf, pairLabel } from '@/
 import { bithumbKlineStream, bithumbSupports, fetchBithumbKlines } from '@/services/bithumb';
 import { fmtPrice, fmtPriceShort, fmtQtyShort, virtualPrecision } from '@/format';
 import Clock from '@/components/Clock';
+import { lockedMargin, positionMargin } from '@/hooks/useEquity';
 import IntervalPicker from '@/components/IntervalPicker';
 import type { Candle } from '@/types';
 
@@ -901,7 +902,7 @@ export default function Chart() {
       if (walletPos.every((p) => unrealizedOf(p) != null)) {
         const totalU = walletPos.reduce((a, p) => a + (unrealizedOf(p) ?? 0), 0);
         // 평가자산 = 여유잔고 + Σ(잠긴 증거금 + 미실현손익). PositionsPanel/서버와 동일한 산식(증거금 항 포함).
-        const totalMargin = walletPos.reduce((a, p) => a + (p.entryPrice * p.size) / p.leverage, 0);
+        const totalMargin = walletPos.reduce((a, p) => a + positionMargin(p), 0) + lockedMargin(pendingOrders, q);
         for (const p of mine) {
           const others = totalU - (unrealizedOf(p) ?? 0);
           const d = p.side === 'long' ? 1 : -1;

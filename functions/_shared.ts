@@ -163,10 +163,21 @@ const KST_OFFSET_MS = 9 * 3600 * 1000;
 export function todayKst(): string {
   return new Date(Date.now() + KST_OFFSET_MS).toISOString().slice(0, 10);
 }
-// USDT 페어는 형식만 검증(고정 목록 동기화 부담 제거, 실제 존재 여부는 fetchPrice 가 검증).
-// 원화 페어는 화이트리스트(KRW_SYMBOLS) — `USDTKRW`(환율 키)가 거래 심볼로 들어오면 안 된다.
+// ⚠⚠ 거래 심볼은 **화이트리스트**다(2026-10-01). 예전엔 USDT 페어를 형식(`/^[A-Z0-9]{2,20}USDT$/`)만 봤는데, 그러면
+// 존재하지 않는 심볼로도 지정가·조건부를 걸 수 있었다(조건부는 증거금도 안 든다). 평가할 때마다 그 심볼의 시세를
+// OKX → Coinbase → 바이낸스 순으로 **세 번씩 헛되이** 받으러 가므로, 열 개쯤 걸어두면 cron 한 번의 외부 요청·D1
+// 쿼리 한도(50)를 혼자 다 써서 **접속 안 한 모든 유저의 강제청산·SL/TP 가 멈췄다**(감사). src/symbols.ts SYMBOLS 와
+// 같은 목록이어야 한다 — 심볼을 늘릴 땐 두 곳 다(원화는 KRW_SYMBOLS 두 곳, 가상은 VIRTUAL_SYMBOLS).
+// 원화 쪽도 화이트리스트라 `USDTKRW`(환율 키)가 거래 심볼로 들어오지 않는다.
+const USDT_SYMBOLS = [
+  'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT', 'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT',
+  'TRXUSDT', 'LINKUSDT', 'DOTUSDT', 'LTCUSDT', 'BCHUSDT', 'UNIUSDT', 'AAVEUSDT', 'NEARUSDT',
+  'XLMUSDT', 'SUIUSDT', 'ARBUSDT', 'POLUSDT', 'HBARUSDT', 'INJUSDT', 'CRVUSDT', 'ENAUSDT',
+  'WLDUSDT', 'TAOUSDT', 'PEPEUSDT', 'FETUSDT', 'ONDOUSDT', 'JTOUSDT', 'ZECUSDT', 'KAITOUSDT',
+  'PUMPUSDT', 'XPLUSDT', 'GRAMUSDT', 'KITEUSDT', 'SENTUSDT', 'ALLOUSDT',
+] as const;
 export function isSymbol(s: unknown): s is string {
-  return typeof s === 'string' && (/^[A-Z0-9]{2,20}USDT$/.test(s) || isKrwSymbol(s));
+  return typeof s === 'string' && ((USDT_SYMBOLS as readonly string[]).includes(s) || isVirtualSymbol(s) || isKrwSymbol(s));
 }
 
 const COOKIE = 'ox64_sess';
@@ -512,9 +523,12 @@ export async function fetchPrices(env: Env, symbols: string[], seed?: Record<str
   return out;
 }
 
-/** 크로스 마진 가용 증거금 계산용 — 그 통화 지갑의 전 포지션 미실현손익 합(marks 에 있는 심볼만 반영).
+/** 크로스 마진 가용 증거금 계산용 — 그 통화 지갑의 전 포지션 미실현손익 합.
  * 신규 주문 가용 = 여유잔고 + 이 값 (= 평가자산 − 사용중 증거금). 이익 중이면 그 미실현이익까지 새
- * 주문 증거금으로 쓸 수 있고(=크로스), 손실 중이면 가용이 줄어든다. 아이솔레이티드였다면 이 항이 없다. */
+ * 주문 증거금으로 쓸 수 있고(=크로스), 손실 중이면 가용이 줄어든다. 아이솔레이티드였다면 이 항이 없다.
+ * ⚠ 그 지갑에 **시세를 못 받은 포지션이 하나라도 있으면 NaN** 이다(2026-10-01). 예전엔 그 포지션을 0 으로 쳐서, 시세
+ * 소스가 멈춘 동안 모르는 손실을 무시하고 새 주문이 크로스 가드를 통과했다. 호출자는 `isFinite` 가 아니면 새 위험을
+ * 받지 말 것(`/api/convert` 는 이미 그렇게 한다). */
 export async function unrealizedTotal(env: Env, uid: string, marks: Record<string, number>, quote: Quote): Promise<number> {
   const positions = (
     await env.DB.prepare('SELECT symbol, side, entry_price, size FROM positions WHERE user_id = ?')
@@ -526,10 +540,135 @@ export async function unrealizedTotal(env: Env, uid: string, marks: Record<strin
     // ⚠ 지갑별 크로스 — 다른 통화 포지션의 손익은 이 지갑의 담보가 아니다(단위부터 다르다).
     if (quoteOf(p.symbol) !== quote) continue;
     const mark = marks[p.symbol];
-    if (mark == null) continue;
+    if (mark == null) return NaN;
     u += (mark - p.entry_price) * p.size * (p.side === 'long' ? 1 : -1);
   }
   return u;
+}
+export const NO_MARK_MSG = '시세를 받지 못한 포지션이 있어 증거금을 계산할 수 없습니다. 잠시 후 다시 시도해 주세요';
+
+// ── 가드 문장 — batch 를 **조건부로** 만든다(2026-10-01) ─────────────────────────────────────
+// ⚠⚠ D1 batch 는 트랜잭션이지만 0행 UPDATE/DELETE 를 실패로 보지 않는다(§4). 그래서 지금까지는 "잔고 차감·선점을 **단독으로
+// 먼저** 돌려 changes 를 보고, 그 뒤에 나머지 batch" 로 피해 왔는데, 두 번째 batch 가 던지면(요청당 쿼리 50 초과·D1 오류)
+// 첫 단계만 커밋된 채 남는다 — 증거금만 빠지고 포지션이 없거나, 포지션만 지워지고 환급이 없는 상태(§6 이 경고하던 그 사고).
+// 되돌리기(refund/undo)를 시도해도 같은 한도에 걸려 같이 실패한다.
+// 그래서 가드를 **batch 안에** 넣는다: 조건부 문장 바로 뒤에 "방금 문장이 정확히 n 행을 바꿨나"를 묻는 SELECT 를 두고, 아니면
+// 일부러 SQL 오류(malformed JSON)를 낸다 → D1 이 batch **전체를 롤백**한다. 차감·선점·정산이 한 트랜잭션이 되므로
+// 중간에 무엇이 실패하든 "전부 아니면 전무"다. (운영·로컬 D1 둘 다 확인: `changes()` 는 같은 batch 의 직전 문장 값.)
+// ⚠ 가드 바로 앞 문장은 반드시 그 조건부 UPDATE/DELETE 여야 한다 — 사이에 다른 쓰기가 끼면 그 문장의 행 수를 보게 된다.
+const GUARD_SQL = "SELECT json(CASE WHEN changes() = ? THEN '1' ELSE 'ox64-guard' END)";
+/** 바로 앞 문장이 정확히 `n` 행을 바꾸지 않았으면 batch 전체를 되돌리는 문장. */
+export function guardStmt(env: Env, n = 1): D1PreparedStatement {
+  return env.DB.prepare(GUARD_SQL).bind(n);
+}
+/** 가드가 batch 를 되돌린 오류인가(그 밖의 D1 오류와 구분). */
+export function isGuardAbort(e: unknown): boolean {
+  return /malformed JSON/i.test(e instanceof Error ? e.message : String(e));
+}
+/** 가드가 든 batch 실행 — 가드에 걸려 되돌려졌으면 false(아무것도 안 바뀜), 다른 오류는 그대로 던진다(역시 아무것도 안 바뀜). */
+export async function guardedBatch(env: Env, stmts: D1PreparedStatement[]): Promise<boolean> {
+  try {
+    await env.DB.batch(stmts);
+    return true;
+  } catch (e) {
+    if (isGuardAbort(e)) return false;
+    throw e;
+  }
+}
+
+// ── 포지션 쓰기 — **읽어 둔 값으로 덮어쓰지 않는다**(2026-10-01, 돈이 생기던 경합 수정) ─────────────
+// ⚠⚠ 같은 포지션을 동시에 만지는 요청은 흔하다: 화면 폴링(2.5초)과 cron 이 같은 유저를 평가하고, 탭이 둘일 수 있고,
+// 누구나 요청을 병렬로 보낼 수 있다. 예전 코드는 포지션을 읽은 뒤 (a)새 평단·수량·증거금을 **절대값으로** 써 넣고
+// (b)청산 환급을 삭제가 실제로 지웠는지 확인하지 않고 같은 batch 에 넣었다. 그래서 동시 청산 20번 = 환급 20번,
+// 동시 물타기 = 증거금은 두 번·수량은 한 번, 청산과 물타기가 겹치면 환급받은 수량이 되살아났다(감사 다섯 군데에서 지적).
+// 규칙은 둘이다:
+//   ① 늘리기는 `positionAddStmts` — SQL 이 **상대값**으로 합치고 없을 때만 새로 연다(한 트랜잭션).
+//   ② 줄이기·지우기는 `positionClaimStmt`(읽은 값 그대로일 때만 바뀌는 선점) + 가드 + 정산을 **한 batch** 로(`claimThenSettle`).
+
+/** 체결분을 같은 심볼·방향 포지션에 **합치거나**(물타기) 없으면 **새로 연다** — 문장 2개, 읽어 둔 포지션에 기대지 않는다.
+ * ① 가장 오래된 같은 방향 포지션에 상대값으로 합친다(SET 의 우변은 전부 갱신 전 값이라 평단 계산이 정확하다).
+ * ② 그런 포지션이 없을 때만 새 행을 넣는다. 둘은 같은 batch(=트랜잭션) 안에서 차례로 돌아 다른 요청이 끼지 못한다.
+ * 합칠 때 레버리지는 기존 행 값이 그대로 남는다(호출자는 증거금을 그 레버리지로 계산해 넘긴다 — 차감한 금액 그대로).
+ * SL/TP 는 새로 준 값이 있을 때만 바꾼다. ⚠ 같은 방향 포지션이 이미 둘인 옛 데이터도 한 행(가장 오래된 것)에만 합친다. */
+export function positionAddStmts(
+  env: Env,
+  a: {
+    uid: string;
+    symbol: string;
+    side: string;
+    price: number;
+    size: number;
+    leverage: number;
+    margin: number;
+    stopLoss: number | null;
+    takeProfit: number | null;
+    now: number;
+  },
+): D1PreparedStatement[] {
+  return [
+    env.DB.prepare(
+      `UPDATE positions SET entry_price = (entry_price * size + ? * ?) / (size + ?), size = size + ?, margin = margin + ?,
+         stop_loss = COALESCE(?, stop_loss), take_profit = COALESCE(?, take_profit)
+       WHERE id = (SELECT id FROM positions WHERE user_id = ? AND symbol = ? AND side = ? ORDER BY opened_at LIMIT 1)`,
+    ).bind(a.price, a.size, a.size, a.size, a.margin, a.stopLoss, a.takeProfit, a.uid, a.symbol, a.side),
+    env.DB.prepare(
+      `INSERT INTO positions (id, user_id, symbol, side, entry_price, size, leverage, margin, opened_at, stop_loss, take_profit)
+       SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM positions WHERE user_id = ? AND symbol = ? AND side = ?)`,
+    ).bind(
+      crypto.randomUUID(),
+      a.uid,
+      a.symbol,
+      a.side,
+      a.price,
+      a.size,
+      a.leverage,
+      a.margin,
+      a.now,
+      a.stopLoss,
+      a.takeProfit,
+      a.uid,
+      a.symbol,
+      a.side,
+    ),
+  ];
+}
+
+/** 청산 한 건이 포지션에서 빼는 양. `full` 이면 행을 지우고 잠긴 증거금 전액을 돌려준다(반올림 손실 없이). */
+export interface PositionCut {
+  size: number;
+  margin: number;
+  full: boolean;
+}
+/** 포지션을 줄이거나 지우는 **선점** — 읽어 둔 수량·증거금이 그대로일 때만 바뀐다(compare-and-swap).
+ * ⚠ 값 비교가 정확한 이유: D1 은 REAL 을 왕복 가능한 최단 표기로 돌려주고 같은 double 을 그대로 바인딩하므로 같다. */
+export function positionClaimStmt(env: Env, uid: string, pos: PositionRow, cut: PositionCut): D1PreparedStatement {
+  return cut.full
+    ? env.DB.prepare('DELETE FROM positions WHERE id = ? AND user_id = ? AND size = ? AND margin = ?').bind(pos.id, uid, pos.size, pos.margin)
+    : env.DB.prepare('UPDATE positions SET size = size - ?, margin = margin - ? WHERE id = ? AND user_id = ? AND size = ? AND margin = ?').bind(
+        cut.size,
+        cut.margin,
+        pos.id,
+        uid,
+        pos.size,
+        pos.margin,
+      );
+}
+
+/** 대기 주문을 **읽은 그대로일 때만** 지우는 선점(체결·청산 직전) — 그 사이 체결·수정·취소됐으면 0행이다. */
+export function pendingClaimStmt(env: Env, p: PendingRow): D1PreparedStatement {
+  return env.DB.prepare('DELETE FROM pending_orders WHERE id = ? AND user_id = ? AND size = ? AND margin = ? AND limit_price = ?').bind(
+    p.id,
+    p.user_id,
+    p.size,
+    p.margin,
+    p.limit_price,
+  );
+}
+
+/** 선점(들) + 정산을 **한 batch** 로 — 선점마다 가드를 붙여, 하나라도 빗나가면(다른 요청이 먼저 바꿨으면) 전부 되돌리고 false.
+ * 정산 중 오류도 batch 전체가 롤백되므로 "선점만 되고 정산은 안 된" 상태가 생기지 않는다(§ 가드 문장). */
+export function claimThenSettle(env: Env, claims: D1PreparedStatement[], settle: D1PreparedStatement[]): Promise<boolean> {
+  return guardedBatch(env, [...claims.flatMap((c) => [c, guardStmt(env)]), ...settle]);
 }
 
 // ── D1 행 → 클라이언트 응답 형태 ────────────────────────────────
@@ -863,6 +1002,9 @@ export async function loadState(
       entryPrice: p.entry_price,
       size: p.size,
       leverage: p.leverage,
+      // 실제로 잠긴 증거금 — 진입가×수량÷레버리지와 다를 수 있다(레버리지가 다른 물타기·지정가 체결). 화면의 평가자산·
+      // 청산가 추정이 서버 강제청산과 같은 값을 쓰게 그대로 내려준다.
+      margin: p.margin,
       openedAt: p.opened_at,
       stopLoss: p.stop_loss,
       takeProfit: p.take_profit,
@@ -887,6 +1029,7 @@ export async function loadState(
       size: p.size,
       leverage: p.leverage,
       limitPrice: p.limit_price,
+      margin: p.margin, // 이 주문에 잠긴 증거금(지정가 청산은 0) — 평가자산에 들어간다(§ _trading bankruptWallets)
       stopLoss: p.stop_loss,
       takeProfit: p.take_profit,
       createdAt: p.created_at,

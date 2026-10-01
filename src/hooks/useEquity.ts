@@ -1,9 +1,25 @@
 import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { quoteOf, USDT_KRW, type Quote } from '@/symbols';
+import type { ApiPendingOrder, ApiPosition } from '@/services/api';
+
+/** 포지션에 실제로 잠긴 증거금(서버 값). 옛 응답이면 진입가×수량÷레버리지로 근사. */
+export function positionMargin(p: ApiPosition): number {
+  return p.margin ?? (p.entryPrice * p.size) / p.leverage;
+}
+/** 그 지갑의 대기 지정가(진입)에 잠긴 증거금 합 — 잔고에서 빠져 주문에 묶였을 뿐 순자산이다(지정가 청산은 0). */
+export function lockedMargin(pendings: ApiPendingOrder[], quote: Quote): number {
+  let sum = 0;
+  for (const o of pendings) {
+    if (o.reduceOnly || quoteOf(o.symbol) !== quote) continue;
+    sum += o.margin ?? (o.limitPrice * o.size) / o.leverage;
+  }
+  return sum;
+}
 
 /**
- * 평가자산(equity) = 여유잔고 + Σ(잠긴 증거금 + 미실현손익) — **지갑(결제통화)별로** 따로, 그리고 합산.
+ * 평가자산(equity) = 여유잔고 + 대기 지정가 증거금 + Σ(잠긴 증거금 + 미실현손익) — **지갑(결제통화)별로** 따로, 그리고 합산.
+ * (대기 지정가 증거금도 순자산이다 — 서버 강제청산·리필·랭킹이 2026-10-01 부터 같은 식이다.)
  *
  * ⚠ 증거금 항을 빠뜨리면 안 된다 — 진입할 때 증거금은 잔고에서 이미 빠져나가지만(그게 곧 담보다)
  * 청산하면 `balance += margin + pnl` 로 돌아오므로 **증거금은 순자산의 일부**다. 예전에 이걸
@@ -29,20 +45,24 @@ export function useEquity(): {
   const balance = useTradingStore((s) => s.balance);
   const krwBalance = useTradingStore((s) => s.krwBalance);
   const positions = useTradingStore((s) => s.positions);
+  const pendingOrders = useTradingStore((s) => s.pendingOrders);
   const prices = useMarketStore((s) => s.prices);
 
-  const wallets: Record<Quote, number> = { USDT: balance, KRW: krwBalance };
+  const wallets: Record<Quote, number> = {
+    USDT: balance + lockedMargin(pendingOrders, 'USDT'),
+    KRW: krwBalance + lockedMargin(pendingOrders, 'KRW'),
+  };
   let known = true;
   for (const p of positions) {
     const q = quoteOf(p.symbol);
-    const margin = (p.entryPrice * p.size) / p.leverage;
+    const margin = positionMargin(p);
     const live = prices[p.symbol];
     if (live == null) known = false;
     const u = live == null ? 0 : (live - p.entryPrice) * p.size * (p.side === 'long' ? 1 : -1);
     wallets[q] += margin + u;
   }
   const rate = prices[USDT_KRW] ?? null;
-  const hasKrw = krwBalance !== 0 || positions.some((p) => quoteOf(p.symbol) === 'KRW');
+  const hasKrw = krwBalance !== 0 || wallets.KRW !== 0 || positions.some((p) => quoteOf(p.symbol) === 'KRW');
   if (hasKrw && !rate) known = false;
   const equity = wallets.USDT + (hasKrw && rate ? wallets.KRW / rate : 0);
 

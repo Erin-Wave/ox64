@@ -16,7 +16,8 @@ import {
 
 /**
  * GET /api/leaderboard — 친구들 자산 순위.
- * equity = 잔고(balance) + 열린 포지션의 미실현 손익(서버 시세 기준). 원화 지갑은 USDT 로 환산해 합산한다.
+ * equity = 잔고(balance) + 대기 지정가에 잠긴 증거금 + 포지션(증거금 + 미실현 손익, 서버 시세 기준). 원화 지갑은 USDT 로
+ * 환산해 합산한다. 강제청산·리필·화면(useEquity)과 같은 식이다.
  * 로그인 필요(친구 전용, 공개 스크래핑 방지).
  */
 export function onRequestGet({ request, env }: Ctx): Promise<Response> {
@@ -45,6 +46,14 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   const positions = (
     await env.DB.prepare('SELECT * FROM positions').all<PositionRow>()
   ).results;
+  // 대기 지정가(진입)에 잠긴 증거금 — 잔고에서 빠져 주문에 묶였을 뿐 순자산이다(빼면 지정가를 걸어 두는 것만으로 순위가 떨어진다).
+  const lockedRows = (
+    await env.DB.prepare('SELECT user_id, symbol, margin FROM pending_orders WHERE reduce_only = 0').all<{
+      user_id: string;
+      symbol: string;
+      margin: number;
+    }>()
+  ).results;
 
   // 거래소(플랫폼)가 수수료로 번 총액. ⚠ `fee_ledger` 를 SUM 하면 정확하지만 그 테이블은 체결 1건당
   // 1행이라 봇 때문에 빠르게 수백만 행으로 불어난다 — 5초 폴링마다 전체 스캔할 수는 없다. 같은 값이
@@ -63,7 +72,10 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   const feeFromBots = rev?.fromBots ?? 0;
 
   // 원화 노출(잔고나 포지션)이 있는 유저가 하나라도 있으면 환율도 받는다 — 빗썸 한 요청에 같이 실려 공짜다.
-  const anyKrw = users.some((u) => (u.krw_balance ?? 0) !== 0) || positions.some((p) => quoteOf(p.symbol) === 'KRW');
+  const anyKrw =
+    users.some((u) => (u.krw_balance ?? 0) !== 0) ||
+    positions.some((p) => quoteOf(p.symbol) === 'KRW') ||
+    lockedRows.some((p) => quoteOf(p.symbol) === 'KRW');
   const prices = await fetchPrices(env, [...positions.map((p) => p.symbol), ...(anyKrw ? [USDT_KRW] : [])]);
   // 환율을 못 받으면 이 isolate 가 최근에 본 값으로, 그것도 없으면 원화분은 빼고 센다(0 으로 두면 ÷0).
   const rate = prices[USDT_KRW] ?? krwPerUsdt();
@@ -80,6 +92,8 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     marginByUser[p.user_id] = (marginByUser[p.user_id] ?? 0) + toUsdt(p.symbol, p.margin);
     openCountByUser[p.user_id] = (openCountByUser[p.user_id] ?? 0) + 1;
   }
+  const lockedByUser: Record<string, number> = {};
+  for (const p of lockedRows) lockedByUser[p.user_id] = (lockedByUser[p.user_id] ?? 0) + toUsdt(p.symbol, p.margin);
 
   const rows = users
     .map((u) => {
@@ -90,7 +104,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       return {
         name: u.name,
         balance: u.balance + krwInUsdt,
-        equity: u.balance + krwInUsdt + (marginByUser[u.id] ?? 0) + unrealized,
+        equity: u.balance + krwInUsdt + (lockedByUser[u.id] ?? 0) + (marginByUser[u.id] ?? 0) + unrealized,
         unrealized,
         openCount: openCountByUser[u.id] ?? 0,
         vipTier: vipOf(u.total_volume ?? 0).tier,
