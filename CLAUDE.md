@@ -62,6 +62,7 @@ ox64/
 ├── public/
 │   ├── favicon.png · fonts/  아이콘(원본 src/resources/images/icon2_256.png) · ProximaNova ttf 4종
 │   ├── _redirects          `/* /index.html 200` — SPA 폴백(/api/* 는 Functions 가 먼저). /b,/5m,/s1,/c 직접 진입용
+│   ├── _routes.json        ⚠ Functions 를 타는 경로 = `/api/*` + 문서 경로(/, /b, /5m, /s1, /c — *.pages.dev 리다이렉트용)뿐. 없으면 루트 `_middleware` 때문에 JS·폰트·이미지까지 전부 함수 요청으로 집계됐다(페이지 한 번에 ~15~20건, 무료 10만/일). **새 SPA 경로를 만들면 여기에도**
 │   └── ads.txt             애드센스 판매자 선언(없으면 경고). 정적 파일이 `_redirects` 보다 먼저 매칭
 └── src/                    ── 프론트 ──
     ├── App.tsx             세션확인 → Login 또는 트레이딩 UI(반응형) + 랭킹/설정 모달. PC 2열 그리드의 차트↔포지션 행 높이는 분할선(`hooks/usePanelSplit.ts` — 드래그·더블클릭 원복·↑/↓, localStorage). ⚠ 드래그 중엔 리렌더 없이 그리드 style 만 직접 바꾼다(App 이 다시 그려지면 전 패널이 렌더된다). 분할선은 포지션 패널 **밖**의 별도 그리드 칸(안에 두면 패널 스크롤에 같이 밀린다)
@@ -80,7 +81,7 @@ ox64/
     │   └── api.ts          백엔드 클라이언트(/api/*, credentials 포함)
     ├── hooks/
     │   ├── useMarkPrices.ts   현재+포지션 심볼 가격 1.2초 폴링. **소스=OKX**(서버 체결가와 동일), 실패 시 바이낸스 폴백. 가상 심볼 제외. 보유·미체결·현재 심볼의 precision 도 없으면 1회 조회(가상 심볼은 가격에서 파생)
-    │   ├── useTriggerPoll.ts  로그인 시 **항상 2.5초** /api/state 재조회 = 서버 checkTriggers 클럭. in-flight 가드
+    │   ├── useTriggerPoll.ts  로그인 시 **2.5초** /api/state 재조회 = 서버 checkTriggers 클럭. in-flight 가드. ⚠ **탭이 숨으면 정지**(돌아오면 즉시 1회 — 숨은 탭 하나가 하루 3.4만 요청을 쓰던 것, 그동안의 체결은 cron)
     │   ├── useTradeTape.ts    체결 테이프 → recentTrades. ⚠ 가상 코인은 교체 아닌 **`mergeTrades`**(서버가 최근 50건만 주므로 통째로 갈아끼우면 버퍼가 영영 50건). `MAX_TRADES`=400 은 클라 메모리(비용 0). ⚠⚠ **`spotPair === symbol` 일 때만 병합** — 심볼 전환 직후 첫 렌더엔 spotTrades 가 아직 이전 코인 것이라 대조 없이 병합하면 이전 코인 체결이 새 코인 버퍼에 영구히 남았다. `setSymbol` 은 테이프를 통째로 비운다(되돌아왔을 때 시간이 끊긴 테이프 방지)
     │   ├── useEquity.ts       평가자산(= 여유잔고 + Σ(증거금 + 미실현)) + 파산 여부 — 서버와 **같은 식**을 클라 한 곳에만(Header·RefillModal 공유)
     │   └── useSpotPoll.ts     현재 심볼이 가상일 때만 1초 **통합 폴링**(`?tick=`, 3틱에 한 번 `&state=1`). 이 폴링이 곧 봇 클럭. **탭 백그라운드면 정지**(§6)
@@ -517,7 +518,8 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
          | `repeating` 조건부 체결 | `REPEAT_BLOCK_DAY_ROWS` 55,000 | 그 주문 하나가 쉰다(국지적) |
          | 마켓메이커 봇 | `BOT_BLOCK_DAY_ROWS` 80,000 | 가상 코인 시장이 통째로 선다 = **최후 방어선** |
        - 무료 한도 10만에서 2만(`DAY_RESERVE_ROWS`)을 계량 안 되는 몫(주문 생성/취소, 퍼즐, 던전)과
-         "차단 후에도 유저가 청산은 할 수 있어야 한다"는 여유로 남긴다. 날짜(KST)가 바뀌면 자동 해제.
+         "차단 후에도 유저가 청산은 할 수 있어야 한다"는 여유로 남긴다. 날짜가 바뀌면 자동 해제 — ⚠ 계량기의 날짜는 **UTC**
+         (D1 한도가 리셋되는 시각 = 한국 09:00, 2026-10-01 전엔 KST 라 차단선이 최대 1.6배 늦게 걸렸다).
        - **월선은 없앴다** — 무료 플랜의 한도는 일 단위라 월 누적은 의미가 없다(`npm run d1:budget` 표시용).
        - **계속 도는 것: 유저 수동 거래·강제청산·지정가·SL/TP·1회성 조건부** — 돈이 걸린 기능을 DB 비용
          때문에 막는 건 더 큰 사고다. 봇이 멈춰도 유저는 청산할 수 있어야 한다.
@@ -535,11 +537,11 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
     | 폴링 | 주기 | D1 쓰기 | 요청 수(§ 10만/일) |
     | --- | --- | --- | --- |
     | `useSpotPoll` → `/api/state?tick=` | 1s (탭 숨기면 정지) | **봇 커밋 1행**(게이트 0.45~0.95s, 2026-08-20 이전엔 선점 UPDATE 1행이 더 있었다) + 체결 시 20행 — 계량·차단 대상 | 3,600/시 |
-    | `useTriggerPoll` → `/api/state` | 2.5s (**OX 볼 땐 위가 대신하므로 건너뜀**) | 체결이 성립할 때만 **20행** | 1,440/시 (OX 볼 땐 0) |
+    | `useTriggerPoll` → `/api/state` | 2.5s (**OX 볼 땐 위가 대신하므로 건너뜀**, 탭 숨기면 정지) | 체결이 성립할 때만 **20행** | 1,440/시 (OX 볼 땐 0) |
     | ~~`Chart` → `/api/spot?candles=1`~~ | — | 위 통합 폴링에 흡수됨(과거봉 로드만 별도, 스크롤 시에만) | — |
     | `SymbolSelect` → `/api/spot?candles=1` ×2 | 5s (드롭다운 열었을 때만) | **0** | — |
-    | `Leaderboard` → `/api/leaderboard` | 5s | **0** (읽기 전용) |
-    | `useDungeonStore` → `/api/dungeon` GET | 0.5~4s | **0** (§8 — 계정당 평생 1회 stats INSERT 제외) |
+    | `Leaderboard` → `/api/leaderboard` | 5s (모달 열렸을 때만, 탭 숨기면 정지) | **0** (읽기 전용) |
+    | `useDungeonStore` → `/api/dungeon` GET | 0.5~4s (탭 숨기면 정지) | **0** (§8 — 계정당 평생 1회 stats INSERT 제외) |
     | `useMarkPrices` → OKX | 1.2s | **0** (외부 API, D1 미접촉) |
     | 퍼즐 | 폴링 없음 | 클릭당 2~3행 |
     | 상자깡(§10) | 랭킹 모달을 **열었을 때만** 5s (탭 숨기면 정지) | 액션당 **1행**(유저의 모든 상태가 crate_stats 한 행이라 개봉 10연도 1행), 랭킹 폴링은 **쓰기 0** |

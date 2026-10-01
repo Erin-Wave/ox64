@@ -21,7 +21,7 @@
 //   ② `repeating` 조건부  → REPEAT_BLOCK_DAY_ROWS (주문 하나가 쉬는 건 국지적)
 //   ③ 마켓메이커 봇       → BOT_BLOCK_DAY_ROWS    (멈추면 가상 코인 시장이 통째로 선다 = 최후 방어선)
 // **수동 거래·강제청산·지정가 첫 체결·SL/TP·1회성 조건부는 절대 막지 않는다** — 돈이 걸린 기능을 DB
-// 비용 때문에 막는 건 더 큰 사고다. 날짜(KST)가 바뀌면 자동으로 풀린다.
+// 비용 때문에 막는 건 더 큰 사고다. 날짜(UTC — D1 한도 리셋 시각, 한국 09:00)가 바뀌면 자동으로 풀린다.
 import type { Env, D1PreparedStatement } from './_shared';
 
 /** ⚠⚠ **무료 플랜 기준이다**(2026-08-14 전환). Paid 와 성격이 완전히 다르다:
@@ -43,7 +43,7 @@ const DAY_RESERVE_ROWS = 20_000;
  *      주문 하나가 하루 3,000건을 체결했다.)
  *  2) repeat — `continuous` 무한 조건부 체결. 주문 하나가 쉬는 건 국지적이다.
  *  3) bot    — 마켓메이커. 멈추면 가상 코인 시장이 통째로 선다 → **최후 방어선**.
- * 셋 다 날짜(KST)가 바뀌면 자동으로 풀린다. 수동 거래·강제청산·지정가 첫 체결·SL/TP·1회성 조건부는
+ * 셋 다 날짜(UTC — D1 한도 리셋 시각, 한국 09:00)가 바뀌면 자동으로 풀린다. 수동 거래·강제청산·지정가 첫 체결·SL/TP·1회성 조건부는
  * **절대 막지 않는다** — 돈이 걸린 기능을 DB 비용 때문에 막는 건 더 큰 사고다. */
 export const NIBBLE_BLOCK_DAY_ROWS = 45_000;
 export const REPEAT_BLOCK_DAY_ROWS = 55_000;
@@ -82,19 +82,20 @@ export function rowsForFill(prints = 0): number {
   return ROWS_PER_FILL + ROWS_PER_TAPE_PRINT * Math.max(0, prints - PRINTS_IN_ROWS_PER_FILL);
 }
 
-/** KST(UTC+9) 기준 오늘 날짜. ⚠ `_shared.todayKst` 와 같은 로직이지만 **일부러 복사**했다 —
- * `_shared.ts` 가 이 파일의 `meterStmt` 를 쓰므로, 여기서 `_shared` 의 값을 import 하면 런타임 순환
- * 의존이 된다(타입 import 는 컴파일 시 지워지므로 무해). 2줄짜리 함수라 복사가 순환보다 싸다. */
-function todayKst(): string {
-  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+/** 계량기의 "오늘" = **UTC** 날짜(2026-10-01, 예전엔 KST). D1 무료 한도(쓰기 10만/일)는 UTC 자정(한국 09:00)에 리셋되는데
+ * 계량기만 한국 자정에 리셋돼서, 00~09시(KST)엔 계량기는 0 부터 다시 세는데 실제 한도는 그날 15시간치가 이미 쌓여
+ * 있었다 — 차단선이 최대 1.6배 늦게 걸려 한도를 넘길 수 있었다. 유저에게 보이는 날짜(리필·퍼즐·상자깡)는 그대로 KST.
+ * (`_shared` 를 import 하지 않는 이유: `_shared.ts` 가 이 파일의 `meterStmt` 를 써서 런타임 순환이 된다.) */
+function meterDay(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
-/** 오늘(KST) 계량값에 rows 를 더하는 문장. ⚠ 반드시 **이미 실행되는 batch 에 얹을 것**(단독 실행 금지) —
+/** 오늘(UTC) 계량값에 rows 를 더하는 문장. ⚠ 반드시 **이미 실행되는 batch 에 얹을 것**(단독 실행 금지) —
  * 계량기가 왕복을 늘리면 계량기 자체가 비용이 된다. 봇 틱 단가 7 = 실제 ~6행 + 이 문장 1행. */
 export function meterStmt(env: Env, rows: number): D1PreparedStatement {
   return env.DB.prepare(
     'INSERT INTO usage_meter (day, rows_est) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET rows_est = usage_meter.rows_est + excluded.rows_est',
-  ).bind(todayKst(), Math.max(0, Math.round(rows)));
+  ).bind(meterDay(), Math.max(0, Math.round(rows)));
 }
 
 // 누적을 매 틱 읽으면 읽기가 틱마다 하나씩 늘어난다(읽기는 싸지만 공짜는 아니다) — isolate 안에서 짧게
@@ -105,7 +106,7 @@ let cache: { at: number; day: number } | null = null;
 const CACHE_MS = 60_000;
 const CACHE_MS_BLOCKED = 10 * 60_000;
 
-/** 오늘(KST) 자동 쓰기 누적 추정치.
+/** 오늘(UTC) 자동 쓰기 누적 추정치.
  * ⚠ 실패하면 0 을 돌려준다 — **계량기 고장이 시장을 멈추면 안 된다**(테이블 미생성 등으로 조회가 깨졌을 때
  * 봇이 통째로 서는 게 더 큰 사고다. 그 경우는 `npm run d1:budget` 월 점검이 잡는다).
  *
@@ -119,7 +120,7 @@ export async function meterRows(env: Env): Promise<{ day: number }> {
   const now = Date.now();
   const blocked = cache && cache.day >= NIBBLE_BLOCK_DAY_ROWS;
   if (cache && now - cache.at < (blocked ? CACHE_MS_BLOCKED : CACHE_MS)) return { day: cache.day };
-  const today = todayKst();
+  const today = meterDay();
   try {
     const row = await env.DB.prepare('SELECT rows_est FROM usage_meter WHERE day = ?')
       .bind(today)
@@ -143,7 +144,7 @@ export async function meterRows(env: Env): Promise<{ day: number }> {
  * 결과는 `primeMeter` 로 넘겨 캐시를 채운다. ⚠ D1 호출 하나가 isolate CPU ~0.45ms 라(2026-10-01 실측) 무료 플랜
  * 10ms 안에서 따로 왕복할 여유가 없다. */
 export function meterReadStmt(env: Env): D1PreparedStatement {
-  return env.DB.prepare('SELECT rows_est FROM usage_meter WHERE day = ?').bind(todayKst());
+  return env.DB.prepare('SELECT rows_est FROM usage_meter WHERE day = ?').bind(meterDay());
 }
 /** batch 로 미리 읽은 오늘 계량값을 캐시에 넣는다 — 이후 `autoWritesBlocked` 는 D1 을 다시 읽지 않는다. */
 export function primeMeter(rowsEst: number | null | undefined): void {
@@ -182,11 +183,11 @@ export async function budgetStatus(env: Env): Promise<{
   const month =
     (
       await env.DB.prepare('SELECT COALESCE(SUM(rows_est),0) AS m FROM usage_meter WHERE day LIKE ?')
-        .bind(`${todayKst().slice(0, 7)}%`)
+        .bind(`${meterDay().slice(0, 7)}%`)
         .first<{ m: number }>()
     )?.m ?? 0;
   return {
-    day: todayKst(),
+    day: meterDay(),
     dayRows: day,
     monthRows: month,
     monthBudget: MONTHLY_ROW_BUDGET,

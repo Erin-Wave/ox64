@@ -17,6 +17,10 @@ const BASE_MS = 2500;
  * 실행이라 폴링 주기가 곧 매수 간격이었기 때문. 2026-08-01 에 그 모드의 재실행 간격에 **하한 5초**가
  * 생겨서(functions/_shared.ts MIN_CONTINUOUS_COOLDOWN_MS — 1초 간격이면 주문 하나가 월 D1 쓰기 포함분을
  * 혼자 다 먹는다) 2.5초 폴링이면 하한을 충분히 따라잡는다. 그래서 적응형 분기를 없애고 항상 2.5초다.
+ *
+ * ⚠⚠ **탭이 숨겨져 있으면 멈춘다**(2026-10-01). 예전엔 백그라운드에서도 2.5초마다 돌아서 탭 하나를 켜 둔 채 다른
+ * 일을 하면 하루 최대 3.4만 요청 — 무료 플랜 하루 10만 요청의 1/3 을 혼자 썼다(넘으면 Pages Functions 전체가 실패해
+ * **모두의 거래가 멈춘다**). 숨어 있는 동안의 체결은 cron(1분)이 그대로 처리하고, 돌아오는 순간 한 번 즉시 갱신한다.
  */
 export function useTriggerPoll() {
   const authed = useTradingStore((s) => s.authed);
@@ -25,8 +29,8 @@ export function useTriggerPoll() {
   useEffect(() => {
     if (!authed) return;
     let inFlight = false;
-    const t = setInterval(async () => {
-      if (inFlight) return; // 직전 폴링이 아직 안 끝났으면 건너뜀(느린 네트워크에서 중첩 방지)
+    const run = async () => {
+      if (inFlight || document.hidden) return; // 직전 폴링이 아직 안 끝났으면(중첩 방지)·탭이 숨어 있으면 건너뜀
       // ⚠ OX 를 보고 있으면 통합 폴링(§ useSpotPoll)이 계정 상태도 함께 받아온다 → 여기서 또 요청하면
       // 그게 곧 예전의 "폴링 3개" 로 되돌아간다. 방금 갱신됐으면 이번 차례는 건너뛴다.
       if (Date.now() - useTradingStore.getState().stateAt < BASE_MS) return;
@@ -36,7 +40,15 @@ export function useTriggerPoll() {
       } finally {
         inFlight = false;
       }
-    }, BASE_MS);
-    return () => clearInterval(t);
+    };
+    const t = setInterval(run, BASE_MS);
+    const onVisibility = () => {
+      if (!document.hidden) void run(); // 돌아오면 숨어 있던 동안의 체결·청산을 바로 보여준다
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [authed, refresh]);
 }

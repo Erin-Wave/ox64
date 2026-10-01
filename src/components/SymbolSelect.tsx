@@ -146,6 +146,7 @@ export default function SymbolSelect() {
     if (!open) return;
     let alive = true;
     const load = async () => {
+      if (document.hidden) return; // 이건 Cloudflare 요청이다 — 숨은 탭에선 쓰지 않는다(위 둘은 거래소 직결이라 무관)
       try {
         const entries = await Promise.all(
           VIRTUAL_SYMBOLS.map(async (sym) => {

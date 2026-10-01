@@ -23,7 +23,10 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
         })
         .catch((e) => alive && setErr((e as Error).message));
     load();
-    const t = setInterval(load, 5000);
+    // 탭이 숨어 있으면 건너뛴다 — Cloudflare 요청(무료 10만/일)을 아무도 안 보는 화면에 쓰지 않게.
+    const t = setInterval(() => {
+      if (!document.hidden) load();
+    }, 5000);
     return () => {
       alive = false;
       clearInterval(t);

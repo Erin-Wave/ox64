@@ -190,7 +190,9 @@ export const useDungeonStore = create<Store>((set, get) => {
       const tick = async () => {
         pollTimer = null;
         if (!get().polling) return;
-        await get().poll();
+        // 탭이 숨어 있으면 요청하지 않는다(무료 플랜 하루 요청 10만 — 진행 중 0.5초 폴링이면 숨은 탭 하나가 하루 17만).
+        // 다시 보이면 다음 차례(최대 몇 초)에 따라잡는다 — GET 이 곧 동기화라 놓치는 건 없다.
+        if (!document.hidden) await get().poll();
         if (!get().polling) return;
         pollTimer = setTimeout(tick, delayFor(get().room));
       };
