@@ -37,7 +37,16 @@ export function useSpotPoll() {
     // 가상 코인의 호가창이 그려진다(가상 코인이 둘 이상이면 바로 티가 난다).
     spotClear(); // 이전 코인의 호가/체결이 잠깐 남아 보이지 않게
     let t: number | undefined;
-    const tick = () => spotTick(symbol, interval);
+    // ⚠ 직전 요청이 아직 안 끝났으면 건너뛴다(2026-10-01) — 느린 망에서 1초마다 새 요청이 겹겹이 쌓이면 요청 수(무료 10만/일)만
+    // 늘고 응답 순서도 뒤섞인다. 끝나는 대로 다음 차례에 이어간다.
+    let inFlight = false;
+    const tick = () => {
+      if (inFlight) return;
+      inFlight = true;
+      void spotTick(symbol, interval).finally(() => {
+        inFlight = false;
+      });
+    };
     const start = () => {
       if (t !== undefined) return;
       tick(); // 돌아온 직후 한 번은 즉시(호가창이 낡은 채로 1초 기다리지 않게)

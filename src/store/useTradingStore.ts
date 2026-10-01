@@ -237,6 +237,10 @@ function dripTrades(set: (s: Partial<TradingState>) => void, incoming: SpotTrade
 // 수량은 한 번만 늘어나는** 경합이 된다. 그래서 누른 만큼 전부 받되 서버에는 **하나씩** 보낸다(각 요청은 차례가 왔을 때
 // 그 시점의 주문 커서로 나간다 — § setOrdersCursor). `busy` = 줄에 남은 액션이 있다(처리 중 포함).
 // ⚠ 주문 내용(수량·레버리지·가격)은 **누른 순간**의 값이다 — 호출하는 쪽이 그때 인자를 만들어 넘긴다.
+// ⚠ 액션 응답을 마지막으로 반영한 시각(2026-10-01). 폴링은 액션과 따로 돌아서, **액션보다 먼저 보낸 폴링**의 응답이 액션
+// 응답보다 늦게 도착하면 방금 청산한 포지션이 되살아나 보이고 잔고가 옛 값으로 돌아갔다(다음 폴링까지 2.5초). 폴링 응답은
+// 보낸 시각이 이 값보다 앞서면 계정 상태를 버린다(호가·캔들은 그대로 반영).
+let lastActionAt = 0;
 let actionChain: Promise<unknown> = Promise.resolve();
 let actionsQueued = 0;
 function enqueue<T>(set: (s: Partial<TradingState>) => void, run: () => Promise<T>): Promise<T> {
@@ -254,6 +258,7 @@ function action(set: (s: Partial<TradingState>) => void, call: () => Promise<App
     set({ error: null });
     try {
       apply(set, await call());
+      lastActionAt = Date.now();
     } catch (e) {
       set({ error: (e as Error).message });
     }
@@ -375,7 +380,10 @@ export const useTradingStore = create<TradingState>((set) => ({
     try {
       // 주문내역은 증분으로만 받는다(§ mergeOrders) — 목록이 비어 있으면(최초·로그아웃 후) 전체.
       const since = useTradingStore.getState().orders[0]?.createdAt;
-      apply(set, await api.state(since));
+      const sentAt = Date.now();
+      const st = await api.state(since);
+      if (sentAt < lastActionAt) return; // 그 사이 액션 응답이 더 새 상태를 넣었다
+      apply(set, st);
     } catch (e) {
       // 401(인증만료)일 때만 로그아웃. 일시적 네트워크/5xx 로는 세션을 끊지 않는다
       // (쿠키가 멀쩡한데도 폴링 실패 한 번에 로그인 화면으로 튕기던 문제 → 30일 유지 안 되던 체감의 원인).
@@ -414,6 +422,7 @@ export const useTradingStore = create<TradingState>((set) => ({
       set({ error: null });
       try {
         apply(set, await api.convert(from, amount));
+        lastActionAt = Date.now();
         return true;
       } catch (e) {
         set({ error: (e as Error).message });
@@ -459,6 +468,7 @@ export const useTradingStore = create<TradingState>((set) => ({
       : Math.min(FULL_BARS, Math.max(POLL_MIN_BARS, Math.ceil((Date.now() - st.spotCandlesAt) / 1000 / sec) + 2));
     const wantState = tickCount % STATE_EVERY === 0;
     tickCount++;
+    const sentAt = Date.now();
     try {
       const r = await api.spotTick(pair, {
         interval,
@@ -474,7 +484,7 @@ export const useTradingStore = create<TradingState>((set) => ({
       // 헤더에 넣으면 3초마다 오는 markPrices 와 번갈아 **숫자가 깜빡인다**(고배율이면 손익도 같이 튄다).
       const mark = r.mark ?? r.candles.at(-1)?.close;
       if (typeof mark === 'number' && isFinite(mark) && mark > 0) useMarketStore.getState().setPrice(pair, mark);
-      if (r.state) apply(set, r.state);
+      if (r.state && sentAt >= lastActionAt) apply(set, r.state); // 액션보다 먼저 보낸 응답의 계정 상태는 버린다
     } catch {
       /* 다음 폴링에서 재시도 — 마지막 알려진 값 유지 */
     }

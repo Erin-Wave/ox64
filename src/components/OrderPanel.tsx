@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { tradeHotkeyAllowed } from '@/hotkeys';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
@@ -76,6 +77,26 @@ export default function OrderPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [existingPosition?.leverage]);
 
+  // ⚠⚠ 심볼이 바뀌면 이전 코인 기준으로 넣은 **가격 입력을 비운다**(2026-10-01). BTC 에서 넣은 60,000 지정가·트리거가가
+  // OX(≈1) 화면에 그대로 남아, 매수 지정가는 즉시 시장가처럼 체결되고 "이하" 조건부는 그 자리에서 발동했다. 재무장가·SL/TP 도
+  // 같은 이유로 비우고, 수량은 코인 단위면(코인마다 뜻이 다르다) 또는 결제통화가 바뀌면(USDT↔원) 비운다. 지금 지정가·조건부
+  // 탭이면 새 심볼의 현재가로 바로 채운다(없으면 아래 효과가 시세가 들어오는 대로 채운다).
+  const prevSymbolRef = useRef(symbol);
+  useEffect(() => {
+    const prev = prevSymbolRef.current;
+    if (prev === symbol) return;
+    prevSymbolRef.current = symbol;
+    const fill = lastPrice ? String(lastPrice) : '';
+    setLimitPrice(effectiveTab === 'limit' ? fill : '');
+    setTriggerPrice(effectiveTab === 'conditional' ? fill : '');
+    setRearmPrice('');
+    setStopLoss('');
+    setTakeProfit('');
+    setPct(0);
+    if (unit === 'coin' || quoteOf(prev) !== quoteOf(symbol)) setAmtInput('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol]);
+
   // 지정가/조건부 탭을 처음 열 때 현재가로 기본값 채움
   useEffect(() => {
     if (effectiveTab === 'limit' && !limitPrice && lastPrice) setLimitPrice(String(lastPrice));
@@ -110,9 +131,10 @@ export default function OrderPanel() {
   const amtNum = Number(amtInput || 0);
   const sizeCoin = unit === 'coin' ? amtNum : refPrice ? amtNum / refPrice : 0;
 
+  // ⚠ SL/TP 칸은 Standard 모드에서만 보인다 — Easy 모드에서 숨겨진 옛 값이 주문에 실리면 안 된다(2026-10-01).
   const parseSlTp = () => ({
-    stopLoss: useSlTp && stopLoss ? Number(stopLoss) : null,
-    takeProfit: useSlTp && takeProfit ? Number(takeProfit) : null,
+    stopLoss: standard && useSlTp && stopLoss ? Number(stopLoss) : null,
+    takeProfit: standard && useSlTp && takeProfit ? Number(takeProfit) : null,
   });
 
   // ⚠ 앞 주문이 처리 중이어도(`busy`) 버리지 않는다 — 스토어가 줄을 세워 차례로 보낸다(§ useTradingStore enqueue).
@@ -159,6 +181,7 @@ export default function OrderPanel() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'F9' && e.key !== 'F10') return;
+      if (!tradeHotkeyAllowed(e)) return; // 모달이 떠 있거나 조합키면 주문하지 않는다(§ hotkeys.ts)
       e.preventDefault(); // F10 은 일부 브라우저(윈도우 파이어폭스 등)에서 메뉴 막대를 연다
       if (e.repeat) return;
       submitRef.current(e.key === 'F9' ? 'long' : 'short');

@@ -32,7 +32,7 @@ export default function VipModal({ onClose }: { onClose: () => void }) {
   const remaining = isMax ? 0 : Math.max(0, nextAt - totalVolume);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+    <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
       <div
         className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-border bg-panel p-5 shadow-2xl"
         onClick={(e) => e.stopPropagation()}

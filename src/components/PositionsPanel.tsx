@@ -6,6 +6,7 @@ import { fmtPrice, fmtPriceShort, fmtQty, fmtQtyShort, fmtMoney, fmtMoneyShort, 
 import { baseOf, pairLabel, quoteOf } from '@/symbols';
 import type { ApiOrder } from '@/services/api';
 import { lockedMargin, positionMargin } from '@/hooks/useEquity';
+import { tradeHotkeyAllowed } from '@/hotkeys';
 
 type Tab = 'positions' | 'pending' | 'conditional' | 'history';
 
@@ -115,6 +116,7 @@ export default function PositionsPanel() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'F8') return;
+      if (!tradeHotkeyAllowed(e)) return; // 모달이 떠 있거나 조합키면 청산하지 않는다(§ hotkeys.ts)
       e.preventDefault();
       if (e.repeat) return;
       f8Ref.current();
