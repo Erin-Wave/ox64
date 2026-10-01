@@ -82,6 +82,7 @@ export function isVirtualSymbol(s: string): boolean {
 const KRW_SYMBOLS = [
   'BTCKRW', 'ETHKRW', 'SOLKRW', 'FKRW',
   'MERLKRW', 'GHXKRW', 'BOBAKRW', 'MOVEKRW', 'HFTKRW', 'BMTKRW', 'WAXPKRW', 'BREVKRW', 'OSMOKRW', 'TAIKOKRW', 'ROAKRW',
+  'AGIKRW', 'DEBITKRW', 'PUFFERKRW', 'MAYKRW',
 ] as const;
 export type Quote = 'USDT' | 'KRW';
 /** 결제통화. ⚠ 'FKRW' 처럼 기준통화가 한 글자인 심볼도 있어서 길이가 아니라 접미사로 가른다. */

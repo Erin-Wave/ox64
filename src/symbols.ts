@@ -23,6 +23,7 @@ export const isVirtualSymbol = (s: string): boolean => (VIRTUAL_SYMBOLS as reado
 export const KRW_SYMBOLS = [
   'BTCKRW', 'ETHKRW', 'SOLKRW', 'FKRW',
   'MERLKRW', 'GHXKRW', 'BOBAKRW', 'MOVEKRW', 'HFTKRW', 'BMTKRW', 'WAXPKRW', 'BREVKRW', 'OSMOKRW', 'TAIKOKRW', 'ROAKRW',
+  'AGIKRW', 'DEBITKRW', 'PUFFERKRW', 'MAYKRW',
 ] as const;
 /** 빗썸 한글명 — 심볼 검색이 "비트", "솔라나" 로도 걸리게. */
 export const KRW_NAMES: Record<string, string> = {
@@ -41,6 +42,10 @@ export const KRW_NAMES: Record<string, string> = {
   OSMOKRW: '오스모시스',
   TAIKOKRW: '타이코',
   ROAKRW: '로아코어',
+  AGIKRW: '델리시움',
+  DEBITKRW: '텔러파이낸스',
+  PUFFERKRW: '퍼퍼',
+  MAYKRW: '메이플라워',
 };
 export const isKrwSymbol = (s: string): boolean => (KRW_SYMBOLS as readonly string[]).includes(s);
 export type Quote = 'USDT' | 'KRW';

@@ -68,7 +68,7 @@ ox64/
     ├── main.tsx            pathname 으로 트레이딩·퍼즐(/b)·던전(/5m)·RTS(/s1)·상자깡(/c) 분기(라우터 없음, 동적 import). useSettingsStore 먼저 import(FOUC 방지). ⚠ /s1 만 StrictMode 안 씌움(이펙트 2회 실행이 rAF 루프를 두 벌 만든다)
     ├── index.css           Tailwind + 테마 CSS 변수 + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position/PendingOrder/Side)
-    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + KRW_SYMBOLS(빗썸 원화 15종)/quoteOf/baseOf/**pairLabel**(화면 표기 'BTC/KRW' — `replace('USDT','')` 금지)/categoryOf + INTERVAL_GROUPS + KST_OFFSET(+9h)
+    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + KRW_SYMBOLS(빗썸 원화 19종)/quoteOf/baseOf/**pairLabel**(화면 표기 'BTC/KRW' — `replace('USDT','')` 금지)/categoryOf + INTERVAL_GROUPS + KST_OFFSET(+9h)
     ├── format.ts           fmtPrice/fmtVol/precisionFromTick + 축약 헬퍼(§6)
     ├── services/
     │   ├── binanceRest.ts  초기 과거봉(스팟 REST)
@@ -214,7 +214,7 @@ ox64/
   - **⚠ 큰 금액 표시는 `fmtKor`(만/억/조), 반올림이 아니라 내림** — 999,999 를 "100만"으로 올려 보이면 기준선을 넘은 것처럼 읽힌다.
 - **아직 없음**: 펀딩비.
 
-### 원화 마켓 — 빗썸 15종(BTC·ETH·SOL·F + MERL·GHX·BOBA·MOVE·HFT·BMT·WAXP·BREV·OSMO·TAIKO·ROA, 원화 지갑, 2026-09-24)
+### 원화 마켓 — 빗썸 19종(BTC·ETH·SOL·F + MERL·GHX·BOBA·MOVE·HFT·BMT·WAXP·BREV·OSMO·TAIKO·ROA·AGI·DEBIT·PUFFER·MAY, 원화 지갑, 2026-09-24)
 
 - **⚠⚠ 지갑이 둘이고 크로스 담보는 지갑별이다.** 원화 심볼은 `users.krw_balance`, 나머지(가상 포함)는 `users.balance`. 증거금·손익·수수료·지정가 잠금/환불·강제청산이 전부 **그 심볼의 결제통화 지갑 안에서만** 일어난다. 그래서 **잔고 SQL 에 컬럼을 하드코딩하지 말고 `balColOf(symbol)`**(`_shared.ts`, 고정 매핑이라 인젝션 없음), **미실현 합은 `unrealizedTotal(env, uid, marks, quote)`**(quote 필수 인자 — 빠뜨리면 원화 손익(원)이 USDT 가용에 섞인다). 새 체결 경로를 추가할 때 이 둘을 안 거치면 원화 포지션의 증거금이 USDT 지갑에서 빠져나간다.
 - **강제청산 = 지갑별**(`liquidateIfBankrupt` 가 통화마다 따로 판정·청산·그 통화 미체결 취소·그 컬럼 0). 한 지갑의 시세가 비면 그 지갑만 건너뛴다(빗썸이 멈춰도 USDT 판정은 돈다). 클라 청산가(`PositionsPanel`/`Chart`)도 같은 통화의 포지션·잔고만.
