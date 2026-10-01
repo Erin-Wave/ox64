@@ -211,10 +211,12 @@ export default function OrderBook() {
   const [groupIdx, setGroupIdx] = useState(0);
   const [tab, setTab] = useState<'book' | 'trades'>('book');
 
+  // 심볼마다 tick 단위가 달라서 묶음 배수 선택을 리셋한다 — ⚠ 가상 코인도(예전엔 아래 효과가 가상이면 먼저 return 해서 BTC 의 ×1000
+  // 묶음이 OX 로 그대로 넘어갔다)
+  useEffect(() => setGroupIdx(0), [symbol]);
   useEffect(() => {
     if (virtual) return; // 가상 심볼은 useSpotPoll 이 채우는 store.spotBook 을 대신 사용
     setBook(null);
-    setGroupIdx(0); // 심볼마다 tick 단위가 달라서 배수 선택을 리셋
     // 원화 심볼은 빗썸 호가(30단계, 브라우저 직결), 나머지 실제 코인은 바이낸스 부분 호가(최대 20단계).
     const stream = quoteOf(symbol) === 'KRW' ? bithumbOrderbookStream(symbol) : orderbookStream(symbol, 20);
     const sub = stream.subscribe({ next: setBook });

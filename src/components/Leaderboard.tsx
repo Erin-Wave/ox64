@@ -20,6 +20,7 @@ export default function Leaderboard({ onClose }: { onClose: () => void }) {
           if (!alive) return;
           setRows(d.leaderboard);
           setRevenue(d.revenue ?? null);
+          setErr(null); // 한 번 실패했다 다시 받아오면 에러 문구를 지운다
         })
         .catch((e) => alive && setErr((e as Error).message));
     load();
