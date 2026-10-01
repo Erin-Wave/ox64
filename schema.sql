@@ -514,6 +514,9 @@ CREATE TABLE IF NOT EXISTS dungeon_players (
   PRIMARY KEY (room_code, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_dungeon_players_room ON dungeon_players(room_code);
+-- 폴링(GET, 0.5~4초)이 "내 방"을 user_id 로 찾는다 — PK(room_code, user_id)로는 못 찾아 매번 전체를 읽었다(2026-10-01).
+-- 쓰기는 입장·퇴장 때만이라(손패 갱신은 인덱스 컬럼을 안 건드린다) 비용 증가는 거의 없다.
+CREATE INDEX IF NOT EXISTS idx_dungeon_players_user ON dungeon_players(user_id);
 
 -- ⚠ 일회성 마이그레이션 (2026-07-27 추가, 5분 던전 콘텐츠 확장): 위 CREATE TABLE 에는 이미 포함돼
 -- 있지만, 이미 테이블이 만들어진 기존 DB(=prod)에는 CREATE TABLE IF NOT EXISTS 가 컬럼을 더해주지

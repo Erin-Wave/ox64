@@ -250,10 +250,12 @@ export async function signToken(payload: Omit<SessionPayload, 'exp'>, secret: st
 async function verifyToken(token: string, secret: string): Promise<SessionPayload | null> {
   const [body, sig] = token.split('.');
   if (!body || !sig) return null;
-  const key = await hmacKey(secret);
-  const ok = await crypto.subtle.verify('HMAC', key, bs(fromB64url(sig)), bs(enc.encode(body)));
-  if (!ok) return null;
+  // ⚠ 깨진 쿠키(base64 가 아닌 서명 등)는 **예외가 아니라 "세션 없음"** 이다(2026-10-01) — 예전엔 디코딩 예외가 그대로 올라가
+  // 모든 요청이 500 이 됐고, 클라는 500 을 일시 오류로 보고 로그인 화면으로 보내지 않아 계속 실패만 반복했다(401 이어야 다시 로그인).
   try {
+    const key = await hmacKey(secret);
+    const ok = await crypto.subtle.verify('HMAC', key, bs(fromB64url(sig)), bs(enc.encode(body)));
+    if (!ok) return null;
     const payload = JSON.parse(new TextDecoder().decode(fromB64url(body))) as SessionPayload;
     if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
     return payload;
