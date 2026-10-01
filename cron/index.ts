@@ -11,7 +11,8 @@
 // 계산하고 한도가 요청당 30초다(공식 DO 한도표 + prod 실측: DO 안에서 70~120ms 를 연속 13회 써도 정상, 그동안
 // 호출한 쪽 CPU 는 0~2ms). 그래서 cron 은 DO 를 깨우기만 하고(CPU ~1ms), 버스트 → sweep 순서·범위 전달은 예전과
 // 똑같이 DO 안의 runTick 이 한다(의미 변화 없음). ⚠ 서비스 바인딩은 이 용도로 못 쓴다 — 호출 체인 CPU 를 합산한다.
-// DO 저장소는 쓰지 않는다(데이터는 전부 D1). 인스턴스는 하나(`idFromName`)라 실행이 겹치면 DO 가 줄을 세운다.
+// DO 저장소는 쓰지 않는다(데이터는 전부 D1). 인스턴스는 하나(`idFromName`)다. ⚠ DO 는 실행을 줄 세우지 **않는다** — 입력 게이트는
+// DO 자기 저장소에만 걸리고 D1·fetch 를 기다리는 동안 다른 요청이 끼어든다. 그래서 MarketClock 이 직접 한 번에 하나만 돌린다(409).
 // 비용(무료): DO 요청 1,440/일(한도 10만), duration ≈ 1.5초 × 128MB × 1,440 ≈ 270 GB-s/일(한도 13,000).
 //
 // @cloudflare/workers-types 를 의존성으로 두지 않는 프로젝트 관례(functions/_shared.ts 참고)를
@@ -40,7 +41,7 @@ interface MinimalScheduledEvent {
 interface MinimalExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
 }
-type TickResult = { sweep: { checked: number; liquidated: number } };
+type TickResult = { sweep: { checked: number; liquidated: number }; busy?: boolean };
 
 // ⚠ 마켓메이커 틱 예산은 **가상 코인 수와 무관하게 고정**이다 — 코인마다 12틱씩 돌리면 비용이 코인 수에
 // 그대로 비례한다. 그래서 총량을 정해두고 코인들이 나눠 쓴다.
@@ -66,10 +67,20 @@ export class MarketClock {
     private readonly env: Env,
   ) {}
 
+  // ⚠ 한 번에 하나만(2026-10-01) — 실행이 1분을 넘기거나 수동 재실행(fetch 핸들러)이 겹치면 runTick 두 개가 섞여 돌았다. 각 쓰기의
+  // 가드 덕에 돈은 안 새지만 쿼리·CPU 를 두 배로 쓰고 같은 주문을 서로 선점하려 다툰다. 겹친 쪽은 409 로 그냥 물러난다.
+  private running = false;
+
   async fetch(): Promise<Response> {
-    const r = await runTick(this.env);
-    console.log(`[ox64-clock] sweep checked=${r.sweep.checked} liquidated=${r.sweep.liquidated}`);
-    return new Response(JSON.stringify(r), { headers: { 'content-type': 'application/json' } });
+    if (this.running) return new Response(JSON.stringify({ busy: true }), { status: 409, headers: { 'content-type': 'application/json' } });
+    this.running = true;
+    try {
+      const r = await runTick(this.env);
+      console.log(`[ox64-clock] sweep checked=${r.sweep.checked} liquidated=${r.sweep.liquidated}`);
+      return new Response(JSON.stringify(r), { headers: { 'content-type': 'application/json' } });
+    } finally {
+      this.running = false;
+    }
   }
 }
 
@@ -77,9 +88,14 @@ export class MarketClock {
  * 만들어지는데 cron 은 아무 데서나 돌기 때문(멀면 D1 왕복만큼 벽시계가 늘어난다, CPU 와는 무관). 바인딩이 없으면
  * (로컬 dev 등) 예전처럼 직접 돈다. */
 async function runViaClock(env: Env): Promise<TickResult> {
-  if (!env.CLOCK) return runTick(env);
+  if (!env.CLOCK) {
+    // ⚠ 운영에서 이게 찍히면 바인딩이 빠진 것이다 — cron(CPU 10ms)에서 직접 돌면 2026-10-01 의 CPU 초과 사고가 되풀이된다.
+    console.warn('[ox64-cron] CLOCK 바인딩 없음 — cron 안에서 직접 실행(로컬 dev 전용이어야 한다)');
+    return runTick(env);
+  }
   const stub = env.CLOCK.get(env.CLOCK.idFromName('market-clock'), { locationHint: 'apac' });
   const res = await stub.fetch('https://market-clock/tick', { method: 'POST' });
+  if (res.status === 409) return { sweep: { checked: 0, liquidated: 0 }, busy: true }; // 앞 실행이 아직 도는 중 — 이번 분은 양보
   if (!res.ok) throw new Error(`MarketClock ${res.status}: ${await res.text()}`);
   return (await res.json()) as TickResult;
 }
@@ -118,16 +134,19 @@ async function runTick(env: Env): Promise<TickResult> {
 }
 
 export default {
-  async scheduled(_event: MinimalScheduledEvent, env: Env, ctx: MinimalExecutionContext): Promise<void> {
+  async scheduled(_event: MinimalScheduledEvent, env: Env, _ctx: MinimalExecutionContext): Promise<void> {
     // ⚠ 여기서 일을 직접 하지 않는다 — DO 에 맡기고 기다리기만 한다(§ 파일 머리). 실패하면 이번 분은 건너뛴다
     // (다음 분이 최대 2분치를 따라잡는다 — § spot.ts ELAPSED_MAX_MS). 직접 돌리는 폴백을 두지 않는 이유: DO 가 일을
     // 끝낸 뒤 응답만 실패한 경우 sweep 이 두 번 돌아 반복 조건부가 한 번 더 체결될 수 있다.
-    ctx.waitUntil(
-      runViaClock(env).then(
-        (r) => console.log(`[ox64-cron] sweep checked=${r.sweep.checked} liquidated=${r.sweep.liquidated}`),
-        (e) => console.error('[ox64-cron] MarketClock failed:', e instanceof Error ? e.message : e),
-      ),
-    );
+    // ⚠ waitUntil 이 아니라 **직접 기다리고 실패는 던진다**(2026-10-01) — 예전엔 waitUntil 안에서 잡아 삼켜서 Cron Events 에 늘 "성공"으로
+    // 남았다(DO 가 죽어도 대시보드로는 알 수 없었다). 기다리는 동안 이쪽 CPU 는 거의 0 이다(일은 DO 가 한다).
+    try {
+      const r = await runViaClock(env);
+      console.log(`[ox64-cron] sweep checked=${r.sweep.checked} liquidated=${r.sweep.liquidated}${r.busy ? ' (busy — 앞 실행 진행 중)' : ''}`);
+    } catch (e) {
+      console.error('[ox64-cron] MarketClock failed:', e instanceof Error ? e.message : e);
+      throw e;
+    }
   },
 
   // 수동 트리거(로컬 테스트/즉시 재실행용): POST + 헤더 "x-cron-secret: <CRON_SECRET>"

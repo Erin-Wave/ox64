@@ -93,8 +93,9 @@ async function reflectVirtualFill(env: Env, symbol: string, uid: string, price: 
   if (!isVirtualSymbol(symbol)) return;
   try {
     await recordVirtualFill(env, symbol, uid, price, takerSide, size);
-  } catch {
-    /* 표시용 부가효과 — 실패해도 무시 */
+  } catch (e) {
+    // 표시용 부가효과(테이프·봇 재고) — 실패해도 정산은 끝났다. 다만 봇 재고가 어긋나므로 남긴다.
+    console.error(`[reflectVirtualFill] ${symbol} uid=${uid}`, e instanceof Error ? e.message : e);
   }
 }
 

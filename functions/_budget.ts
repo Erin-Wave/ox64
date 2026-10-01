@@ -134,7 +134,9 @@ export async function meterRows(env: Env): Promise<{ day: number }> {
           ` (재체결 ${NIBBLE_BLOCK_DAY_ROWS} · 반복조건부 ${REPEAT_BLOCK_DAY_ROWS} · 봇 ${BOT_BLOCK_DAY_ROWS})`,
       );
     }
-  } catch {
+  } catch (e) {
+    // 계량기가 고장 나면 차단이 꺼진다(봇·반복 주문이 멈추는 것보다 낫다) — 대신 **반드시 남긴다**(조용히 꺼지면 아무도 모른다).
+    console.error('[budget] 계량기 조회 실패 — 이번 분은 차단 없이 진행:', e instanceof Error ? e.message : e);
     cache = { at: now, day: 0 };
   }
   return { day: cache.day };
