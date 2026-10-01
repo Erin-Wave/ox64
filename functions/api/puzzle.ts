@@ -1,4 +1,4 @@
-import { type Ctx, type Env, bad, json, safe, missingEnv, getSession, todayKst } from '../_shared';
+import { type Ctx, type Env, bad, json, safe, missingEnv, getSession, todayKst, guardStmt, guardedBatch } from '../_shared';
 
 /**
  * POST /api/puzzle { action: 'start', level }
@@ -330,55 +330,63 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     const gameId = String(body.gameId ?? '');
     const x = Math.round(Number(body.x));
     const y = Math.round(Number(body.y));
-    const row = await env.DB.prepare('SELECT * FROM puzzle_games WHERE id = ? AND user_id = ?').bind(gameId, uid).first<PuzzleGameRow>();
-    if (!row) return bad('게임을 찾을 수 없습니다');
-    if (row.status !== 'active') return bad('이미 종료된 게임입니다');
-    if (!(x >= 0 && x < row.size && y >= 0 && y < row.size)) return bad('범위를 벗어났습니다');
-    const revealed: string[] = JSON.parse(row.revealed);
     const coord = `${x},${y}`;
-    if (revealed.includes(coord)) return bad('이미 연 칸입니다');
-
-    // 코스트를 먼저 원자적으로 차감(잔여 재화 확인 겸용) — 실패하면 게임 상태는 그대로 둔다.
-    const deduct = await env.DB.prepare('UPDATE puzzle_stats SET currency = currency - ? WHERE user_id = ? AND currency >= ?')
-      .bind(OPEN_COST, uid, OPEN_COST)
-      .run();
-    if (deduct.meta.changes === 0) return bad('재화가 부족합니다');
-
-    const board: Record<string, string> = JSON.parse(row.board);
-    const gems: Record<string, GemMeta> = JSON.parse(row.gems);
-    const gemId = board[coord] ?? null;
-    revealed.push(coord);
+    // ⚠⚠ 판 상태·재화를 **읽은 그대로일 때만** 바꾼다(2026-10-01) — 예전엔 읽은 판(열린 칸 목록·보석 진행)을 통째로 덮어써서, 빠르게 연달아
+    // 연 칸끼리 서로를 지워(재화는 빠졌는데 칸은 닫힌 채) 남았고, 마지막 칸을 동시에 열면 **보상이 요청 수만큼** 들어왔다(감사). 판은
+    // `spent`(오픈할 때마다 오르는 값)를, 재화는 읽은 값을 버전으로 쓰는 가드 batch 하나로 처리하고, 그 사이 다른 오픈이 끼었으면 다시
+    // 읽어 이어서 한다(연타가 에러가 되지 않게).
+    let row: PuzzleGameRow | null = null;
+    let gems: Record<string, GemMeta> = {};
+    let revealed: string[] = [];
+    let gemId: string | null = null;
     let justCompleted: { label: string; color: string } | null = null;
-    if (gemId) {
-      gems[gemId].revealedCount++;
-      if (gems[gemId].revealedCount === gems[gemId].size) {
-        justCompleted = { label: gems[gemId].label, color: gems[gemId].color };
-      }
-    }
-    const allFound = Object.values(gems).every((g) => g.revealedCount >= g.size);
-    const now = Date.now();
-    let status = row.status;
+    let status = 'active';
     let reward = 0;
+    let done = false;
+    for (let attempt = 0; attempt < 8 && !done; attempt++) {
+      // 겹쳤으면 아주 잠깐 비켜서 다시(동시에 들어온 요청끼리 같은 순간에 또 부딪히지 않게)
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 5 + Math.random() * 25 * attempt));
+      const [gameRes, statsRes] = await env.DB.batch([
+        env.DB.prepare('SELECT * FROM puzzle_games WHERE id = ? AND user_id = ?').bind(gameId, uid),
+        env.DB.prepare('SELECT currency FROM puzzle_stats WHERE user_id = ?').bind(uid),
+      ]);
+      row = (gameRes.results[0] as PuzzleGameRow | undefined) ?? null;
+      const currency = (statsRes.results[0] as { currency: number } | undefined)?.currency ?? 0;
+      if (!row) return bad('게임을 찾을 수 없습니다');
+      if (row.status !== 'active') return bad('이미 종료된 게임입니다');
+      if (!(x >= 0 && x < row.size && y >= 0 && y < row.size)) return bad('범위를 벗어났습니다');
+      revealed = JSON.parse(row.revealed);
+      if (revealed.includes(coord)) return bad('이미 연 칸입니다');
+      if (currency < OPEN_COST) return bad('재화가 부족합니다');
 
-    if (allFound) {
-      status = 'won';
-      reward = LEVELS[row.level - 1].reward;
-      await env.DB.prepare(
-        'UPDATE puzzle_stats SET currency = currency + ?, best_level = MAX(best_level, ?), games_played = games_played + 1, games_won = games_won + 1 WHERE user_id = ?',
-      )
-        .bind(reward, row.level, uid)
-        .run();
-    } else {
-      const cur = await env.DB.prepare('SELECT currency FROM puzzle_stats WHERE user_id = ?').bind(uid).first<{ currency: number }>();
-      if ((cur?.currency ?? 0) <= 0) {
-        status = 'lost';
-        await env.DB.prepare('UPDATE puzzle_stats SET games_played = games_played + 1 WHERE user_id = ?').bind(uid).run();
+      const board: Record<string, string> = JSON.parse(row.board);
+      gems = JSON.parse(row.gems);
+      gemId = board[coord] ?? null;
+      revealed.push(coord);
+      justCompleted = null;
+      if (gemId) {
+        gems[gemId].revealedCount++;
+        if (gems[gemId].revealedCount === gems[gemId].size) {
+          justCompleted = { label: gems[gemId].label, color: gems[gemId].color };
+        }
       }
+      const allFound = Object.values(gems).every((g) => g.revealedCount >= g.size);
+      const after = currency - OPEN_COST;
+      status = allFound ? 'won' : after <= 0 ? 'lost' : 'active';
+      reward = status === 'won' ? LEVELS[row.level - 1].reward : 0;
+      const now = Date.now();
+      done = await guardedBatch(env, [
+        env.DB.prepare(
+          "UPDATE puzzle_games SET gems = ?, revealed = ?, spent = spent + ?, status = ?, updated_at = ? WHERE id = ? AND user_id = ? AND spent = ? AND status = 'active'",
+        ).bind(JSON.stringify(gems), JSON.stringify(revealed), OPEN_COST, status, now, gameId, uid, row.spent),
+        guardStmt(env),
+        env.DB.prepare(
+          'UPDATE puzzle_stats SET currency = currency - ? + ?, best_level = MAX(best_level, ?), games_played = games_played + ?, games_won = games_won + ? WHERE user_id = ? AND currency = ?',
+        ).bind(OPEN_COST, reward, status === 'won' ? row.level : 0, status === 'active' ? 0 : 1, status === 'won' ? 1 : 0, uid, currency),
+        guardStmt(env),
+      ]);
     }
-
-    await env.DB.prepare('UPDATE puzzle_games SET gems = ?, revealed = ?, spent = spent + ?, status = ?, updated_at = ? WHERE id = ?')
-      .bind(JSON.stringify(gems), JSON.stringify(revealed), OPEN_COST, status, now, gameId)
-      .run();
+    if (!done || !row) return bad('방금 다른 칸이 열렸습니다 — 다시 눌러 주세요', 409);
 
     // loadPuzzleState().activeGame 은 status='active' 인 판만 찾으므로, 이 오픈으로 방금 끝난(won/lost)
     // 판은 거기서 null 로 빠진다 — 클라가 "이번 오픈으로 뭐가 어떻게 됐는지" 확정적으로 알 수 있도록
@@ -411,9 +419,13 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     const usedToday = stats.refill_date === today ? stats.refill_count : 0;
     if (usedToday >= PUZZLE_REFILL_DAILY_LIMIT)
       return bad(`오늘 리필 횟수를 모두 사용했습니다 (${PUZZLE_REFILL_DAILY_LIMIT}/${PUZZLE_REFILL_DAILY_LIMIT})`);
-    await env.DB.prepare('UPDATE puzzle_stats SET currency = currency + ?, refill_count = ?, refill_date = ? WHERE user_id = ?')
-      .bind(PUZZLE_REFILL_AMOUNT, usedToday + 1, today, uid)
+    // ⚠ 읽은 값 그대로일 때만(동시에 여러 번 누르면 요청 수만큼 들어오던 것, 2026-10-01)
+    const res = await env.DB.prepare(
+      "UPDATE puzzle_stats SET currency = currency + ?, refill_count = ?, refill_date = ? WHERE user_id = ? AND currency = ? AND refill_count = ? AND IFNULL(refill_date, '') = ?",
+    )
+      .bind(PUZZLE_REFILL_AMOUNT, usedToday + 1, today, uid, stats.currency, stats.refill_count, stats.refill_date ?? '')
       .run();
+    if (res.meta.changes !== 1) return bad('방금 처리됐습니다 — 다시 확인해 주세요', 409);
     return json(await loadPuzzleState(env, uid));
   }
 

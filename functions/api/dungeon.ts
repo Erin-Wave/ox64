@@ -28,6 +28,10 @@ import {
   pushLog,
 } from '../_dungeonEngine';
 
+/** 요구치에 실제로 있는 항목인가 — ⚠ `in` 은 `toString`·`constructor` 같은 내장 이름도 참이라(2026-10-01, 감사) 와일드 카드로 그 이름을
+ * 겨냥하면 엉뚱한 진행도 키가 생기고 기여 통계가 부풀었다. 자기 키만 본다. */
+const hasReq = (req: object, key: string) => Object.prototype.hasOwnProperty.call(req, key);
+
 /**
  * "5분 던전"(ox64.app/5m) — 실시간 협동 카드게임. 트레이딩·퍼즐과 완전히 분리(재화 없음, 승패
  * 통계만 dungeon_stats 에 기록). Durable Objects/WebSocket 대신 기존 OX 마켓메이커와 동일한
@@ -587,9 +591,15 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     if (room.status !== 'lobby') return bad('이미 시작된 던전입니다');
     const players = await loadPlayerRows(env, code);
     if (players.length >= MAX_PARTY) return bad(`파티 정원이 가득 찼습니다 (최대 ${MAX_PARTY}명)`);
-    await env.DB.prepare('INSERT INTO dungeon_players (room_code, user_id, name, hero_id, joined_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(code, uid, sess.name, '', Date.now())
+    // ⚠ 정원·로비 확인을 INSERT 안에서(같은 문장) — 따로 확인하고 넣으면 동시에 들어온 사람들이 정원을 넘겼다(2026-10-01, 감사)
+    const joined = await env.DB.prepare(
+      `INSERT INTO dungeon_players (room_code, user_id, name, hero_id, joined_at)
+       SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM dungeon_rooms WHERE code = ? AND status = 'lobby')
+         AND (SELECT COUNT(*) FROM dungeon_players WHERE room_code = ?) < ?`,
+    )
+      .bind(code, uid, sess.name, '', Date.now(), code, code, MAX_PARTY)
       .run();
+    if (joined.meta.changes !== 1) return bad(`파티 정원이 가득 찼거나 이미 시작됐습니다 (최대 ${MAX_PARTY}명)`);
     return json(await loadDungeonState(env, uid));
   }
 
@@ -602,9 +612,11 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     const room = await loadRoomByCode(env, code);
     if (!room || room.status !== 'lobby') return bad('로비 상태에서만 던전을 바꿀 수 있습니다');
     if (room.host_user_id !== uid) return bad('방장만 던전을 고를 수 있습니다');
-    await env.DB.prepare('UPDATE dungeon_rooms SET dungeon_id = ?, hp = ?, version = version + 1 WHERE code = ?')
+    // ⚠ 로비일 때만(같은 문장 안에서) — 시작과 겹치면 진행 중인 판의 체력이 초기화됐다(2026-10-01, 감사)
+    const changed = await env.DB.prepare("UPDATE dungeon_rooms SET dungeon_id = ?, hp = ?, version = version + 1 WHERE code = ? AND status = 'lobby'")
       .bind(dungeonId, dungeon.startHp, code)
       .run();
+    if (changed.meta.changes !== 1) return bad('로비 상태에서만 던전을 바꿀 수 있습니다');
     return json(await loadDungeonState(env, uid));
   }
 
@@ -617,9 +629,15 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     if (!room || room.status !== 'lobby') return bad('로비 상태에서만 영웅을 선택할 수 있습니다');
     const players = await loadPlayerRows(env, code);
     if (players.some((p) => p.user_id !== uid && p.hero_id === heroId)) return bad('이미 다른 파티원이 선택한 영웅입니다');
-    await env.DB.prepare('UPDATE dungeon_players SET hero_id = ?, version = version + 1 WHERE room_code = ? AND user_id = ?')
-      .bind(heroId, code, uid)
+    // ⚠ 중복 확인을 UPDATE 안에서(같은 문장) — 따로 확인하면 두 사람이 동시에 같은 영웅을 골랐다(2026-10-01, 감사)
+    const picked = await env.DB.prepare(
+      `UPDATE dungeon_players SET hero_id = ?, version = version + 1 WHERE room_code = ? AND user_id = ?
+         AND NOT EXISTS (SELECT 1 FROM dungeon_players WHERE room_code = ? AND user_id != ? AND hero_id = ?)
+         AND EXISTS (SELECT 1 FROM dungeon_rooms WHERE code = ? AND status = 'lobby')`,
+    )
+      .bind(heroId, code, uid, code, uid, heroId, code)
       .run();
+    if (picked.meta.changes !== 1) return bad('이미 다른 파티원이 선택한 영웅입니다');
     return json(await loadDungeonState(env, uid));
   }
 
@@ -719,7 +737,7 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
         }
         if (card.special) return bad('특수카드는 전용 버튼으로만 사용할 수 있습니다');
         const target = play.target as Icon | 'any';
-        if (!(target in current.req)) {
+        if (!hasReq(current.req, target)) {
           reject = '그 사이 다음 카드로 넘어갔습니다';
           break;
         }
@@ -801,7 +819,7 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
       if (!current0) return bad('공개된 카드가 없습니다');
       if (hero.id === 'barbarian') {
         const target = String(body.target ?? '');
-        if (!(target in current0.req)) return bad('올바른 요구치 항목을 선택해주세요');
+        if (!hasReq(current0.req, target)) return bad('올바른 요구치 항목을 선택해주세요');
         planned = { [target]: 3 };
       } else {
         planned = autoFill(current0.req as Req, current0.progress, 2);

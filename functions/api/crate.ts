@@ -579,7 +579,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
     const level = Math.round(Number(body.level));
     // ⚠ 상한이 없으면 조각 수천 개를 한 요청에 밀어넣을 수 있다. D1 쓰기는 여전히 1행이지만
     // 응답의 `shardCrates` 배열이 그만큼 길어지고, 클라가 그걸 전부 렌더한다.
-    const times = Math.min(MAX_MERGE_TIMES, Math.max(1, Math.round(Number(body.times ?? 1))));
+    // ⚠ 숫자가 아니면("x" → NaN) 1 로 — NaN 은 `have < 2*times` 를 통과해 버린다(2026-10-01, 감사)
+    const rawTimes = Number(body.times ?? 1);
+    const times = Math.min(MAX_MERGE_TIMES, Math.max(1, Number.isFinite(rawTimes) ? Math.round(rawTimes) : 1));
     if (!isValidMat(cat, level)) return bad('없는 재료입니다');
     const def = CAT_BY_KEY.get(cat)!;
     // ⚠ 골드복권은 레벨이 없어서 합칠 수 없다(maxLevel 1 이라 아래 분기에서도 걸리지만,
