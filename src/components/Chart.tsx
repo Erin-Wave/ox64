@@ -911,19 +911,24 @@ export default function Chart() {
     const mine = positions.filter((p) => p.symbol === symbol);
 
     if (opts.positionLine && mine.length > 0) {
-      const totSize = mine.reduce((a, p) => a + p.size, 0);
-      const avg = mine.reduce((a, p) => a + p.entryPrice * p.size, 0) / totSize;
-      const side = mine[0].side;
-      priceLines.current.push(
-        c.createPriceLine({
-          price: avg,
-          color: side === 'long' ? '#00c076' : '#f6465d',
-          lineWidth: 1,
-          lineStyle: LineStyle.Dashed,
-          axisLabelVisible: true,
-          title: '평단',
-        }),
-      );
+      // ⚠ 방향별로 따로 그린다(2026-10-01) — 롱·숏을 같이 들고 있으면(서버는 방향별 포지션) 예전엔 두 진입가를 섞은 평균 한 줄을
+      // 첫 포지션 색으로 그려 어느 쪽 평단도 아니었다.
+      for (const side of ['long', 'short'] as const) {
+        const ps = mine.filter((p) => p.side === side);
+        if (ps.length === 0) continue;
+        const totSize = ps.reduce((a, p) => a + p.size, 0);
+        const avg = ps.reduce((a, p) => a + p.entryPrice * p.size, 0) / totSize;
+        priceLines.current.push(
+          c.createPriceLine({
+            price: avg,
+            color: side === 'long' ? '#00c076' : '#f6465d',
+            lineWidth: 1,
+            lineStyle: LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: mine.some((p) => p.side !== side) ? (side === 'long' ? '롱 평단' : '숏 평단') : '평단',
+          }),
+        );
+      }
 
       // 청산가(추정) 수평선 — PositionsPanel 과 동일 산식(평가자산=잔고+전 포지션 미실현손익 이 0 되는 가격).
       // 다른 포지션들의 미실현손익이 필요하므로 전 심볼 가격이 있어야 계산 가능(없으면 생략).
