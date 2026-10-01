@@ -4,7 +4,7 @@ import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { fmtMoney, fmtMoneyShort, fmtNumInput, unfmtNum, fmtFeeRate } from '@/format';
-import { baseOf, quoteOf } from '@/symbols';
+import { baseOf, quoteOf, USDT_KRW } from '@/symbols';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit' | 'conditional';
@@ -79,8 +79,10 @@ export default function OrderPanel() {
 
   // ⚠⚠ 심볼이 바뀌면 이전 코인 기준으로 넣은 **가격 입력을 비운다**(2026-10-01). BTC 에서 넣은 60,000 지정가·트리거가가
   // OX(≈1) 화면에 그대로 남아, 매수 지정가는 즉시 시장가처럼 체결되고 "이하" 조건부는 그 자리에서 발동했다. 재무장가·SL/TP 도
-  // 같은 이유로 비우고, 수량은 코인 단위면(코인마다 뜻이 다르다) 또는 결제통화가 바뀌면(USDT↔원) 비운다. 지금 지정가·조건부
-  // 탭이면 새 심볼의 현재가로 바로 채운다(없으면 아래 효과가 시세가 들어오는 대로 채운다).
+  // 같은 이유로 비운다. 지금 지정가·조건부 탭이면 새 심볼의 현재가로 바로 채운다(없으면 아래 효과가 시세가 들어오는 대로 채운다).
+  // ⚠ **수량과 비중(슬라이더)은 그대로 둔다** — 코인을 바꿀 때마다 수량이 비워져 다시 쳐야 했다(제보, 2026-10-01). Easy 모드는 그
+  // 비중으로 새 코인 수량을 정한다. 단 금액 단위(USDT/원)로 넣은 값은 **결제통화가 바뀌면**(원 ↔ USDT) 숫자의 뜻이 ~1,400배
+  // 달라지므로(BTC/KRW 의 1,000,000원이 BTC/USDT 에서 1,000,000 USDT 가 된다) 환율로 같은 금액으로 바꾼다 — 환율을 모르면 비운다.
   const prevSymbolRef = useRef(symbol);
   useEffect(() => {
     const prev = prevSymbolRef.current;
@@ -93,8 +95,13 @@ export default function OrderPanel() {
     setRepeating(false); // 무한 반복도 끈다 — 새 코인에서 조건이 즉시 참이면 5초마다 계속 사들인다
     setStopLoss('');
     setTakeProfit('');
-    setPct(0);
-    if (unit === 'coin' || quoteOf(prev) !== quoteOf(symbol)) setAmtInput('');
+    const toQuote = quoteOf(symbol);
+    if (unit !== 'coin' && quoteOf(prev) !== toQuote) {
+      const rate = useMarketStore.getState().prices[USDT_KRW];
+      const amt = Number(amtInput);
+      if (rate && amt > 0) setAmtInput(trimNum(toQuote === 'KRW' ? amt * rate : amt / rate, toQuote === 'KRW' ? 0 : 2));
+      else if (amt > 0) setAmtInput('');
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol]);
 
