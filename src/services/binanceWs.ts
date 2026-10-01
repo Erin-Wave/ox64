@@ -1,13 +1,14 @@
 import { webSocket, type WebSocketSubject } from 'rxjs/webSocket';
 import { Observable, Subject } from 'rxjs';
-import { filter, map, retry, share, throttleTime } from 'rxjs/operators';
+import { filter, map, repeat, retry, share, throttleTime } from 'rxjs/operators';
 import type { Candle, KlineTick } from '@/types';
 
 /**
  * 바이낸스 선물 실시간 kline 스트림 (RxJS).
  *
  * - 브라우저 Native WebSocket 을 RxJS webSocket 으로 래핑.
- * - retry 로 끊김 자동 재연결.
+ * - retry 로 끊김 자동 재연결 + repeat 로 **깨끗하게 닫혀도** 재연결(rxjs webSocket 은 정상 종료면 complete 해서 retry 가 안 걸린다 —
+ *   바이낸스는 연결을 24시간마다 끊는다. 그대로 두면 차트·호가·체결이 연결 표시는 초록인 채로 얼어붙었다, 2026-10-01).
  * - share() 로 다중 구독 시 소켓 하나만 유지.
  *
  * 참고: 스팟 스트림 = wss://stream.binance.com:9443
@@ -52,6 +53,7 @@ export function klineStream(symbol: string, interval = '1m'): Observable<KlineTi
       return { symbol: m.s, candle, isClosed: k.x };
     }),
     retry({ delay: 2000 }), // 재연결 백오프
+    repeat({ delay: 2000 }), // 정상 종료(complete)도 재연결
     share(), // 소켓 공유
   );
 }
@@ -101,6 +103,7 @@ export function orderbookStream(symbol: string, levels: 5 | 10 | 20 = 10): Obser
     // leading+trailing — 첫 스냅샷은 즉시 보여주고, 마지막 것도 버리지 않는다(호가창이 낡은 채로 굳지 않게).
     throttleTime(BOOK_THROTTLE_MS, undefined, { leading: true, trailing: true }),
     retry({ delay: 2000 }),
+    repeat({ delay: 2000 }),
     share(),
   );
 }
@@ -134,6 +137,7 @@ export function aggTradeStream(symbol: string): Observable<AggTrade> {
       time: m.T,
     })),
     retry({ delay: 2000 }),
+    repeat({ delay: 2000 }),
     share(),
   );
 }

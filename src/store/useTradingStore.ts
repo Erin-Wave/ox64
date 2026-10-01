@@ -167,7 +167,8 @@ function apply(set: (s: Partial<TradingState>) => void, st: AppState) {
     pendingOrders: st.pendingOrders,
     conditionalOrders: st.conditionalOrders ?? [],
     markPrices: st.markPrices ?? {},
-    error: null,
+    // ⚠ 여기서 error 를 지우지 않는다(2026-10-01) — 폴링 응답이 2.5초 안에 방금 실패한 주문의 사유를 지워 버렸다. 에러는 다음
+    // 액션 묶음이 시작될 때(§ action) 지운다.
     stateAt: Date.now(), // useTriggerPoll 이 "방금 갱신됐으니 건너뛰자"를 판단하는 기준
   });
   // 서버 마크가격을 가격 맵에 시드 — 보유 심볼(OX 포함, 현재 보고 있지 않아도)의 청산가/미실현PnL 이
@@ -254,15 +255,28 @@ function enqueue<T>(set: (s: Partial<TradingState>) => void, run: () => Promise<
 }
 /** 서버에 상태를 바꾸는 요청 하나 — 응답(새 계정 상태)을 반영하고, 실패하면 사유를 `error` 에 남긴다. */
 function action(set: (s: Partial<TradingState>) => void, call: () => Promise<AppState>): Promise<void> {
+  // ⚠ 에러는 **줄이 비어 있을 때 새로 시작한 액션**만 지운다(2026-10-01) — F9 세 번 중 두 번째가 실패했는데 세 번째가 성공하면서
+  // 그 사유를 지워, 한 건이 안 들어간 걸 알 수 없었다.
+  const fresh = actionsQueued === 0;
   return enqueue(set, async () => {
-    set({ error: null });
+    if (fresh) set({ error: null });
     try {
       apply(set, await call());
       lastActionAt = Date.now();
     } catch (e) {
-      set({ error: (e as Error).message });
+      showError(set, (e as Error).message);
     }
   });
+}
+/** 액션 실패 사유를 보여 주고 8초 뒤 지운다(그 사이 다른 사유로 바뀌었으면 그대로 둔다) — 폴링이 지우던 시절처럼 금방 사라지지도,
+ * 영원히 남지도 않게. */
+let errorTimer: ReturnType<typeof setTimeout> | undefined;
+function showError(set: (s: Partial<TradingState>) => void, msg: string) {
+  set({ error: msg });
+  clearTimeout(errorTimer);
+  errorTimer = setTimeout(() => {
+    if (useTradingStore.getState().error === msg) set({ error: null });
+  }, 8000);
 }
 
 function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState, pair: string) {

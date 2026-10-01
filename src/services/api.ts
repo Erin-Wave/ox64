@@ -139,12 +139,28 @@ export class ApiError extends Error {
   }
 }
 
+/** 요청 하나의 최대 대기(ms). ⚠ 거래 액션은 한 줄로 차례로 나가므로(§ useTradingStore enqueue) 멈춘 요청 하나가 뒤의 주문·
+ * 청산(F8 포함)을 전부 막았다 — 그 사이 누른 키는 쌓였다가 한참 뒤 다른 가격에 한꺼번에 나갔다(2026-10-01). 서버 쪽 정상 처리는
+ * 길어야 몇 초다(외부 시세 폴백 2.5초 × 몇 단계). ⚠ 시간이 지나 끊겨도 서버는 이미 처리했을 수 있다 — 메시지가 그렇게 말한다. */
+const REQUEST_TIMEOUT_MS = 20_000;
+
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
-  const res = await fetch(`/api${path}`, {
-    credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
-    ...opts,
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(`/api${path}`, {
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      ...opts,
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    if (ctrl.signal.aborted) throw new ApiError('응답이 너무 늦어 기다리지 않았습니다 — 처리됐을 수 있으니 목록을 확인하세요', 0);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   const data = (await res.json().catch(() => ({}))) as T & { error?: string };
   if (!res.ok) throw new ApiError(data.error || `HTTP ${res.status}`, res.status);
   return data;

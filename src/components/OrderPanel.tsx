@@ -90,6 +90,7 @@ export default function OrderPanel() {
     setLimitPrice(effectiveTab === 'limit' ? fill : '');
     setTriggerPrice(effectiveTab === 'conditional' ? fill : '');
     setRearmPrice('');
+    setRepeating(false); // 무한 반복도 끈다 — 새 코인에서 조건이 즉시 참이면 5초마다 계속 사들인다
     setStopLoss('');
     setTakeProfit('');
     setPct(0);
@@ -97,12 +98,19 @@ export default function OrderPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol]);
 
-  // 지정가/조건부 탭을 처음 열 때 현재가로 기본값 채움
+  // 지정가/조건부 탭을 처음 열 때 현재가로 기본값 채움 — ⚠ (심볼, 탭)마다 **한 번만**(2026-10-01). 예전엔 시세가 틱마다
+  // 바뀔 때마다 "비어 있으면 채움"이 돌아서, 칸을 지우고 1초만 머뭇거려도 현재가가 다시 들어오고 이어 친 숫자가 그 뒤에 붙었다
+  // (1.0436 뒤에 5 → 1.04365 같은 엉뚱한 지정가).
+  const autoFilledRef = useRef('');
   useEffect(() => {
-    if (effectiveTab === 'limit' && !limitPrice && lastPrice) setLimitPrice(String(lastPrice));
-    if (effectiveTab === 'conditional' && !triggerPrice && lastPrice) setTriggerPrice(String(lastPrice));
+    if (!lastPrice || (effectiveTab !== 'limit' && effectiveTab !== 'conditional')) return;
+    const key = `${symbol}|${effectiveTab}`;
+    if (autoFilledRef.current === key) return;
+    autoFilledRef.current = key;
+    if (effectiveTab === 'limit' && !limitPrice) setLimitPrice(String(lastPrice));
+    if (effectiveTab === 'conditional' && !triggerPrice) setTriggerPrice(String(lastPrice));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveTab, lastPrice]);
+  }, [effectiveTab, lastPrice, symbol]);
 
   // 차트/호가창 클릭 → 그 가격을 지정가 입력에 채운다. ⚠ 예전엔 클릭만 해도 지정가 탭으로 강제
   // 전환해서, 시장가로 주문하려다 무심코 차트를 클릭하면 시장가 주문이 지정가로 걸리던 버그가 있었다.
@@ -140,7 +148,7 @@ export default function OrderPanel() {
   // ⚠ 앞 주문이 처리 중이어도(`busy`) 버리지 않는다 — 스토어가 줄을 세워 차례로 보낸다(§ useTradingStore enqueue).
   // 예전엔 여기서 `busy` 면 return 해서 F9·버튼 연타가 두세 번에 한 번씩 씹혔다. 인자는 **지금** 값으로 만든다.
   const submit = (side: Side) => {
-    const sz = sizeCoin;
+    const sz = orderSize; // ⚠ Easy 모드는 슬라이더 비중에서 바로(§ orderSize)
     if (!sz || sz <= 0) return;
     if (effectiveTab === 'conditional') {
       const tpx = Number(triggerPrice);
@@ -190,10 +198,6 @@ export default function OrderPanel() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const notional = refPrice ? refPrice * sizeCoin : 0;
-  const margin = notional / leverage;
-  // 진입 수수료 = 명목가 × VIP 수수료율(서버가 체결 시 실제로 떼는 값과 같은 식). 청산할 때 한 번 더 든다.
-  const fee = notional * feeRate;
 
   // 크로스 마진 가용 증거금 = 여유잔고 + 전 포지션 미실현손익(서버 markPrices 기준 — 서버 가용 판정과
   // 동일 시세). 이익 중이면 그 미실현이익까지 새 주문에 쓸 수 있고, 손실 중이면 가용이 줄어든다.
@@ -216,6 +220,17 @@ export default function OrderPanel() {
   // (1/leverage + feeRate) 이므로 명목가 = 가용 / (1/leverage + feeRate). 수수료를 빼먹으면 고배율에서
   // 슬라이더 100% 가 그대로 거부된다(200배면 수수료가 증거금의 ~6% 라 0.1% 여유로는 못 덮는다).
   const SAFETY = 0.999;
+  // 주문에 실제로 쓰는 코인 수량. ⚠ Easy 모드엔 수량 칸이 없으므로 **슬라이더 비중에서만** 정한다(2026-10-01) — 예전엔 숨은
+  // 입력칸 값(기본 0.01 코인, 또는 Standard 에서 친 값)이 그대로 나가서 0% 인데도 주문이 들어갔다. 0% 면 주문하지 않는다.
+  const orderSize = standard
+    ? sizeCoin
+    : pct > 0 && refPrice
+      ? (available * (pct / 100) * SAFETY) / (1 / leverage + feeRate) / refPrice
+      : 0;
+  const notional = refPrice ? refPrice * orderSize : 0;
+  const margin = notional / leverage;
+  // 진입 수수료 = 명목가 × VIP 수수료율(서버가 체결 시 실제로 떼는 값과 같은 식). 청산할 때 한 번 더 든다.
+  const fee = notional * feeRate;
   // Number() 로 뒷자리 0 을 떨군다(55000000.000000 → 55000000). 코인은 최대 6자리, USDT 는 2자리로 표기.
   // ⚠ 1e21 이상은 toFixed/String 이 지수 표기("1e+21")를 돌려줘 입력칸이 사람이 읽을 수 없게 된다
   // (싼 코인+고배율+거대 잔고면 슬라이더 100% 가 실제로 이 영역에 들어간다) → Intl 로 전체 자릿수 전개.

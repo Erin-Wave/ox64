@@ -177,6 +177,9 @@ export default function Chart() {
   const [legend, setLegend] = useState<Candle | null>(null);
   const [indLegend, setIndLegend] = useState<Record<string, IndLegendValue>>({});
   const [countdown, setCountdown] = useState('');
+  // 불러온 봉 구간(첫 봉|마지막 봉 시각) — 바뀌면 매매 마커를 다시 봉에 맞춘다(§ 매매 마커). 값이 같으면 렌더도 안 일어난다.
+  const [barsKey, setBarsKey] = useState('');
+  const markBars = (arr: Candle[]) => setBarsKey(arr.length ? `${arr[0].time}|${arr[arr.length - 1].time}` : '');
   // 카운트다운 위치 — 트레이딩뷰처럼 우측 가격축의 현재가 티커(마지막 봉 종가 라벨) 바로 아래에 붙인다.
   // top=현재가 y좌표, width=가격축 너비, up=마지막 봉 방향(색상). 가격/스케일 변화마다 갱신.
   const [countdownPos, setCountdownPos] = useState<{ top: number; width: number; up: boolean } | null>(null);
@@ -589,6 +592,7 @@ export default function Chart() {
         const cut = fresh[0].time;
         const merged = prev.length ? [...prev.filter((c) => c.time < cut), ...fresh] : fresh;
         candlesRef.current = merged;
+        markBars(merged);
         for (const c of fresh) volMap.current.set(c.time, c.volume ?? 0);
         draw(merged);
         // 최초 1회만 표시 범위를 잡는다 — 매 폴링마다 다시 잡으면 사용자가 확대/축소한 뷰가 계속
@@ -632,6 +636,7 @@ export default function Chart() {
           const ts = chartRef.current?.timeScale();
           const before = ts?.getVisibleLogicalRange();
           candlesRef.current = [...fresh, ...cur];
+          markBars(candlesRef.current);
           for (const c of fresh) volMap.current.set(c.time, c.volume ?? 0);
           draw(candlesRef.current);
           // 프리펜드로 인덱스가 fresh.length 만큼 밀리므로 보이던 구간 그대로 유지
@@ -714,12 +719,17 @@ export default function Chart() {
         .catch(() => {});
     }
 
+    // ⚠⚠ 실시간 구독은 **과거봉을 그린 뒤에** 시작한다(2026-10-01). 예전엔 바로 구독해서, 과거봉 요청(빗썸은 3~10번 연속)이 끝나기
+    // 전에 체결이 오면 그 한 건으로 현재 봉을 만들었고, 과거봉이 같은 시각으로 도착해도 스트림 쪽 봉이 이겨서 **그 기간 내내 현재
+    // 봉이 틀렸다**(1d 면 하루 종일 — 시가 = 차트를 연 뒤 첫 체결, 고저·거래량 = 연 뒤의 체결뿐). 실패해도 구독은 한다.
+    let sub: { unsubscribe: () => void } | undefined;
     (async () => {
       try {
         const candles = await loadKlines(500);
         if (cancelled) return;
         if (krw && candles.length) applyPrecision(virtualPrecision(candles[candles.length - 1].close));
         candlesRef.current = candles;
+        markBars(candles);
         for (const c of candles) volMap.current.set(c.time, c.volume ?? 0);
         candle.setData(
           candles.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
@@ -737,6 +747,7 @@ export default function Chart() {
       } catch (e) {
         console.error('[chart] load failed', e);
       }
+      if (!cancelled) sub = subscribeLive();
     })();
 
     // ── 과거봉 추가 로드 (왼쪽 스크롤) ──────────────────────────
@@ -760,6 +771,7 @@ export default function Chart() {
         const ts = chart.timeScale();
         const before = ts.getVisibleLogicalRange();
         candlesRef.current = [...fresh, ...arr];
+        markBars(candlesRef.current);
         for (const c of fresh) volMap.current.set(c.time, c.volume ?? 0);
         candle.setData(
           candlesRef.current.map((c) => ({ time: toChart(c.time), open: c.open, high: c.high, low: c.low, close: c.close })) as CandlestickData[],
@@ -796,8 +808,11 @@ export default function Chart() {
     const tsApi = chartRef.current?.timeScale();
     tsApi?.subscribeVisibleLogicalRangeChange(onRange);
 
+    // 함수 선언이라 위의 비동기 로드가 끝난 뒤 호출해도 된다(호이스팅).
+    function subscribeLive(): { unsubscribe: () => void } | undefined {
+    if (!candle) return undefined; // (함수 선언 안에선 바깥의 null 검사가 좁혀지지 않는다)
     const live$ = krw ? bithumbKlineStream(symbol, interval, () => candlesRef.current.at(-1)) : klineStream(symbol, interval);
-    const sub = live$.subscribe({
+    return live$.subscribe({
       next: (tick) => {
         setConnected(true);
         // ⚠ 실제 코인의 mark(현재가/PnL 기준)는 바이낸스 WS 가 아니라 OKX(useMarkPrices)로 온다 —
@@ -814,7 +829,10 @@ export default function Chart() {
         volMap.current.set(bar.time, bar.volume ?? 0);
         const arr = candlesRef.current;
         if (arr.length && arr[arr.length - 1].time === bar.time) arr[arr.length - 1] = bar;
-        else arr.push(bar);
+        else {
+          arr.push(bar);
+          markBars(arr); // 새 봉이 열렸다 — 그 봉 안의 체결 마커가 제자리를 찾게
+        }
         if (!hovering.current) setLegend(bar);
         repositionCountdownRef.current(); // 현재가 이동 → 카운트다운도 축 티커 따라 이동
         const now = Date.now();
@@ -826,10 +844,11 @@ export default function Chart() {
       },
       error: () => setConnected(false),
     });
+    }
 
     return () => {
       cancelled = true;
-      sub.unsubscribe();
+      sub?.unsubscribe();
       tsApi?.unsubscribeVisibleLogicalRangeChange(onRange);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -847,22 +866,40 @@ export default function Chart() {
     const c = candleRef.current;
     if (!c) return;
     if (!opts.tradeMarkers) { c.setMarkers([]); return; }
-    const markers: SeriesMarker<Time>[] = orders
-      .filter((o) => o.symbol === symbol)
-      .map((o) => {
-        const long = o.side === 'long';
-        const liquidation = o.kind === 'liquidation';
-        return {
-          time: toChart(Math.floor(o.createdAt / 1000)) as Time,
-          position: (long ? 'belowBar' : 'aboveBar') as SeriesMarker<Time>['position'],
-          color: liquidation ? '#ff9800' : long ? '#00c076' : '#f6465d',
-          shape: (long ? 'arrowUp' : 'arrowDown') as SeriesMarker<Time>['shape'],
-          text: liquidation ? 'L' : o.kind === 'close' ? 'C' : long ? 'B' : 'S',
-        };
-      })
-      .sort((a, b) => (a.time as number) - (b.time as number));
+    // ⚠ 마커 시각을 **그 체결이 속한 봉의 시작**으로 맞춘다(2026-10-01) — LWC 는 마커를 "그 시각 이후의 첫 봉"에 붙여서 13:44:30
+    // 체결이 13:45 봉(1d 면 다음 날 봉)에 찍혔다. 불러온 구간보다 오래된 주문은 첫 봉에 몰려 쌓이므로 뺀다.
+    const bars = candlesRef.current;
+    const barOf = (t: number): number | null => {
+      if (bars.length === 0 || t < bars[0].time) return null;
+      let lo = 0;
+      let hi = bars.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (bars[mid].time <= t) lo = mid;
+        else hi = mid - 1;
+      }
+      return bars[lo].time;
+    };
+    const markers: SeriesMarker<Time>[] = [];
+    for (const o of orders) {
+      if (o.symbol !== symbol) continue;
+      const bt = barOf(Math.floor(o.createdAt / 1000));
+      if (bt == null) continue;
+      // 체결 방향 = 진입은 포지션 방향, 청산·강제청산은 그 반대(롱 청산 = 매도). 예전엔 롱 청산이 매수처럼 초록 ▲ 로 찍혔다.
+      const buy = o.kind === 'open' ? o.side === 'long' : o.side === 'short';
+      const liquidation = o.kind === 'liquidation';
+      markers.push({
+        time: toChart(bt) as Time,
+        position: (buy ? 'belowBar' : 'aboveBar') as SeriesMarker<Time>['position'],
+        color: liquidation ? '#ff9800' : buy ? '#00c076' : '#f6465d',
+        shape: (buy ? 'arrowUp' : 'arrowDown') as SeriesMarker<Time>['shape'],
+        text: liquidation ? 'L' : o.kind === 'close' ? 'C' : buy ? 'B' : 'S',
+      });
+    }
+    markers.sort((a, b) => (a.time as number) - (b.time as number));
     c.setMarkers(markers);
-  }, [orders, symbol, opts.tradeMarkers]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orders, symbol, opts.tradeMarkers, barsKey]);
 
   // ── 포지션 평단 / SL·TP 수평선 ───────────────────────────────
   useEffect(() => {
@@ -1004,9 +1041,25 @@ export default function Chart() {
   useEffect(() => {
     if (!opts.showCountdown) { setCountdown(''); return; }
     const sec = intervalSec(interval);
+    // ⚠ 남은 시간은 **마지막 봉의 시작 시각** 기준으로 센다(2026-10-01) — `now % sec` 는 봉이 유닉스 시각 경계에서 시작한다고 가정해서
+    // 바이낸스 1w(월요일 시작)·1M(달력 월)과 빗썸 2h~1M(한국 시각 정렬)에서 틀렸다(20시 KST 의 BTC/KRW 1d 가 4시간 대신 13시간).
+    const kstAligned = quoteOf(symbol) === 'KRW';
+    const nextMonth = (startSec: number) => {
+      const off = kstAligned ? 9 * 3600 : 0;
+      const d = new Date((startSec + off) * 1000);
+      return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000 - off;
+    };
     const tick = () => {
       const now = Date.now() / 1000;
-      const remain = Math.max(0, Math.ceil(sec - (now % sec)));
+      const last = candlesRef.current.at(-1)?.time;
+      let remain: number;
+      if (last == null) remain = sec - (now % sec);
+      else if (interval === '1M') {
+        let next = nextMonth(last);
+        while (next <= now) next = nextMonth(next);
+        remain = next - now;
+      } else remain = sec - ((((now - last) % sec) + sec) % sec);
+      remain = Math.max(0, Math.ceil(remain));
       const h = Math.floor(remain / 3600);
       const m = Math.floor((remain % 3600) / 60);
       const s = Math.floor(remain % 60);
@@ -1017,7 +1070,8 @@ export default function Chart() {
     tick();
     const t = window.setInterval(tick, 1000);
     return () => window.clearInterval(t);
-  }, [interval, opts.showCountdown]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [interval, symbol, opts.showCountdown]);
 
   const up = legend ? legend.close >= legend.open : true;
   // 종가 옆 변동률 = 그 봉의 (종가-시가)/시가 (레전드 상하 색과 동일 기준). hover 시 그 봉, 아니면 마지막 봉.

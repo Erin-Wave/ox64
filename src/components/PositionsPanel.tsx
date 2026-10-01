@@ -22,10 +22,11 @@ const effCooldownSec = (cooldownMs: number) => Math.max(MIN_COOLDOWN_SEC, (coold
 
 /** 슬라이더가 만든 수량을 입력칸 문자열로. ⚠ 1e21 이상은 String/toFixed 가 지수 표기("1e+21")를 줘서
  * 입력칸이 사람이 못 읽는 값이 된다(OrderPanel trimNum 과 같은 이유) → Intl 로 전체 자릿수를 편다. */
-/** 입력칸 문자열 → 슬라이더 위치(%). 비어 있으면 "전량"이라 100% 로 본다. */
+/** 입력칸 문자열 → 슬라이더 위치(%). 비어 있으면 "전량"이라 100%, 양수가 아닌 값("0"·".")은 0% 다(전량이 아니다). */
 const closePctOf = (raw: string | undefined, closable: number): number => {
-  const n = Number(raw ?? '');
-  if (!raw || !(n > 0) || !(closable > 0)) return 100;
+  if (!raw) return 100;
+  const n = Number(raw);
+  if (!(n > 0) || !(closable > 0)) return 0;
   return Math.max(0, Math.min(100, Math.round((n / closable) * 100)));
 };
 
@@ -86,7 +87,11 @@ export default function PositionsPanel() {
     void closePosition(id).finally(() => fullClosing.current.delete(id));
   };
   const doClose = (id: string, closable: number) => {
-    const amt = closeAmt[id] ? Number(closeAmt[id]) : NaN;
+    const raw = (closeAmt[id] ?? '').trim();
+    const amt = raw ? Number(raw) : NaN;
+    // ⚠⚠ 비어 있지 않은데 양수가 아니면("0"·"."·"0.") **아무것도 하지 않는다**(2026-10-01) — 예전엔 아래 `closeAll` 로 떨어져
+    // 전량 청산됐다("0.05" 를 치다 "0" 에서 F8 을 누르면 포지션 전체가 닫혔다). 전량 청산은 칸을 비웠을 때뿐이다.
+    if (raw && !(amt > 0)) return;
     const px = closePx[id] ? Number(closePx[id]) : NaN;
     if (px > 0) void limitClose(id, amt > 0 ? amt : closable, px);
     else if (amt > 0) void closePosition(id, amt);
@@ -472,7 +477,8 @@ export default function PositionsPanel() {
                                 const v = Number(e.target.value);
                                 setCloseAmt((st) => ({
                                   ...st,
-                                  [p.id]: v >= 100 ? '' : qtyInputStr((closable * v) / 100),
+                                  // 100% = 비움(전량), 0% = "0"(아무것도 안 함 — 빈칸이면 전량으로 읽힌다)
+                                  [p.id]: v >= 100 ? '' : v <= 0 ? '0' : qtyInputStr((closable * v) / 100),
                                 }));
                               }}
                               title="청산 수량 비중 — 청산 가능 수량 기준"
