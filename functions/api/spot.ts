@@ -776,14 +776,19 @@ export interface TickCtx {
   mark: number | null;
 }
 
-/** 대기 지정가 목록 → 가격대별 합계(봇의 "유저 벽" 판정용). 예전엔 이걸 SQL `GROUP BY` 로 따로 읽었다. */
+/** 대기 지정가 목록 → 가격대별 합계(봇의 "유저 벽" 판정용). 예전엔 이걸 SQL `GROUP BY` 로 따로 읽었다.
+ * `readyAt` = 그 가격대에서 **가장 먼저 다시 체결될 수 있는 시각**(부분 체결된 주문은 § PARTIAL_FILL_COOLDOWN_MS 뒤) —
+ * 봇이 벽 가격에 흡수 호가를 낼지 정할 때 쓴다(§ simulateTick). */
 function wallsOf(pendings: PendingLite[]): WallRow[] {
   const m = new Map<string, WallRow>();
   for (const p of pendings) {
     const k = `${p.side}|${p.price}`;
+    const ready = p.last_fill_at == null ? 0 : p.last_fill_at + PARTIAL_FILL_COOLDOWN_MS;
     const cur = m.get(k);
-    if (cur) cur.size += p.size;
-    else m.set(k, { side: p.side, price: p.price, size: p.size });
+    if (cur) {
+      cur.size += p.size;
+      cur.readyAt = Math.min(cur.readyAt, ready);
+    } else m.set(k, { side: p.side, price: p.price, size: p.size, readyAt: ready });
   }
   return [...m.values()];
 }
@@ -1991,6 +1996,29 @@ interface WallRow {
   side: string;
   price: number;
   size: number;
+  /** 그 가격대가 다시 체결될 수 있는 가장 이른 시각(ms, § wallsOf) — 테스트·sim 처럼 모르면 0 */
+  readyAt: number;
+}
+
+/** 이 틱에서 봇 가격을 가두는 유저 벽 — 최우선 매수(가장 비싼 유저 매수)와 최우선 매도(가장 싼 유저 매도).
+ * ⚠⚠ **걸려 있는 유저 지정가는 전부 경계다**(2026-10-02, 예전엔 기준가 너머의 비-marketable 주문만). 예전 규칙은 "현재가보다
+ * 위의 매수"를 벽에서 뺐는데, 큰 매수가 걸리면서 사다리를 먹으면 기준가가 체결 평균(그 매수가 아래)으로 내려가 **그 순간 벽에서
+ * 빠졌고**, 봇은 그 매수를 무시한 채 아래에서 봇끼리 체결했다(제보: 0.7 에 1조 개 매수를 걸어도 0.68 에 막 매도·체결된다).
+ * 실제 거래소에선 0.7 매수가 남아 있는 한 0.7 아래 체결은 있을 수 없다(팔 사람은 0.7 에 판다). 유저 주문끼리 서로 교차하면
+ * (같은 계정의 양방향 주문 등 — 유저끼리는 직접 체결되지 않는다) 둘 다 지킬 수 없어서 그때만 예전 규칙(기준가 너머만)으로 고른다. */
+function pickWalls(rows: WallRow[], ref: number) {
+  const pick = (beyondOnly: boolean) => {
+    let bid: WallRow | null = null;
+    let ask: WallRow | null = null;
+    for (const r of rows) {
+      if (!(r.size > EPS) || !(r.price > 0)) continue;
+      if (r.side === 'long' && (!beyondOnly || r.price <= ref) && (!bid || r.price > bid.price)) bid = r;
+      else if (r.side === 'short' && (!beyondOnly || r.price >= ref) && (!ask || r.price < ask.price)) ask = r;
+    }
+    return { bid, ask };
+  };
+  const all = pick(false);
+  return all.bid && all.ask && all.bid.price >= all.ask.price ? pick(true) : all;
 }
 
 /** 한 틱의 결과. ⚠ D1 을 전혀 건드리지 않는다(§ 봇 틱은 메모리에서, 커밋은 한 번에). */
@@ -2069,27 +2097,18 @@ export function simulateTick(
   // 먹었고, 그래서 큰 벽 앞에서 몇십 분씩 가격이 굳어버렸다("봇이 쫄보라 큰 벽을 못 뚫는 느낌").
   // ⚠ 벽 목록은 **틱마다가 아니라 실행마다** 읽는다(호출자가 넘겨준다) — 한 invocation 안에서는 유저
   // 주문이 새로 들어올 수 없어 값이 안 변하는데, 틱마다 읽으면 그것만으로 쿼리가 틱 수만큼 늘어난다.
-  // 단, 어느 호가가 "벽"인지는 그 틱의 기준가(prev.ref)에 따라 달라지므로 **판정은 매 틱 다시** 한다.
-  let wallAsk: number | null = null;
-  let wallAskSize = 0;
-  let wallBid: number | null = null;
-  let wallBidSize = 0;
-  // ⚠ **marketable 주문은 벽으로 취급하지 않는다**(2026-07-24 버그 수정). 벽은 현재가 너머의 저항/지지
-  // (매도벽=현재가 이상, 매수벽=현재가 이하)여야 한다 — 유저가 현재가보다 낮게 건 매도(=지금 팔겠다는
-  // marketable 청산/지정가)나 현재가보다 높게 건 매수를 벽으로 잡으면, 기준가를 그 주문 가격으로 끌어내려
-  // /끌어올려 **시장이 그 주문 쪽으로 통째로 끌려가고**(예: 시세 1.0 인데 0.5 청산 예약 하나에 시장이 0.5 로
-  // 붕괴), 사다리가 그 가격에 깔려 정작 그 주문이 크로스가 안 돼 거의 안 팔리는 교착이 생긴다. marketable
-  // 주문은 벽에서 빼면 아래 sweep 이 정상 사다리에 walking 체결한다. 비-marketable 벽(진짜 저항/지지)은
-  // 그대로 존중 → "가짜 high"(벽 너머 유령체결) 방지 로직은 유지된다.
-  for (const r of wallRows) {
-    if (r.side === 'short' && r.price >= prev.ref && (wallAsk == null || r.price < wallAsk)) {
-      wallAsk = r.price;
-      wallAskSize = r.size;
-    } else if (r.side === 'long' && r.price <= prev.ref && (wallBid == null || r.price > wallBid)) {
-      wallBid = r.price;
-      wallBidSize = r.size;
-    }
-  }
+  // 단, 어느 호가가 "벽"인지는 그 틱의 기준가(prev.ref)에 따라 달라질 수 있으므로 **판정은 매 틱 다시** 한다.
+  // ⚠⚠ 벽은 **걸려 있는 유저 지정가 전부**다(§ pickWalls, 2026-10-02) — 현재가보다 위의 매수·아래의 매도도 포함한다. 예전엔
+  // marketable 주문을 뺐다(2026-07-24, "시세 1.0 에 0.5 청산 예약 하나로 시장이 0.5 로 끌려간다") — 하지만 걸려 있다는 건 사다리를
+  // 다 먹고도 남았다는 뜻이라 그 주문이 곧 최우선호가이고, 빼면 봇이 그 주문을 건너뛰고 너머에서 봇끼리 체결했다(제보: 0.7 에 1조 개
+  // 매수를 걸어도 0.68 에 체결). 끌려가는 게 실제 거래소의 결과다 — 그 가격 너머엔 유동성이 없다. 교착은 아래 흡수 호가가 푼다.
+  const walls = pickWalls(wallRows, prev.ref);
+  const wallAsk: number | null = walls.ask ? walls.ask.price : null;
+  const wallAskSize = walls.ask ? walls.ask.size : 0;
+  const wallAskReady = walls.ask ? walls.ask.readyAt : 0;
+  const wallBid: number | null = walls.bid ? walls.bid.price : null;
+  const wallBidSize = walls.bid ? walls.bid.size : 0;
+  const wallBidReady = walls.bid ? walls.bid.readyAt : 0;
   let ref = candidateRef;
   let press: 'up' | 'down' | null = null;
   if (wallAsk != null && ref > wallAsk) {
@@ -2100,13 +2119,13 @@ export function simulateTick(
     press = 'down'; // 매수벽에 눌림 — 봇이 벽 가격에 매도호가를 놓아 벽을 소비
   }
 
-  // 기준가뿐 아니라 개별 합성 체결 가격도 같은 벽 안으로 가둔다 — 안 그러면 봉 안의 노이즈가 벽을 넘어
-  // 찍혀서 "벽은 안 팔렸는데 차트 고가만 벽 너머"인 가짜 꼬리가 생긴다(가짜 high 버그와 같은 원리).
-  function clampToWalls(p: number): number {
-    if (wallAsk != null && p > wallAsk) return roundOx(wallAsk);
-    if (wallBid != null && p < wallBid) return roundOx(wallBid);
-    return p;
-  }
+  // ⚠⚠ 개별 합성 체결도 벽 안에서만 찍는다 — 그리고 **벽 가격이나 그 너머에 찍힐 체결은 봇끼리 체결이 아니다**(2026-10-02).
+  // 0.7 매수가 걸려 있으면 그 가격 이하에 팔려는 물량은 전부 그 매수가 받아야 한다(가격 우선). 예전엔 그런 체결을 벽 가격으로
+  // 끌어올려(clampToWalls) 봇끼리 찍었다 — "0.7 에 체결되는데 내 0.7 매수는 안 채워진다". 지금은 테이프에 찍지 않고 그 물량을
+  // 모아(absorbedAtBid/AtAsk) 아래 흡수 호가에 얹는다 → sweep 이 그 물량을 유저 주문에 **유저 가격으로** 체결한다(유저 체결로 찍힌다).
+  let absorbedAtBid = 0; // 유저 매수벽 이하에 찍힐 뻔한 물량(→ 벽 가격의 봇 매도호가)
+  let absorbedAtAsk = 0; // 유저 매도벽 이상에 찍힐 뻔한 물량(→ 벽 가격의 봇 매수호가)
+  let printed = 0; // 실제로 테이프에 찍힌 건수(전부 흡수됐으면 봉도 없다)
   // ── 이번 틱의 체결(테이프) ─ ⚠ 사다리보다 **먼저** 계산한다(§ 함수 주석: 지나간 자리의 호가는 체결된다)
   // 합성 체결을 여러 건 찍는다. ⚠ 예전엔 전부 같은 가격(ref)이라 봉 안에 구조가 없었다(몸통만 있고
   // 꼬리가 없는 캔들) — 지금은 직전 기준가에서 새 기준가로 "걸어가면서" 노이즈를 얹어 찍으므로 봉마다
@@ -2219,6 +2238,9 @@ export function simulateTick(
     // ③ 파고든 만큼 **mid 자체가 밀린다**(사다리가 소비됐다) — 그리고 목표 경로가 서서히 되돌린다.
     //    그래서 고래가 훑고 간 자리엔 꼬리가 남고, 같은 방향이 이어지는 동안엔 가격이 단조로 걸어간다.
     mid += (walk - mid) * follow + dir * dig * mid;
+    // 호가 중간값도 유저 벽을 넘지 못한다 — 파고든 물량이 벽 너머로 mid 를 밀면 그 너머의 호가 바운스가 생긴다.
+    if (wallBid != null && mid < wallBid) mid = wallBid;
+    if (wallAsk != null && mid > wallAsk) mid = wallAsk;
     // ② 호가 바운스 — 매수는 매도호가에(mid 위), 매도는 매수호가에(mid 아래). 잔잔한 구간에선 두 가격
     //    사이를 딸깍딸깍 왕복하고, 한쪽 흐름이 몰리면 그 방향으로 계단처럼 걸어간다.
     let raw = mid * (1 + dir * half);
@@ -2238,8 +2260,28 @@ export function simulateTick(
     const tapeStep = 5 * virtualTick(raw);
     const grid = Math.round(raw / tapeStep) * tapeStep;
     const snapped = Math.random() < 0.65 && Math.abs(grid - raw) <= half * raw ? grid : raw;
-    const price = clampToWalls(roundOx(snapped));
-    if (i === 0) open = price;
+    let price = roundOx(snapped);
+    // 벽 가격 이하(매수벽)/이상(매도벽)에 떨어진 체결: **벽 쪽으로 거래하려던 물량**(매수벽에 파는 쪽)은 유저 주문 몫이라 찍지 않고 흡수
+    // 물량으로(§ 위 absorbedAtBid), 반대쪽(매수벽 앞에서 사는 쪽)은 벽 바로 위 한 틱의 호가를 산 것으로 찍는다. 벽에 붙은 시장은 반 스프레드가
+    // 한 틱보다 좁아 사는 체결도 반올림으로 벽 가격에 떨어지는데, 그걸 흡수하면 사려던 물량까지 유저 매수가 받게 된다.
+    if (wallBid != null && price <= wallBid) {
+      if (flowSide === 'sell') {
+        absorbedAtBid += sz;
+        continue;
+      }
+      price = roundOx(wallBid + virtualTick(wallBid));
+    }
+    if (wallAsk != null && price >= wallAsk) {
+      if (flowSide === 'buy') {
+        absorbedAtAsk += sz;
+        continue;
+      }
+      price = roundOx(wallAsk - virtualTick(wallAsk));
+    }
+    // 두 벽이 한 틱 안에 붙어 있으면 위 조정이 반대쪽 벽에 닿는다 — 그땐 찍을 자리가 없다.
+    if ((wallBid != null && price <= wallBid) || (wallAsk != null && price >= wallAsk)) continue;
+    if (printed === 0) open = price;
+    printed++;
     close = price;
     high = Math.max(high, price);
     low = Math.min(low, price);
@@ -2255,7 +2297,7 @@ export function simulateTick(
   }
 
   const next: BotState = { ...step.next, ref };
-  const bar = nTrades > 0 ? { open, high, low, close, volume } : null;
+  const bar = printed > 0 ? { open, high, low, close, volume } : null;
   // 규칙 ①의 "지나간 범위" — 체결 범위에 새 공정가를 더한다(체결이 0건이면 공정가 한 점). 호가가 새 공정가를
   // 넘어 교차된 채 남지 않게 하는 것이 곧 역전 방지다. 버스트에서 사다리를 건너뛴 틱들의 범위·교체 속도도
   // 여기서 합친다(§ LadderDebt).
@@ -2407,11 +2449,20 @@ export function simulateTick(
   // 유저 벽에 눌렸으면(press) 그 벽 가격에 봇 호가를 얹는다 — 아래 sweep 이 유저 벽을 그 가격에 소비.
   // 물량은 **벽 크기에 비례**한다(wallAbsorbSize) — 고정 크기면 큰 벽을 영원히 못 뚫는다.
   // ⚠ 그리고 **이 틱이 흘려보낸 시장 시간에 비례**한다 — 한산한 시장은 벽을 천천히 갉고, 거래가 몰리면 빨리 뚫는다.
+  // ⚠ 이번 틱에 벽에 닿아 찍지 않은 체결 물량(absorbedAt*)도 여기에 얹는다 — 눌리지 않았어도 벽에 닿은 만큼은 유저가 받는다.
+  // ⚠ 두 조건에서만 낸다: (1) 봇 자기 호가와 교차하지 않을 때(벽이 실제로 최우선일 때 — 아니면 시장가로 봇 매수·매도를 오가는
+  //    공짜 차익이 생긴다), (2) 그 가격의 유저 주문이 **지금 체결될 수 있을 때**(재체결 간격 § PARTIAL_FILL_COOLDOWN_MS). (2)가 없으면
+  //    간격을 기다리는 동안 호가창에 "0.7 매도 물량"이 보이는데 내 0.7 매수는 안 채워지는 모습이 된다 — 그동안의 흐름은 그냥 사라진다.
   const bite = clamp(step.h, 0.15, 3);
-  if (press === 'up') {
-    book.bids.push({ price: ref, size: Math.max(1, Math.round(wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment) * bite)) });
-  } else if (press === 'down') {
-    book.asks.push({ price: ref, size: Math.max(1, Math.round(wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment) * bite)) });
+  const sellToBid = (press === 'down' ? wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment) * bite : 0) + absorbedAtBid;
+  const buyFromAsk = (press === 'up' ? wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment) * bite : 0) + absorbedAtAsk;
+  const botBestBid = book.bids.reduce((m, l) => Math.max(m, l.price), -Infinity);
+  const botBestAsk = book.asks.reduce((m, l) => Math.min(m, l.price), Infinity);
+  if (wallBid != null && sellToBid >= 1 && wallBidReady <= now && botBestBid < wallBid) {
+    book.asks.push({ price: wallBid, size: Math.round(sellToBid) });
+  }
+  if (wallAsk != null && buyFromAsk >= 1 && wallAskReady <= now && botBestAsk > wallAsk) {
+    book.bids.push({ price: wallAsk, size: Math.round(buyFromAsk) });
   }
   // 가격 우선순위대로 정렬해 둔다 — 매칭(makerLevels)도 호가창 표시도 이 순서를 그대로 쓴다.
   book.bids.sort((a, b) => b.price - a.price);

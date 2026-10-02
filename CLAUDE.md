@@ -34,7 +34,7 @@ ox64/
 ├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB) 코드 관리 → Git 배포가 읽음
 ├── schema.sql              D1 스키마(users/positions/orders/pending_orders/conditional_orders/spot_orders(폐기)/spot_trades/spot_candles/spot_bot_state/usage_meter/puzzle_*/dungeon_*/crate_stats). wrangler d1 execute 로 적용
 ├── docs/HISTORY.md         완료된 작업의 배경·수정·검증 기록(규칙의 진실원본은 이 문서 본문)
-├── scripts/                d1-budget.mjs(D1 예산 점검, §6) · sim-crate.ts(`npm run sim:crate` — 드롭 확률·가격·가치를 바꿨으면 반드시, §10) · sim-bot.ts(`npm run sim:bot` — 봇 심리·관심도 파라미터를 바꿨으면 반드시. 기본 1초 틱 7일=한 주. 편향은 **로그드리프트/단위**로 보되 판정은 1초·5초 틱 **둘 다** 실행당 추정 192회급으로(SE ~0.35e-6, §4 가상 코인))
+├── scripts/                d1-budget.mjs(D1 예산 점검, §6) · sim-crate.ts(`npm run sim:crate` — 드롭 확률·가격·가치를 바꿨으면 반드시, §10) · sim-bot.ts(`npm run sim:bot` — 봇 심리·관심도 파라미터를 바꿨으면 반드시. 기본 1초 틱 7일=한 주. 편향은 **로그드리프트/단위**로 보되 판정은 1초·5초 틱 **둘 다** 실행당 추정 192회급으로(SE ~0.35e-6, §4 가상 코인)) · check-walls.ts(`npm run check:walls` — 봇 체결·기준가·호가가 유저 지정가를 관통하는지 7개 상황 × 2만 틱, 벽·체결 미세구조를 바꿨으면 반드시. 위반 0 이 합격)
 ├── vite.config.ts          @ alias(src), charts/rx 청크 분리
 ├── tailwind.config.js       색상 토큰이 CSS 변수 참조 — 실제 값은 src/index.css 테마 블록
 ├── cron/                   ── 접속자 없이도 돌아야 하는 백그라운드 전용 Cron Worker(메인 Pages 와 별도 배포) ──
@@ -251,7 +251,7 @@ ox64/
 - 호가 사다리는 이전 틱을 물려받는다(`prevBook`) — 체결(테이프)을 먼저 찍고 그 고저로 사다리를 만든다. 슬롯 귀속은 지터 뺀 `LEVEL_STEP` 격자 중심, 생존 주문을 먼저 다 앉히지 말고 슬롯마다 배정, 배정은 새 호가보다 먼저. 사다리 기하(`SPREAD_BASE`/`LEVEL_STEP`/`LEVEL_JITTER`)는 한 곳에만. 라운드 가격 벽은 `priceHash` 로 고정.
 - 격자 스냅은 반드시 1e-9 오차 흡수와 함께(`humanQuotePrice`/`OrderBook.snapToGrid`). 가격 관련 상수는 절대값이 아니라 "틱 몇 개"로(`roundVirtual`/`virtualTick`, 유효숫자 4자리). 기준가 클램프는 `VIRTUAL_PRICE_MIN/MAX`(1e-12~1e12) 안전장치일 뿐 — 시세 하한을 거기 적지 말 것.
 - 캔들 upsert 에 넘기는 `now` 는 그 체결이 실제로 일어난 시각(과거 시각이면 마감된 봉이 변조된다). 저장 인터벌은 1m/1h/1d 뿐, 나머지는 조회 시 롤업 — 새 인터벌은 그 셋의 정수배여야 한다.
-- 벽은 현재가 너머의 비-marketable 주문만(`price>=ref` 매도 / `<=ref` 매수). `sweepRestingOxPendings` 는 요청당 **실제 체결** `MAX_SWEEP_FILLS`(1)까지, 사다리에 안 걸리는 주문은 메모리에서 미리 거른다(트리거 평가도 `crossingOxPendings` 로 같은 거르기). ⚠ cron 은 커밋 뒤 sweep 하지 않는다 — 같은 실행의 `sweepTriggers` 가 대신한다.
+- **⚠⚠ 걸려 있는 유저 지정가는 전부 봇 가격의 경계다**(`spot.ts pickWalls`, 2026-10-02 — 예전엔 현재가 너머의 비-marketable 주문만). 유저 매수 B 가 있으면 봇 기준가·mid·체결은 B 아래로 못 가고, **B 이하에 찍힐 봇 체결은 테이프에 찍지 않고 그 물량을 B 가격의 흡수 호가로** 낸다(sweep 이 유저 가격 B 에 체결 — 유저 체결로 찍힌다). 매도는 대칭. 예전 규칙은 "현재가보다 위의 매수"를 뺐는데, 큰 매수가 사다리를 먹으면 기준가가 체결 평균(그 매수 아래)으로 내려가 그 순간 벽에서 빠져 **봇이 그 매수를 건너뛰고 아래에서 봇끼리 체결**했다(제보: 0.7 에 1조 개 매수에도 0.68 에 체결). 그래서 걸려 있는(= 사다리를 다 먹고 남은) 주문 쪽으로 시장이 끌려가는 건 의도된 동작이다 — 그 너머엔 유동성이 없다. 흡수 호가는 ①봇 자기 호가와 교차하지 않을 때만(공짜 차익 방지) ②그 가격의 주문이 지금 체결될 수 있을 때만(`readyAt` = 부분 체결 + `PARTIAL_FILL_COOLDOWN_MS`, 대기 중엔 "매도호가가 보이는데 안 채워지는" 모습이 된다) 낸다. 유저 주문끼리 교차하면(같은 계정 양방향 등) 둘 다 지킬 수 없어 그때만 예전 규칙. ⚠ 유저끼리는 아직 직접 체결되지 않는다 — 유저 시장가가 봇 사다리를 먹다 다른 유저의 지정가를 지나쳐 갈 수 있다(다음 봇 틱에 기준가는 벽으로 돌아온다). 바꿨으면 `npm run check:walls`. `sweepRestingOxPendings` 는 요청당 **실제 체결** `MAX_SWEEP_FILLS`(1)까지, 사다리에 안 걸리는 주문은 메모리에서 미리 거른다(트리거 평가도 `crossingOxPendings` 로 같은 거르기). ⚠ cron 은 커밋 뒤 sweep 하지 않는다 — 같은 실행의 `sweepTriggers` 가 대신한다.
 - `spot_orders` 테이블은 아무도 읽지도 쓰지도 않는다(롤백 여지로 정의만) — 새 코드에서 참조 금지.
 
 ## 5. 빌드 / 실행 / 배포
