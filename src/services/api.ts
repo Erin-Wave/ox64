@@ -90,6 +90,8 @@ export interface AppState {
   // 보유/미체결 심볼의 서버 마크가격 맵 — 클라가 서버와 동일 시세로 청산가/평가자산을 즉시 계산하게 한다
   // (OX 를 보고 있지 않아도 그 포지션 청산가가 계산되고, 진입 직후 청산가가 바로 표시됨).
   markPrices?: Record<string, number>;
+  /** 시장가가 요청 수량을 다 못 채웠을 때의 안내(호가 물량 부족·증거금 한도) — 에러가 아니다(체결된 만큼은 반영됐다). 주문 응답에만 온다. */
+  notice?: string;
 }
 export interface LeaderRow {
   name: string;

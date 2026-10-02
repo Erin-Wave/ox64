@@ -46,6 +46,8 @@ interface TradingState {
   markPrices: Record<string, number>;
   busy: boolean;
   error: string | null;
+  /** 주문은 들어갔지만 일부만 체결된 안내(서버 `notice` — 시장가는 호가 물량만큼만 체결된다). error 와 같은 자리에 중립색으로. */
+  notice: string | null;
 
   // OX/USDT 는 다른 심볼과 동일하게 레버리지로 거래된다(positions/orders 공용) — 이 두 필드는
   // 호가창·체결내역 "표시용" 시장 데이터일 뿐(유저 개인 데이터 아님, 봇이 만든 합성 시장).
@@ -263,12 +265,13 @@ function action(set: (s: Partial<TradingState>) => void, call: () => Promise<App
   return enqueue(set, async () => {
     const startedAt = Date.now();
     if (startedAt < lastLogoutAt) return; // 로그아웃 전에 줄 선 액션 — 보내지 않는다
-    if (fresh) set({ error: null });
+    if (fresh) set({ error: null, notice: null });
     try {
       const st = await call();
       if (startedAt < lastLogoutAt) return; // 그 사이 로그아웃했다
       apply(set, st);
       lastActionAt = Date.now();
+      if (st.notice) showNotice(set, st.notice);
     } catch (e) {
       if (startedAt >= lastLogoutAt) showError(set, (e as Error).message);
     }
@@ -282,6 +285,15 @@ function showError(set: (s: Partial<TradingState>) => void, msg: string) {
   clearTimeout(errorTimer);
   errorTimer = setTimeout(() => {
     if (useTradingStore.getState().error === msg) set({ error: null });
+  }, 8000);
+}
+/** 부분 체결 안내 — showError 와 같은 수명(8초). */
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+function showNotice(set: (s: Partial<TradingState>) => void, msg: string) {
+  set({ notice: msg });
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => {
+    if (useTradingStore.getState().notice === msg) set({ notice: null });
   }, 8000);
 }
 
@@ -319,6 +331,7 @@ export const useTradingStore = create<TradingState>((set) => ({
   markPrices: {},
   busy: false,
   error: null,
+  notice: null,
 
   spotBook: { bids: [], asks: [] },
   spotTrades: [],
@@ -376,6 +389,7 @@ export const useTradingStore = create<TradingState>((set) => ({
     set({
       authed: false,
       error: null, // 로그인 화면에 지난 계정의 거래 에러가 남지 않게
+      notice: null,
       busy: false,
       name: null,
       balance: 0,

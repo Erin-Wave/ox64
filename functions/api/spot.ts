@@ -1395,8 +1395,8 @@ function addBotFill(fills: Map<string, BotFill>, botId: string, notional: number
  * ⚠ 예전엔 이 정산을 아예 안 해서 `users.balance`/`ox_balance` 가 구조 개편(2026-07-18) 시점 값에
  * **영구히 얼어붙어 있었다** — 봇이 아무리 사고팔아도 숫자가 그대로라 "봇 재고"라는 개념 자체가 없었다.
  * ⚠ **잔고 가드는 절대 붙이지 않는다**(조건부 UPDATE 아님) — 봇은 설계상 무한 유동성 공급자라
- * 현금/재고가 음수로 내려가도 체결은 계속돼야 한다. 가드를 붙이는 순간 대량 시장가 완결(SYNTH 경로)이
- * 봇 잔고 바닥에서 끊기고, 봇 호가 에스크로를 되살리는 꼴이라 틱마다 왕복이 폭증한다.
+ * 현금/재고가 음수로 내려가도 체결은 계속돼야 한다. 가드를 붙이는 순간 유저 체결이 호가창 물량이
+ * 아니라 봇 잔고 바닥에서 끊기고, 봇 호가 에스크로를 되살리는 꼴이라 틱마다 왕복이 폭증한다.
  * 음수는 정상이다 — 봇 재고는 "유저 전체 순포지션의 거울"이라 유저가 순매수면 봇 OX 가 마이너스로 간다.
  *
  * 여러 봇이 섞인 체결은 봇별로 모아 한 번에 처리한다(read 1회 + 봇당 2~3문장, 호출부 batch 에 얹힘).
@@ -2897,26 +2897,20 @@ export async function recordVirtualFill(
 // 하고 나머지를 batch 로 보내서, 두 번째가 실패하면 증거금만 빠지거나(진입) 환급이 두 번 되거나(동시 청산) 했다(감사).
 // 포지션 합치기는 읽어 둔 값이 아니라 SQL 상대값으로(§ _shared positionAddStmts) — 동시 물타기가 서로를 덮어쓰지 않는다.
 //
-// ⚠⚠ **유저 체결 뒤 기준가 = 그 체결의 가중평균가**(2026-10-01, 예전엔 마지막 체결가). 큰 주문은 사다리 + 합성 흡수를 지나며
-// 가격을 최대 3% 밀어 올리는데, 기준가를 그 꼭대기에 두면 다음 봇 호가가 꼭대기 근처에 깔려 **자기가 밀어 올린 가격에 바로
+// ⚠⚠ **유저 체결 뒤 기준가 = 그 체결의 가중평균가**(2026-10-01, 예전엔 마지막 체결가). 큰 주문은 사다리를 먹어 올라가며
+// 가격을 밀어 올리는데, 기준가를 그 꼭대기에 두면 다음 봇 호가가 꼭대기 근처에 깔려 **자기가 밀어 올린 가격에 바로
 // 되파는** 순환이 이익이 됐다(지정가 청산·SL/TP 로 꼭대기 근처 매수호가를 반복해서 먹는다). 평균가는 그 주문이 실제로 낸
 // 단가라 즉시 되팔아도 본전 − 수수료이고, 꼭대기까지의 나머지는 꼬리(wick)로만 남는다 — 실제 시장의 "일시 충격은 빠지고
 // 영구 충격만 남는다"와 같은 모양. 체결 테이프·캔들 종가는 그대로 마지막 체결가다(실제로 찍힌 가격).
 
-// ── 시장가 잔량 흡수용 합성 유동성(스냅샷 매칭) ─────────────────────────────
-// ⚠ 봇 호가창은 한 틱 스냅샷이라 22단계 × 2천~1만 = 최대 십수만 개뿐이다. 봇은 설계상 "무한 유동성
-// 공급자"이므로, 시장가는 실제 사다리를 다 먹은 뒤에도 봇이 잔량을 받아줘야 한다(예전엔 사다리 소진 시
-// break → **부분 체결 후 멈춤**, 유저가 버튼을 계속 눌러야 했다). ⚠ 핵심 재설계(2026-07-24): 예전엔
-// **청크마다 DB batch/claim 을 remote D1 로 왕복**해서, 대량 주문이 수십~수백 왕복이 나고 리쿼트와 경합해
-// claim 실패로 스핀하며 정체됐다(체결이 조금씩·느리게·심하면 멈춤). 이제 matchMarketOxOrder·
-// closePositionAgainstBook 은 봇 호가를 **스냅샷 1회**로 읽어 **메모리에서 walking** 하고 결과를 **단일
-// batch**로 적용한다(왕복이 주문 크기와 무관하게 상수). 합성 흡수도 메모리에서 잔량을 SYNTH_STEPS 로
-// 균등 분할하고, 시장충격은 스텝이 진행될수록 선형으로 커지되 SYNTH_MAX_IMPACT 로 상한 — 봇은 "깊은
-// 유동성 풀"이라 대량이라도 슬리피지가 완만하다. 작은 잔량은 청크 하한(SYNTH_CHUNK_MIN)으로 스텝이 준다.
-// 지정가(limitPrice != null) 청산은 합성 안 함 — 크로스 호가 없으면 잔량은 대기하는 게 맞다.
-const SYNTH_STEPS = 24; // 합성 흡수를 나누는 고정 스텝 수
-const SYNTH_MAX_IMPACT = 0.03; // 합성 구간 누적 시장충격 상한(3%)
-const SYNTH_CHUNK_MIN = 50_000; // 합성 청크 최소 크기(작은 잔량은 이 크기로 몇 스텝만에 끝남)
+// ── 시장가 = 스냅샷 매칭, **호가에 있는 물량만**(2026-10-02) ─────────────────────────────
+// matchMarketOxOrder·closePositionAgainstBook 은 봇 호가를 **스냅샷 1회**로 읽어 **메모리에서 walking** 하고 결과를 **단일
+// batch** 로 적용한다(왕복이 주문 크기와 무관하게 상수 — 예전엔 청크마다 D1 을 왕복해 대량 주문이 느리고·조금씩·멈췄다).
+// ⚠⚠ 사다리를 다 먹으면 **거기서 멈춘다** — 진입은 남은 수량을 버리고(IOC), 청산은 남은 수량을 포지션에 그대로 둔다.
+// 예전엔 사다리 소진 뒤 봇이 "무한 유동성"으로 잔량을 24스텝·최대 3% 충격에 전부 받아 줘서(`synthMaker`), 호가창에 십수만 개뿐인데
+// 1e20 개 시장가가 3% 안에 즉시 전량 체결됐다(제보 "호가 물량 상관없이 아무리 큰 값도 바로 체결된다"). 실제 거래소에 없는 유동성이다.
+// 다음 틱(≈1초)에 봇이 사다리를 다시 깔면 이어서 주문하면 된다. ⚠ 합성 흡수를 되살리지 말 것.
+// 지정가(limitPrice != null) 청산도 같다 — 크로스되는 호가가 없으면 잔량은 대기한다.
 const MAKER_SNAPSHOT_LIMIT = 60; // 스냅샷으로 읽어오는 봇 호가 레벨 수(실제 사다리는 ~22 + 벽)
 // ⚠ 유저 시장가 체결이 적정가(anchor)를 끌어당기는 비율 — "매수하면 오르고 유지된다"의 핵심.
 // 예전엔 유저 체결이 ref 만 밀고 anchor 는 그대로라, 다음 봇 틱의 평균회귀(적정가 대비 과열도로 되돌림)가
@@ -3115,8 +3109,9 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
 }
 
 /**
- * OX 시장가 주문 — 봇 호가창을 가격 제한 없이 walking 하며 있는 만큼만 체결(잔량은 버림).
+ * OX 시장가 주문 — 봇 호가창을 가격 제한 없이 walking 하며 **호가에 있는 만큼만** 체결(잔량은 버림 = IOC).
  * 증거금은 실제 체결가 기준으로 차감(잔고 부족하면 감당 가능한 만큼만). 체결 총량 반환.
+ * `short` = 요청 수량을 다 못 채운 이유('liquidity' 호가 물량 부족 / 'margin' 증거금 한도) — 호출부가 유저에게 알린다.
  * `extra(filled)` = 같은 batch 에 함께 실을 문장(조건부 주문의 체결 기록·선점 — § _trading conditionalFillStmts).
  * 그 안의 가드가 걸리면 체결까지 통째로 되돌려진다.
  */
@@ -3131,10 +3126,9 @@ export async function matchMarketOxOrder(
   tp: number | null,
   floorPnL = 0, // 크로스 가용 = 여유잔고 + floorPnL(전 포지션 미실현손익). balance 는 -floorPnL 까지 허용.
   extra?: (filled: number) => D1PreparedStatement[],
-): Promise<{ filled: number; avgPrice: number; reason?: 'liquidity' | 'margin' }> {
+): Promise<{ filled: number; avgPrice: number; reason?: 'liquidity' | 'margin'; short?: 'liquidity' | 'margin' }> {
   const isLong = side === 'long';
   const openMakerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'; // 봇이 잡는 쪽(롱 진입이면 봇이 매도)
-  const openAdverse = isLong ? 1 : -1; // 사면 위로, 팔면 아래로 시장충격
 
   // ── 1) 필요한 값을 몇 번의 read 로 한 번에 확보(예전엔 청크마다 read/batch 왕복이라 대량이 느리고
   //        리쿼트와 경합해 정체됐다). 수수료율은 주문 전체에 한 번만 확정(청크마다 등급이 바뀌지 않게). ──
@@ -3163,9 +3157,10 @@ export async function matchMarketOxOrder(
   const target = Math.min(size, Math.max(0, affordableUnits));
   if (target <= EPS) return { filled: 0, avgPrice: 0, reason: 'margin' };
 
-  // ── 2) 위에서 함께 읽어온 봇 사다리를 메모리에서 walking(청크마다 왕복하지 않는다). ──
+  // ── 2) 위에서 함께 읽어온 봇 사다리를 메모리에서 walking(청크마다 왕복하지 않는다). 사다리가 끝나면 거기서 멈춘다
+  //        (§ 위 "호가에 있는 물량만" — 봇이 잔량을 받아 주는 합성 흡수는 없다). ──
   const book = parseBook(st?.book_json);
-  type MemFill = { level: BookLevel | null; makerUserId: string; price: number; size: number };
+  type MemFill = { level: BookLevel; makerUserId: string; price: number; size: number };
   const planned: MemFill[] = [];
   let remaining = target;
   for (const level of makerLevels(book, openMakerSide, null).slice(0, MAKER_SNAPSHOT_LIMIT)) {
@@ -3174,22 +3169,6 @@ export async function matchMarketOxOrder(
     if (take <= EPS) continue;
     planned.push({ level, makerUserId: book.owner, price: level.price, size: take });
     remaining -= take;
-  }
-  // 실제 사다리를 다 먹으면 봇 무한 유동성(합성)으로 잔량 흡수 — 고정 스텝·상한 시장충격(슬리피지 완만).
-  // ⚠ 램프의 **기준은 사다리를 다 먹은 지점**(마지막 체결가)이지 주문 전 기준가가 아니다. 예전엔 `est`
-  // 에서 다시 시작해서, 사다리 위쪽(예 1.156)까지 먹고도 합성 첫 스텝이 1.130 으로 **되돌아갔다** —
-  // 체결을 1건으로 집계해 찍던 시절엔 안 보였지만, 이제 walking 을 가격대별로 찍으므로 체결창에 가격이
-  // 위아래로 튀는 게 그대로 드러난다(실제 거래소의 한 번의 sweep 은 절대 되돌아가지 않는다).
-  if (remaining > EPS) {
-    const synthBase = planned.length ? planned[planned.length - 1].price : est;
-    const synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
-    for (let idx = 1; remaining > EPS && idx <= SYNTH_STEPS * 4; idx++) {
-      const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
-      const price = roundOx(Math.max(VIRTUAL_PRICE_MIN, synthBase * (1 + openAdverse * impact)));
-      const take = Math.min(remaining, synthChunk);
-      planned.push({ level: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], price, size: take });
-      remaining -= take;
-    }
   }
 
   // ── 3) 가용 증거금 안에서 정밀 정산(사다리를 위로 갈수록 가격이 올라 실제 비용이 est 추정보다 크므로
@@ -3208,10 +3187,12 @@ export async function matchMarketOxOrder(
   let lastPx = est;
   const makerFills = new Map<string, BotFill>();
   const settled: { price: number; size: number }[] = []; // 체결 테이프에 찍을 실제 체결들(가격대별)
+  let marginCut = false; // 가용이 사다리보다 먼저 끝났나(못 채운 이유 구분용)
   for (const f of planned) {
     const perUnit = f.price / effLev + f.price * feeRate;
     let sz = f.size;
     if (spent + sz * perUnit > budget) {
+      marginCut = true;
       const afford = (budget - spent) / perUnit;
       if (afford <= EPS) break;
       sz = Math.min(sz, afford);
@@ -3227,10 +3208,13 @@ export async function matchMarketOxOrder(
     lastPx = f.price;
     addBotFill(makerFills, f.makerUserId, f.price * sz, sz);
     settled.push({ price: f.price, size: sz });
-    if (f.level) f.level.size -= sz; // 실제 사다리 물량 소비(참조라 그대로 book 에 반영된다)
+    f.level.size -= sz; // 실제 사다리 물량 소비(참조라 그대로 book 에 반영된다)
     if (sz < f.size - EPS) break; // 가용 소진 — 여기서 멈춤
   }
-  if (filled <= EPS) return { filled: 0, avgPrice: 0, reason: 'liquidity' };
+  if (filled <= EPS) return { filled: 0, avgPrice: 0, reason: marginCut ? 'margin' : 'liquidity' };
+  // 요청을 다 못 채웠으면 그 이유 — 사다리가 먼저 끝났으면 호가 물량, 아니면 증거금 한도(감당 클램프 포함).
+  const short: 'liquidity' | 'margin' | undefined =
+    filled >= size - sizeEps(size) ? undefined : !marginCut && remaining > EPS ? 'liquidity' : 'margin';
 
   const avgPrice = cost / filled;
   const totalMargin = cost / effLev; // Σ(price*size)/effLev
@@ -3283,14 +3267,15 @@ export async function matchMarketOxOrder(
   stmts.push(...(await botFillStmts(env, pair, makerFills, openMakerSide, now)));
   if (extra) stmts.push(...extra(filled));
   if (!(await guardedBatch(env, stmts))) return { filled: 0, avgPrice: 0, reason: 'margin' };
-  return { filled, avgPrice };
+  return { filled, avgPrice, short };
 }
 
 /**
  * OX 포지션을 봇 호가창에 walking 매칭해 청산한다(시장가 청산·지정가 청산·SL/TP 공용의 핵심).
  * ⚠ 예전엔 OX 청산이 호가창을 무시하고 `fetchPrice`(ref) 한 값에 **전량** 정산돼, 매물이 없어도(호가창이
  * 얇아도) 전 물량이 즉시 청산되는 버그가 있었다. 이제 진입(matchMarketOxOrder)과 대칭으로 **있는 물량만**
- * 실제 호가 가격에 청산하고, 매물이 부족하면 그만큼만(부분) 청산하고 나머지는 포지션에 남긴다.
+ * 실제 호가 가격에 청산하고, 매물이 부족하면 그만큼만(부분) 청산하고 나머지는 포지션에 남긴다(시장가도 마찬가지 —
+ * 사다리 너머를 받아 주는 합성 유동성은 없다, 2026-10-02).
  * - limitPrice=null : 시장가 청산(가격 제한 없이 walking).
  * - limitPrice!=null: 지정가 청산(그 가격보다 불리하게는 체결 안 함 — 롱 청산은 ≥limit 매수호가만 소비).
  * - pending!=null   : 지정가 청산의 대기 주문(pending_orders) — 체결분만큼 줄이거나(부분) 삭제(완료).
@@ -3313,7 +3298,6 @@ async function closePositionAgainstBook(
   const tapeSide = takerSideOf(userSide, aggressor); // ⚠ 체결내역 라벨만 aggressor 로 뒤집힌다(장부는 userSide)
   const makerSide: 'buy' | 'sell' = closeTaker === 'long' ? 'sell' : 'buy';
   const dir = pos.side === 'long' ? 1 : -1;
-  const adverse = closeTaker === 'long' ? 1 : -1; // 사면(숏청산) 위로, 팔면(롱청산) 아래로 시장충격
   const marginPerUnit = pos.size > EPS ? pos.margin / pos.size : 0;
   // 요율은 이 청산 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 바뀔 수 있다).
   const closeFeeRate = await feeRateOf(env, uid);
@@ -3327,7 +3311,7 @@ async function closePositionAgainstBook(
   const est = st?.ref_price ?? pos.entry_price;
   const book = parseBook(st?.book_json);
 
-  type MemFill = { level: BookLevel | null; makerUserId: string; price: number; size: number };
+  type MemFill = { level: BookLevel; makerUserId: string; price: number; size: number };
   const planned: MemFill[] = [];
   let remaining = Math.min(closeSize, pos.size);
   // 지정가 청산이면 그 가격보다 불리한 레벨은 makerLevels 가 걸러낸다(롱 청산은 ≥limit 매수호가만 소비).
@@ -3339,22 +3323,10 @@ async function closePositionAgainstBook(
     planned.push({ level, makerUserId: book.owner, price: level.price, size: take });
     remaining -= take;
   }
-  // 시장가 청산은 봇 무한 유동성으로 잔량 흡수. ⚠ 지정가 청산(limitPrice != null)은 크로스되는 호가가
-  // 없으면 잔량을 대기시킨다(합성 안 함 — 기존 동작 유지).
-  if (remaining > EPS && limitPrice == null) {
-    // ⚠ 진입과 같은 규칙 — 램프 기준은 사다리를 다 먹은 지점(마지막 체결가)이다(위 matchMarketOxOrder 참고).
-    const synthBase = planned.length ? planned[planned.length - 1].price : est;
-    const synthChunk = Math.max(SYNTH_CHUNK_MIN, remaining / SYNTH_STEPS);
-    for (let idx = 1; remaining > EPS && idx <= SYNTH_STEPS * 4; idx++) {
-      const impact = Math.min(SYNTH_MAX_IMPACT, (SYNTH_MAX_IMPACT * idx) / SYNTH_STEPS);
-      const price = roundOx(Math.max(VIRTUAL_PRICE_MIN, synthBase * (1 + adverse * impact)));
-      const take = Math.min(remaining, synthChunk);
-      planned.push({ level: null, makerUserId: BOT_USER_IDS[idx % BOT_USER_IDS.length], price, size: take });
-      remaining -= take;
-    }
-  }
+  // ⚠ 사다리를 다 먹으면 거기서 멈춘다 — 시장가 청산이든 지정가 청산이든 남은 수량은 포지션에 그대로 남는다
+  // (§ 위 "호가에 있는 물량만". 예전엔 시장가 청산만 봇이 잔량을 합성 유동성으로 전부 받아 줬다).
 
-  // ── 2) 메모리에서 정산(청산은 잔고를 환급하므로 감당 제약 없음 — 계획대로 전량 체결). ──
+  // ── 2) 메모리에서 정산(청산은 잔고를 환급하므로 감당 제약 없음 — 사다리에서 먹은 만큼 체결). ──
   let filled = 0;
   let cost = 0;
   let pnlTotal = 0;

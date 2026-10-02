@@ -16,6 +16,9 @@ import {
   type PositionRow,
   type ConditionalRow,
   fetchPrices,
+  fetchBook,
+  takeSideOf,
+  walkBook,
   isVirtualSymbol,
   feeRateOf,
   feeAccrualStmts,
@@ -468,24 +471,26 @@ function slTpHit(pos: PositionRow, low: number, high: number): 'sl' | 'tp' | nul
   return null;
 }
 
-/** 실제 코인 SL/TP 전량 청산 — 포지션을 **선점한 뒤에만** 환급한다(동시 평가가 두 번 환급하지 않게, § claimThenSettle). */
-async function settleSlTpClose(env: Env, uid: string, pos: PositionRow, price: number): Promise<void> {
-  const pnl = (price - pos.entry_price) * pos.size * (pos.side === 'long' ? 1 : -1);
+/** 실제 코인 SL/TP 청산(size 만큼, 호가가 모자라면 부분) — 포지션을 **선점한 뒤에만** 환급한다(동시 평가가 두 번 환급하지 않게,
+ * § claimThenSettle). 남은 수량은 SL/TP 를 단 채 포지션에 남아 다음 평가에서 이어서 청산된다. */
+async function settleSlTpClose(env: Env, uid: string, pos: PositionRow, price: number, size: number): Promise<void> {
+  const full = size >= pos.size - sizeEps(pos.size);
+  const cut = { size: full ? pos.size : size, margin: full ? pos.margin : (pos.margin * size) / pos.size, full };
+  const pnl = (price - pos.entry_price) * cut.size * (pos.side === 'long' ? 1 : -1);
   const now = Date.now();
   const rate = await feeRateOf(env, uid);
-  const notional = price * pos.size;
+  const notional = price * cut.size;
   const fee = notional * rate;
   const col = balColOf(pos.symbol);
-  const cut = { size: pos.size, margin: pos.margin, full: true };
   await claimThenSettle(
     env,
     [positionClaimStmt(env, uid, pos, cut)],
     [
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(pos.margin + pnl - fee, uid),
+      env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(cut.margin + pnl - fee, uid),
       ...feeAccrualStmts(env, uid, pos.symbol, 'close', notional, rate, fee, now),
       env.DB.prepare(
         'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, price, pos.size, pos.leverage, 'close', pnl, now),
+      ).bind(crypto.randomUUID(), uid, pos.symbol, pos.side, price, cut.size, pos.leverage, 'close', pnl, now),
     ],
   );
 }
@@ -532,8 +537,8 @@ function conditionalFillStmts(env: Env, uid: string, c: ConditionalRow, filled: 
 }
 
 /** 조건부(스탑) 주문 정산 — 트리거 가격을 넘어서면 그 자리에서 **시장가**로 남은 수량만큼 진입한다.
- * OX 는 봇 호가창 walking(matchMarketOxOrder), 실제 코인은 mark 가에 즉시 체결하되 **가용 증거금만큼만**
- * 체결하고 못 채운 잔량은 조건을 살려둔다(size 를 줄임) — "예약 수량이 다 안 채워지면 계속 조건 유지".
+ * OX 는 봇 호가창 walking(matchMarketOxOrder), 실제 코인은 거래소 호가창 walking(§ _shared fetchBook) — 둘 다 **호가 물량과
+ * 가용 증거금 안에서만** 체결하고 못 채운 잔량은 조건을 살려둔다(size 를 줄임) — "예약 수량이 다 안 채워지면 계속 조건 유지".
  * 트리거가 안 됐으면 아무것도 안 하고 그대로 대기. marks 는 크로스 가용(미실현손익) 계산용.
  *
  * ⚠ 무한(반복) 조건부는 체결 후에도 사라지지 않는다:
@@ -545,7 +550,6 @@ async function settleConditionalOrder(
   env: Env,
   uid: string,
   c: ConditionalRow,
-  mark: number,
   marks: Record<string, number>,
   low: number,
   high: number,
@@ -606,25 +610,27 @@ async function settleConditionalOrder(
     return;
   }
 
-  // 실제 코인 — 외부 시세(mark)로 즉시 체결(무한 유동성). 단, 감당 가능한 만큼만 체결하고 잔량은 유지.
-  const price = mark;
+  // 실제 코인 — 서버가 받은 거래소 호가창을 먹으며 시장가 진입(2026-10-02, 예전엔 mark 한 값에 수량 무제한). 있는 물량만,
+  // 가용 증거금(크로스) 안에서만 체결하고 못 채운 잔량은 조건을 살려둔다(1회성은 size 차감). 호가창을 못 받았으면 이번엔 쉰다.
+  const [book, user, existing] = await Promise.all([
+    fetchBook(c.symbol).catch(() => null),
+    env.DB.prepare(`SELECT ${balColOf(c.symbol)} AS bal FROM users WHERE id = ?`).bind(uid).first<{ bal: number }>(), // 원화 심볼이면 원화 지갑
+    env.DB.prepare('SELECT leverage FROM positions WHERE user_id = ? AND symbol = ? AND side = ? ORDER BY opened_at LIMIT 1')
+      .bind(uid, c.symbol, c.side)
+      .first<{ leverage: number }>(),
+  ]);
+  if (!book || !user) return;
   const feeRate = await feeRateOf(env, uid);
-  const col = balColOf(c.symbol); // 원화 심볼이면 원화 지갑(§ _shared quoteOf)
-  const user = await env.DB.prepare(`SELECT ${col} AS bal FROM users WHERE id = ?`).bind(uid).first<{ bal: number }>();
-  const existing = await env.DB.prepare(
-    'SELECT leverage FROM positions WHERE user_id = ? AND symbol = ? AND side = ? ORDER BY opened_at LIMIT 1',
-  )
-    .bind(uid, c.symbol, c.side)
-    .first<{ leverage: number }>();
+  const col = balColOf(c.symbol);
   const effLev = existing ? existing.leverage : c.leverage; // 물타기 시 기존 포지션 레버리지 고정
-  const available = (user?.bal ?? 0) + uPnL;
-  const perUnit = price / effLev + price * feeRate; // 1코인당 드는 돈(증거금+수수료)
-  const affordable = perUnit > 0 ? (available * 0.999) / perUnit : 0;
-  const fillSize = Math.min(c.size, Math.max(0, affordable));
-  if (!user || fillSize <= EPS) return; // 가용이 부족해 하나도 못 삼 → 조건 유지, 다음 평가 재시도
+  const available = (user.bal ?? 0) + uPnL;
+  const w = walkBook(takeSideOf(book, c.side === 'long'), c.size, available * 0.999, (p) => p / effLev + p * feeRate);
+  const fillSize = w.filled;
+  if (fillSize <= EPS) return; // 가용이 부족하거나 호가가 비어 하나도 못 삼 → 조건 유지, 다음 평가 재시도
 
-  const margin = (price * fillSize) / effLev;
-  const notional = price * fillSize;
+  const price = w.cost / fillSize; // 가중평균 체결가
+  const notional = w.cost;
+  const margin = notional / effLev;
   const fee = notional * feeRate;
   // 잔고 차감(크로스 가드) · 이 주문의 체결 기록(선점) · 포지션 · 원장을 **한 batch** 로 — 가드 둘 중 하나라도 걸리면
   // (가용 부족·다른 평가가 먼저 처리) 통째로 되돌려져 조건은 그대로 남는다(§ _shared 가드 문장).
@@ -806,19 +812,21 @@ async function runTriggers(
       await marketCloseOxPosition(env, uid, pos, pos.size);
       continue;
     }
-    // 실제 코인 — 외부 시세라 자기 체결로 가격을 움직일 수 없다. TP 는 지정가처럼 그 가격에, SL 은 **SL 가격과 현재가 중
-    // 불리한 쪽**에 체결한다(가격이 SL 을 뛰어넘어 갭으로 지나갔으면 현재가 — 실제 거래소의 스탑-마켓과 같다. 예전엔
-    // 항상 SL 가격이라, 앱을 닫아둔 사이 크게 빠지면 SL 보다 훨씬 아래 가격을 SL 가격에 팔아 주는 공짜 보험이었다).
-    const mark = prices[pos.symbol];
-    const price = hit === 'tp' ? pos.take_profit! : pos.side === 'long' ? Math.min(pos.stop_loss!, mark) : Math.max(pos.stop_loss!, mark);
-    await settleSlTpClose(env, uid, pos, price);
+    // 실제 코인도 SL/TP 는 **스탑-마켓**이다(2026-10-02) — 발동하면 서버가 받은 거래소 호가창을 먹으며 청산한다(롱 = 매수호가에
+    // 판다). 있는 물량만이라 모자라면 그만큼만 청산되고, 남은 수량은 SL/TP 를 단 채 다음 평가에서 이어서 청산된다. 예전엔 TP 는
+    // TP 가격에, SL 은 SL·현재가 중 불리한 쪽에 **수량 무제한**으로 정산해서 호가 물량과 무관하게 전량이 한 번에 나갔다.
+    // 호가창을 못 받았으면 이번엔 건너뛴다(조건은 그대로 남아 다음 평가에서 — 물량을 모르는데 무한으로 치지 않는다).
+    const book = await fetchBook(pos.symbol).catch(() => null);
+    if (!book) continue;
+    const w = walkBook(takeSideOf(book, pos.side === 'short'), pos.size);
+    if (!(w.filled > 0)) continue;
+    await settleSlTpClose(env, uid, pos, w.cost / w.filled, w.filled);
   }
 
   // ── 조건부(스탑) 주문 트리거 ── 트리거 가격을 넘어서면 시장가로 진입(있는 만큼만, 잔량은 조건 유지).
   for (const c of conditionals) {
-    const mark = prices[c.symbol];
-    if (mark == null) continue;
-    await settleConditionalOrder(env, uid, c, mark, prices, lowOf(c.symbol), highOf(c.symbol), budget);
+    if (prices[c.symbol] == null) continue;
+    await settleConditionalOrder(env, uid, c, prices, lowOf(c.symbol), highOf(c.symbol), budget);
   }
 
   return false;

@@ -498,6 +498,104 @@ export async function fetchPrice(env: Env, symbol: string): Promise<number> {
   }
   throw new Error(`시세 조회 실패 (${last})`);
 }
+// ── 실제 코인 호가창(시장가 체결의 물량 한도, 2026-10-02) ─────────────────────────────────────────
+// ⚠⚠ 실제 코인 시장가는 **서버가 받은 호가창을 앞에서부터 먹으며** 체결한다 — 있는 물량만, 단계별 실제 가격에. 예전엔 시세 한 값에
+// 수량 제한 없이 전량 체결해서 1e20 BTC 시장가가 슬리피지 0 으로 즉시 들어갔다(제보 "호가 물량 상관없이 아무리 큰 값도 바로 체결").
+// 소스는 시세와 같은 거래소다: USDT = OKX 400단계(BTC 한쪽 ~75개·$6M, 알트 수천만 개 — 2026-10-02 실측), 원화 = 빗썸 30단계.
+// OKX 가 실패하면 Coinbase 최우선 1단계만(전체 호가는 BTC 가 1MB 라 CPU 10ms 를 파싱에 태운다 — 보수적으로 덜 체결되는 쪽).
+// mark(현재가·PnL·SL/TP 검증)는 여전히 fetchPrice 다 — 호가창은 **체결 물량과 체결가**에만 쓴다.
+/** [가격, 수량] — asks 는 가격 오름차순, bids 는 내림차순(먹는 순서). */
+export type BookLevels = [number, number][];
+export interface ExtBook {
+  asks: BookLevels;
+  bids: BookLevels;
+}
+const OKX_BOOK_DEPTH = 400; // OKX books 엔드포인트 상한
+function cleanLevels(raw: unknown, asc: boolean): BookLevels {
+  const out: BookLevels = [];
+  if (Array.isArray(raw)) {
+    for (const l of raw) {
+      const p = Number((l as unknown[])?.[0]);
+      const q = Number((l as unknown[])?.[1]);
+      if (p > 0 && q > 0 && isFinite(p) && isFinite(q)) out.push([p, q]);
+    }
+  }
+  return out.sort((a, b) => (asc ? a[0] - b[0] : b[0] - a[0]));
+}
+async function okxBook(symbol: string): Promise<ExtBook> {
+  const r = await timedFetch(`https://www.okx.com/api/v5/market/books?instId=${base(symbol)}-USDT&sz=${OKX_BOOK_DEPTH}`);
+  if (!r.ok) throw new Error(`okx book ${r.status}`);
+  const d = (await r.json()) as { data?: { asks: unknown; bids: unknown }[] };
+  return { asks: cleanLevels(d.data?.[0]?.asks, true), bids: cleanLevels(d.data?.[0]?.bids, false) };
+}
+async function coinbaseTop(symbol: string): Promise<ExtBook> {
+  const r = await timedFetch(`https://api.exchange.coinbase.com/products/${base(symbol)}-USD/book?level=1`);
+  if (!r.ok) throw new Error(`coinbase book ${r.status}`);
+  const d = (await r.json()) as { asks?: unknown; bids?: unknown };
+  return { asks: cleanLevels(d.asks, true), bids: cleanLevels(d.bids, false) };
+}
+async function bithumbBook(symbol: string): Promise<ExtBook> {
+  const arr = (await hedgedJson(`https://api.bithumb.com/v1/orderbook?markets=${bithumbMarket(symbol)}`, BITHUMB_STAGGER_MS)) as {
+    orderbook_units?: { ask_price: number; bid_price: number; ask_size: number; bid_size: number }[];
+  }[];
+  const units = arr?.[0]?.orderbook_units ?? [];
+  return {
+    asks: cleanLevels(units.map((u) => [u.ask_price, u.ask_size]), true),
+    bids: cleanLevels(units.map((u) => [u.bid_price, u.bid_size]), false),
+  };
+}
+/** 실제 코인 호가창 — 못 받으면 throw(호출부는 "체결하지 않음"으로 처리한다. 물량을 모르면 무한으로 치지 않는다). */
+export async function fetchBook(symbol: string): Promise<ExtBook> {
+  if (isVirtualSymbol(symbol)) throw new Error('virtual symbol has its own book');
+  if (quoteOf(symbol) === 'KRW') return bithumbBook(symbol);
+  let last = '';
+  for (const src of [okxBook, coinbaseTop]) {
+    try {
+      const b = await src(symbol);
+      if (b.asks.length && b.bids.length) return b;
+      last = 'empty book';
+    } catch (e) {
+      last = e instanceof Error ? e.message : 'error';
+    }
+  }
+  throw new Error(`호가 조회 실패 (${last})`);
+}
+/** 시장가로 먹을 쪽 — 사면(롱 진입·숏 청산) 매도호가, 팔면(숏 진입·롱 청산) 매수호가. */
+export const takeSideOf = (book: ExtBook, buy: boolean): BookLevels => (buy ? book.asks : book.bids);
+export interface BookWalk {
+  filled: number;
+  cost: number; // Σ 가격 × 수량(명목금액)
+  /** 돈(budget)이 호가보다 먼저 끝났나 — 못 채운 이유 구분용 */
+  budgetCut: boolean;
+}
+/** 호가를 앞에서부터 size 만큼 먹는다(순수 계산). `perUnit(price)` 와 `budget` 을 주면 그 돈 안에서만(증거금+수수료) —
+ * 감당 못 하는 단계에서 잘라 멈춘다. 호가가 먼저 끝나면 거기서 멈춘다(잔량은 호출부가 버리거나 남긴다). */
+export function walkBook(levels: BookLevels, size: number, budget = Infinity, perUnit?: (price: number) => number): BookWalk {
+  let filled = 0;
+  let cost = 0;
+  let spent = 0;
+  let budgetCut = false;
+  for (const [price, qty] of levels) {
+    const want = size - filled;
+    if (want <= sizeEps(size)) break;
+    let take = Math.min(want, qty);
+    if (perUnit) {
+      const u = perUnit(price);
+      if (spent + take * u > budget) {
+        budgetCut = true;
+        take = Math.max(0, (budget - spent) / u);
+      }
+      spent += take * u;
+    }
+    if (take > 0) {
+      filled += take;
+      cost += price * take;
+    }
+    if (budgetCut) break;
+  }
+  return { filled, cost, budgetCut };
+}
+
 export async function fetchPrices(env: Env, symbols: string[], seed?: Record<string, number>): Promise<Record<string, number>> {
   // ⚠ `seed` = 이 요청이 **이미 손에 쥔** 가격(§ spot.ts TickCtx). 통합 폴링에선 봇 틱이 방금 커밋한
   // OX 기준가가 그것이라, 다시 읽으면 같은 행을 한 번 더 읽는 것뿐이다.

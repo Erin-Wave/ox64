@@ -8,6 +8,9 @@ import {
   isSymbol,
   isVirtualSymbol,
   fetchPrice,
+  fetchBook,
+  takeSideOf,
+  walkBook,
   loadState,
   unrealizedTotal,
   feeRateOf,
@@ -94,6 +97,25 @@ function noMarginMsg(available: number, price: number, leverage: number, feeRate
   const n = max >= 1e15 ? max.toExponential(4) : String(Number(max.toPrecision(8)));
   return `증거금이 부족합니다 (최대 약 ${n} 개)`;
 }
+
+/** 서버 문구용 수량 — 유효숫자 12자리(부동소수 먼지만 털고 남은 수량은 정확히), 아주 큰 값은 지수. */
+function qtyText(n: number): string {
+  return n >= 1e15 ? n.toExponential(4) : Number(n.toPrecision(12)).toLocaleString('en-US', { maximumFractionDigits: 8 });
+}
+/** 시장가가 요청 수량을 다 못 채웠을 때 응답에 싣는 안내(`notice`) — 에러가 아니다(체결된 만큼은 반영됐다).
+ * ⚠ 시장가는 **호가에 있는 물량만** 체결한다(2026-10-02, § spot.ts "호가에 있는 물량만" · § _shared fetchBook). 안내가 없으면
+ * 1e20 개를 눌렀는데 75 개만 들어간 걸 알 방법이 없다. */
+function openShortNotice(requested: number, filled: number, why: 'liquidity' | 'margin' | undefined): string | undefined {
+  if (!why || filled >= requested - sizeEps(requested)) return undefined;
+  return why === 'liquidity'
+    ? `호가 물량이 부족해 ${qtyText(filled)} 개만 체결됐습니다 (주문 ${qtyText(requested)} 개 · 나머지는 취소)`
+    : `증거금 한도까지 ${qtyText(filled)} 개만 체결됐습니다 (주문 ${qtyText(requested)} 개)`;
+}
+function closeShortNotice(requested: number, filled: number, left: number): string | undefined {
+  if (filled >= requested - sizeEps(requested)) return undefined;
+  return `호가 물량이 부족해 ${qtyText(filled)} 개만 청산됐습니다 — 남은 ${qtyText(left)} 개는 포지션에 그대로 있습니다`;
+}
+const NO_BOOK_MSG = '호가를 받지 못했습니다 — 잠시 후 다시 시도해 주세요';
 
 /** 무한(반복) 조건부 옵션 파싱 — conditionalOpen/editConditional 이 공유한다.
  * 필드가 `undefined`(=아예 안 보냄)면 prev 값을 유지하고, `null`/`''` 이면 "해제"로 본다.
@@ -186,9 +208,9 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
 
-    // OX/USDT 시장가 = 봇 호가창을 walking 하며 "있는 물량만" 실제 호가 가격에 체결(잔량 버림).
-    // 실제 코인 38종은 외부 시세로 즉시 전량 체결(아래 기존 경로). ⚠ 호가창을 무시하고 ref 한 값에
-    // 전량 체결하던 게 "20만개가 최우선호가보다 싸게 즉시 체결"되던 버그의 원인 → 실제 매칭으로 교체.
+    // ⚠⚠ 시장가는 가상·실제 코인 모두 **호가창에 있는 물량만** 실제 호가 가격에 체결한다(잔량은 버림 = IOC, 2026-10-02).
+    // 가상 코인 = 봇 호가창 walking(§ spot.ts matchMarketOxOrder), 실제 코인 = 서버가 받은 거래소 호가창 walking(아래, § _shared fetchBook).
+    // 예전엔 가상은 사다리 너머를 봇이 합성 유동성으로, 실제는 시세 한 값에 수량 무제한으로 받아 줘서 1e20 개도 즉시 전량 체결됐다.
     if (isVirtualSymbol(symbol)) {
       const marks = await checkTriggers(env, uid);
       // ⚠ 트리거 평가가 이미 이 심볼의 기준가를 읽었으면 그걸 쓴다 — 같은 행(spot_bot_state)을 한 요청에서
@@ -200,16 +222,18 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       // (가상 코인은 USDT 지갑 — 원화 포지션 손익은 섞지 않는다)
       const uPnL = await unrealizedTotal(env, uid, marks, 'USDT');
       if (!isFinite(uPnL)) return bad(NO_MARK_MSG);
-      const { filled, avgPrice, reason } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
+      const { filled, avgPrice, reason, short } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
       // 사유를 구분해서 답한다 — 잔고 레이스로 못 넣은 걸 "호가 물량이 없다"로 답하면 원인을 오해한다.
       if (!(filled > 0)) return bad(reason === 'margin' ? '증거금이 부족합니다 (잔고가 방금 바뀌었을 수 있습니다)' : '체결 가능한 호가 물량이 없습니다');
       marks[symbol] = avgPrice || ref;
-      return json(await loadState(env, uid, marks, since));
+      return json({ ...(await loadState(env, uid, marks, since)), notice: openShortNotice(size, filled, short) });
     }
 
-    // 실제 코인: 트리거 평가와 체결가 fetch 를 병렬로 돌려 롱/숏 버튼 지연을 줄인다.
-    // 둘 다 끝난 뒤에야 잔고/기존포지션을 읽으므로(아래) 원자성 문제는 없다.
-    const [marks, price] = await Promise.all([checkTriggers(env, uid), fetchPrice(env, symbol)]);
+    // 실제 코인: 트리거 평가·mark·호가창을 병렬로 받아 롱/숏 버튼 지연을 줄인다. 셋 다 끝난 뒤에야 잔고/기존포지션을
+    // 읽으므로(아래) 원자성 문제는 없다. ⚠ 호가창을 못 받으면 체결하지 않는다 — 물량을 모르는데 무한으로 치지 않는다.
+    // mark(price)는 SL/TP 검증·증거금 안내·화면 시세용이고, 체결가·체결 수량은 호가창에서 나온다.
+    const [marks, price, book] = await Promise.all([checkTriggers(env, uid), fetchPrice(env, symbol), fetchBook(symbol).catch(() => null)]);
+    if (!book) return bad(NO_BOOK_MSG);
 
     // ⚠ 원화 심볼은 원화 지갑에서 증거금·수수료가 나간다(§ _shared quoteOf) — 컬럼을 하드코딩하지 말 것.
     const col = balColOf(symbol);
@@ -227,8 +251,6 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 수수료 = 명목금액(체결가×수량) × VIP 등급 수수료율. 진입 시엔 증거금과 **함께** 차감해야
     // 원자 가드가 성립한다(따로 빼면 증거금은 통과하고 수수료만 실패하는 틈이 생긴다).
     const feeRate = await feeRateOf(env, uid);
-    const notional = price * size;
-    const fee = notional * feeRate;
 
     // 같은 심볼·같은 방향으로 이미 보유 중인 포지션이 있으면 새 행을 또 만들지 않고 그 포지션에
     // 물타기/불타기 방식으로 합친다(평단가 재계산) — 거래소들의 "원웨이 모드"와 동일한 동작.
@@ -242,8 +264,21 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const effLev = existing ? existing.leverage : leverage;
     // ⚠ SL/TP 는 **지금 가격** 기준(롱: 손절 < 현재가 < 익절). 물타기면 새로 준 값만 바뀌고 안 준 쪽은 기존 값이 남는다.
     if (!validSlTp(side, price, stopLoss, takeProfit)) return bad(SLTP_MSG);
-    const margin = (price * size) / effLev;
-    if (margin + fee > available) return bad(noMarginMsg(available, price, effLev, feeRate));
+
+    // ── 호가창 walking: ① 물량만큼으로 자르고 ② 그 수량도 mark 로 따져 감당 못 하면 예전처럼 거부("최대 약 N 개") ③ 실제
+    //    호가 가격(슬리피지 포함)으로 다시 먹되 가용 안에서만 — 슬라이더 100% 처럼 mark 로 딱 맞춘 주문이 슬리피지만큼 모자라
+    //    통째로 거부되지 않고 감당되는 만큼 들어간다. ──
+    const levels = takeSideOf(book, side === 'long');
+    const depth = walkBook(levels, size);
+    if (!(depth.filled > 0)) return bad('체결 가능한 호가 물량이 없습니다');
+    if (price * depth.filled * (1 / effLev + feeRate) > available) return bad(noMarginMsg(available, price, effLev, feeRate));
+    const w = walkBook(levels, depth.filled, available * (1 - 1e-6), (p) => p / effLev + p * feeRate);
+    if (!(w.filled > 0)) return bad(noMarginMsg(available, price, effLev, feeRate));
+    const filled = w.filled;
+    const fillPx = w.cost / filled; // 가중평균 체결가
+    const notional = w.cost;
+    const fee = notional * feeRate;
+    const margin = notional / effLev;
 
     const now = Date.now();
     // ⚠⚠ 잔고 차감(크로스 가드) + 가드 + 포지션·원장을 **한 batch** 로(2026-10-01). 예전엔 이 가드를 포지션 INSERT 와 같은
@@ -254,15 +289,17 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(margin + fee, uid, margin + fee, -uPnL),
       guardStmt(env),
       ...feeAccrualStmts(env, uid, symbol, 'open', notional, feeRate, fee, now),
-      ...positionAddStmts(env, { uid, symbol, side, price, size, leverage: effLev, margin, stopLoss, takeProfit, now }),
+      ...positionAddStmts(env, { uid, symbol, side, price: fillPx, size: filled, leverage: effLev, margin, stopLoss, takeProfit, now }),
       env.DB.prepare(
         'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), uid, symbol, side, price, size, effLev, 'open', null, now),
+      ).bind(crypto.randomUUID(), uid, symbol, side, fillPx, filled, effLev, 'open', null, now),
     ]);
     if (!ok) return bad(noMarginMsg(available, price, effLev, feeRate));
 
+    // 화면 시세는 mark 그대로(체결가는 슬리피지만큼 불리하다 — 그 차이가 곧 진입 직후의 미실현손익이다).
     marks[symbol] = price;
-    return json(await loadState(env, uid, marks, since));
+    const why = depth.filled < size - sizeEps(size) ? 'liquidity' : w.budgetCut ? 'margin' : undefined;
+    return json({ ...(await loadState(env, uid, marks, since)), notice: openShortNotice(size, filled, why) });
   }
 
   if (body.action === 'close') {
@@ -288,14 +325,19 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       if (changed) return bad(CHANGED_MSG, 409); // 그 사이 다른 청산·체결이 이 포지션을 바꿨다(연타·두 탭·트리거)
       if (!(filled > 0)) return bad('청산할 수 있는 호가 물량이 없습니다');
       if (avgPrice > 0) marks[pos.symbol] = avgPrice;
-      return json(await loadState(env, uid, marks, since));
+      return json({ ...(await loadState(env, uid, marks, since)), notice: closeShortNotice(closeSize, filled, pos.size - filled) });
     }
 
-    // 실제 코인: 외부 시세로 즉시 청산(로컬 호가창이 없어 mark 정산이 표준, 유동성 사실상 무한).
-    const isPartial = closeSize < pos.size - sizeEps(pos.size);
-    const price = await fetchPrice(env, pos.symbol); // 서버 청산가
+    // 실제 코인: 서버가 받은 거래소 호가창을 먹으며 청산한다(롱 청산 = 매수호가에 판다). 있는 물량만 — 모자라면 그만큼만
+    // 부분 청산하고 나머지는 포지션에 남는다(§ _shared fetchBook). 예전엔 시세 한 값에 수량 무제한으로 전량 청산했다.
+    const book = await fetchBook(pos.symbol).catch(() => null);
+    if (!book) return bad(NO_BOOK_MSG);
+    const w = walkBook(takeSideOf(book, pos.side === 'short'), closeSize);
+    if (!(w.filled > 0)) return bad('청산할 수 있는 호가 물량이 없습니다');
+    const price = w.cost / w.filled; // 가중평균 청산가
+    const isPartial = w.filled < pos.size - sizeEps(pos.size);
     const dir = pos.side === 'long' ? 1 : -1;
-    const cut = { size: isPartial ? closeSize : pos.size, margin: isPartial ? (pos.margin * closeSize) / pos.size : pos.margin, full: !isPartial };
+    const cut = { size: isPartial ? w.filled : pos.size, margin: isPartial ? (pos.margin * w.filled) / pos.size : pos.margin, full: !isPartial };
     const pnl = (price - pos.entry_price) * cut.size * dir;
     const now = Date.now();
     // 청산 수수료는 환급액에서 뺀다(증거금 + 손익 − 수수료).
@@ -306,7 +348,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const col = balColOf(pos.symbol);
     // ⚠⚠ 포지션 선점(읽은 수량·증거금 그대로일 때만 줄이거나 지운다) + 가드 + 환급을 한 batch 로(2026-10-01).
     // 예전엔 환급과 삭제를 한 batch 에 넣고 삭제가 실제로 지웠는지 보지 않아서, 같은 포지션을 동시에 N번 청산하면
-    // N번 환급됐다(감사). 위 fetchPrice 가 외부 요청이라 그 사이 창이 길었다.
+    // N번 환급됐다(감사). 위 fetchBook 이 외부 요청이라 그 사이 창이 길다.
     const ok = await claimThenSettle(
       env,
       [positionClaimStmt(env, uid, pos, cut)],
@@ -320,8 +362,8 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     );
     if (!ok) return bad(CHANGED_MSG, 409);
 
-    marks[pos.symbol] = price;
-    return json(await loadState(env, uid, marks, since));
+    // 화면 시세(marks)는 트리거 평가가 받은 mark 그대로 — 청산가는 호가를 먹은 평균이라 현재가가 아니다.
+    return json({ ...(await loadState(env, uid, marks, since)), notice: closeShortNotice(closeSize, cut.size, pos.size - cut.size) });
   }
 
   // 지정가 청산(reduce-only) — 포지션을 지정가에 청산 예약. 증거금을 새로 잠그지 않고(청산이므로),

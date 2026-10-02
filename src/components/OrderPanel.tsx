@@ -38,6 +38,7 @@ export default function OrderPanel() {
   const balance = useTradingStore((s) => s.balance);
   const krwBalance = useTradingStore((s) => s.krwBalance);
   const error = useTradingStore((s) => s.error);
+  const notice = useTradingStore((s) => s.notice);
   const positions = useTradingStore((s) => s.positions);
   const markPrices = useTradingStore((s) => s.markPrices);
   const feeRate = useTradingStore((s) => s.feeRate);
@@ -606,6 +607,7 @@ export default function OrderPanel() {
       {error && (
         <p className="rounded-md bg-downDim px-2.5 py-1.5 text-xs text-down">{error}</p>
       )}
+      {notice && <p className="rounded-md border border-border bg-panel2 px-2.5 py-1.5 text-xs text-text">{notice}</p>}
 
       {/* 롱/숏 — 처리 중에도 눌린다(누른 만큼 차례로 나간다, § submit) */}
       <div className="mt-auto grid grid-cols-2 gap-2">
