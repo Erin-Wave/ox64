@@ -123,17 +123,19 @@ const PERSIST_INTERVALS: readonly [string, number][] = [
  * 캔들과 체결내역이 서로 다른 시장을 보여주게 된다(마켓메이커 한 틱은 여러 건을 찍으므로 그 묶음의
  * OHLC 를 그대로 넘긴다). now 가 과거면 이미 마감된 봉이 변조되므로 항상 현재 이후 시각일 것.
  * 이 경로는 유저 체결(한 순간에 끝난다)이라 시가·종가 시각이 둘 다 now 다. */
-function candleUpsertStmts(
-  env: Env,
-  pair: string,
-  bar: { open: number; high: number; low: number; close: number; volume: number },
-  now: number,
-): D1PreparedStatement[] {
+function candleUpsertStmts(env: Env, pair: string, bar: CandleBar, now: number): D1PreparedStatement[] {
   return PERSIST_INTERVALS.map(([code, sec]) => {
     const bucket = Math.floor(now / (sec * 1000)) * (sec * 1000);
-    return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, bucket, bar.open, bar.high, bar.low, bar.close, bar.volume, now, now);
+    return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, bucket, bar.open, bar.high, bar.low, bar.close, bar.volume, now, now, bar.buy, bar.sell);
   });
 }
+
+/** 한 묶음 체결의 OHLCV + **테이커 방향별 거래량**(buy+sell = volume). 방향별 몫은 24시간 체결강도
+ * (매수 체결량 ÷ 매도 체결량, 클라 OrderBook)의 원본이다 — 실제 코인은 거래소(바이낸스 봉의 taker buy volume,
+ * 빗썸 24H 시세)에서 받고, 가상 코인은 이 칸이 유일한 출처다. ⚠ 새 체결 경로는 테이프에 찍는 taker 라벨과
+ * 같은 쪽으로 넣을 것(`sideVol`). */
+type CandleBar = { open: number; high: number; low: number; close: number; volume: number; buy: number; sell: number };
+const sideVol = (side: 'buy' | 'sell', size: number) => (side === 'buy' ? { buy: size, sell: 0 } : { buy: 0, sell: size });
 
 // ⚠ 누적 upsert 라 같은 버킷에 여러 번 써도 값이 맞는다(high/low 는 극값, volume 은 합). 이 성질 덕에
 // "봇은 버킷이 닫힐 때 자기 몫을 한 번에" / "유저 체결은 그때그때" 따로 써도 결과가 정확히 합쳐진다.
@@ -150,7 +152,7 @@ function candleUpsertStmts(
 // (컬럼을 늘려도 인덱스가 안 늘어 **쓰기 행 수는 그대로**다, §6 과금 모델.)
 // ⚠ 마이그레이션 전 행은 open_at=0 이라 새 쓰기가 open 을 못 이긴다(= 예전 동작 유지). 배포 시점에
 // 진행 중이던 버킷 하나만 해당되고 그 뒤로는 자연히 해소된다.
-const CANDLE_UPSERT_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume, open_at, close_at) VALUES (?,?,?,?,?,?,?,?,?,?)
+const CANDLE_UPSERT_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(pair, interval, bucket) DO UPDATE SET
          open = CASE WHEN excluded.open_at < spot_candles.open_at THEN excluded.open ELSE spot_candles.open END,
          open_at = MIN(spot_candles.open_at, excluded.open_at),
@@ -158,7 +160,9 @@ const CANDLE_UPSERT_SQL = `INSERT INTO spot_candles (pair, interval, bucket, ope
          low = MIN(spot_candles.low, excluded.low),
          close = CASE WHEN excluded.close_at >= spot_candles.close_at THEN excluded.close ELSE spot_candles.close END,
          close_at = MAX(spot_candles.close_at, excluded.close_at),
-         volume = spot_candles.volume + excluded.volume`;
+         volume = spot_candles.volume + excluded.volume,
+         buy_volume = CASE WHEN excluded.buy_volume IS NULL THEN spot_candles.buy_volume ELSE COALESCE(spot_candles.buy_volume, 0) + excluded.buy_volume END,
+         sell_volume = CASE WHEN excluded.sell_volume IS NULL THEN spot_candles.sell_volume ELSE COALESCE(spot_candles.sell_volume, 0) + excluded.sell_volume END`;
 
 // ── 진행 중(안 닫힌) 캔들 버킷 = spot_bot_state.live_json (2026-08-14, § D1 예산) ─────────────
 // 봇은 초당 몇 번씩 도는데 그때마다 같은 1m/1h/1d 버킷을 다시 쓰는 건 "매 틱 갈아엎히는 집계"를 행으로
@@ -176,6 +180,8 @@ interface CandleRow {
   volume: number;
   open_at: number;
   close_at: number;
+  buy_volume: number | null; // 테이커 방향별 거래량(§ CandleBar). NULL = 컬럼이 생기기 전의 봉
+  sell_volume: number | null;
 }
 
 interface LiveBar {
@@ -189,6 +195,9 @@ interface LiveBar {
   // "봇의 첫 틱이 유저 체결보다 빨랐나"를 이 값으로 가린다 — 없으면 먼저 INSERT 한 쪽이 시가를 가져간다.
   ot?: number;
   ct?: number;
+  // 테이커 방향별 거래량(§ CandleBar). 옛 형식(없음)은 다음 틱부터 0 에서 센다 — 그 봉만 방향별 몫이 volume 보다 작다.
+  bv?: number;
+  sv?: number;
 }
 type LiveBars = Record<string, LiveBar>;
 
@@ -212,7 +221,7 @@ function parseLive(json: string | null | undefined): LiveBars {
 }
 
 /** 이 틱의 OHLCV 를 진행 중 버킷들에 누적한다. 버킷이 넘어갔으면 닫힌 버킷을 돌려준다(= 테이블로 넘길 것). */
-function accrueLive(live: LiveBars, bar: { open: number; high: number; low: number; close: number; volume: number }, now: number): { code: string; bar: LiveBar }[] {
+function accrueLive(live: LiveBars, bar: CandleBar, now: number): { code: string; bar: LiveBar }[] {
   const closed: { code: string; bar: LiveBar }[] = [];
   for (const [code, sec] of PERSIST_INTERVALS) {
     const bucket = Math.floor(now / (sec * 1000)) * (sec * 1000);
@@ -221,12 +230,14 @@ function accrueLive(live: LiveBars, bar: { open: number; high: number; low: numb
       // ⚠ 과거 버킷일 때만 넘긴다 — 시계가 뒤로 가는 이상 상황에서 미래 버킷을 "닫힌 것"으로 쓰면
       // 이미 마감된 봉을 다시 건드리게 된다(§ 마감된 봉은 불변).
       if (cur && cur.b < bucket) closed.push({ code, bar: cur });
-      live[code] = { b: bucket, o: bar.open, h: bar.high, l: bar.low, c: bar.close, v: bar.volume, ot: now, ct: now };
+      live[code] = { b: bucket, o: bar.open, h: bar.high, l: bar.low, c: bar.close, v: bar.volume, ot: now, ct: now, bv: bar.buy, sv: bar.sell };
     } else {
       cur.h = Math.max(cur.h, bar.high);
       cur.l = Math.min(cur.l, bar.low);
       cur.c = bar.close;
       cur.v += bar.volume;
+      cur.bv = (cur.bv ?? 0) + bar.buy;
+      cur.sv = (cur.sv ?? 0) + bar.sell;
       cur.ct = now;
     }
   }
@@ -251,12 +262,14 @@ interface BotCommitGuard {
 function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar, guard?: BotCommitGuard): D1PreparedStatement {
   const ot = b.ot ?? b.b;
   const ct = b.ct ?? b.b;
-  if (guard === undefined) return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct);
-  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, pair, guard.lastRun, guard.ref, guard.version);
+  const bv = b.bv ?? null;
+  const sv = b.sv ?? null;
+  if (guard === undefined) return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, bv, sv);
+  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, bv, sv, pair, guard.lastRun, guard.ref, guard.version);
 }
 
-const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume, open_at, close_at)
-       SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ? AND ref_price = ? AND book_version = ?)
+const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ? AND ref_price = ? AND book_version = ?)
        ON CONFLICT(pair, interval, bucket) DO UPDATE SET
          open = CASE WHEN excluded.open_at < spot_candles.open_at THEN excluded.open ELSE spot_candles.open END,
          open_at = MIN(spot_candles.open_at, excluded.open_at),
@@ -264,7 +277,9 @@ const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, buck
          low = MIN(spot_candles.low, excluded.low),
          close = CASE WHEN excluded.close_at >= spot_candles.close_at THEN excluded.close ELSE spot_candles.close END,
          close_at = MAX(spot_candles.close_at, excluded.close_at),
-         volume = spot_candles.volume + excluded.volume`;
+         volume = spot_candles.volume + excluded.volume,
+         buy_volume = CASE WHEN excluded.buy_volume IS NULL THEN spot_candles.buy_volume ELSE COALESCE(spot_candles.buy_volume, 0) + excluded.buy_volume END,
+         sell_volume = CASE WHEN excluded.sell_volume IS NULL THEN spot_candles.sell_volume ELSE COALESCE(spot_candles.sell_volume, 0) + excluded.sell_volume END`;
 
 /** 읽기 경로용 — 진행 중 버킷을 (이미 읽어온) 영속 봉 배열 뒤에 병합한다.
  * ⚠ 같은 버킷의 행이 이미 있을 수 있다(그 사이 **유저 체결**이 직접 upsert 했을 때) → 겹치면 합친다.
@@ -289,16 +304,34 @@ function mergeLiveBar(asc: CandleRow[], live: LiveBar | undefined) {
       last.close_at = ct;
     }
     last.volume += live.v;
+    last.buy_volume = addVol(last.buy_volume, live.bv);
+    last.sell_volume = addVol(last.sell_volume, live.sv);
     return asc;
   }
   if (last && live.b < last.bucket) return asc; // 이미 넘어간 버킷(경합) — 무시
-  asc.push({ bucket: live.b, open: live.o, high: live.h, low: live.l, close: live.c, volume: live.v, open_at: ot, close_at: ct });
+  asc.push({
+    bucket: live.b,
+    open: live.o,
+    high: live.h,
+    low: live.l,
+    close: live.c,
+    volume: live.v,
+    open_at: ot,
+    close_at: ct,
+    buy_volume: live.bv ?? null,
+    sell_volume: live.sv ?? null,
+  });
   return asc;
 }
 
+/** 방향별 거래량 합산 — NULL(방향 정보 없음)끼리면 NULL 을 유지한다(SQL 의 CASE 와 같은 규칙). */
+function addVol(a: number | null | undefined, b: number | null | undefined): number | null {
+  return a == null && b == null ? null : (a ?? 0) + (b ?? 0);
+}
+
 /** 단일 가격 체결용 단축(진입/청산 등 개별 체결 — OHLC 가 전부 같은 가격). */
-function candleUpsertOne(env: Env, pair: string, price: number, size: number, now: number): D1PreparedStatement[] {
-  return candleUpsertStmts(env, pair, { open: price, high: price, low: price, close: price, volume: size }, now);
+function candleUpsertOne(env: Env, pair: string, price: number, size: number, side: 'buy' | 'sell', now: number): D1PreparedStatement[] {
+  return candleUpsertStmts(env, pair, { open: price, high: price, low: price, close: price, volume: size, ...sideVol(side, size) }, now);
 }
 
 /** 최근 체결을 interval 버킷으로 묶어 OHLCV 를 만든다(1s 등 단기 인터벌 + 영속 캔들 폴백 전용).
@@ -353,6 +386,19 @@ async function bucketTradesToCandles(env: Env, pair: string, bucketMs: number, l
  * 상한을 넘는 만큼은 목표 봉 수를 줄여 돌려주고(30m 이면 페이지당 100봉), 과거 페이지는 `more` 로 "더 있음"을 알린다. */
 const SRC_ROW_CAP = 3000;
 
+/** 캔들 응답 한 봉. buyVolume/sellVolume = 테이커 방향별 거래량(§ CandleBar) — 영속 봉(1m 이상)만 싣고,
+ * NULL 이면 컬럼이 생기기 전의 봉이라 방향 정보가 없다(클라 24시간 체결강도가 합산에서 뺀다). */
+type SpotCandleOut = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  buyVolume?: number | null;
+  sellVolume?: number | null;
+};
+
 export async function loadSpotCandles(
   env: Env,
   pair: string,
@@ -371,7 +417,7 @@ export async function loadSpotCandlesPage(
   limit: number,
   endTimeMs?: number,
   liveCtx?: LiveBars | null,
-): Promise<{ candles: { time: number; open: number; high: number; low: number; close: number; volume: number }[]; more: boolean }> {
+): Promise<{ candles: SpotCandleOut[]; more: boolean }> {
   const sec = intervalSecFromCode(intervalCode);
   const bucketMs = sec * 1000;
   // ⚠ 1s 등 <60s 는 영속 테이블이 없어(최신 거래 버킷팅) 과거 페이지가 존재하지 않는다 —
@@ -397,8 +443,8 @@ export async function loadSpotCandlesPage(
   const [rowsRes, liveRow] = await Promise.all([
     env.DB.prepare(
       endTimeMs
-        ? 'SELECT bucket, open, high, low, close, volume, open_at, close_at FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
-        : 'SELECT bucket, open, high, low, close, volume, open_at, close_at FROM spot_candles WHERE pair = ? AND interval = ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?',
+        ? 'SELECT bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
+        : 'SELECT bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume FROM spot_candles WHERE pair = ? AND interval = ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?',
     )
       .bind(...(endTimeMs ? [pair, srcCode, endTimeMs, srcLimit] : [pair, srcCode, windowStart, srcLimit]))
       .all<CandleRow>(),
@@ -416,30 +462,50 @@ export async function loadSpotCandlesPage(
   if (asc.length === 0) return { candles: endTimeMs ? [] : await bucketTradesToCandles(env, pair, bucketMs, limit), more: false };
   if (ratio === 1) {
     return {
-      candles: asc.map((r) => ({ time: Math.floor(r.bucket / 1000), open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume })),
+      candles: asc.map((r) => ({
+        time: Math.floor(r.bucket / 1000),
+        open: r.open,
+        high: r.high,
+        low: r.low,
+        close: r.close,
+        volume: r.volume,
+        buyVolume: r.buy_volume,
+        sellVolume: r.sell_volume,
+      })),
       more,
     };
   }
   // 롤업 — 원본 봉을 목표 버킷으로 묶는다(open=첫 봉, close=마지막 봉, high/low=극값, volume=합).
   // 원본이 시간순(asc)이라 open/close 가 자연히 맞는다.
-  const merged = new Map<number, { open: number; high: number; low: number; close: number; volume: number }>();
+  const merged = new Map<number, { open: number; high: number; low: number; close: number; volume: number; buy: number | null; sell: number | null }>();
   for (const r of asc) {
     const b = Math.floor(r.bucket / bucketMs) * bucketMs;
     const cur = merged.get(b);
     if (!cur) {
-      merged.set(b, { open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume });
+      merged.set(b, { open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, buy: r.buy_volume, sell: r.sell_volume });
     } else {
       cur.high = Math.max(cur.high, r.high);
       cur.low = Math.min(cur.low, r.low);
       cur.close = r.close;
       cur.volume += r.volume;
+      cur.buy = addVol(cur.buy, r.buy_volume);
+      cur.sell = addVol(cur.sell, r.sell_volume);
     }
   }
   return {
     candles: [...merged.entries()]
       .sort((a, b) => a[0] - b[0])
       .slice(-limit)
-      .map(([t, c]) => ({ time: Math.floor(t / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })),
+      .map(([t, c]) => ({
+        time: Math.floor(t / 1000),
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+        buyVolume: c.buy,
+        sellVolume: c.sell,
+      })),
     more,
   };
 }
@@ -2028,7 +2094,7 @@ interface TickResult {
   book: BotBook;
   /** 이 틱이 찍은 합성 체결들의 OHLCV(캔들 누적용). ⚠ 체결이 0건인 틱은 `null` 이다(§ 관심도 — 한산한 초엔
    * 아무도 안 산다). 그 틱은 캔들을 건드리지 않는다(거래량 0 짜리 봉 조각을 만들지 않게). */
-  bar: { open: number; high: number; low: number; close: number; volume: number } | null;
+  bar: CandleBar | null;
   /** 합성 체결 명목금액 합(봇 수수료 산정용). */
   notional: number;
   actor: string;
@@ -2170,6 +2236,7 @@ export function simulateTick(
   const huntLen = huntRoll ? 1 + Math.floor(Math.random() * 3) : 0;
   const huntAt = huntRoll ? 1 + Math.floor(Math.random() * Math.max(1, nTrades - 1 - huntLen)) : -1;
   let volume = 0;
+  let buyVolume = 0; // 테이커 방향별 거래량(§ CandleBar) — 24시간 체결강도의 원본
   let notionalSum = 0; // 봇 수수료 산정용(합성 체결의 명목금액 합)
   // 봉은 **체결만으로** 만든다(체결이 없으면 봉도 없다). 사다리 규칙 ①(지나간 자리는 체결됐다)은 아래에서
   // 이 범위에 ref 를 더해 판정한다 — 호가가 새 공정가를 넘어 교차된 채 남지 않게.
@@ -2287,6 +2354,7 @@ export function simulateTick(
     low = Math.min(low, price);
 
     volume += sz;
+    if (flowSide === 'buy') buyVolume += sz;
     notionalSum += price * sz;
 
     // 라벨 = 원인(누가 호가를 때렸나) 그 자체. 강제된 가격이 없으므로 되짚을 건도 없다.
@@ -2297,7 +2365,7 @@ export function simulateTick(
   }
 
   const next: BotState = { ...step.next, ref };
-  const bar = printed > 0 ? { open, high, low, close, volume } : null;
+  const bar = printed > 0 ? { open, high, low, close, volume, buy: buyVolume, sell: volume - buyVolume } : null;
   // 규칙 ①의 "지나간 범위" — 체결 범위에 새 공정가를 더한다(체결이 0건이면 공정가 한 점). 호가가 새 공정가를
   // 넘어 교차된 채 남지 않게 하는 것이 곧 역전 방지다. 버스트에서 사다리를 건너뛴 틱들의 범위·교체 속도도
   // 여기서 합친다(§ LadderDebt).
@@ -2929,7 +2997,7 @@ export async function recordVirtualFill(
     env.DB.prepare(
       `INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, price, interestBumpOf(size)),
-    ...candleUpsertOne(env, pair, price, size, now), // 영속 캔들 갱신
+    ...candleUpsertOne(env, pair, price, size, takerSide, now), // 영속 캔들 갱신
     // 이 경로(호가창 walking 을 안 타는 SL/TP 정산 등)의 상대편도 봇이다 — 재고/현금/수수료를 똑같이 정산한다.
     ...(await botFillStmts(env, pair, fills, oppositeSide, now)),
   ]);
@@ -3124,7 +3192,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
     env.DB.prepare(
       `INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, roundOx(fillAvg), interestBumpOf(filled)),
-    ...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled }, now),
+    ...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled, ...sideVol(tapeSide, filled) }, now),
     // 체결 이력(주문내역)엔 이번 호출의 총 체결을 가중평균가로 1건 기록.
     env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
       crypto.randomUUID(),
@@ -3299,7 +3367,7 @@ export async function matchMarketOxOrder(
       `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, newRef, newAnchor, interestBumpOf(filled)),
   );
-  stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled }, now));
+  stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled, ...sideVol(isLong ? 'buy' : 'sell', filled) }, now));
   stmts.push(
     env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
       crypto.randomUUID(),
@@ -3440,7 +3508,7 @@ async function closePositionAgainstBook(
       `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, newRef, newAnchor, interestBumpOf(filled)),
   );
-  stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled }, now));
+  stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled, ...sideVol(tapeSide, filled) }, now));
   stmts.push(
     env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
       crypto.randomUUID(),

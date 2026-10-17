@@ -11,6 +11,9 @@ export interface Candle {
   low: number;
   close: number;
   volume?: number;
+  // 테이커 방향별 거래량 — 가상 코인 영속 봉(서버 spot_candles)만 싣는다. null = 방향 정보가 생기기 전의 봉
+  buyVolume?: number | null;
+  sellVolume?: number | null;
 }
 
 /** 바이낸스 kline websocket payload 중 우리가 쓰는 필드 */

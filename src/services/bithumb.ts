@@ -224,6 +224,35 @@ export function bithumbOrderbookStream(symbol: string): Observable<OrderBookSnap
   );
 }
 
+/** 24시간 체결강도 — 빗썸이 직접 계산한 값을 **구 WebSocket**(pubwss) 시세의 tickType '24H' 에서 받는다
+ * (buyVolume ÷ sellVolume × 100 = volumePower, 롤링 24시간). v1 시세의 acc_bid/ask_volume 은 KST 자정부터 쌓는 값이라
+ * 자정 직후엔 표본이 적어 크게 흔들려서 안 쓴다. 이 시세는 **체결이 날 때만** 오므로 한산한 코인은 첫 값까지 몇 초~몇 분
+ * 걸린다. 브라우저 직결이라 Cloudflare·D1 비용 0. */
+const LEGACY_WS = 'wss://pubwss.bithumb.com/pub/ws';
+export function bithumbPowerStream(symbol: string): Observable<{ buy: number; sell: number }> {
+  return new Observable<{ buy: number; sell: number }>((sub) => {
+    const ws = new WebSocket(LEGACY_WS);
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'ticker', symbols: [`${baseOf(symbol)}_KRW`], tickTypes: ['24H'] }));
+    ws.onmessage = (e) => {
+      try {
+        const m = JSON.parse(String(e.data)) as { type?: string; content?: { tickType?: string; buyVolume?: string; sellVolume?: string } };
+        if (m.type !== 'ticker' || m.content?.tickType !== '24H') return;
+        const buy = Number(m.content.buyVolume);
+        const sell = Number(m.content.sellVolume);
+        if (Number.isFinite(buy) && Number.isFinite(sell)) sub.next({ buy, sell });
+      } catch {
+        /* 깨진 프레임 무시 */
+      }
+    };
+    ws.onerror = () => sub.error(new Error('bithumb legacy ws error'));
+    ws.onclose = () => sub.error(new Error('bithumb legacy ws closed')); // 서버가 닫아도 retry 로 다시 연다
+    return () => {
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      ws.close();
+    };
+  }).pipe(retry({ delay: 3000 }), throttleTime(1000, undefined, { leading: true, trailing: true }));
+}
+
 /** KST 기준 다음 달 1일 0시(초) — 월봉은 길이가 달라 고정 초로 못 나눈다. */
 function nextMonthStart(t: number): number {
   const d = new Date((t + KST_OFFSET) * 1000);

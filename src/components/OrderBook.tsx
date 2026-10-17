@@ -7,6 +7,7 @@ import { baseOf, isVirtualSymbol, quoteOf } from '@/symbols';
 import { bithumbOrderbookStream } from '@/services/bithumb';
 import { fmtMoney, fmtMoneyShort, fmtPct, fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
+import { useTradePower } from '@/hooks/useTradePower';
 
 const EMPTY_TRADES: TickerTrade[] = [];
 // 수량은 세자리 콤마로. 큰 물량(≥1000)은 소수 1자리, 작은 물량은 최대 4자리(뒤 0 은 자동으로 떨어짐).
@@ -131,7 +132,6 @@ const STRENGTH_KNEE_LEVEL = 30;
 const STRENGTH_TAIL_T = 3; // 로그 꼬리의 완만함
 const STRENGTH_TAIL_Z = 600; // 이 이상 벗어나면 최대 레벨(≈ 노이즈의 600배)
 const STRENGTH_TAIL_DEN = Math.log1p((STRENGTH_TAIL_Z - STRENGTH_KNEE_Z) / STRENGTH_TAIL_T);
-const POWER_MIN_TRADES = 30; // 체결강도를 내기 시작하는 최소 체결 수(§ power)
 
 /** 중앙값(입력 배열은 그대로 둔다). */
 function median(values: number[]): number {
@@ -303,24 +303,9 @@ export default function OrderBook() {
   const tradeVal = (t: TickerTrade) => (bookUnit === 'qty' ? t.qty : t.price * t.qty);
   const maxTradeVal = Math.max(0, ...shownTrades.map(tradeVal));
 
-  // 체결강도(빗썸·업비트의 그것) = 매수 체결량 ÷ 매도 체결량 × 100 — 100% 위면 사는 쪽이 더 많이 체결했다.
-  // 창은 클라가 들고 있는 **원본 테이프 전체**(필터 이전, 최대 MAX_TRADES 건): 필터를 걸어 둔 목록으로 세면
-  // 고래끼리의 비율이라 시장의 체결강도가 아니다. 방향 모르는 체결은 뺀다.
-  // ⚠ 표본이 POWER_MIN_TRADES 건 미만이면 값을 안 낸다 — 심볼을 막 바꿔 테이프가 비었을 때 첫 몇 건이 전부
-  // 한쪽이면 0% 나 수천 % 로 시작해 "식이 이상하다"로 읽힌다.
-  const power = useMemo(() => {
-    let buy = 0;
-    let sell = 0;
-    let n = 0;
-    for (const t of trades) {
-      if (t.takerSide === 'buy') buy += t.qty;
-      else if (t.takerSide === 'sell') sell += t.qty;
-      else continue;
-      n++;
-    }
-    const spanSec = trades.length > 1 ? Math.max(0, (trades[0].time - trades[trades.length - 1].time) / 1000) : 0;
-    return { buy, sell, n, spanSec, pct: n >= POWER_MIN_TRADES && sell > 0 ? (buy / sell) * 100 : null };
-  }, [trades]);
+  // 24시간 체결강도(§ useTradePower) — 체결 목록이 화면에 있을 때만 받는다. 테이프는 **필터 이전 원본**을 넘긴다
+  // (받은 뒤의 체결을 얹는 용도 — 걸러낸 목록이면 시장이 아니라 걸러낸 체결끼리의 비율이 된다).
+  const power = useTradePower(symbol, trades, together || tab === 'trades');
 
   const tabBtn = (t: typeof tab, label: string) => (
     <button
@@ -388,18 +373,19 @@ export default function OrderBook() {
   ) : null;
 
   // 체결강도 표시 — 100% 초과 = 매수색, 미만 = 매도색(표시 자릿수로 반올림한 값으로 판정해 "100.00%"가 색을 띠지 않게).
-  const powerPct = power.pct == null ? null : Math.round(power.pct * 100) / 100;
-  const powerSpan = power.spanSec < 90 ? `${Math.round(power.spanSec)}초` : `${Math.round(power.spanSec / 60)}분`;
+  const powerPct = power?.pct == null ? null : Math.round(power.pct * 100) / 100;
+  const powerWindow = power?.hours != null && power.hours < 24 ? `최근 ${power.hours}시간(방향별 기록이 쌓인 만큼)` : '최근 24시간';
   const powerBadge =
-    power.n > 0 ? (
+    together || tab === 'trades' ? (
       <span
         className="shrink-0 whitespace-nowrap px-1 text-[10px] text-muted"
-        title={`체결강도 = 매수 체결량 ÷ 매도 체결량 × 100 (100% 위면 매수 우위)
+        title={`체결강도 = ${powerWindow} 매수 체결량 합 ÷ 매도 체결량 합 × 100 (100% 위면 매수 우위)
 ${
-  power.n < POWER_MIN_TRADES
-    ? `체결을 모으는 중 (${power.n}/${POWER_MIN_TRADES}건)`
-    : `최근 ${power.n}건 · 약 ${powerSpan} 기준
-매수 ${fmtQty(power.buy)} · 매도 ${fmtQty(power.sell)} ${baseOf(symbol)}`
+  power == null || power.pct == null
+    ? quoteOf(symbol) === 'KRW'
+      ? '빗썸 시세를 기다리는 중(체결이 나야 갱신됩니다)'
+      : '불러오는 중'
+    : `매수 ${fmtQty(power.buy)} · 매도 ${fmtQty(power.sell)} ${baseOf(symbol)}`
 }`}
       >
         체결강도{' '}

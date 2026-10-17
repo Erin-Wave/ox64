@@ -266,6 +266,11 @@ CREATE TABLE IF NOT EXISTS spot_candles (
   -- 인덱스가 아니라 컬럼이라 쓰기 행 수는 그대로다(§6 과금 모델).
   open_at  INTEGER NOT NULL DEFAULT 0,
   close_at INTEGER NOT NULL DEFAULT 0,
+  -- 테이커 방향별 거래량(2026-10-17) — 24시간 체결강도(매수 체결량 ÷ 매도 체결량, src/components/OrderBook.tsx)용.
+  -- NULL = 이 컬럼이 생기기 전의 봉(방향 정보 없음 — 합산에서 뺀다). 둘을 따로 두는 이유: 컬럼이 생길 때 진행 중이던
+  -- 봉은 volume 에 그 전 몫이 섞여 있어 `volume − buy` 로 매도량을 내면 틀린다. 컬럼이라 쓰기 행 수는 그대로다.
+  buy_volume  REAL,
+  sell_volume REAL,
   PRIMARY KEY (pair, interval, bucket)   -- (pair,interval) 로 조회 + bucket 정렬을 이 인덱스로 커버
 );
 
@@ -610,3 +615,10 @@ CREATE TABLE IF NOT EXISTS crate_stats (
 -- **코드 배포 전에 먼저 적용해야 한다** — 강제청산 판정(_trading.ts)·loadState 가 매 폴링 이 컬럼을 SELECT 하므로
 -- 없으면 /api/state 부터 500 이 된다(= 거래 전체 정지). DEFAULT 0 이라 기존 행도 그대로 동작.
 -- ALTER TABLE users ADD COLUMN krw_balance REAL NOT NULL DEFAULT 0;
+
+-- ⚠ 일회성 마이그레이션 (2026-10-17 추가, 가상 코인 24시간 체결강도): spot_candles 에 테이커 방향별 거래량.
+-- **코드 배포 전에 먼저 적용해야 한다** — 모든 가상 코인 체결의 캔들 upsert 와 봇의 캔들 flush 가 이 컬럼을 쓰므로
+-- 없으면 체결 batch 가 통째로 롤백된다(= 가상 코인 거래·시장이 멈춘다). NULL 허용이라 기존 행은 "방향 정보 없음".
+-- cron 워커도 재배포(봇 커밋이 functions/api/spot.ts 를 공유한다).
+-- ALTER TABLE spot_candles ADD COLUMN buy_volume REAL;
+-- ALTER TABLE spot_candles ADD COLUMN sell_volume REAL;
