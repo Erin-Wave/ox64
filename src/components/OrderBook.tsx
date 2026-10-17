@@ -303,7 +303,7 @@ export default function OrderBook() {
   const tradeVal = (t: TickerTrade) => (bookUnit === 'qty' ? t.qty : t.price * t.qty);
   const maxTradeVal = Math.max(0, ...shownTrades.map(tradeVal));
 
-  // 24시간 체결강도(§ useTradePower) — 체결 목록이 화면에 있을 때만 받는다. 테이프는 **필터 이전 원본**을 넘긴다
+  // 체결강도(오늘 0시부터, § useTradePower) — 체결 목록이 화면에 있을 때만 받는다. 테이프는 **필터 이전 원본**을 넘긴다
   // (받은 뒤의 체결을 얹는 용도 — 걸러낸 목록이면 시장이 아니라 걸러낸 체결끼리의 비율이 된다).
   const power = useTradePower(symbol, trades, together || tab === 'trades');
 
@@ -374,12 +374,11 @@ export default function OrderBook() {
 
   // 체결강도 표시 — 100% 초과 = 매수색, 미만 = 매도색(표시 자릿수로 반올림한 값으로 판정해 "100.00%"가 색을 띠지 않게).
   const powerPct = power?.pct == null ? null : Math.round(power.pct * 100) / 100;
-  const powerWindow = power?.hours != null && power.hours < 24 ? `최근 ${power.hours}시간(방향별 기록이 쌓인 만큼)` : '최근 24시간';
   const powerBadge =
     together || tab === 'trades' ? (
       <span
         className="shrink-0 whitespace-nowrap px-1 text-[10px] text-muted"
-        title={`체결강도 = ${powerWindow} 매수 체결량 합 ÷ 매도 체결량 합 × 100 (100% 위면 매수 우위)
+        title={`체결강도 = 오늘(한국시간 0시부터) 매수 체결량 합 ÷ 매도 체결량 합 × 100 (100% 위면 매수 우위, 매일 0시 초기화)
 ${
   power == null || power.pct == null
     ? quoteOf(symbol) === 'KRW'

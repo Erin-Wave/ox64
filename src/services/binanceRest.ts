@@ -41,10 +41,10 @@ export async function fetchKlines(
   }));
 }
 
-/** 최근 24시간의 테이커 매수·매도 거래량(체결강도용). 24시간 티커엔 방향별 몫이 없어서 15분봉 96개
- * (= 23시간 45분 + 진행 중 봉)의 `taker buy base volume`(인덱스 9)을 합친다 — 매도 = 전체 − 매수. */
-export async function fetchTakerVolume24h(symbol: string): Promise<{ buy: number; sell: number }> {
-  const res = await fetch(`${SPOT_API}/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=15m&limit=96`);
+/** `startMs` 부터 지금까지의 테이커 매수·매도 거래량(체결강도용 — 한국시간 0시부터). 티커엔 방향별 몫이 없어서 15분봉
+ * (한국 0시 = UTC 15:00 이라 15분 경계에 맞다, 하루 최대 96개)의 `taker buy base volume`(인덱스 9)을 합친다 — 매도 = 전체 − 매수. */
+export async function fetchTakerVolumeSince(symbol: string, startMs: number): Promise<{ buy: number; sell: number }> {
+  const res = await fetch(`${SPOT_API}/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=15m&startTime=${Math.floor(startMs)}&limit=96`);
   if (!res.ok) throw new Error(`klines fetch failed: ${res.status}`);
   const rows: unknown[][] = await res.json();
   let vol = 0;
