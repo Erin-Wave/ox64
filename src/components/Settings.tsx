@@ -347,12 +347,13 @@ export default function Settings({ onClose }: { onClose: () => void }) {
                 >
                   <span className="min-w-0">
                     <span className={`block text-xs font-bold ${tradeStrength ? 'text-accent' : 'text-text'}`}>
-                      강세 · 약세 레벨 배경
+                      강세 · 약세 레벨 · 체결 크기 배경
                     </span>
                     <span className="mt-0.5 block text-[11px] text-muted">
-                      체결 가격·수량 뒤에 <span className="text-text">그 시점 평균보다 싸게(약세) · 비싸게(강세)</span> 체결됐는지를
+                      체결 가격 뒤에 <span className="text-text">그 시점 평균보다 싸게(약세) · 비싸게(강세)</span> 체결됐는지를
                       <span className="text-text"> 1~50 레벨</span> 바로 은은하게 깝니다 — 많이 벗어날수록 바가 길어집니다
-                      (마우스를 올리면 평균 대비 %와 레벨)
+                      (마우스를 올리면 평균 대비 %와 레벨). 수량 뒤에는 <span className="text-text">체결 크기</span> 막대가
+                      오른쪽에서 자랍니다 — 보이는 체결 중 가장 큰 것이 끝까지, 나머지는 크기에 정비례
                     </span>
                   </span>
                   <span

@@ -131,6 +131,7 @@ const STRENGTH_KNEE_LEVEL = 30;
 const STRENGTH_TAIL_T = 3; // 로그 꼬리의 완만함
 const STRENGTH_TAIL_Z = 600; // 이 이상 벗어나면 최대 레벨(≈ 노이즈의 600배)
 const STRENGTH_TAIL_DEN = Math.log1p((STRENGTH_TAIL_Z - STRENGTH_KNEE_Z) / STRENGTH_TAIL_T);
+const POWER_MIN_TRADES = 30; // 체결강도를 내기 시작하는 최소 체결 수(§ power)
 
 /** 중앙값(입력 배열은 그대로 둔다). */
 function median(values: number[]): number {
@@ -297,10 +298,16 @@ export default function OrderBook() {
     }
     return out;
   }, [trades, filtering, filterBasis, filterMin, filterMax, rows]);
+  // 체결 크기 막대의 잣대 — 보이는 행 중 가장 큰 값이 최대 폭이고 나머지는 **정비례**(4억은 8천만의 정확히 5배 길이).
+  // 값은 화면에 찍힌 숫자 그대로(수량 단위면 수량, 총금액 단위면 가격×수량)라 막대와 숫자가 어긋나지 않는다.
+  const tradeVal = (t: TickerTrade) => (bookUnit === 'qty' ? t.qty : t.price * t.qty);
+  const maxTradeVal = Math.max(0, ...shownTrades.map(tradeVal));
 
   // 체결강도(빗썸·업비트의 그것) = 매수 체결량 ÷ 매도 체결량 × 100 — 100% 위면 사는 쪽이 더 많이 체결했다.
   // 창은 클라가 들고 있는 **원본 테이프 전체**(필터 이전, 최대 MAX_TRADES 건): 필터를 걸어 둔 목록으로 세면
   // 고래끼리의 비율이라 시장의 체결강도가 아니다. 방향 모르는 체결은 뺀다.
+  // ⚠ 표본이 POWER_MIN_TRADES 건 미만이면 값을 안 낸다 — 심볼을 막 바꿔 테이프가 비었을 때 첫 몇 건이 전부
+  // 한쪽이면 0% 나 수천 % 로 시작해 "식이 이상하다"로 읽힌다.
   const power = useMemo(() => {
     let buy = 0;
     let sell = 0;
@@ -312,7 +319,7 @@ export default function OrderBook() {
       n++;
     }
     const spanSec = trades.length > 1 ? Math.max(0, (trades[0].time - trades[trades.length - 1].time) / 1000) : 0;
-    return { buy, sell, n, spanSec, pct: sell > 0 ? (buy / sell) * 100 : null };
+    return { buy, sell, n, spanSec, pct: n >= POWER_MIN_TRADES && sell > 0 ? (buy / sell) * 100 : null };
   }, [trades]);
 
   const tabBtn = (t: typeof tab, label: string) => (
@@ -388,8 +395,12 @@ export default function OrderBook() {
       <span
         className="shrink-0 whitespace-nowrap px-1 text-[10px] text-muted"
         title={`체결강도 = 매수 체결량 ÷ 매도 체결량 × 100 (100% 위면 매수 우위)
-최근 ${power.n}건 · 약 ${powerSpan} 기준
-매수 ${fmtQty(power.buy)} · 매도 ${fmtQty(power.sell)} ${baseOf(symbol)}`}
+${
+  power.n < POWER_MIN_TRADES
+    ? `체결을 모으는 중 (${power.n}/${POWER_MIN_TRADES}건)`
+    : `최근 ${power.n}건 · 약 ${powerSpan} 기준
+매수 ${fmtQty(power.buy)} · 매도 ${fmtQty(power.sell)} ${baseOf(symbol)}`
+}`}
       >
         체결강도{' '}
         <span
@@ -507,7 +518,7 @@ export default function OrderBook() {
       <div className="overflow-auto" style={listH}>
         {shownTrades.map((t, i) => {
           const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
-          // 강세·약세 레벨(0~±50) → 가격·수량 칸 배경 바. 레벨이 높을수록 바가 길어지고 아주 조금 진해진다
+          // 강세·약세 레벨(0~±50) → 가격 칸 배경 바(수량 칸 막대는 체결 크기 — 아래). 레벨이 높을수록 바가 길어지고 아주 조금 진해진다
           // ("은은하게" — 숫자를 읽는 데 방해되면 안 된다). +는 평균보다 비싸게(강세), −는 싸게(약세).
           const lvl = showStrength ? t.lvl : 0;
           const mag = Math.abs(lvl);
@@ -541,9 +552,10 @@ export default function OrderBook() {
               </span>
               {/* 수량도 같은 방향 색으로 — 가격만 칠하면 목록을 훑을 때 매수/매도 흐름이 한눈에 안 읽힌다. */}
               {/* 호가창 단위 버튼(수량 ⇄ 총금액)을 체결에도 똑같이 따른다 — 툴팁엔 반대쪽 값 */}
-              {/* 수량 바는 반대로 칸 **오른쪽에서** 자라고, 최대는 가격 숫자 오른쪽 끝 바로 뒤부터 수량 숫자
-                  오른쪽 끝까지다 — 칸을 `-ml-2 pl-2` 로 열 간격(gap-2)만큼 왼쪽으로 늘려 그 간격까지 바가 덮는다
-                  (글자 위치는 그대로). ⚠ 행의 gap 을 바꾸면 이 둘도 같은 값으로. */}
+              {/* 수량 칸 막대는 강세·약세 레벨이 아니라 **체결 크기**다 — 보이는 행 중 최대 체결이 전체 폭이고
+                  나머지는 그 값에 정비례(§ maxTradeVal), 색은 테이커 방향. 칸 **오른쪽에서** 자라고, 전체 폭은 가격 숫자
+                  오른쪽 끝 바로 뒤부터 수량 숫자 오른쪽 끝까지다 — 칸을 `-ml-2 pl-2` 로 열 간격(gap-2)만큼 왼쪽으로
+                  늘려 그 간격까지 바가 덮는다(글자 위치는 그대로). ⚠ 행의 gap 을 바꾸면 이 둘도 같은 값으로. */}
               <span
                 className="relative -ml-2 block overflow-hidden rounded-sm pl-2"
                 title={
@@ -552,7 +564,14 @@ export default function OrderBook() {
                     : `수량 ${fmtQty(t.qty)} ${baseOf(symbol)}`
                 }
               >
-                {mag > 0 && <span className={`${barCls} right-0`} style={barStyle} />}
+                {showStrength && maxTradeVal > 0 && (
+                  <span
+                    className={`absolute inset-y-0 right-0 ${
+                      t.takerSide === 'sell' ? 'bg-downDim' : t.takerSide === 'buy' ? 'bg-upDim' : 'bg-elevated'
+                    }`}
+                    style={{ width: `${Math.min(100, (tradeVal(t) / maxTradeVal) * 100)}%` }}
+                  />
+                )}
                 <span className={`relative block truncate text-right ${color}`}>
                   {bookUnit === 'qty' ? fmtQty(t.qty) : fmtVal(t.price * t.qty)}
                 </span>
