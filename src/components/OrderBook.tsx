@@ -298,6 +298,23 @@ export default function OrderBook() {
     return out;
   }, [trades, filtering, filterBasis, filterMin, filterMax, rows]);
 
+  // 체결강도(빗썸·업비트의 그것) = 매수 체결량 ÷ 매도 체결량 × 100 — 100% 위면 사는 쪽이 더 많이 체결했다.
+  // 창은 클라가 들고 있는 **원본 테이프 전체**(필터 이전, 최대 MAX_TRADES 건): 필터를 걸어 둔 목록으로 세면
+  // 고래끼리의 비율이라 시장의 체결강도가 아니다. 방향 모르는 체결은 뺀다.
+  const power = useMemo(() => {
+    let buy = 0;
+    let sell = 0;
+    let n = 0;
+    for (const t of trades) {
+      if (t.takerSide === 'buy') buy += t.qty;
+      else if (t.takerSide === 'sell') sell += t.qty;
+      else continue;
+      n++;
+    }
+    const spanSec = trades.length > 1 ? Math.max(0, (trades[0].time - trades[trades.length - 1].time) / 1000) : 0;
+    return { buy, sell, n, spanSec, pct: sell > 0 ? (buy / sell) * 100 : null };
+  }, [trades]);
+
   const tabBtn = (t: typeof tab, label: string) => (
     <button
       onClick={() => setTab(t)}
@@ -362,6 +379,28 @@ export default function OrderBook() {
       필터 {filterText} {unit}
     </button>
   ) : null;
+
+  // 체결강도 표시 — 100% 초과 = 매수색, 미만 = 매도색(표시 자릿수로 반올림한 값으로 판정해 "100.00%"가 색을 띠지 않게).
+  const powerPct = power.pct == null ? null : Math.round(power.pct * 100) / 100;
+  const powerSpan = power.spanSec < 90 ? `${Math.round(power.spanSec)}초` : `${Math.round(power.spanSec / 60)}분`;
+  const powerBadge =
+    power.n > 0 ? (
+      <span
+        className="shrink-0 whitespace-nowrap px-1 text-[10px] text-muted"
+        title={`체결강도 = 매수 체결량 ÷ 매도 체결량 × 100 (100% 위면 매수 우위)
+최근 ${power.n}건 · 약 ${powerSpan} 기준
+매수 ${fmtQty(power.buy)} · 매도 ${fmtQty(power.sell)} ${baseOf(symbol)}`}
+      >
+        체결강도{' '}
+        <span
+          className={`font-semibold ${
+            powerPct == null ? 'text-text' : powerPct > 100 ? 'text-up' : powerPct < 100 ? 'text-down' : 'text-text'
+          }`}
+        >
+          {powerPct == null ? '—' : `${fmtPct(powerPct, 2)}%`}
+        </span>
+      </span>
+    ) : null;
 
   // ⚠ 체결 목록은 **고정 높이**다(maxHeight 아님) — 체결이 한 건씩 흘러들어오며(dripTrades) 높이가 오르내리면
   // 아래 컴포넌트가 통째로 밀린다("height 와리가리" 제보). 호가 목록은 반대로 **실제 단계 수만큼 압축**한다
@@ -468,11 +507,15 @@ export default function OrderBook() {
       <div className="overflow-auto" style={listH}>
         {shownTrades.map((t, i) => {
           const color = t.takerSide === 'sell' ? 'text-down' : t.takerSide === 'buy' ? 'text-up' : 'text-text';
-          // 강세·약세 레벨(0~±3) → 가격 칸 배경 바. 레벨이 높을수록 바가 길어지고 아주 조금 진해진다
+          // 강세·약세 레벨(0~±50) → 가격·수량 칸 배경 바. 레벨이 높을수록 바가 길어지고 아주 조금 진해진다
           // ("은은하게" — 숫자를 읽는 데 방해되면 안 된다). +는 평균보다 비싸게(강세), −는 싸게(약세).
           const lvl = showStrength ? t.lvl : 0;
           const mag = Math.abs(lvl);
           const gapPct = t.ref > 0 ? ((t.price - t.ref) / t.ref) * 100 : 0;
+          // 농도는 6~22% — 배경이지 강조가 아니라 낮게 두되, 너무 옅으면 레벨 차이가 안 읽힌다
+          // (4~16% 는 "안 보인다"는 쪽이었고, 3단계 시절의 15~25% 는 숫자를 가릴 만큼 진했다).
+          const barCls = `absolute inset-y-0 ${lvl > 0 ? 'bg-up' : 'bg-down'}`;
+          const barStyle = { width: `${(mag / STRENGTH_MAX_LEVEL) * 100}%`, opacity: 0.06 + (mag / STRENGTH_MAX_LEVEL) * 0.16 };
           return (
             // ⚠ 3열은 반드시 **격자**로 — 예전엔 `flex justify-between` 이라 세 칸의 너비가 행마다
             // 제각각 계산돼, 수량 자릿수가 바뀌면(604 vs 6,694) 가운데 가격이 좌우로 흔들렸다.
@@ -491,29 +534,28 @@ export default function OrderBook() {
                       }${fmtPct(gapPct, 3)}% · ${lvl > 0 ? '강세' : '약세'} ${mag}레벨 (최대 ${STRENGTH_MAX_LEVEL})`
                 }
               >
-                {mag > 0 && (
-                  // ⚠ 바는 **왼쪽에서** 자란다 — 가격 숫자가 오른쪽 정렬이라 오른쪽에 붙이면 바가 숫자
-                  // 밑에 깔려 글자를 읽기 어렵고, 레벨(길이)도 눈으로 비교가 안 된다(시작점이 제각각).
-                  // 농도는 6~22% — 배경이지 강조가 아니라 낮게 두되, 너무 옅으면 레벨 차이가 안 읽힌다
-                  // (4~16% 는 "안 보인다"는 쪽이었고, 3단계 시절의 15~25% 는 숫자를 가릴 만큼 진했다).
-                  <span
-                    className={`absolute inset-y-0 left-0 ${lvl > 0 ? 'bg-up' : 'bg-down'}`}
-                    style={{ width: `${(mag / STRENGTH_MAX_LEVEL) * 100}%`, opacity: 0.06 + (mag / STRENGTH_MAX_LEVEL) * 0.16 }}
-                  />
-                )}
+                {/* 가격 바는 칸 **왼쪽에서** 자라 가격 숫자 오른쪽 끝(칸 끝)이 최대 — 시작점이 행마다 같아야
+                    레벨(길이)을 눈으로 비교할 수 있다. */}
+                {mag > 0 && <span className={`${barCls} left-0`} style={barStyle} />}
                 <span className={`relative block truncate text-right ${color}`}>{fmtPriceShort(t.price, prec, 9)}</span>
               </span>
               {/* 수량도 같은 방향 색으로 — 가격만 칠하면 목록을 훑을 때 매수/매도 흐름이 한눈에 안 읽힌다. */}
               {/* 호가창 단위 버튼(수량 ⇄ 총금액)을 체결에도 똑같이 따른다 — 툴팁엔 반대쪽 값 */}
+              {/* 수량 바는 반대로 칸 **오른쪽에서** 자라고, 최대는 가격 숫자 오른쪽 끝 바로 뒤부터 수량 숫자
+                  오른쪽 끝까지다 — 칸을 `-ml-2 pl-2` 로 열 간격(gap-2)만큼 왼쪽으로 늘려 그 간격까지 바가 덮는다
+                  (글자 위치는 그대로). ⚠ 행의 gap 을 바꾸면 이 둘도 같은 값으로. */}
               <span
-                className={`truncate text-right ${color}`}
+                className="relative -ml-2 block overflow-hidden rounded-sm pl-2"
                 title={
                   bookUnit === 'qty'
                     ? `거래대금 ${fmtUsd(t.price * t.qty)} ${quote}`
                     : `수량 ${fmtQty(t.qty)} ${baseOf(symbol)}`
                 }
               >
-                {bookUnit === 'qty' ? fmtQty(t.qty) : fmtVal(t.price * t.qty)}
+                {mag > 0 && <span className={`${barCls} right-0`} style={barStyle} />}
+                <span className={`relative block truncate text-right ${color}`}>
+                  {bookUnit === 'qty' ? fmtQty(t.qty) : fmtVal(t.price * t.qty)}
+                </span>
               </span>
             </div>
           );
@@ -533,6 +575,7 @@ export default function OrderBook() {
         {bookBody}
         <div className="mb-1 mt-1.5 flex items-center gap-1 border-t border-border pt-1.5">
           {sectionTitle('체결')}
+          {powerBadge}
           <div className="ml-auto flex min-w-0 max-w-[70%] items-center">{filterBadge}</div>
         </div>
         {tradesBody}
@@ -544,6 +587,7 @@ export default function OrderBook() {
       <div className="mb-1 flex items-center gap-1">
         {tabBtn('book', '호가')}
         {tabBtn('trades', '체결')}
+        {tab === 'trades' && powerBadge}
         {tab === 'book' ? (
           bookTools
         ) : (
