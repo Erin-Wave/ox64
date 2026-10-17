@@ -377,19 +377,19 @@ export default function OrderBook() {
   const powerBadge =
     together || tab === 'trades' ? (
       <span
-        className="shrink-0 whitespace-nowrap px-1 text-[10px] text-muted"
+        className="flex shrink-0 items-baseline gap-1 whitespace-nowrap px-1 text-[11px] text-muted"
         title={`체결강도 = 오늘(한국시간 0시부터) 매수 체결량 합 ÷ 매도 체결량 합 × 100 (100% 위면 매수 우위, 매일 0시 초기화)
 ${
   power == null || power.pct == null
     ? quoteOf(symbol) === 'KRW'
-      ? '빗썸 시세를 기다리는 중(체결이 나야 갱신됩니다)'
+      ? '빗썸 시세를 받는 중'
       : '불러오는 중'
     : `매수 ${fmtQty(power.buy)} · 매도 ${fmtQty(power.sell)} ${baseOf(symbol)}`
 }`}
       >
-        체결강도{' '}
+        체결강도
         <span
-          className={`font-semibold ${
+          className={`text-[13px] font-bold ${
             powerPct == null ? 'text-text' : powerPct > 100 ? 'text-up' : powerPct < 100 ? 'text-down' : 'text-text'
           }`}
         >
