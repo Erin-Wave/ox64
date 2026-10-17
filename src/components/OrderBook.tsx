@@ -389,7 +389,7 @@ ${
       >
         체결강도
         <span
-          className={`text-[13px] font-bold ${
+          className={`text-[16px] font-bold leading-none ${
             powerPct == null ? 'text-text' : powerPct > 100 ? 'text-up' : powerPct < 100 ? 'text-down' : 'text-text'
           }`}
         >
