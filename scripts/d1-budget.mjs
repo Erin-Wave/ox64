@@ -4,8 +4,8 @@
 // **그 종류의 작업이 실패한다**(= 거래가 멈춘다). Cloudflare 엔 지출·사용 상한(hard cap) 스위치가 없으므로, 사람이 먼저 알아채는 것
 // (이 스크립트) + 코드가 스스로 멈추는 것(functions/_budget.ts) 두 겹으로 막는다.
 //
-// ⚠⚠ **운영 방침(2026-10-17) = 한 달 내내 무료 한도의 50% 미만 → 하루 기준 45%**(무료 한도는 날마다 리셋되므로 "한 달치의
-// 하루 1.5%" 와 같은 선이다). 이 스크립트는 최근 날짜별로 D1 쓰기·읽기와 Workers+Pages 요청 수를 그 선과 비교하고, 하나라도
+// ⚠⚠ **운영 방침(2026-10-17) = 월 허용량은 무료 사용량의 96%, 하루 허용량은 월 허용량의 3.3%** → 30일 기준 **하루 한도의 95.04%**
+// (무료 한도는 날마다 리셋된다). 이 스크립트는 최근 날짜별로 D1 쓰기·읽기와 Workers+Pages 요청 수를 그 선과 비교하고, 하나라도
 // 넘은 날이 있으면 exit 1.
 //
 // 데이터: GraphQL Analytics(일별 정확한 총계). 토큰은 CLOUDFLARE_API_TOKEN(권한 Account Analytics · Read) 이 있으면 그것,
@@ -21,7 +21,7 @@ const ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || '7bed0008b7981f7f7ce1132
 const DB_NAME = 'ox64';
 // 무료 한도(하루, UTC 자정 = 한국 09:00 리셋)
 const LIMITS = { write: 100_000, read: 5_000_000, req: 100_000 };
-const TARGET = 0.45; // 운영 상한 — functions/_budget.ts DAY_TARGET_ROWS 와 같은 비율
+const TARGET = 0.96 * 0.033 * 30; // 0.9504 — 운영 상한(functions/_budget.ts DAY_TARGET_ROWS 95,000 과 같은 선)
 
 const fmt = (n) => Math.round(n).toLocaleString('en-US');
 const pct = (v, lim) => `${((v / lim) * 100).toFixed(1)}%`;
@@ -95,7 +95,7 @@ for (const g of [...(req.workersInvocationsAdaptive ?? []), ...(req.pagesFunctio
   day(g.dimensions.date).req += g.sum.requests;
 }
 
-console.log(`\n  무료 플랜 사용량 — 하루 운영 상한 ${TARGET * 100}% (쓰기 ${fmt(LIMITS.write * TARGET)} · 읽기 ${fmt(LIMITS.read * TARGET)} · 요청 ${fmt(LIMITS.req * TARGET)})`);
+console.log(`\n  무료 플랜 사용량 — 하루 운영 상한 ${(TARGET * 100).toFixed(2)}% (쓰기 ${fmt(LIMITS.write * TARGET)} · 읽기 ${fmt(LIMITS.read * TARGET)} · 요청 ${fmt(LIMITS.req * TARGET)})`);
 console.log('  날짜(UTC)     D1 쓰기          D1 읽기              요청            ');
 console.log('  ' + '─'.repeat(78));
 let over = false;
@@ -109,7 +109,7 @@ for (const [k, v] of [...days.entries()].sort()) {
 }
 console.log(
   over
-    ? '\n  ❌ 상한(45%)을 넘은 날이 있다 — `npx wrangler d1 insights ox64 --sort-by writes|reads --timePeriod 1d --json` 로 원인 쿼리를 찾을 것(CLAUDE.md §6).\n'
+    ? `\n  ❌ 상한(${(TARGET * 100).toFixed(2)}%)을 넘은 날이 있다 — \`npx wrangler d1 insights ox64 --sort-by writes|reads --timePeriod 1d --json\` 로 원인 쿼리를 찾을 것(CLAUDE.md §6).\n`
     : '\n  ✅ 모든 날이 상한 안이다. (코드 쪽 차단선은 functions/_budget.ts — 재체결 → 반복 조건부 → 새 진입 → 봇 순)\n',
 );
 process.exit(over ? 1 : 0);

@@ -197,7 +197,7 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   // 커서가 없으면(구버전 클라·최초) 전체를 주므로 무회귀다.
   const since = Number(body.ordersSince) || undefined;
 
-  // ⚠ 오늘 D1 쓰기가 운영 상한(무료 한도의 45%)에 가까우면 **새 위험을 여는 주문만** 받지 않는다(§ _budget ENTRY_BLOCK_DAY_ROWS).
+  // ⚠ 오늘 D1 쓰기가 운영 상한(무료 한도의 95%)에 가까우면 **새 위험을 여는 주문만** 받지 않는다(§ _budget ENTRY_BLOCK_DAY_ROWS).
   // 청산·지정가 청산·취소·수정·SL/TP 는 그대로 — 포지션을 줄이는 길은 막지 않는다. 판정은 isolate 캐시(60초)라 D1 읽기는 거의 0.
   if ((body.action === 'open' || body.action === 'limitOpen' || body.action === 'conditionalOpen') && (await autoWritesBlocked(env, 'entry')))
     return bad(ENTRY_BLOCKED_MSG, 429);

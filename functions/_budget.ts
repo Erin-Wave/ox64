@@ -35,13 +35,14 @@ import type { Env, D1PreparedStatement } from './_shared';
 export const FREE_DAY_ROW_LIMIT = 100_000; // D1 Free: rows written / day
 export const FREE_DAY_READ_LIMIT = 5_000_000; // D1 Free: rows read / day (참고용 — 계량 대상 아님)
 
-/** ⚠⚠ **운영 상한 = 하루 무료 한도의 45%**(2026-10-17). 방침은 "한 달 내내 무료 한도의 50% 미만" — 무료 한도는 날마다 리셋되므로
- * 날짜 기준으로 바꾸면 "한 달치의 하루 1.5% ≈ 하루 한도의 45%" 다. 예전 선(재체결 4.5만 · 반복 5.5만 · 봇 8만)은 "한도를 넘겨
- * 서비스가 죽지 않게"만 잡은 값이라 실제로 하루 7만 행대(한도의 73%)가 여러 번 나왔다(9/24·9/26·10/2, GraphQL 실측).
+/** ⚠⚠ **운영 상한 = 하루 무료 한도의 95%**(2026-10-17). 방침(유저): "월 허용량 = 무료 사용량의 96%, 하루 허용량 = 월 허용량의 3.3%"
+ * → 한 달 30일 기준 하루 = 96% × 3.3% × 30 = **하루 한도의 95.04%**(쓰기 95,040행). 무료 한도는 날마다 리셋되고 넘기면 그 종류의
+ * 작업이 실패하므로(= 거래가 멈춘다) 이 선 위로 남는 5% 가 마지막 여유다 — 차단선을 이 위로 올리지 말 것.
  * 계량값은 총계의 대부분이지만 전부는 아니다 — 주문 생성·취소·수정, 로그인, 게임은 안 센다(UNMETERED_ALLOWANCE). 10/1 이후
- * 실측 차이(실제 − 계량)는 최대 9천 행이었고 그중 상당수가 유저 체결 테이블의 보존기간 DELETE 였다(2026-10-17 에 그 테이블을 안 쓰게 바꿨다). */
-export const DAY_TARGET_ROWS = 45_000;
-const UNMETERED_ALLOWANCE = 5_000;
+ * 실측 차이(실제 − 계량)는 최대 9천 행이었고 그중 상당수가 유저 체결 테이블의 보존기간 DELETE 였다(2026-10-17 에 그 테이블을 안 쓰게
+ * 바꿨다). 그래도 사용량이 클수록 계량 밖 몫도 커지므로 넉넉히 8천을 남긴다. */
+export const DAY_TARGET_ROWS = 95_000;
+const UNMETERED_ALLOWANCE = 8_000;
 
 /** ⚠ 차단은 **덜 아픈 것부터** 4단이다. 위험한 순서가 아니라 **잃는 게 적은 순서**로 끊는다.
  *  1) nibble — 시장 깊이보다 큰 지정가의 **재**체결. 멈춰도 주문은 살아있고 잠시 뒤 이어서 채워진다.
@@ -51,10 +52,10 @@ const UNMETERED_ALLOWANCE = 5_000;
  *  4) bot    — 마켓메이커. 멈추면 가상 코인 시장이 통째로 선다 → **최후 방어선**. 봇 커밋은 보고 있는 사람 1명당
  *              시간당 ~3,600행이라(1초 폴링) 거래가 없어도 시청 시간이 길면 여기까지 온다.
  * 넷 다 날짜(UTC — D1 한도 리셋 시각, 한국 09:00)가 바뀌면 자동으로 풀린다. */
-export const NIBBLE_BLOCK_DAY_ROWS = 28_000;
-export const REPEAT_BLOCK_DAY_ROWS = 31_000;
-export const ENTRY_BLOCK_DAY_ROWS = 36_000;
-export const BOT_BLOCK_DAY_ROWS = DAY_TARGET_ROWS - UNMETERED_ALLOWANCE; // 40,000
+export const NIBBLE_BLOCK_DAY_ROWS = 62_000;
+export const REPEAT_BLOCK_DAY_ROWS = 70_000;
+export const ENTRY_BLOCK_DAY_ROWS = 80_000;
+export const BOT_BLOCK_DAY_ROWS = DAY_TARGET_ROWS - UNMETERED_ALLOWANCE; // 87,000
 
 /** 월 누적은 무료 플랜에선 한도가 아니다(매일 리셋) — `npm run d1:budget` 표시용으로만 남긴다. */
 export const MONTHLY_ROW_BUDGET = FREE_DAY_ROW_LIMIT * 31;
