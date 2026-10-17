@@ -8,7 +8,6 @@ import {
   getSession,
   intervalSecFromCode,
   BOT_USER_IDS,
-  type SpotTradeRow,
   type PendingRow,
   type PositionRow,
   type D1PreparedStatement,
@@ -118,8 +117,8 @@ const PERSIST_INTERVALS: readonly [string, number][] = [
 
 /** 한 묶음의 체결(OHLCV)을 모든 영속 인터벌의 캔들에 반영하는 upsert 문장들.
  * 버킷이 없으면 새로 만들고, 있으면 시각을 비교해 open/close 를 골라 넣고 high/low/volume 을 누적한다.
- * 모든 spot_trades INSERT 경로가 이 문장들을 같은 batch 에 함께 넣어 차트 히스토리를 영구 보존한다.
- * ⚠ 여기 넘기는 값은 반드시 같은 batch 에 INSERT 하는 spot_trades 들과 일치해야 한다 — 어긋나면
+ * 모든 유저 체결 경로가 이 문장들을 같은 batch 에 함께 넣어 차트 히스토리를 영구 보존한다.
+ * ⚠ 여기 넘기는 값은 반드시 같은 batch 에서 테이프에 붙이는 프린트들(§ userTapeStmt)과 일치해야 한다 — 어긋나면
  * 캔들과 체결내역이 서로 다른 시장을 보여주게 된다(마켓메이커 한 틱은 여러 건을 찍으므로 그 묶음의
  * OHLC 를 그대로 넘긴다). now 가 과거면 이미 마감된 봉이 변조되므로 항상 현재 이후 시각일 것.
  * 이 경로는 유저 체결(한 순간에 끝난다)이라 시가·종가 시각이 둘 다 now 다. */
@@ -258,6 +257,8 @@ interface BotCommitGuard {
   lastRun: number;
   ref: number;
   version: number;
+  /** 읽을 때의 테이프 길이 — 그 사이 유저 체결이 테이프에 붙었으면(§ userTapeStmt) 이 커밋은 옛 테이프로 덮어쓰게 되므로 진다. */
+  tapeLen: number;
 }
 function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar, guard?: BotCommitGuard): D1PreparedStatement {
   const ot = b.ot ?? b.b;
@@ -265,11 +266,11 @@ function candleFlushStmt(env: Env, pair: string, code: string, b: LiveBar, guard
   const bv = b.bv ?? null;
   const sv = b.sv ?? null;
   if (guard === undefined) return env.DB.prepare(CANDLE_UPSERT_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, bv, sv);
-  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, bv, sv, pair, guard.lastRun, guard.ref, guard.version);
+  return env.DB.prepare(CANDLE_FLUSH_GUARDED_SQL).bind(pair, code, b.b, b.o, b.h, b.l, b.c, b.v, ot, ct, bv, sv, pair, guard.lastRun, guard.ref, guard.version, guard.tapeLen);
 }
 
 const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume)
-       SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ? AND ref_price = ? AND book_version = ?)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ? AND ref_price = ? AND book_version = ? AND COALESCE(length(tape_json), 0) = ?)
        ON CONFLICT(pair, interval, bucket) DO UPDATE SET
          open = CASE WHEN excluded.open_at < spot_candles.open_at THEN excluded.open ELSE spot_candles.open END,
          open_at = MIN(spot_candles.open_at, excluded.open_at),
@@ -335,28 +336,17 @@ function candleUpsertOne(env: Env, pair: string, price: number, size: number, si
 }
 
 /** 최근 체결을 interval 버킷으로 묶어 OHLCV 를 만든다(1s 등 단기 인터벌 + 영속 캔들 폴백 전용).
- * ⚠ 봇 합성 체결은 이제 테이블이 아니라 상태 행의 링 버퍼(tape_json)에 있다(§ 봇 합성 체결 테이프) —
- * 유저 체결(spot_trades)과 병합해서 버킷팅한다. 그래서 이 함수가 볼 수 있는 과거 범위는 링 버퍼 길이
- * ((TAPE_MAX ≈ 70초)로 제한되는데, <60s 인터벌은 애초에 과거 페이지가 없고(loadSpotCandles) 기본
- * 표시가 ~38봉이라 실사용엔 영향이 없다.
- * ⚠ 유저 체결 쪽은 반드시 "가장 최신"부터(DESC 로 뽑아 ASC 재정렬) — ASC LIMIT 이면 행이 한도를 넘는
- * 순간 새 거래가 창 밖으로 밀려 차트 마지막 봉이 멈춘다. */
+ * ⚠ 봇·유저 체결 모두 상태 행의 링 버퍼(tape_json)에 있다(§ 봇 합성 체결 테이프) — 그래서 이 함수가 볼 수 있는
+ * 과거 범위는 링 버퍼 길이(TAPE_MAX ≈ 70초)로 제한되는데, <60s 인터벌은 애초에 과거 페이지가 없고(loadSpotCandles)
+ * 기본 표시가 ~38봉이라 실사용엔 영향이 없다. */
 async function bucketTradesToCandles(env: Env, pair: string, bucketMs: number, limit: number) {
-  const [stateRow, userRows] = await Promise.all([
+  const [stateRow] = await Promise.all([
     env.DB.prepare('SELECT tape_json FROM spot_bot_state WHERE id = ?').bind(pair).first<{ tape_json: string | null }>(),
-    // ⚠ 여기도 시간 범위를 건다 — 이 경로(<60s 인터벌)는 1초 폴링이라 `LIMIT 2000` 을 그대로 두면
-    // 요청 하나가 2,000행이다(시간당 720만 행!). 볼 수 있는 과거가 어차피 테이프 길이(≈3분)로 제한돼
-    // 있으므로(§ 봇 합성 체결 테이프) 그보다 넉넉한 창이면 표시 결과가 같다.
-    env.DB.prepare(
-      'SELECT price, size, created_at FROM (SELECT price, size, created_at FROM spot_trades WHERE pair = ? AND created_at > ? ORDER BY created_at DESC LIMIT 2000) ORDER BY created_at ASC',
-    )
-      .bind(pair, Date.now() - TRADE_VIEW_WINDOW_MS)
-      .all<{ price: number; size: number; created_at: number }>(),
   ]);
-  const trades = [
-    ...parseTape(stateRow?.tape_json).map((t) => ({ price: t.price, size: t.size, created_at: t.createdAt })),
-    ...userRows.results,
-  ].sort((a, b) => a.created_at - b.created_at);
+  // 유저 체결도 테이프에 있다(§ userTapeStmt) — 시각순으로 다시 세운다(유저 체결과 봇 커밋이 겹치면 순서가 살짝 뒤바뀔 수 있다).
+  const trades = parseTape(stateRow?.tape_json)
+    .map((t) => ({ price: t.price, size: t.size, created_at: t.createdAt }))
+    .sort((a, b) => a.created_at - b.created_at);
   if (trades.length === 0) return [];
 
   const buckets = new Map<number, { open: number; high: number; low: number; close: number; volume: number }>();
@@ -598,14 +588,18 @@ function bookWriteStmt(env: Env, pair: string, book: BotBook, version: number): 
 // 세지 않으므로, 10KB JSON 을 매 틱 덮어써도 1행이다). 보존기간 DELETE 도 함께 사라진다(링 버퍼는 넘치는
 // 쪽이 자동으로 잘려나가므로 "누가 이 행을 지우는가" 문제 자체가 없다 — § 봇이 만드는 행은 쌓이면 안 된다).
 //
-// ⚠ **유저 체결은 계속 `spot_trades` 에 남긴다** — 사람이 내는 주문은 하루 수백 건 규모라 비용이 없고,
-// 체결 원장으로서의 가치(누가 언제 무엇을)는 그대로다. 그래서 읽는 쪽은 **둘을 시간순으로 병합**한다
-// (`mergeRecentTrades`). 새 체결 경로를 추가할 때: 봇이 만드는 것이면 테이프에, 유저 것이면 테이블에.
+// ⚠⚠ **유저 체결도 이 테이프에 얹는다(2026-10-17)** — 예전엔 유저 체결만 `spot_trades` 행으로 남겼는데, 큰 시장가 한 방이
+// 프린트 20줄 × (INSERT 3행 + 6시간 뒤 보존기간 DELETE 3행) = **120행**이라 지난 한 달 쓰기의 ~40% 가 이것이었다
+// (insights: INSERT 23만 + DELETE 14만 행). 체결 원장은 따로 있다(orders·fee_ledger) — 이 칸은 화면용 링 버퍼다.
+// 유저 체결은 다섯 번째 칸 1 로 표시하고(`[가격,수량,방향,시각,1]`), 같은 batch 의 UPDATE 한 문장으로 이어 붙인다
+// (§ userTapeStmt — 행 1개). 봇 커밋이 유저 체결 전에 읽은 테이프로 덮어쓰지 못하게 커밋 가드에 테이프 길이를 넣었다
+// (§ BotCommitGuard.tapeLen). 새 체결 경로를 추가할 때: 봇이든 유저든 이 테이프에.
 export interface TapeTrade {
   price: number;
   size: number;
   takerSide: 'buy' | 'sell' | null;
   createdAt: number;
+  user?: boolean; // 유저 체결(JSON 다섯 번째 칸 1) — 체결 목록에서 봇 체결에 밀려 잘리지 않게(§ mergeRecentTrades)
 }
 
 // 링 버퍼 길이 — 1s 캔들이 이 테이프를 버킷팅해 만들어지므로 "몇 초치까지 그릴 수 있나"를 정한다.
@@ -618,14 +612,13 @@ const TAPE_MAX = 700;
 export function parseTape(json: string | null | undefined): TapeTrade[] {
   if (!json) return [];
   try {
-    const arr = JSON.parse(json) as [number, number, number, number][];
+    const arr = JSON.parse(json) as [number, number, number, number, number?][];
     if (!Array.isArray(arr)) return [];
-    return arr.map(([price, size, taker, createdAt]) => ({
-      price,
-      size,
-      takerSide: taker === 1 ? 'buy' : taker === 0 ? 'sell' : null,
-      createdAt,
-    }));
+    return arr.map(([price, size, taker, createdAt, user]) => {
+      const t: TapeTrade = { price, size, takerSide: taker === 1 ? 'buy' : taker === 0 ? 'sell' : null, createdAt };
+      if (user === 1) t.user = true;
+      return t;
+    });
   } catch {
     return [];
   }
@@ -634,7 +627,11 @@ export function parseTape(json: string | null | undefined): TapeTrade[] {
 /** 테이프 → JSON(최근 TAPE_MAX 건만). 배열의 배열로 담아 키 이름이 매 건 반복되지 않게 한다. */
 export function serializeTape(trades: TapeTrade[]): string {
   return JSON.stringify(
-    trades.slice(-TAPE_MAX).map((t) => [t.price, t.size, t.takerSide === 'buy' ? 1 : t.takerSide === 'sell' ? 0 : -1, t.createdAt]),
+    trades.slice(-TAPE_MAX).map((t) => {
+      const row = [t.price, t.size, t.takerSide === 'buy' ? 1 : t.takerSide === 'sell' ? 0 : -1, t.createdAt];
+      if (t.user) row.push(1);
+      return row;
+    }),
   );
 }
 
@@ -667,6 +664,25 @@ export function tapeTail(json: string | null | undefined, n: number): TapeTrade[
   return parseTape(`[${json.slice(tapeTailStart(json, n), -1)}]`);
 }
 
+/** 유저 체결 항목만 골라내는 패턴 — 항목은 숫자뿐이라 `,1]` 로 **끝나는** 건 다섯 번째 칸(유저 표시)뿐이다
+ * (세 번째 칸 방향 1 뒤엔 항상 시각이 온다). */
+const USER_TAPE_ITEM = /\[[^[\]]*,1\]/g;
+/** 체결 목록에 싣는 유저 체결 상한(예전 `spot_trades` 조회의 LIMIT 30 과 같은 값). */
+const USER_TAPE_SHOWN = 30;
+
+/** 체결 목록용 테이프 = 꼬리 TRADES_SHOWN 건 + **그보다 앞에 묻힌 최근 유저 체결**(TRADE_VIEW_WINDOW_MS 안, 최대
+ * USER_TAPE_SHOWN 건). 봇 flurry 가 유저 시장가 20줄 뒤에 40건을 찍으면 꼬리 50건에 유저 줄이 다 안 들어온다 —
+ * 자기 체결이 목록에서 잘리지 않게 문자열에서 유저 항목만 따로 건진다(700건을 다 풀지 않는다, § tapeTail). */
+export function displayTape(json: string | null | undefined): TapeTrade[] {
+  const tail = tapeTail(json, TRADES_SHOWN);
+  const found = json ? json.match(USER_TAPE_ITEM) : null;
+  if (!found) return tail;
+  const since = Date.now() - TRADE_VIEW_WINDOW_MS;
+  const firstTail = tail[0]?.createdAt ?? Infinity;
+  const older = parseTape(`[${found.slice(-USER_TAPE_SHOWN).join(',')}]`).filter((t) => t.createdAt > since && t.createdAt < firstTail);
+  return older.length ? [...older, ...tail] : tail;
+}
+
 /** 새 체결을 테이프 JSON 끝에 이어 붙이고 앞쪽(오래된 쪽)을 잘라 최근 TAPE_MAX 건을 남긴다 — **기존 항목은
  * 풀지 않는다**. 형식이 깨진 값이면 버리고 새 체결로만 시작한다(parseTape 가 깨진 값을 빈 테이프로 보는 것과 같다). */
 export function appendTape(json: string | null | undefined, fresh: TapeTrade[]): string {
@@ -679,20 +695,15 @@ export function appendTape(json: string | null | undefined, fresh: TapeTrade[]):
 // ── 유저 체결은 "한 줄"이 아니라 walking 한 만큼 여러 줄로 찍는다(2026-09-03) ─────────────
 // ⚠ 예전엔 시장가 한 방을 **1건으로 집계**해 찍었다(체결 테이프에 "3,000,000개" 한 줄, 가격은 마지막
 // 체결가). 실제 거래소는 maker 주문 하나하나가 별도 체결로 인쇄되므로 사다리를 walking 하면 그 단계
-// 수만큼 줄이 생긴다("내 시장가가 체결창에 합쳐서 나온다" 제보). 집계했던 이유는 **순전히 비용**이다 —
-// `spot_trades` INSERT 는 1건이 **3 rows written**(행 1 + 암묵 PK + 인덱스, §6 과금 모델)이라 실사다리
-// 22단계 + 합성 24스텝을 전부 찍으면 체결 하나가 138행이 된다. 봇 테이프처럼 JSON 링 버퍼에 얹으면
-// 공짜지만(§ 봇 합성 체결 테이프) 그 칸은 봇이 매 틱 통째로 덮어써서 **유저 체결이 몇 %는 사라진다** —
-// 자기 매매가 체결창에 안 보이는 건 표시용 손실로 넘길 수 없다. 그래서 행으로 찍되 **줄 수를
-// 상한으로 묶는다**: 작은 주문은 예전처럼 1~3줄이고, 아무리 큰 주문도 USER_PRINT_MAX 줄에서 멈춘다.
+// 수만큼 줄이 생긴다("내 시장가가 체결창에 합쳐서 나온다" 제보). 집계했던 이유는 비용이었다 — 그때는
+// 프린트 한 줄이 `spot_trades` 행(INSERT 3 + 보존기간 DELETE 3 rows written)이었다. 2026-10-17 부터 유저 프린트도
+// 봇 테이프(JSON 링 버퍼)에 얹으므로(§ userTapeStmt) 줄 수와 무관하게 **UPDATE 한 문장 = 1행**이다. 예전에 테이프를
+// 피했던 이유("봇이 매 틱 통째로 덮어써서 유저 체결이 몇 % 사라진다")는 커밋 가드에 테이프 길이를 넣어 막았다
+// (§ BotCommitGuard.tapeLen — 유저 체결이 붙은 뒤의 봇 커밋은 진다). 줄 수 상한은 화면 모양 때문에 남긴다.
 //
 // ⚠⚠ **상한 6 → 20 (2026-09-07)**: 6줄은 사다리 22단계 + 합성 24스텝(최대 46개 가격대)을 8개씩 묶어
 // 버려서, 대량 시장가의 체결창이 "가격이 걸어간 모습"이 아니라 뭉개진 6칸으로만 보였다("대량매매했을 때
 // 6개까지밖에 안 뜬다"). 20줄이면 46개 가격대를 3개씩 묶는 정도라 sweep 의 모양이 그대로 남는다.
-// ⚠ 비용은 이 줄 수에 그대로 비례하므로(줄 하나 = 3 rows written) 계량 단가도 **실제 찍은 줄 수**로
-// 넘긴다(§ _budget.rowsForFill) — flat 단가를 20줄 기준으로 올리면 1~3줄뿐인 평범한 체결까지 3배로
-// 과대 계상돼 차단선이 이유 없이 먼저 걸린다. 사람 손으로 내는 주문은 하루 수백 건 규모라(자동 반복
-// 경로가 아니다) 실사용 증가분은 무료 한도(8만/일)의 1% 미만이다.
 const USER_PRINT_MAX = 20;
 
 /** walking 체결들을 화면에 찍을 프린트로 묶는다. 같은 가격은 한 줄로 합치고(사다리 한 단계 = 한 체결),
@@ -722,82 +733,48 @@ function splitPrints(fills: { price: number; size: number }[], max = USER_PRINT_
   return out;
 }
 
-/** 한 INSERT 문장에 넣는 체결 행 수 — **D1 바운드 파라미터 상한이 쿼리당 100개**라 8컬럼 × 12행 = 96 이 최대다. */
-const TRADE_INSERT_ROWS = 12;
+/** 유저 체결을 덧붙일 때 테이프가 이보다 길면(봇이 예산 차단으로 멈춰 아무도 잘라내지 않는 동안) 새 체결로만 다시 시작한다.
+ * 봇 커밋은 매번 TAPE_MAX 건(~30KB)으로 잘라내므로 평소엔 닿지 않는다 — 상태 행이 끝없이 커지지 않게 하는 보험이다. */
+const TAPE_APPEND_MAX_CHARS = 120_000;
+const TAPE_APPEND_SQL = `UPDATE spot_bot_state SET tape_json = CASE
+         WHEN tape_json IS NULL OR substr(tape_json, 1, 2) <> '[[' OR substr(tape_json, -2) <> ']]' OR length(tape_json) > ${TAPE_APPEND_MAX_CHARS} THEN ?
+         ELSE substr(tape_json, 1, length(tape_json) - 1) || ',' || substr(?, 2) END
+       WHERE id = ?`;
 
-/** 프린트들을 `spot_trades` 행으로. ⚠ 시각을 1ms 씩 벌려 찍는다(마지막이 정확히 now) — 같은 ms 에 몰면
- * (a)정렬이 불안정해 walking 순서가 화면에서 뒤섞이고 (b)클라가 새 체결을 **시각**으로 식별하므로
- * (useTradingStore.dripTrades) 한 건만 새 것으로 보고 나머지를 흘려보내지 않는다. 1ms 씩이라 캔들
- * 버킷은 그대로다(§ 체결 시각은 소급하지 않는다 — 여기서도 미래로는 절대 안 찍는다).
- *
- * ⚠⚠ **한 줄에 한 문장이 아니라 다중행 INSERT 다(2026-09-08, "시장가가 가끔 씹힌다" 수정)**: 무료 플랜은
- * **invocation 하나당 D1 쿼리 50개**가 상한이고 `DB.batch` 는 문장 하나하나가 그 1개로 잡힌다(§6). 프린트
- * 상한을 6→20 으로 올린 순간 시장가 한 방의 문장 수가 그만큼 늘어, 실측 기준 한 요청이 47~51 쿼리가 되어
- * **주문 크기·보유 심볼 수에 따라 어떤 날은 넘고 어떤 날은 안 넘는** 상태가 됐다(= "가끔" 씹힌다). 넘으면
- * batch 가 통째로 던져지는데 잔고 차감(charge)은 그 앞에서 이미 확정되므로 **증거금만 나가고 포지션은 안
- * 생긴다** — 표시 문제가 아니라 돈 문제다. 다중행으로 묶으면 20줄이 **문장 2개**가 되어(행 수·과금은 동일)
- * 같은 요청이 30 쿼리 아래로 내려간다. ⚠ 줄 수를 더 늘리더라도 여기 문장 수는 12줄당 1개씩만 는다. */
-function userTradeStmts(
-  env: Env,
-  pair: string,
-  prints: { price: number; size: number }[],
-  buyerId: string,
-  sellerId: string,
-  tapeSide: 'buy' | 'sell',
-  now: number,
-): D1PreparedStatement[] {
+/** 유저 프린트들을 체결 테이프 끝에 이어 붙이는 **한 문장**(행 1개, 줄 수와 무관 — § 봇 합성 체결 테이프).
+ * ⚠ 시각을 1ms 씩 벌려 찍는다(마지막이 정확히 now) — 같은 ms 에 몰면 (a)정렬이 불안정해 walking 순서가 화면에서
+ * 뒤섞이고 (b)클라가 새 체결을 **시각**으로 식별하므로(useTradingStore.dripTrades) 한 건만 새 것으로 보고 나머지를
+ * 흘려보내지 않는다. 1ms 씩이라 캔들 버킷은 그대로다(미래로는 절대 안 찍는다).
+ * ⚠ 앞부분 잘라내기는 다음 봇 커밋이 한다(appendTape 가 TAPE_MAX 건만 남긴다). */
+function userTapeStmt(env: Env, pair: string, prints: { price: number; size: number }[], tapeSide: 'buy' | 'sell', now: number): D1PreparedStatement {
   const n = prints.length;
-  const stmts: D1PreparedStatement[] = [];
-  for (let off = 0; off < n; off += TRADE_INSERT_ROWS) {
-    const chunk = prints.slice(off, off + TRADE_INSERT_ROWS);
-    const binds: unknown[] = [];
-    chunk.forEach((t, k) => {
-      binds.push(crypto.randomUUID(), pair, buyerId, sellerId, t.price, t.size, tapeSide, now - (n - 1 - (off + k)));
-    });
-    stmts.push(
-      env.DB.prepare(
-        `INSERT INTO spot_trades (id,pair,buyer_id,seller_id,price,size,taker_side,created_at) VALUES ${chunk
-          .map(() => '(?,?,?,?,?,?,?,?)')
-          .join(',')}`,
-      ).bind(...binds),
-    );
-  }
-  return stmts;
+  const json = serializeTape(prints.map((t, k) => ({ price: t.price, size: t.size, takerSide: tapeSide, createdAt: now - (n - 1 - k), user: true })));
+  return env.DB.prepare(TAPE_APPEND_SQL).bind(json, json, pair);
 }
 
-/** 표시·버킷팅용 최근 체결 = 봇 테이프(JSON) + 유저 체결(spot_trades) 을 시간순으로 병합.
+/** 체결 목록 = 테이프(봇 + 유저 체결, § displayTape) 최신순.
  * ⚠ 테이프 항목엔 행 id 가 없으므로 (시각, 인덱스) 로 합성 키를 만든다 — 리스트 렌더 key 용도라 유일하면 된다.
  *
- * ⚠⚠ **유저 체결은 상한에 걸려도 잘라내지 않는다(2026-09-08)**: 예전엔 둘을 합쳐 시간순 상위 `limit`(50)만
- * 남겼는데, 봇 한 틱이 몰리면(flurry) 프린트를 최대 40건까지 찍으므로 그 틱 하나가 창의 대부분을 먹고 **유저
- * 시장가 한 방의 프린트 16~20줄 중 뒤쪽이 통째로 잘려나갔다**. 게다가 클라는 새 체결을 시각으로만 식별해
- * (`t.time > lastAt`) **한 번 잘린 프린트는 다음 폴링에 다시 실려도 영영 화면에 안 나온다** — 자기 매매가
- * 체결창에서 사라지는 건 표시용 손실로 넘길 수 없다(§ userTradeStmts 와 같은 판단). 유저 체결은 위 SQL 이
- * 이미 `LIMIT 30` 으로 묶여 있으므로 전부 실어도 목록이 30+limit 을 넘지 않고, **테이프는 상태 행 안의 JSON
- * 이라 몇 건을 담든 D1 읽기가 늘지 않는다**(요청·쓰기 증가 0 — 응답 바이트만 조금 는다). */
+ * ⚠⚠ **유저 체결은 상한에 걸려도 잘라내지 않는다(2026-09-08)**: 봇 한 틱이 몰리면(flurry) 프린트를 최대 40건까지
+ * 찍으므로, 합쳐서 시간순 상위 `limit`(50)만 남기면 **유저 시장가 한 방의 프린트 16~20줄 중 뒤쪽이 통째로 잘린다**.
+ * 게다가 클라는 새 체결을 시각으로만 식별해(`t.time > lastAt`) **한 번 잘린 프린트는 다음 폴링에 다시 실려도 영영
+ * 화면에 안 나온다**. 그래서 유저 체결(최대 USER_TAPE_SHOWN 건)을 먼저 담고 남은 자리를 봇 체결로 채운다. */
 function mergeRecentTrades(
   tape: TapeTrade[],
-  userRows: SpotTradeRow[],
   limit: number,
 ): { id: string; price: number; size: number; takerSide: 'buy' | 'sell' | null; createdAt: number }[] {
-  const userItems = userRows.map((r) => ({
-    id: r.id,
-    price: r.price,
-    size: r.size,
-    takerSide: (r.taker_side as 'buy' | 'sell' | null) ?? null,
-    createdAt: r.created_at,
-  }));
-  // 테이프는 오래된 것부터 쌓이므로(append) 뒤쪽이 최신 — 남은 자리만큼 뒤에서 가져온다.
-  const tapeItems = tape.map((t, i) => ({
-    id: `t${t.createdAt}-${i}`,
+  const item = (t: TapeTrade, i: number) => ({
+    id: `${t.user ? 'u' : 't'}${t.createdAt}-${i}`,
     price: t.price,
     size: t.size,
     takerSide: t.takerSide,
     createdAt: t.createdAt,
-  }));
+  });
+  const users = tape.map(item).filter((_, i) => tape[i].user).slice(-USER_TAPE_SHOWN);
+  const bots = tape.map(item).filter((_, i) => !tape[i].user);
   // ⚠ `slice(-0)` 은 배열 전체를 돌려준다 — room 이 0 이면 명시적으로 빈 배열이어야 한다.
-  const room = Math.max(0, limit - userItems.length);
-  return [...userItems, ...(room > 0 ? tapeItems.slice(-room) : [])].sort((a, b) => b.createdAt - a.createdAt);
+  const room = Math.max(0, limit - users.length);
+  return [...users, ...(room > 0 ? bots.slice(-room) : [])].sort((a, b) => b.createdAt - a.createdAt);
 }
 
 /** 호가창·체결내역 "표시용" 데이터 — 특정 유저의 개인 데이터가 아니라 시장 전체를 보여준다.
@@ -826,7 +803,7 @@ export interface PendingLite {
  * 되돌려야 한다 — 낡은 스냅샷을 그대로 그리면 호가창에 이미 체결된 물량이 1초 더 남는다. */
 export interface TickCtx {
   book: BotBook | null;
-  /** 테이프의 **최근 TRADES_SHOWN 건만**(호가창 체결 목록용 — § tapeTail). 전체가 필요한 곳(<60s 캔들)은 따로 읽는다. */
+  /** 체결 목록용 테이프(§ displayTape — 꼬리 + 최근 유저 체결). 전체가 필요한 곳(<60s 캔들)은 따로 읽는다. */
   tape: TapeTrade[] | null;
   pendings: PendingLite[] | null;
   // ⚠ 아래 둘도 **같은 상태 행에서 나온다**(2026-09-02, 4차 다이어트). 예전엔 `?tick=` 요청 하나가
@@ -867,7 +844,7 @@ export async function loadSpotMarket(env: Env, uid: string, pair: string, ctx?: 
   // 여전히 테이블이라 SQL 로 가격대별 집계만 받아온다.
   // ⚠ `ctx` 가 있으면 **그 요청의 봇 틱이 이미 읽어둔 값**을 그대로 쓴다(2026-08-26) — 통합 폴링에서
   // 상태 행과 `pending_orders` 를 각각 두 번·세 번 읽던 것을 한 번으로 줄인다(§ PendingLite).
-  const [stateRow, pendingRows, tradeRows] = await Promise.all([
+  const [stateRow, pendingRows] = await Promise.all([
     ctx?.book && ctx.tape
       ? Promise.resolve(null)
       : env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id = ?`).bind(pair).first<BookRow>(),
@@ -880,15 +857,6 @@ export async function loadSpotMarket(env: Env, uid: string, pair: string, ctx?: 
           )
           .bind(uid, pair)
           .all<{ side: string; price: number; size: number; mine: number }>(),
-    // ⚠ **시간 범위를 함께 건다**(2026-08-14). 이 조회는 1초마다 도는데 `LIMIT 30` 만 있으면 인덱스를
-    // 30행 걸어가므로 **항상 30행**을 읽는다(시간당 10.8만 행 — state 다음으로 큰 읽기였다). 그런데 이
-    // 테이블에 남는 건 **유저 체결뿐**이고(봇 합성 체결은 tape_json 링 버퍼로 갔다, § 봇 합성 체결 테이프)
-    // 아래 mergeRecentTrades 가 테이프와 합쳐 상위 30건만 쓰므로, 실제로 화면에 낄 수 있는 유저 체결은
-    // 최근 것뿐이다. 범위를 주면 `(pair, created_at)` 인덱스가 그 구간만 읽어 평상시 0~3행이 된다.
-    // LIMIT 은 그대로 둬서 **어떤 경우에도 예전보다 많이 읽지 않는다**(구간에 30건 넘게 있어도 30에서 멈춤).
-    env.DB.prepare('SELECT * FROM spot_trades WHERE pair = ? AND created_at > ? ORDER BY created_at DESC LIMIT 30')
-      .bind(pair, Date.now() - TRADE_VIEW_WINDOW_MS)
-      .all<SpotTradeRow>(),
   ]);
 
   const book = ctx?.book ?? parseBook(stateRow?.book_json);
@@ -934,7 +902,7 @@ export async function loadSpotMarket(env: Env, uid: string, pair: string, ctx?: 
     // (클라 표시 개수 상한과 동일). ⚠ 위 SQL 의 `LIMIT 30` 은 일부러 그대로 둔다 — 테이프는 상태 행 안의
     // JSON 이라 몇 건을 쓰든 읽기가 안 늘지만, 테이블 쪽을 늘리면 그만큼 D1 읽기가 늘어난다(1초 폴링).
     // 한 시간 안에 유저 체결이 30건을 넘는 드문 경우에만 그 뒤쪽이 목록에서 빠진다.
-    trades: mergeRecentTrades(ctx?.tape ?? tapeTail(stateRow?.tape_json, TRADES_SHOWN), tradeRows.results, TRADES_SHOWN),
+    trades: mergeRecentTrades(ctx?.tape ?? displayTape(stateRow?.tape_json), TRADES_SHOWN),
   };
 }
 
@@ -1092,26 +1060,16 @@ function burstTicks(lastRun: number, budget: number): number {
 // 곱하면 D1 쓰기와 invocation당 쿼리 수가 코인 수에 그대로 비례하기 때문.
 export const VIRTUAL_PAIRS: readonly string[] = ['OXUSDT', 'EWUSDT'];
 
-// ⚠ 체결 테이프(spot_trades) 보존 기간 — 예전엔 영구 보존이라 하루 ~10만 행씩 무한히 쌓였다(prod 실측
-// 2026-07-31: 157만 행). 그런데 실제로 읽는 건 (a)호가창 체결내역 최근 30건 (b)1s 등 단기 캔들 버킷팅의
-// 최신 5,000건 (c)기준가 폴백 1건뿐이고, 차트 히스토리는 영속 캔들(spot_candles)이 따로 들고 있어서
-// 오래된 체결을 지워도 잃는 게 없다. 봇이 분당 ~70건을 찍으므로 5,000건 ≈ 70분 — 6시간이면 그 8배라
-// 버킷팅이 창 밖으로 밀릴 위험이 없다.
+// ⚠ `spot_trades` 보존 기간 — 2026-10-17 부터 아무도 이 테이블에 쓰지 않는다(유저 체결도 테이프로, § userTapeStmt).
+// 남은 옛 행을 치우는 DELETE 만 봇 커밋에 가끔 얹혀 있고, 다 지워진 뒤엔 지울 게 없어 비용 0 이다. 읽는 곳은 기준가 폴백
+// 1건(상태 행이 없을 때)뿐이다.
 const TRADE_RETENTION_MS = 6 * 3600 * 1000;
 // 프루닝을 매 틱 넣으면 배치 문장만 늘어난다(지워지는 총량은 어차피 같다) — 가끔만 넣어 잘라낸다.
 const TRADE_PRUNE_CHANCE = 0.05; // ≈20틱마다 1회
 
-/** 체결내역을 **표시**하려고 `spot_trades` 를 읽을 때 거는 시간 범위(2026-08-14, 읽기 절감).
- * 이 테이블엔 유저 체결만 남고 봇 합성 체결은 tape_json 링 버퍼(≈90초치)에 있으므로, 화면(최근 30건 ·
- * <60s 캔들 버킷팅)에 낄 수 있는 유저 체결은 그 창 근처뿐이다.
- *
- * ⚠ **1시간 → 3분**(2026-08-20). 1시간짜리 창은 prod 에서 **폴링당 24행**을 읽어 하루 16.3만 행 =
- * **전체 읽기의 41%(1위)** 였는데, 그 24행 중 화면에 낄 수 있는 건 사실상 없었다: `mergeRecentTrades`
- * 는 테이프+테이블을 시간순으로 합쳐 **상위 50건만** 쓰고, 봇 테이프 혼자 초당 ~4.5건을 찍으므로 그
- * 50건은 **최근 11초** 안에서 끝난다(cron 만 도는 조용한 시장이라도 ~33초). 즉 그보다 오래된 유저 체결은
- * 읽어봐야 정렬에서 밀려 버려지는 행이었다. 3분이면 가장 조용한 시장 기준으로도 5배 여유다.
- * ⚠ 봇이 멈춰(예산 차단 등) 테이프가 낡으면 그 테이프의 옛 항목이 상위 50건을 차지하므로, 창을
- * 늘려도 유저 체결이 더 보이지는 않는다 — 창 길이로 해결되는 문제가 아니다. */
+/** 체결 목록에 다시 싣는 유저 체결의 시간 범위(§ displayTape) — 클라는 1초마다 받아 자기 버퍼에 쌓으므로
+ * 이보다 오래된 건 이미 받아 갔다. (예전엔 `spot_trades` 를 읽을 때 거는 범위였다 — 2026-08-20 에 1시간 → 3분으로
+ * 줄여 읽기의 41% 를 걷어냈고, 2026-10-17 부터는 그 조회 자체가 없다.) */
 const TRADE_VIEW_WINDOW_MS = 3 * 60 * 1000;
 
 // ── 봇 매매 심리 모델 ─────────────────────────────────────────────────────
@@ -2655,7 +2613,12 @@ async function runBotTicks(
   // ⚠⚠ last_run 만이 아니라 **기준가·사다리 버전까지** 본다(2026-10-01). 유저 체결은 last_run 을 안 건드리고 ref_price·
   // anchor·사다리(book_version+1)만 바꾸므로, last_run 가드만으로는 "체결 전에 읽어 계산한 봇 틱"이 그 체결 뒤에 커밋돼
   // 유저가 옮긴 가격과 먹은 호가를 옛 값으로 되돌렸다 — 방금 산 물량이 호가창에 되살아나고 시장충격이 지워진다(감사).
-  const guard: BotCommitGuard = { lastRun: row?.last_run ?? 0, ref: row ? row.ref_price : ref0, version: row?.book_version ?? 0 };
+  const guard: BotCommitGuard = {
+    lastRun: row?.last_run ?? 0,
+    ref: row ? row.ref_price : ref0,
+    version: row?.book_version ?? 0,
+    tapeLen: row?.tape_json?.length ?? 0, // ⚠ 테이프는 ASCII(숫자·괄호·쉼표)라 JS length = SQLite length()
+  };
   // ⚠ 이 한 번의 조회가 **셋을 먹여 살린다**(2026-08-26): 벽 판정 · 아래 sweep · 호출자의 호가창 표시.
   // 예전엔 셋이 각자 `pending_orders WHERE symbol=?` 를 읽어 `?tick=` 요청 하나가 같은 테이블을 세 번
   // 스캔했다. 집계(GROUP BY)를 메모리로 옮겨도 **읽는 행 수는 같다** — SQLite 는 집계하려고 어차피
@@ -2774,7 +2737,7 @@ async function runBotTicks(
   const tapeJson = appendTape(row?.tape_json, fresh);
   stmts.push(
     env.DB.prepare(
-      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, interest=?, hype=?, fair=?, book_version=book_version+1 WHERE id=? AND last_run=? AND ref_price=? AND book_version=?',
+      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, interest=?, hype=?, fair=?, book_version=book_version+1 WHERE id=? AND last_run=? AND ref_price=? AND book_version=? AND COALESCE(length(tape_json),0)=?',
     ).bind(
       lastTs,
       roundOx(state.ref), // 바깥(체결가·마크·트리거)은 틱 격자 위의 값만 본다(§ BotState.ref)
@@ -2799,6 +2762,7 @@ async function runBotTicks(
       guard.lastRun,
       guard.ref,
       guard.version,
+      guard.tapeLen,
     ),
   );
   const res = await env.DB.batch(stmts);
@@ -2824,7 +2788,7 @@ async function runBotTicks(
     path,
     ctx: touched
       ? { book: null, tape: null, pendings: null, live, ref: null, mark: roundOx(state.ref) }
-      : { book, tape: tapeTail(tapeJson, TRADES_SHOWN), pendings, live, ref: roundOx(state.ref), mark: roundOx(state.ref) },
+      : { book, tape: displayTape(tapeJson), pendings, live, ref: roundOx(state.ref), mark: roundOx(state.ref) },
   };
 }
 
@@ -2845,7 +2809,7 @@ export async function runMarketMaker(env: Env, pair: string): Promise<TickCtx> {
   // 다시 푸므로 여기선 필요할 때만 푼다(CPU — § runBotTicks).
   const asRead = (): TickCtx => ({
     book: parseBook(row?.book_json),
-    tape: tapeTail(row?.tape_json, TRADES_SHOWN), // 체결 목록에 쓰는 꼬리만(§ tapeTail)
+    tape: displayTape(row?.tape_json), // 체결 목록에 쓰는 만큼만(§ displayTape)
     pendings: null,
     live: parseLive(row?.live_json),
     ref: row?.ref_price ?? null,
@@ -2990,9 +2954,7 @@ export async function recordVirtualFill(
 
   await env.DB.batch([
     bookWriteStmt(env, pair, book, bookRow?.book_version ?? 0),
-    env.DB.prepare(
-      'INSERT INTO spot_trades (id, pair, buyer_id, seller_id, price, size, taker_side, created_at) VALUES (?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), pair, uid, uid, price, size, takerSide, now),
+    userTapeStmt(env, pair, [{ price, size }], takerSide, now),
     // 유저 체결은 관심을 끈다(§ interestBumpOf) — 같은 upsert 에 컬럼 하나가 붙을 뿐이라 행·문장 증가 0.
     env.DB.prepare(
       `INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price, ${INTEREST_BUMP_SQL}`,
@@ -3188,7 +3150,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
       now,
     }),
     // 체결 테이프는 walking 한 가격대별로 여러 줄(상한 USER_PRINT_MAX), 캔들은 walking 구간의 OHLC.
-    ...userTradeStmts(env, pair, prints, isLong ? p.user_id : book.owner, isLong ? book.owner : p.user_id, tapeSide, now),
+    userTapeStmt(env, pair, prints, tapeSide, now),
     env.DB.prepare(
       `INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, roundOx(fillAvg), interestBumpOf(filled)),
@@ -3258,7 +3220,7 @@ export async function matchMarketOxOrder(
   const effLev = existing0 ? existing0.leverage : leverage; // 물타기 시 기존 레버리지 고정
   // ⚠ 잔고와 요율은 **같은 users 행**이라 한 번에 읽는다 — 예전엔 feeRateOf(total_volume) 와 balance 를
   // 따로 읽어 같은 행을 두 번 조회했다(§6 "같은 걸 한 요청 안에서 두 번 읽지 않는다"). 무료 플랜은
-  // invocation 당 쿼리가 50 뿐이라 이런 한 개가 실제로 체결 성패를 가른다(§ userTradeStmts).
+  // invocation 당 쿼리가 50 뿐이라 이런 한 개가 실제로 체결 성패를 가른다.
   const me = await env.DB.prepare('SELECT balance, total_volume FROM users WHERE id=?')
     .bind(uid)
     .first<{ balance: number; total_volume: number }>();
@@ -3358,10 +3320,10 @@ export async function matchMarketOxOrder(
     bookWriteStmt(env, pair, book, st?.book_version ?? 0),
     ...positionAddStmts(env, { uid, symbol: pair, side, price: avgPrice, size: filled, leverage: effLev, margin: totalMargin, stopLoss: sl, takeProfit: tp, now }),
   ];
-  // 체결 테이프는 **walking 한 가격대별로 여러 줄**(§ userTradeStmts) — 예전엔 1건으로 집계해서 큰
+  // 체결 테이프는 **walking 한 가격대별로 여러 줄**(§ userTapeStmt) — 예전엔 1건으로 집계해서 큰
   // 시장가가 "한 줄에 몇 백만 개"로 찍혔다. 봇 상대라 counterparty 는 표시용.
   const prints = splitPrints(settled);
-  stmts.push(...userTradeStmts(env, pair, prints, isLong ? uid : BOT_USER_IDS[0], isLong ? BOT_USER_IDS[0] : uid, isLong ? 'buy' : 'sell', now));
+  stmts.push(userTapeStmt(env, pair, prints, isLong ? 'buy' : 'sell', now));
   stmts.push(
     env.DB.prepare(
       `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${INTEREST_BUMP_SQL}`,
@@ -3500,9 +3462,9 @@ async function closePositionAgainstBook(
   stmts.push(env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(marginReleased + pnlTotal - closeFeeTotal, uid));
   // 소비한 사다리를 best-effort 로 되쓴다(재호가가 끼었으면 0행 — 봇은 무한 유동성이라 체결은 성립).
   stmts.push(bookWriteStmt(env, pair, book, st?.book_version ?? 0));
-  // 청산도 walking 한 가격대별로 여러 줄(§ userTradeStmts) — 진입과 같은 규칙.
+  // 청산도 walking 한 가격대별로 여러 줄(§ userTapeStmt) — 진입과 같은 규칙.
   const prints = splitPrints(planned.map((f) => ({ price: f.price, size: f.size })));
-  stmts.push(...userTradeStmts(env, pair, prints, userSide === 'buy' ? uid : book.owner, userSide === 'buy' ? book.owner : uid, tapeSide, now));
+  stmts.push(userTapeStmt(env, pair, prints, tapeSide, now));
   stmts.push(
     env.DB.prepare(
       `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${INTEREST_BUMP_SQL}`,

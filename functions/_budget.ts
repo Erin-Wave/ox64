@@ -15,13 +15,15 @@
 // 계량하지 않는 것: 주문 생성/취소/수정, 로그인, 퍼즐, 던전. 전부 사람 손 속도에 묶여 있고 체결 batch 보다
 // 훨씬 작다(1~5행). 즉 이 숫자는 **총계가 아니라 "폭주 가능한 몫"** 이고, 정확한 총계는 `npm run d1:budget`.
 //
-// ── 차단(3단) ──────────────────────────────────────────────────────────────────────────
-// 스스로 반복해서 도는(=폭주할 수 있는) 경로는 셋이고, **잃는 게 적은 쪽부터** 끊는다:
+// ── 차단(4단) ──────────────────────────────────────────────────────────────────────────
+// **잃는 게 적은 쪽부터** 끊는다:
 //   ① 큰 지정가의 재체결   → NIBBLE_BLOCK_DAY_ROWS (주문은 살아있고 나중에 이어서 채워진다)
 //   ② `repeating` 조건부  → REPEAT_BLOCK_DAY_ROWS (주문 하나가 쉬는 건 국지적)
-//   ③ 마켓메이커 봇       → BOT_BLOCK_DAY_ROWS    (멈추면 가상 코인 시장이 통째로 선다 = 최후 방어선)
-// **수동 거래·강제청산·지정가 첫 체결·SL/TP·1회성 조건부는 절대 막지 않는다** — 돈이 걸린 기능을 DB
-// 비용 때문에 막는 건 더 큰 사고다. 날짜(UTC — D1 한도 리셋 시각, 한국 09:00)가 바뀌면 자동으로 풀린다.
+//   ③ **새 진입**(시장가·지정가·조건부 주문 접수) → ENTRY_BLOCK_DAY_ROWS (2026-10-17) — 사람이 내는 주문이 하루 쓰기의
+//      대부분이라 여기서 멈추지 않으면 상한을 지킬 수 없다. 청산·취소·수정·SL/TP 는 계속 된다(시장도 아직 돈다).
+//   ④ 마켓메이커 봇       → BOT_BLOCK_DAY_ROWS    (멈추면 가상 코인 시장이 통째로 선다 = 최후 방어선)
+// **청산·강제청산·이미 걸린 지정가/SL/TP/1회성 조건부의 체결은 절대 막지 않는다** — 포지션을 줄이는 길을 DB 비용 때문에
+// 막는 건 더 큰 사고다(그 몫은 걸린 주문 수로 묶여 있다). 날짜(UTC — D1 한도 리셋 시각, 한국 09:00)가 바뀌면 자동으로 풀린다.
 import type { Env, D1PreparedStatement } from './_shared';
 
 /** ⚠⚠ **무료 플랜 기준이다**(2026-08-14 전환). Paid 와 성격이 완전히 다르다:
@@ -33,21 +35,26 @@ import type { Env, D1PreparedStatement } from './_shared';
 export const FREE_DAY_ROW_LIMIT = 100_000; // D1 Free: rows written / day
 export const FREE_DAY_READ_LIMIT = 5_000_000; // D1 Free: rows read / day (참고용 — 계량 대상 아님)
 
-/** 계량되지 않는 잔여분(주문 생성/취소/수정, 로그인, 퍼즐, 던전 — 전부 사람 손 속도, 하루 수천 행)과
- * "차단이 걸린 뒤에도 유저가 청산/주문은 할 수 있어야 한다"는 여유분으로 남겨두는 몫. */
-const DAY_RESERVE_ROWS = 20_000;
+/** ⚠⚠ **운영 상한 = 하루 무료 한도의 45%**(2026-10-17). 방침은 "한 달 내내 무료 한도의 50% 미만" — 무료 한도는 날마다 리셋되므로
+ * 날짜 기준으로 바꾸면 "한 달치의 하루 1.5% ≈ 하루 한도의 45%" 다. 예전 선(재체결 4.5만 · 반복 5.5만 · 봇 8만)은 "한도를 넘겨
+ * 서비스가 죽지 않게"만 잡은 값이라 실제로 하루 7만 행대(한도의 73%)가 여러 번 나왔다(9/24·9/26·10/2, GraphQL 실측).
+ * 계량값은 총계의 대부분이지만 전부는 아니다 — 주문 생성·취소·수정, 로그인, 게임은 안 센다(UNMETERED_ALLOWANCE). 10/1 이후
+ * 실측 차이(실제 − 계량)는 최대 9천 행이었고 그중 상당수가 유저 체결 테이블의 보존기간 DELETE 였다(2026-10-17 에 그 테이블을 안 쓰게 바꿨다). */
+export const DAY_TARGET_ROWS = 45_000;
+const UNMETERED_ALLOWANCE = 5_000;
 
-/** ⚠ 차단은 **덜 아픈 것부터** 3단이다. 위험한 순서가 아니라 **잃는 게 적은 순서**로 끊는다.
+/** ⚠ 차단은 **덜 아픈 것부터** 4단이다. 위험한 순서가 아니라 **잃는 게 적은 순서**로 끊는다.
  *  1) nibble — 시장 깊이보다 큰 지정가의 **재**체결. 멈춰도 주문은 살아있고 잠시 뒤 이어서 채워진다.
- *     (개수 제한이 없고 조건이 유지되는 한 영원히 반복되는, 실측상 가장 큰 폭주 경로다 — prod 에서
- *      주문 하나가 하루 3,000건을 체결했다.)
+ *     (개수 제한이 없고 조건이 유지되는 한 영원히 반복되는 경로다 — prod 에서 주문 하나가 하루 3,000건을 체결했다.)
  *  2) repeat — `continuous` 무한 조건부 체결. 주문 하나가 쉬는 건 국지적이다.
- *  3) bot    — 마켓메이커. 멈추면 가상 코인 시장이 통째로 선다 → **최후 방어선**.
- * 셋 다 날짜(UTC — D1 한도 리셋 시각, 한국 09:00)가 바뀌면 자동으로 풀린다. 수동 거래·강제청산·지정가 첫 체결·SL/TP·1회성 조건부는
- * **절대 막지 않는다** — 돈이 걸린 기능을 DB 비용 때문에 막는 건 더 큰 사고다. */
-export const NIBBLE_BLOCK_DAY_ROWS = 45_000;
-export const REPEAT_BLOCK_DAY_ROWS = 55_000;
-export const BOT_BLOCK_DAY_ROWS = FREE_DAY_ROW_LIMIT - DAY_RESERVE_ROWS; // 80,000
+ *  3) entry  — 새 진입 주문 접수(order.ts open/limitOpen/conditionalOpen). 청산·취소는 되고 시장도 돈다.
+ *  4) bot    — 마켓메이커. 멈추면 가상 코인 시장이 통째로 선다 → **최후 방어선**. 봇 커밋은 보고 있는 사람 1명당
+ *              시간당 ~3,600행이라(1초 폴링) 거래가 없어도 시청 시간이 길면 여기까지 온다.
+ * 넷 다 날짜(UTC — D1 한도 리셋 시각, 한국 09:00)가 바뀌면 자동으로 풀린다. */
+export const NIBBLE_BLOCK_DAY_ROWS = 28_000;
+export const REPEAT_BLOCK_DAY_ROWS = 31_000;
+export const ENTRY_BLOCK_DAY_ROWS = 36_000;
+export const BOT_BLOCK_DAY_ROWS = DAY_TARGET_ROWS - UNMETERED_ALLOWANCE; // 40,000
 
 /** 월 누적은 무료 플랜에선 한도가 아니다(매일 리셋) — `npm run d1:budget` 표시용으로만 남긴다. */
 export const MONTHLY_ROW_BUDGET = FREE_DAY_ROW_LIMIT * 31;
@@ -58,28 +65,19 @@ export const MONTHLY_ROW_BUDGET = FREE_DAY_ROW_LIMIT * 31;
 //               ⚠ 실측 평균은 6.3 이다 — 캔들 upsert 가 **새 버킷이면 2행**(행 1 + PK 인덱스 1)이라
 //               분/시/일이 넘어갈 때 조금 더 든다. 과소평가는 차단을 늦게 걸리게 하므로 7 로 올려 잡는다.
 //   체결 24행 = users 1 + positions 1~3 + orders 3 + fee_ledger 4 + 계량기 1
-//               (+ OX 는 체결테이프 3줄까지 9 + 캔들 3 + 봇 정산 1 + 재고 2 + 사다리 1)
-//               ⚠⚠ **테이프 프린트는 이제 flat 단가에 안 들어있다**(2026-09-07). 상한을 6줄 → 20줄로
-//               올렸는데(§ spot.ts USER_PRINT_MAX) 그걸 flat 단가에 넉넉히 반영하면 60행이 되어,
-//               프린트가 1~3줄뿐인 **대다수의 평범한 체결까지 3배로 과대 계상**된다 — 그러면 차단선이
-//               실제 사용량보다 훨씬 먼저 걸려 반복 조건부·재체결이 이유 없이 멈춘다. 그래서 flat 단가는
-//               "프린트 3줄까지"만 품고, 그 이상은 실제로 찍은 줄 수를 `feeAccrualStmts(..., prints)` 로
-//               받아 정확히 더한다(계량 문장은 그대로 1개 — **왕복·행 증가 0**).
-//               ⚠ 새 체결 경로가 프린트를 여러 줄 찍는다면 그 줄 수를 반드시 넘길 것(누락은 과소계상).
+//               (+ OX 는 체결 테이프 1 + 캔들 3 + 기준가 1 + 봇 정산 1 + 재고 2 + 사다리 1)
+//               ⚠ 체결 테이프는 2026-10-17 부터 **줄 수와 무관하게 1행**이다(유저 프린트도 상태 행 JSON 에 얹는다 —
+//               § spot.ts userTapeStmt). 그 전엔 프린트 한 줄이 INSERT 3 + 보존기간 DELETE 3 = 6행이라 줄 수를 따로 셌다.
 // ⚠ D1 은 한 문장의 비용을 **"바뀐 행 1 + 갱신된 인덱스 항목 수"** 로 센다(암묵 PK 인덱스도 포함).
 // 실측: spot_trades INSERT 3(=1+PK+1), fee_ledger INSERT 4(=1+PK+2), 비인덱스 컬럼 UPDATE 1.
 // 그래서 **인덱스를 하나 더 다는 것은 그 테이블 모든 INSERT 비용을 올리는 결정**이다.
 // ⚠ 봇 단가는 이제 "틱당"이 아니라 **"커밋당"** 이라 여기 없다 — 버스트는 틱을 몇 개 돌든 상태 행을
 // 한 번만 쓴다(§ spot.ts ROWS_PER_BOT_COMMIT). 틱 수와 쓰기가 분리된 게 이번 전환의 핵심이다.
 export const ROWS_PER_FILL = 24;
-/** `spot_trades` INSERT 1건의 비용 = 행 1 + 암묵 PK 인덱스 1 + idx_spot_trades_pair 1 (실측 3행). */
-export const ROWS_PER_TAPE_PRINT = 3;
-/** 위 flat 단가(ROWS_PER_FILL)가 이미 품고 있는 프린트 줄 수 — 이걸 넘는 줄만 추가 계상한다. */
-export const PRINTS_IN_ROWS_PER_FILL = 3;
 
-/** 체결 1건의 계량값. `prints` = 그 체결이 체결 테이프에 실제로 찍은 줄 수(0=모름/1줄 취급). */
-export function rowsForFill(prints = 0): number {
-  return ROWS_PER_FILL + ROWS_PER_TAPE_PRINT * Math.max(0, prints - PRINTS_IN_ROWS_PER_FILL);
+/** 체결 1건의 계량값 — 프린트 줄 수와 무관하다(위 주석). 인자는 호출부 호환용으로만 남겼다. */
+export function rowsForFill(_prints = 0): number {
+  return ROWS_PER_FILL;
 }
 
 /** 계량기의 "오늘" = **UTC** 날짜(2026-10-01, 예전엔 KST). D1 무료 한도(쓰기 10만/일)는 UTC 자정(한국 09:00)에 리셋되는데
@@ -131,7 +129,7 @@ export async function meterRows(env: Env): Promise<{ day: number }> {
     if (cache.day >= NIBBLE_BLOCK_DAY_ROWS) {
       console.log(
         `[budget] 자동 쓰기 차단 — 오늘 ${cache.day} 행 / 무료 한도 ${FREE_DAY_ROW_LIMIT}` +
-          ` (재체결 ${NIBBLE_BLOCK_DAY_ROWS} · 반복조건부 ${REPEAT_BLOCK_DAY_ROWS} · 봇 ${BOT_BLOCK_DAY_ROWS})`,
+          ` (재체결 ${NIBBLE_BLOCK_DAY_ROWS} · 반복조건부 ${REPEAT_BLOCK_DAY_ROWS} · 새 진입 ${ENTRY_BLOCK_DAY_ROWS} · 봇 ${BOT_BLOCK_DAY_ROWS})`,
       );
     }
   } catch (e) {
@@ -153,18 +151,21 @@ export function primeMeter(rowsEst: number | null | undefined): void {
   cache = { at: Date.now(), day: rowsEst ?? 0 };
 }
 
-const BLOCK_AT: Record<'nibble' | 'repeat' | 'bot', number> = {
+type BlockKind = 'nibble' | 'repeat' | 'entry' | 'bot';
+const BLOCK_AT: Record<BlockKind, number> = {
   nibble: NIBBLE_BLOCK_DAY_ROWS,
   repeat: REPEAT_BLOCK_DAY_ROWS,
+  entry: ENTRY_BLOCK_DAY_ROWS,
   bot: BOT_BLOCK_DAY_ROWS,
 };
 
 /** 이 자동 경로를 지금 돌려도 되는가. `kind` 는 **잃는 게 적은 순서**로 끊긴다(위 BLOCK_AT):
  *  - `'nibble'` = 시장 깊이보다 큰 지정가의 재체결(가장 먼저 — 주문은 살아있고 나중에 이어서 채워진다)
  *  - `'repeat'` = `repeating` 조건부 체결(개수 제한이 없어 N배로 늘어난다)
+ *  - `'entry'`  = 새 진입 주문 접수(order.ts — 이것만 유저에게 이유를 알린다, 나머지는 조용한 후퇴)
  *  - `'bot'`    = 마켓메이커 봇(최후 방어선 — 멈추면 가상 코인 시장이 통째로 선다)
- * true 면 그 작업을 **그냥 하지 않는다**(에러가 아니라 조용한 후퇴 — 날짜가 바뀌면 자동 해제). */
-export async function autoWritesBlocked(env: Env, kind: 'bot' | 'repeat' | 'nibble'): Promise<boolean> {
+ * true 면 그 작업을 **그냥 하지 않는다**(날짜가 바뀌면 자동 해제). */
+export async function autoWritesBlocked(env: Env, kind: BlockKind): Promise<boolean> {
   const { day } = await meterRows(env);
   return day >= BLOCK_AT[kind];
 }
@@ -178,6 +179,7 @@ export async function budgetStatus(env: Env): Promise<{
   dayBudget: number;
   nibbleBlocked: boolean;
   repeatBlocked: boolean;
+  entryBlocked: boolean;
   botBlocked: boolean;
 }> {
   const { day } = await meterRows(env);
@@ -196,6 +198,7 @@ export async function budgetStatus(env: Env): Promise<{
     dayBudget: FREE_DAY_ROW_LIMIT,
     nibbleBlocked: day >= NIBBLE_BLOCK_DAY_ROWS,
     repeatBlocked: day >= REPEAT_BLOCK_DAY_ROWS,
+    entryBlocked: day >= ENTRY_BLOCK_DAY_ROWS,
     botBlocked: day >= BOT_BLOCK_DAY_ROWS,
   };
 }

@@ -874,7 +874,7 @@ export function feeAccrualStmts(
   rate: number,
   fee: number,
   now: number,
-  /** 이 체결이 체결 테이프(`spot_trades`)에 찍은 줄 수 — OX walking 경로만 넘긴다(§ _budget.rowsForFill).
+  /** 이 체결이 체결 테이프에 찍은 줄 수 — 2026-10-17 부터 계량값에 영향이 없다(§ _budget.rowsForFill, 테이프는 줄 수와 무관하게 1행).
    * 0/미지정이면 flat 단가에 이미 포함된 몫으로 본다. */
   prints = 0,
 ): D1PreparedStatement[] {

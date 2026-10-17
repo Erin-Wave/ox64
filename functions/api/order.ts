@@ -36,6 +36,10 @@ import {
 } from '../_shared';
 
 import { checkTriggers, POLL_FILL_Q } from '../_trading';
+import { autoWritesBlocked } from '../_budget';
+
+const ENTRY_BLOCKED_MSG =
+  '오늘 서버 사용량이 무료 한도의 안전선에 닿아 새 진입을 잠시 멈췄습니다. 청산·취소·SL/TP 는 그대로 됩니다. 한국시간 오전 9시에 풀립니다.';
 import { matchLimitPendingAgainstBook, matchMarketOxOrder, marketCloseOxPosition, matchReduceOnlyOxPending } from './spot';
 
 const SLTP_MSG = 'SL/TP 값이 올바르지 않습니다 (롱: 손절가 < 현재가 < 익절가, 숏은 반대)';
@@ -192,6 +196,11 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   // 주문 시각을 보내면 그 이후만 읽는다(방금 체결된 주문은 당연히 그 이후라 응답에 포함된다).
   // 커서가 없으면(구버전 클라·최초) 전체를 주므로 무회귀다.
   const since = Number(body.ordersSince) || undefined;
+
+  // ⚠ 오늘 D1 쓰기가 운영 상한(무료 한도의 45%)에 가까우면 **새 위험을 여는 주문만** 받지 않는다(§ _budget ENTRY_BLOCK_DAY_ROWS).
+  // 청산·지정가 청산·취소·수정·SL/TP 는 그대로 — 포지션을 줄이는 길은 막지 않는다. 판정은 isolate 캐시(60초)라 D1 읽기는 거의 0.
+  if ((body.action === 'open' || body.action === 'limitOpen' || body.action === 'conditionalOpen') && (await autoWritesBlocked(env, 'entry')))
+    return bad(ENTRY_BLOCKED_MSG, 429);
 
   // 지정가/SL·TP/강제청산 체크는 각 액션 안에서 호출한다(수동 액션과 레이스 방지). 반환된 마크가격
   // 맵을 loadState 로 넘겨 클라가 서버와 동일 시세로 청산가/평가자산을 즉시 계산하게 한다.
