@@ -170,6 +170,7 @@ interface WsTicker {
   ty: 'ticker';
   abv: number; // 당일(KST 0시부터) 누적 매수량
   aav: number; // 당일 누적 매도량
+  pcp: number; // 전일 종가(KST 0시 기준가)
 }
 type WsMsg = WsTrade | WsOrderbook | WsTicker | { ty?: string };
 
@@ -187,7 +188,7 @@ function socketOf(market: string): Observable<WsMsg> {
           { ticket: `ox64-${Math.random().toString(36).slice(2)}` },
           { type: 'trade', codes: [market] },
           { type: 'orderbook', codes: [market] },
-          { type: 'ticker', codes: [market] }, // 체결강도(당일 누적 매수·매도량) — § bithumbDayPowerStream
+          { type: 'ticker', codes: [market] }, // 체결강도·호가 등락률 기준가 — § bithumbDayStream
           { format: 'SIMPLE' },
         ]),
       );
@@ -230,13 +231,13 @@ export function bithumbOrderbookStream(symbol: string): Observable<OrderBookSnap
   );
 }
 
-/** 체결강도(당일) — v1 시세의 **한국시간 0시부터의 누적** 매수량 `abv` · 매도량 `aav`(빗썸이 0시에 초기화한다). 차트·호가와
- * 같은 소켓이라 연결이 늘지 않고, 구독하면 첫 값(SNAPSHOT)이 바로 온다. 그 뒤엔 체결이 날 때마다 오므로 1초에 한 번으로 솎는다.
- * 브라우저 직결이라 Cloudflare·D1 비용 0. */
-export function bithumbDayPowerStream(symbol: string): Observable<{ buy: number; sell: number }> {
+/** 오늘 통계(§ hooks/useDayStats) — v1 시세의 **한국시간 0시부터의 누적** 매수량 `abv` · 매도량 `aav`(체결강도)와 전일 종가
+ * `pcp`(호가 등락률 기준가). 빗썸이 0시에 초기화한다. 차트·호가와 같은 소켓이라 연결이 늘지 않고, 구독하면 첫 값(SNAPSHOT)이 바로
+ * 온다. 그 뒤엔 체결이 날 때마다 오므로 1초에 한 번으로 솎는다. 브라우저 직결이라 Cloudflare·D1 비용 0. */
+export function bithumbDayStream(symbol: string): Observable<{ buy: number; sell: number; ref: number | null }> {
   return socketOf(bithumbMarket(symbol)).pipe(
     filter((m): m is WsTicker => m.ty === 'ticker' && Number.isFinite((m as WsTicker).abv) && Number.isFinite((m as WsTicker).aav)),
-    map((m) => ({ buy: m.abv, sell: m.aav })),
+    map((m) => ({ buy: m.abv, sell: m.aav, ref: m.pcp > 0 ? m.pcp : null })),
     throttleTime(1000, undefined, { leading: true, trailing: true }),
   );
 }

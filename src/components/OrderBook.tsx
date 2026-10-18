@@ -7,7 +7,7 @@ import { baseOf, isVirtualSymbol, quoteOf } from '@/symbols';
 import { bithumbOrderbookStream } from '@/services/bithumb';
 import { fmtMoney, fmtMoneyShort, fmtPct, fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
-import { useTradePower } from '@/hooks/useTradePower';
+import { useDayStats } from '@/hooks/useDayStats';
 
 const EMPTY_TRADES: TickerTrade[] = [];
 // 수량은 세자리 콤마로. 큰 물량(≥1000)은 소수 1자리, 작은 물량은 최대 4자리(뒤 0 은 자동으로 떨어짐).
@@ -303,9 +303,24 @@ export default function OrderBook() {
   const tradeVal = (t: TickerTrade) => (bookUnit === 'qty' ? t.qty : t.price * t.qty);
   const maxTradeVal = Math.max(0, ...shownTrades.map(tradeVal));
 
-  // 체결강도(오늘 0시부터, § useTradePower) — 체결 목록이 화면에 있을 때만 받는다. 테이프는 **필터 이전 원본**을 넘긴다
+  // 오늘(한국시간 0시부터) 통계 — 체결강도 + 호가 등락률의 기준가(§ useDayStats). 테이프는 **필터 이전 원본**을 넘긴다
   // (받은 뒤의 체결을 얹는 용도 — 걸러낸 목록이면 시장이 아니라 걸러낸 체결끼리의 비율이 된다).
-  const power = useTradePower(symbol, trades, together || tab === 'trades');
+  const { power, ref: dayRef } = useDayStats(symbol, trades);
+  // 호가 등락률 = 0시 기준가(전일 종가) 대비 — 업비트·빗썸 호가창과 같은 기준. 기준가를 아직 모르면 칸을 비운다.
+  const chgOf = (price: number) => (dayRef != null ? (price / dayRef - 1) * 100 : null);
+  // 자릿수: 상하 배치(행이 패널 폭 전체)는 2자리, 좌우 배치(한 칸 ~120px 에 가격·등락률·수량)는 1자리.
+  const chgDigits = vertical ? 2 : 1;
+  const chgText = (v: number | null, digits = 2) => {
+    if (v == null) return '';
+    const k = 10 ** digits;
+    const r = Math.round(v * k) / k; // 표시 자릿수로 판정 — "-0.00%" 가 색을 띠지 않게
+    return `${r > 0 ? '+' : ''}${fmtPct(r === 0 ? 0 : r, digits)}%`;
+  };
+  const chgColor = (v: number | null, digits = 2) => {
+    const k = 10 ** digits;
+    const r = v == null ? 0 : Math.round(v * k) / k;
+    return r > 0 ? 'text-up' : r < 0 ? 'text-down' : 'text-muted';
+  };
 
   const tabBtn = (t: typeof tab, label: string) => (
     <button
@@ -445,11 +460,16 @@ ${
         {isLast && (
           <span key={blinkKey} className="trade-blink pointer-events-none absolute inset-0 rounded-sm ring-1 ring-inset ring-text/80" />
         )}
-        <span className={`relative z-10 flex items-center gap-1 font-medium ${side === 'bid' ? 'text-up' : 'text-down'}`}>
-          {!!l.mine && <span className="h-1 w-1 shrink-0 rounded-full bg-accent" />}
+        {/* ⚠ 좁으면 등락률이 먼저 잘린다(가격 칸 min-w-0 + overflow, 수량 칸 shrink-0) — 가격·수량은 항상 다 보이게 */}
+        <span className={`relative z-10 flex min-w-0 items-baseline gap-1 overflow-hidden whitespace-nowrap font-medium ${side === 'bid' ? 'text-up' : 'text-down'}`}>
+          {!!l.mine && <span className="h-1 w-1 shrink-0 self-center rounded-full bg-accent" />}
           {fmtPriceShort(l.price, groupPrec, 9)}
+          {/* 0시 기준가(전일 종가) 대비 등락률 — 가격 색(매수·매도 쪽)과 별개로 부호 색 */}
+          {dayRef != null && (
+            <span className={`text-[9px] font-normal opacity-80 ${chgColor(chgOf(l.price), chgDigits)}`}>{chgText(chgOf(l.price), chgDigits)}</span>
+          )}
         </span>
-        <span className={`relative z-10 ${l.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{l.phantom ? '—' : fmtVal(v)}</span>
+        <span className={`relative z-10 shrink-0 pl-1 ${l.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{l.phantom ? '—' : fmtVal(v)}</span>
       </button>
     );
   };
@@ -472,6 +492,9 @@ ${
           className={`text-[13px] font-bold ${lastTakerSide === 'buy' ? 'text-up' : lastTakerSide === 'sell' ? 'text-down' : 'text-text'}`}
         >
           {lastPrice != null ? fmtPriceShort(lastPrice, prec, 9) : '—'}
+          {lastPrice != null && dayRef != null && (
+            <span className={`ml-1 text-[10px] font-semibold ${chgColor(chgOf(lastPrice))}`}>{chgText(chgOf(lastPrice))}</span>
+          )}
         </span>
         {bids[0] && asks[0] && (
           <span className="text-[10px] text-muted">스프레드 {fmtPriceShort(Math.max(0, asks[0].price - bids[0].price), groupPrec, 9)}</span>
