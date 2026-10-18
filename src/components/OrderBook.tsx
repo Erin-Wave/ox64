@@ -466,7 +466,7 @@ ${
           {fmtPriceShort(l.price, groupPrec, 9)}
           {/* 0시 기준가(전일 종가) 대비 등락률 — 가격 색(매수·매도 쪽)과 별개로 부호 색 */}
           {dayRef != null && (
-            <span className={`font-normal opacity-80 ${chgColor(chgOf(l.price), chgDigits)}`}>{chgText(chgOf(l.price), chgDigits)}</span>
+            <span className={chgColor(chgOf(l.price), chgDigits)}>{chgText(chgOf(l.price), chgDigits)}</span>
           )}
         </span>
         <span className={`relative z-10 shrink-0 pl-1 ${l.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{l.phantom ? '—' : fmtVal(v)}</span>
@@ -493,7 +493,7 @@ ${
         >
           {lastPrice != null ? fmtPriceShort(lastPrice, prec, 9) : '—'}
           {lastPrice != null && dayRef != null && (
-            <span className={`ml-1 font-semibold ${chgColor(chgOf(lastPrice))}`}>{chgText(chgOf(lastPrice))}</span>
+            <span className={`ml-1 ${chgColor(chgOf(lastPrice))}`}>{chgText(chgOf(lastPrice))}</span>
           )}
         </span>
         {bids[0] && asks[0] && (
