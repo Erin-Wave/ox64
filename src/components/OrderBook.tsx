@@ -308,17 +308,14 @@ export default function OrderBook() {
   const { power, ref: dayRef } = useDayStats(symbol, trades);
   // 호가 등락률 = 0시 기준가(전일 종가) 대비 — 업비트·빗썸 호가창과 같은 기준. 기준가를 아직 모르면 칸을 비운다.
   const chgOf = (price: number) => (dayRef != null ? (price / dayRef - 1) * 100 : null);
-  // 자릿수: 상하 배치(행이 패널 폭 전체)는 2자리, 좌우 배치(한 칸 ~120px 에 가격·등락률·수량)는 1자리.
-  const chgDigits = vertical ? 2 : 1;
-  const chgText = (v: number | null, digits = 2) => {
+  // 자릿수는 배치와 무관하게 소수 2자리 — 좌우 배치(모바일 기본)에서 칸이 좁으면 등락률이 먼저 잘린다(가격·수량은 다 보인다).
+  const chgText = (v: number | null) => {
     if (v == null) return '';
-    const k = 10 ** digits;
-    const r = Math.round(v * k) / k; // 표시 자릿수로 판정 — "-0.00%" 가 색을 띠지 않게
-    return `${r > 0 ? '+' : ''}${fmtPct(r === 0 ? 0 : r, digits)}%`;
+    const r = Math.round(v * 100) / 100; // 표시 자릿수로 판정 — "-0.00%" 가 색을 띠지 않게
+    return `${r > 0 ? '+' : ''}${fmtPct(r === 0 ? 0 : r, 2)}%`;
   };
-  const chgColor = (v: number | null, digits = 2) => {
-    const k = 10 ** digits;
-    const r = v == null ? 0 : Math.round(v * k) / k;
+  const chgColor = (v: number | null) => {
+    const r = v == null ? 0 : Math.round(v * 100) / 100;
     return r > 0 ? 'text-up' : r < 0 ? 'text-down' : 'text-muted';
   };
 
@@ -466,7 +463,7 @@ ${
           {fmtPriceShort(l.price, groupPrec, 9)}
           {/* 0시 기준가(전일 종가) 대비 등락률 — 가격 색(매수·매도 쪽)과 별개로 부호 색 */}
           {dayRef != null && (
-            <span className={chgColor(chgOf(l.price), chgDigits)}>{chgText(chgOf(l.price), chgDigits)}</span>
+            <span className={chgColor(chgOf(l.price))}>{chgText(chgOf(l.price))}</span>
           )}
         </span>
         <span className={`relative z-10 shrink-0 pl-1 ${l.mine ? 'font-semibold text-accent' : 'text-muted'}`}>{l.phantom ? '—' : fmtVal(v)}</span>
