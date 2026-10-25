@@ -408,6 +408,48 @@ export async function loadSpotCandlesPage(
   endTimeMs?: number,
   liveCtx?: LiveBars | null,
 ): Promise<{ candles: SpotCandleOut[]; more: boolean }> {
+  const page = await readSpotCandlesPage(env, pair, intervalCode, limit, endTimeMs, liveCtx);
+  // 최신 페이지만 빈 봉을 채운다(§ fillEmptyBars) — 과거 페이지는 지금 시각과 무관하다.
+  if (!endTimeMs) page.candles = fillEmptyBars(page.candles, intervalSecFromCode(intervalCode), limit, Date.now());
+  return page;
+}
+
+/** 체결이 없던 버킷을 **직전 종가의 빈 봉**(시가=고가=저가=종가, 거래량 0)으로 채운다 — 지금 막 시작한 봉까지(2026-10-25).
+ * 봉은 그 버킷의 첫 체결로만 생겨서, 한산한 시장에선 새 1분봉이 :00 이 아니라 첫 체결(몇 초 뒤)에야 나타났다(제보 "최소 05초는
+ * 되어야 새 봉이 생긴다" — prod 1분봉의 첫 체결은 경계 뒤 0~13초). 거래소 차트(바이낸스 kline)처럼 봉은 시각이 되면 생기고 체결이
+ * 없으면 평평하다. 첫 체결이 오면 그 버킷은 진짜 봉으로 바뀐다(시가 = 그 체결가). 메모리 계산이라 D1 읽기·쓰기는 그대로다.
+ * ⚠ 사이의 빈 버킷도 채운다 — 끝만 채우면 다음 폴링이 받은 구간에서 빠진 빈 봉이 차트에서 사라졌다 나타났다 한다(1초봉).
+ * ⚠ 결과는 버킷 하나에 봉 하나인 연속열의 마지막 `limit` 개 — 봇이 오래 멈춰 진행 중 봉이 몇 시간 전 것이어도 그만큼만 만든다.
+ * ⚠ 빈 봉의 방향별 거래량은 null 이 아니라 0 이다(null 은 "방향 정보 없음" — § SpotCandleOut). */
+function fillEmptyBars(candles: SpotCandleOut[], sec: number, limit: number, nowMs: number): SpotCandleOut[] {
+  if (candles.length === 0 || limit <= 0) return candles;
+  // 버킷 격자에서 벗어난 봉이 있으면 손대지 않는다(아래 격자 순회가 그 봉을 건너뛰어 잃게 된다 — 현재는 없다).
+  if (candles.some((c) => c.time % sec !== 0)) return candles;
+  const end = Math.max(Math.floor(nowMs / 1000 / sec) * sec, candles[candles.length - 1].time);
+  const start = Math.max(candles[0].time, end - (limit - 1) * sec);
+  const out: SpotCandleOut[] = [];
+  let i = 0;
+  let close = candles[0].close;
+  for (let t = start; t <= end; t += sec) {
+    while (i < candles.length && candles[i].time < t) close = candles[i++].close; // start 앞의 봉은 종가만 물려받는다
+    if (i < candles.length && candles[i].time === t) {
+      close = candles[i].close;
+      out.push(candles[i++]);
+    } else {
+      out.push({ time: t, open: close, high: close, low: close, close, volume: 0, buyVolume: 0, sellVolume: 0 });
+    }
+  }
+  return out;
+}
+
+async function readSpotCandlesPage(
+  env: Env,
+  pair: string,
+  intervalCode: string,
+  limit: number,
+  endTimeMs: number | undefined,
+  liveCtx: LiveBars | null | undefined,
+): Promise<{ candles: SpotCandleOut[]; more: boolean }> {
   const sec = intervalSecFromCode(intervalCode);
   const bucketMs = sec * 1000;
   // ⚠ 1s 등 <60s 는 영속 테이블이 없어(최신 거래 버킷팅) 과거 페이지가 존재하지 않는다 —
