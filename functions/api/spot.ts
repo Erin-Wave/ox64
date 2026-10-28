@@ -1115,6 +1115,24 @@ const TRADE_PRUNE_CHANCE = 0.05; // ≈20틱마다 1회
 const TRADE_VIEW_WINDOW_MS = 3 * 60 * 1000;
 
 // ── 봇 매매 심리 모델 ─────────────────────────────────────────────────────
+// ⚠⚠⚠ **2026-10-28 — 방향은 읽히지 않는다(마팅게일). 아래 옛 설명보다 이 문단이 우선한다.**
+// 제보: "차트 움직임이 너무 예측 가능하다, 좀만 눈치보면 돈을 불릴 수 있겠다". 재 보니 사실이었다(`npm run sim:edge`):
+// 10초 모멘텀 → 다음 10초 상관 0.58, 5~20분 이평에서 벌어진 만큼 반대로 타면 평균 35~60bp(VIP0 시장가 왕복 비용 ~26bp 를
+// 넘는다). 원인은 기대수익률을 움직이는 항이 전부 **유저가 볼 수 있는 것**(최근 가격 경로)에서 나왔기 때문이다 — 추세(drift)
+// AR(1)·국면 bias·돌파 추격/손절 연쇄 킥·코일 해제 킥(모멘텀), 적정가 되돌림·저항/지지 마찰·라운드넘버 자석(되돌림).
+// 지인끼리 수익률을 겨루는 곳이라 방향이 읽히면 그게 곧 공짜 돈이다. 그래서 지금은:
+//   · **이번 틱의 기대수익률은 언제나 정확히 0** 이다(`E[다음 공정가] = 지금 공정가`, 산술 — 선물 손익이 가격에 선형이라
+//     산술 마팅게일이어야 어떤 전략도 기대값이 0 이다). 노이즈·팻테일·점프·뉴스가 전부 부호 대칭이다.
+//   · 심리(국면·탐욕/공포·고저점·라운드넘버)는 **크기와 모양만** 바꾼다 — 변동성·거래량·호가 두께·체결 성격·관심도.
+//     저항/지지와 라운드넘버는 "끌어당김"이 아니라 그 근처에서 **변동성이 죽는 것**(머뭇거림)으로, 돌파·코일 해제·뉴스는
+//     방향 킥이 아니라 **변동성·관심도 폭발**(+ 부호가 반반인 점프)로 바뀌었다. 변동성은 뭉쳐도(=크기는 읽혀도) 선형 손익엔
+//     엣지가 안 생긴다.
+//   · `drift` 칸은 이제 **군중이 체감하는 추세**(실현 수익률의 지수평균)다 — 심리·국면 전이의 입력일 뿐 가격엔 안 들어간다.
+// ⚠ 추세·급등락은 여전히 보인다 — 랜덤워크는 모든 시간 규모에서 추세처럼 보이고, 관심도·변동성이 뭉쳐 큰 봉이 몰려 나온다.
+//   다만 **이어질지 꺾일지가 반반**이다. 예전 sim 합격선(추세효율 0.55↑·acf1 ≈ 0.5·되돌려주는 몫)은 바로 그 예측 가능성을
+//   목표로 삼은 것이라 폐기했다. 새 항을 넣을 땐 "이 항의 기대값이 유저가 볼 수 있는 무엇에 따라 달라지나"를 먼저 물을 것 —
+//   달라진다면 그건 엣지다. 바꿨으면 `npm run sim:edge`(합격선: 관측 신호 |IC| ≤ 0.02).
+//
 // ⚠ 예전 기준가는 `ref * (1 + (rand-0.5)*0.012)` 짜리 **IID 랜덤워크** 하나였다 — 추세도, 변동성 뭉침도,
 // 과열도 공포도 없는 무특징 노이즈. 매 틱이 직전과 완전히 독립이라 차트에 읽을 구조가 아예 없었고
 // ("사람 심리가 안 들어간 매매라 노잼"), 어떤 분석도 무의미했다. 지금은 실제 시장에서 관찰되는 정형화된
@@ -1156,8 +1174,10 @@ export interface BotState {
   hype: number;       // 느린 관심(며칠짜리 화제성, 평균 ~1, 0=미초기화)
 }
 
-// 국면별 성격. bias=틱당 추가 드리프트, volMult=변동성 배수, sizeMult=거래량 배수,
-// takerBias=체결 방향 편향(+면 매수 우위), minTicks=최소 지속 틱(국면이 1틱만에 튕기지 않게),
+// ⚠⚠ 2026-10-28: 국면은 **방향을 갖지 않는다**(§ 위 마팅게일 문단) — 예전의 bias(국면 드리프트)·takerBias(체결 방향 편향)
+// 칸은 지웠다. 국면 이름은 "어떤 가격 경로 뒤에 오는 시장의 성격"(급락 뒤의 공포장은 거칠고 붐비고 매수벽이 얇다)이고,
+// 그 다음 방향은 반반이다. 아래 설명의 bias·takerBias 언급은 그 시절 기록이다.
+// 국면별 성격. volMult=변동성 배수, sizeMult=거래량 배수, minTicks=최소 지속 틱(국면이 1틱만에 튕기지 않게),
 // exit=최소 지속을 넘긴 뒤 매 틱 국면을 벗어날 기본 확률(평균 지속 ≈ minTicks + 1/exit),
 // bidDepth/askDepth=호가 사다리 물량 배수(공포장엔 매수벽이 사라지고 매도벽이 쌓인다),
 // spread=호가 스프레드 배수(거친 국면일수록 마켓메이커가 물러난다).
@@ -1181,10 +1201,8 @@ export interface BotState {
 const REGIME_PARAMS: Record<
   Regime,
   {
-    bias: number;
     volMult: number;
     sizeMult: number;
-    takerBias: number;
     minTicks: number;
     exit: number;
     bidDepth: number;
@@ -1194,12 +1212,12 @@ const REGIME_PARAMS: Record<
     buzz: number;
   }
 > = {
-  calm:         { bias:  0,       volMult: 0.72, sizeMult: 0.50, takerBias:  0.02, minTicks: 60, exit: 0.007, bidDepth: 1.10, askDepth: 1.10, spread: 0.90, heat: 0.75, buzz: 0 },
-  rally:        { bias:  0.00101, volMult: 1.05, sizeMult: 1.45, takerBias:  0.22, minTicks: 45, exit: 0.011, bidDepth: 1.30, askDepth: 0.80, spread: 0.95, heat: 1.15, buzz: 0.15 },
-  euphoria:     { bias:  0.00324, volMult: 1.85, sizeMult: 3.10, takerBias:  0.40, minTicks: 20, exit: 0.022, bidDepth: 1.55, askDepth: 0.45, spread: 1.25, heat: 2.2,  buzz: 0.4 },
-  pullback:     { bias: -0.00054, volMult: 1.25, sizeMult: 1.15, takerBias: -0.20, minTicks: 40, exit: 0.014, bidDepth: 0.85, askDepth: 1.20, spread: 1.05, heat: 1.05, buzz: 0.1 },
-  panic:        { bias: -0.0027,  volMult: 2.70, sizeMult: 3.60, takerBias: -0.46, minTicks: 16, exit: 0.045, bidDepth: 0.45, askDepth: 1.55, spread: 1.55, heat: 2.5,  buzz: 0.55 },
-  capitulation: { bias: -0.0085,  volMult: 3.70, sizeMult: 6.00, takerBias: -0.66, minTicks: 6,  exit: 0.130, bidDepth: 0.25, askDepth: 1.85, spread: 2.10, heat: 3.5,  buzz: 0.8 },
+  calm:         { volMult: 0.72, sizeMult: 0.50, minTicks: 60, exit: 0.007, bidDepth: 1.10, askDepth: 1.10, spread: 0.90, heat: 0.75, buzz: 0 },
+  rally:        { volMult: 1.05, sizeMult: 1.45, minTicks: 45, exit: 0.011, bidDepth: 1.30, askDepth: 0.80, spread: 0.95, heat: 1.15, buzz: 0.15 },
+  euphoria:     { volMult: 1.85, sizeMult: 3.10, minTicks: 20, exit: 0.022, bidDepth: 1.55, askDepth: 0.45, spread: 1.25, heat: 2.2,  buzz: 0.4 },
+  pullback:     { volMult: 1.25, sizeMult: 1.15, minTicks: 40, exit: 0.014, bidDepth: 0.85, askDepth: 1.20, spread: 1.05, heat: 1.05, buzz: 0.1 },
+  panic:        { volMult: 2.70, sizeMult: 3.60, minTicks: 16, exit: 0.045, bidDepth: 0.45, askDepth: 1.55, spread: 1.55, heat: 2.5,  buzz: 0.55 },
+  capitulation: { volMult: 3.70, sizeMult: 6.00, minTicks: 6,  exit: 0.130, bidDepth: 0.25, askDepth: 1.85, spread: 2.10, heat: 3.5,  buzz: 0.8 },
 };
 
 // ── 시장의 하루 리듬(세션·주말) ─────────────────────────────────────────────
@@ -1297,7 +1315,9 @@ const NEWS_PER_HOUR = 0.3; // 뉴스(거래량 급증) 도착률 — 세션·화
 const NEWS_MIN = Math.LN2; // 뉴스 한 번이 관심도를 최소 ×2
 const NEWS_SCALE = 0.7; // 그 위로 지수분포 꼬리(평균 ×4, 5% 확률로 ×15 이상)
 const NEWS_DIR_CHANCE = 0.6; // 방향(호재/악재)을 싣는 뉴스의 비율 — 방향은 50:50(장기 편향 0)
-const NEWS_KICK = 0.0009; // 방향 뉴스가 drift 에 꽂는 킥(× MOVE_SCALE, × 뉴스 크기)
+// 방향 뉴스는 그 자리에서 가격을 한 번 옮긴다(× 뉴스 크기 ÷ ln2, 부호 반반). ⚠ 2026-10-28 전엔 drift 에 킥을 꽂아
+// 뉴스 뒤 몇 분간 같은 방향이 이어졌다 — 뉴스를 본 사람이 따라 타면 이기는 구조였다. 지금은 반영이 즉시 끝난다.
+const NEWS_JUMP = 0.002;
 const NEWS_MOOD = 0.3; // 방향 뉴스가 군중 심리에 주는 충격
 // ⚠ 뉴스 → 화제성 → (뉴스 도착률) 은 되먹임 고리다. 도착률을 화제성에 **√** 로만 걸고 남기는 몫을 작게 둬야
 // 화제성이 상한에 붙지 않는다(첫 구현에서 도착률 ∝ 화제성, 몫 0.15 로 하루 뉴스 53회·화제성 상한 고착).
@@ -1317,6 +1337,12 @@ function interestBumpOf(size: number): number {
   return 1 + INTEREST_TRADE_GAIN * Math.sqrt(Math.max(0, size) / BOT_TRADE_MEAN);
 }
 const INTEREST_BUMP_SQL = `interest = MIN(${INTEREST_MAX}, MAX(spot_bot_state.interest, ${INTEREST_MIN}) * ?)`;
+/** 유저 체결이 체결 가능한 가격(ref_price)을 옮길 때 **공정가(fair)도 같은 비율로** 옮긴다(2026-10-28, § toBotState). 시장충격은
+ * 공정가에도 남아야 하고(안 그러면 다음 봇 틱이 충격을 지운다), 벽이 가두는 동안 벌어진 공정가와의 차이는 보존돼야 한다(안 그러면
+ * 작은 시장가 한 번으로 그 차이를 지워 벽 체결의 역선택을 피할 수 있다). 기준가 upsert 에 붙는 같은 문장의 컬럼 하나 — 행·문장 증가 0.
+ * ⚠ SQLite 의 SET 우변은 전부 **갱신 전** 값으로 계산된다 — 여기 `spot_bot_state.ref_price` 는 옛 기준가다. */
+const FAIR_FOLLOW_SQL =
+  'fair = CASE WHEN spot_bot_state.fair > 0 AND spot_bot_state.ref_price > 0 THEN spot_bot_state.fair * excluded.ref_price / spot_bot_state.ref_price ELSE excluded.ref_price END';
 
 // ── 진폭(MOVE_SCALE) ─────────────────────────────────────────────────────────
 // ⚠⚠ 예전 모델은 business time 1단위당 움직임 자체가 너무 컸다 — 틱 표준편차 0.27%, 1분봉 2.9%, 7일 범위가
@@ -1329,72 +1355,58 @@ const INTEREST_BUMP_SQL = `interest = MIN(${INTEREST_MAX}, MAX(spot_bot_state.in
 //   · 가격 거리에 곱해지는 심리 계수(45×drift, 1.6×stretch) → ÷ MOVE_SCALE
 //   · 3차 되돌림 계수(거리³) → ÷ MOVE_SCALE²
 export const MOVE_SCALE = 0.2;
-/** 국면 구조가 원래 갖고 있는 상승 편향을 지우는 상수(단위당, × MOVE_SCALE). ⚠⚠ 2026-09-23 에 드러난 사실:
- * `REGIME_PARAMS.bias` 는 "점유율로 가중하면 합이 0" 이라고 적혀 있었지만 **tether 를 끄고 재니 +27e-6/틱**
- * (진폭 1 기준)이었다 — 예전의 기준선 tether 가 그 편향을 "1 위에선 끌어내리고 1 아래선 밀어올리는" 식으로
- * 눌러왔던 것이고, 그게 곧 "1 이상이면 무조건 하락" 의 정체다. tether 를 없앴으므로 편향을 직접 지운다:
- * 상승 국면(rally·euphoria) bias 를 4.6% 낮추고, 남은 잔차를 이 값으로 뺀다(sim 로그드리프트 ≈ 0 이 되게).
- * ⚠ 국면·심리 파라미터를 바꾸면 **반드시 다시 잴 것**(`npm run sim:bot` 의 로그드리프트, SIM_RUNS=48 이상) —
- * 되돌려줄 힘이 없으므로 남은 편향은 그대로 추세가 된다(단위당 1e-6 ≈ 하루 1%). */
-const DRIFT_TRIM = 20.8e-6;
+// ⚠ 2026-09-23~10-27 엔 국면 bias 의 상승 편향을 지우는 `DRIFT_TRIM` 이 여기 있었다(sim 로그드리프트를 0 에 맞추는 상수).
+// 지금은 기대수익률이 구조적으로 0 이라(§ 마팅게일 문단) 맞출 편향 자체가 없다 — 대신 로그 가격은 단위당 −½·분산 만큼
+// 내려간다(산술 마팅게일의 성질, 하루 ~0.5%). 유저 손익은 가격에 선형이라 이게 공정한 쪽이다.
 /** business time 1단위당 거래량 정규화 — 틱당 거래량이 예전 한 틱(관심도 1)과 같게 맞춘다(§ sim "단위당 거래량"). */
 const FLOW_NORM = 0.823;
 
 // ── 관망 → 수축 → 확장(coil) ────────────────────────────────────────────────
 // 사람 시장은 조용할 때 **점점 더** 조용해진다(관망세가 길어지면 아무도 먼저 움직이지 않는다). 그리고
-// 그렇게 눌린 에너지는 국면이 바뀌는 순간 한 방향으로 터진다 — 차트에서 "삼각수렴 후 급등/급락"으로
-// 읽히는 바로 그 패턴이다. 예전엔 calm 이 60틱이든 600틱이든 성격이 똑같아서, 조용한 구간은 그냥
-// 심심한 구간이었고 그 끝에 아무 사건도 없었다.
+// 그렇게 눌린 에너지는 국면이 바뀌는 순간 터진다 — 차트에서 "삼각수렴 후 급등/급락"으로 읽히는 바로 그 패턴이다.
+// 예전엔 calm 이 60틱이든 600틱이든 성격이 똑같아서, 조용한 구간은 그냥 심심한 구간이었고 그 끝에 아무 사건도 없었다.
+// ⚠⚠ 2026-10-28: 터지는 건 **변동성**이다(방향은 반반). 예전엔 새 국면 방향으로 drift 킥을 꽂아 "코일이 풀리는 쪽으로
+// 따라 타면" 이겼다 — 수렴 뒤 확장은 실제 시장에서도 방향을 알려주지 않는다.
 // ⚠ 새 상태가 필요 없다 — `regimeTicks`(국면 나이)가 이미 있다.
 const COIL_MIN = 0.45; // calm 이 아주 길어졌을 때의 변동성 배수 하한
 const COIL_HALF = 260; // 이 틱수만큼 지나면 수축이 절반쯤 진행된다
-const COIL_RELEASE = 0.00085; // 코일이 풀릴 때 그 방향으로 drift 에 꽂히는 킥(총 이동 ≈ 17배)
-const COIL_FULL_TICKS = 500; // 킥이 최대가 되는 코일 길이
+const COIL_BURST = 0.8; // 코일이 풀릴 때 변동성에 곱해지는 몫(꽉 눌린 코일이면 ×1.8 — vol AR 로 서서히 식는다)
+const COIL_FULL_TICKS = 500; // 폭발이 최대가 되는 코일 길이
 
 // ── 저항·지지 — 사람은 "직전 고점/저점"을 기준으로 행동한다 ─────────────────
 // ⚠ peak/trough 는 지금까지 **게이지(탐욕·공포)와 사건 방아쇠**로만 쓰였다. 그래서 가격이 직전 고점에
 // 다가가도 아무 일이 없었고, 지나가도 아무 일이 없었다 — 사람이 차트에서 제일 많이 하는 행동(전 고점에서
-// 팔고, 전 저점에서 사고, 뚫리면 따라가기)이 통째로 빠져 있었던 것이다. 여기서 둘을 실제 **마찰**로 만든다:
-//   · 전 고점 아래로 다가갈수록 매도 압력(그 가격에 산 사람들의 본전 매도 = disposition effect)
-//   · 전 저점 위로 다가갈수록 매수 압력(저가 매수 대기)
-//   · 단 극값 **바로 앞**은 무저항 구간이다 — 거기까지 왔다는 건 저항이 이미 소진됐다는 뜻이고,
-//     그래야 "저항선을 뚫으면 저항이 사라진다"(그리고 FOMO 추격이 붙는다)가 성립한다.
-// ⚠ 구조가 대칭(위는 아래로, 아래는 위로)이라 장기 편향을 만들지 않는다. 대신 추세를 **늦추므로**
-//   추세효율이 떨어질 수 있다 — 반드시 `npm run sim:bot` 으로 0.55 선을 다시 확인할 것.
+// 팔고, 전 저점에서 사고, 뚫리면 따라가기)이 통째로 빠져 있었던 것이다.
+// ⚠⚠ 2026-10-28: 레벨은 **가격을 밀지 않고 변동성을 죽인다**(머뭇거림). 예전엔 전 고점 아래에서 매도 압력·전 저점 위에서
+// 매수 압력을 걸어 "전 저점 근처에서 사면" 이겼다(되돌림 엣지). 지금은 영향권 안에서 움직임이 작아져 가격이 그 근처에
+// 오래 머물고(차트엔 지지·저항으로 보인다), 어느 쪽으로 빠질지는 반반이다. 극값 바로 앞(LEVEL_DEAD)은 예전처럼 무저항이다.
 const LEVEL_ZONE = 0.022; // 극값에서 이 비율 안쪽이 그 레벨의 영향권
 const LEVEL_DEAD = 0.0012; // 극값 바로 앞의 무저항 구간(돌파 직전)
-const LEVEL_FRICTION = 0.00105; // 영향권 한가운데에서 걸리는 최대 압력(틱당)
+const LEVEL_DAMP = 0.35; // 영향권 한가운데에서 변동성이 줄어드는 몫(머뭇거림)
 
 // ── 추세 · 되돌림 파라미터 ────────────────────────────────────────────
-// ⚠⚠ **여기가 "사팔사팔"의 진짜 원인이었다**(2026-08-26). 예전엔 적정가(anchor) 대비 되돌림이
-// `-0.045×stretch` 로 **반감기 15틱**이나 됐고 anchor 자체도 1%/틱로 따라와서, 국면 드리프트 g 가
-// 실제로 가격에 남기는 몫은 `g×a/(k+a) = g×0.01/0.055 = g 의 18%` 뿐이었다. 즉 rally 든 panic 이든
-// **82% 가 그 자리에서 취소**되고, 남은 건 매 틱 새로 뽑는 가우시안 노이즈뿐이라 차트가 방향 없이
-// 잘게 떨렸다. 지금은 되돌림을 1/3 로 줄여(k=0.014) 드리프트의 **42%** 가 남게 하고, 대신
-//  (a) 과열이 커질수록 급격히 세지는 고차항(REVERT_CUBE)으로 발산을 막고
-//  (b) anchor 를 기준선으로 당기는 장기 tether(BOT_BASE_PULL)를 비선형으로 만들어
-//      "며칠짜리 큰 파도는 허용하되 몇 배로 튀지는 못하게" 했다 — ⚠ 2026-09-23 에 **(b)는 없앴다**
-//      (§ clamp 위 "기준선 tether 는 없앴다"). 이 되돌림은 전부 움직이는 적정가 기준이다.
-const REVERT_LIN = 0.014;  // 적정가 대비 과열의 선형 되돌림(작을수록 추세가 오래 산다)
-// ⚠⚠ **먼 구간 브레이크는 2차가 아니라 3차다**(2026-09-10, "EMA 뚫고 되돌아옴이 심하다" 제보).
-// 예전 2차항 `0.30 × x|x|` 는 **평범한 과열 구간에서 이미 너무 셌다** — 과열 5% 에서 0.075%/틱,
-// 10% 에서 0.30%/틱 이라, 틱 표준편차(0.27%)만 한 힘이 한 방향으로 매 틱 걸렸다. 그래서 EMA 를
-// 뚫고 나간 봉이 1~2분 만에 통째로 되감겼다. 실제 시장의 되돌림은 이렇게 즉각적이지 않다 —
-// 분산비(VR: 긴 구간 분산 ÷ 랜덤워크 분산)로 재면 실거래소는 1 근처인데 이 모델은 60틱에서 8.9 로
-// 부풀었다가 1800틱에서 3.4 로 **꺾여 내려왔다**(=쌓은 변동의 61% 를 되돌려줬다).
-// 3차로 바꾸면 **발산을 막는 먼 구간(±30%)의 세기는 그대로**이면서(1.5×0.30³ = 0.027/틱 ≈ 옛
-// 0.30×0.30²) 가까운 구간만 풀린다: 과열 5% 에서 6배 · 10% 에서 3배 약하다.
-// ⚠ 이 값을 더 낮추면 되돌림은 더 줄지만 변동성·MDD 가 같이 커진다(1.2 로 내리면 1분봉 3.08%).
-// 지금 값은 문서화된 합격선(1분봉 2~3% · 틱sd 0.3% 이하) 안쪽을 유지하는 선에서 고른 것이다.
-const REVERT_CUBE = 1.5;   // 3차 되돌림 — 과열 ±25~30% 부근에서 급브레이크(발산 방지)
-const ANCHOR_FOLLOW = 0.01; // 적정가가 현재가를 따라가는 속도(반감기 ≈ 69단위 — 관심도 0.2·1초 틱이면 약 17분)
-// 매 틱 새로 뽑는 순수 노이즈. ⚠ **이 값을 키우면 "사팔사팔"이 그대로 돌아온다** — 다이내믹함은
-// 노이즈가 아니라 위 국면·추세·사건에서 나와야 한다(노이즈는 방향이 없어서 봉만 지저분해진다).
-const TICK_NOISE = 0.00052;
-// 추세(모멘텀)의 지속계수 — 예전 0.86(반감기 4.6틱)은 사실상 노이즈였다. 0.94 면 반감기 11틱이라
-// 한 번 잡힌 방향이 봉 하나를 넘어 이어진다. ⚠ 1 미만이어야 발산하지 않는다.
-const DRIFT_PERSIST = 0.94;
-const DRIFT_NOISE = 0.00026;
+// ⚠⚠ 2026-10-28: **가격엔 추세도 되돌림도 없다**(§ 마팅게일 문단). 예전 이 자리의 REVERT_LIN/REVERT_CUBE(적정가 대비
+// 되돌림)·DRIFT_PERSIST/DRIFT_NOISE(모멘텀 AR(1))가 곧 엣지였다 — sim:edge 실측 10초 모멘텀 IC 0.58, 20분 이평 괴리 역추종
+// 15분 뒤 +51bp. 지난 재설계들("사팔사팔" 2026-08-26, "EMA 뚫고 되돌아옴" 2026-09-10)은 둘 사이의 비율만 옮겼을 뿐 둘 다
+// 남아 있었다. 지금 가격 = 공정가 × (1 + 부호 대칭 충격) 이고, 아래 상수들은 "군중이 보는 것"만 만든다.
+const ANCHOR_FOLLOW = 0.01; // 적정가(군중이 생각하는 "원래 가격")가 현재가를 따라가는 속도 — 심리(과열 판정)에만 쓴다
+// 단위당 기본 충격(× MOVE_SCALE × 실효 변동성 × 국면 배수). ⚠ 예전 값(0.00052)은 추세가 변동의 대부분을 만들던 시절의
+// "곁가지 노이즈"였다 — 추세를 걷어낸 만큼 이 값이 시장의 움직임 전부를 맡는다(1분·1시간·하루 폭을 예전과 비슷하게 맞춘 값).
+const TICK_NOISE = 0.002;
+// ⚠ 붐빌수록 한 단위가 더 크게 움직인다(단위당 sd × (관심도 ÷ 기준)^이 지수). 예전엔 추세가 붐비는 구간에서 시간의 제곱으로
+// 쌓여 "한산할 땐 거의 안 움직이다 몰리면 급변"이 됐는데, 추세를 걷어내면 그 대비가 관심도 하나(분산 ∝ 관심도)로는 모자란다
+// — 한산한 1분봉이 두 배로 커지고 시간봉은 절반이 된다. 분산이 관심도^(1+2×지수) 로 반응하게 해 대비를 되살린다. 방향과는
+// 무관하다(크기만). 관심도는 벽시계 상태라 틱 간격(폴링 1초·cron 5초)과도 무관하다.
+const VOL_INTEREST_GAIN = 0.3;
+const VOL_INTEREST_REF = 0.3;
+// 그 배수의 상한 — 과열(관심도 2+)에서 1분봉이 몇 %씩 튀지 않게(상한이 없으면 사건→관심→변동성이 서로를 키운다).
+const VOL_INTEREST_CAP = 1.7;
+// 군중이 체감하는 추세(`drift` 칸) — 실현 수익률의 지수평균(반감기 ≈ 11단위). 심리·국면 전이만 이 값을 본다.
+const TREND_PERSIST = 0.94;
+// 체감 추세가 무드를 미는 세기(÷ MOVE_SCALE). 예전 45 는 국면 bias 가 drift 를 크게 밀던 시절 값이다.
+const TREND_MOOD = 45;
+// 거래량 반응의 기준 폭 — 이번 틱 움직임이 노이즈 단위(TICK_NOISE)의 몇 배면 거래량이 1배 더 붙나.
+const VOLUME_MOVE_UNIT = 1.35;
 /** 변동성 충격 e^(0.45g) 의 평균(= e^(0.45²/2)) — business time 식에서 평균과 요동을 나눠 적는 데 쓴다. */
 const VOL_SHOCK_MEAN = Math.exp((0.45 * 0.45) / 2);
 /** 한산할 때 스프레드가 벌어지는 정도 — 관심도 0 이면 ×(1+이 값). 경쟁하는 마켓메이커가 적다. */
@@ -1414,7 +1426,8 @@ const EXTREME_DECAY = 0.005;
 // 스윙 크기가 바뀌면 같이 움직여야 한다. 되돌림을 풀어 파도가 커졌을 때 0.18 을 그대로 두니 평균 공포가
 // 0.30→0.36 으로 올라 변동성·거래량·투매가 통째로 부풀었다(1분봉 2.72%→3.07%, 투매 52→72회/7일).
 // 0.22 로 넓히니 **되돌림만 줄고 나머지 지표는 개편 전으로 복귀**했다(1분봉 2.82%, 틱sd 0.274%).
-// 즉 REVERT_* 를 손볼 때는 이 값도 같이 재보정할 것.
+// 즉 REVERT_* 를 손볼 때는 이 값도 같이 재보정할 것. ⚠ 2026-10-28 부터 되돌림은 없다 — 지금은 노이즈 크기(TICK_NOISE 등)가
+// 파도를 정한다. 그걸 바꿨으면 평균 공포(sim:bot, ~0.2)를 다시 볼 것.
 // ⚠ 가격 거리라 MOVE_SCALE 을 곱한다(2026-09-23) — 파도가 작아진 만큼 자도 작아져야 게이지 분포가 그대로다.
 export const GAUGE_FULL = 0.22 * MOVE_SCALE;
 // 무드의 군집(herding) — sentiment 가 자기 자신을 키우되 s(1-s²) 라 극단(±1)에선 0 이 되어 발산하지
@@ -1423,23 +1436,25 @@ export const GAUGE_FULL = 0.22 * MOVE_SCALE;
 //   중간에 식어버려 확신(conviction) 배수가 안 붙는다.
 const MOOD_PERSIST = 0.91;
 const HERD_GAIN = 0.05;
-// 신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄 — **연쇄 쪽이 1.5배 크고 자주 터진다**(공포가 탐욕보다
-// 빠르다). 둘 다 "그 방향으로 이미 쏠려 있을 때만" 발동해서, 평상시엔 아무 일도 일어나지 않는다.
-// ⚠⚠ **킥은 이제 그 틱의 수익률이 아니라 `drift`(추세) 에 꽂힌다**(2026-08-26). 예전엔 한 틱만 튀고
-// 끝나서 다음 봉이면 흔적도 없었다 — 사람이 "돌파했다"고 읽으려면 그 뒤로 몇 봉이 따라와야 한다.
-// drift 는 DRIFT_PERSIST 로 감쇠하므로 킥 k 는 총 `k/(1-0.94) ≈ 17k` 만큼의 이동으로 풀린다.
-// 발동률 = 돌파 거리(예전 진폭 기준) 1 당 hazard. ⚠ 예전엔 "고점에 있는 틱당 확률"(0.035 / 0.055)이었다 —
-// § nextMarketState 사건 참고. 예전 모델의 1000단위당 빈도(추격 5.5 / 연쇄 6.8)에 맞춘 값이다.
+// 신고점 돌파 추격(FOMO)과 지지 붕괴 손절 연쇄 — **연쇄 쪽이 더 자주 터진다**(공포가 탐욕보다 빠르다). 둘 다 "그 방향으로
+// 이미 쏠려 있을 때만" 발동해서, 평상시엔 아무 일도 일어나지 않는다.
+// ⚠⚠ 2026-10-28: 사건은 **방향 킥이 아니라 변동성·관심도 폭발**이다. 예전엔 돌파 방향으로 drift 에 킥을 꽂아(총 이동 ≈ 17배)
+// "뚫리면 따라 타기"가 이겼다. 지금은 돌파하면 사람이 몰리고(buzz) 봉이 커지지만, 진짜 돌파인지 속임수인지는 반반이다.
+// 발동률 = 돌파 거리(예전 진폭 기준) 1 당 hazard — 예전 모델의 1000단위당 빈도(추격 5.5 / 연쇄 6.8)에 맞춘 값이다.
 const FOMO_RATE = 15;
-const FOMO_KICK = 0.00075;
 const CASCADE_RATE = 22;
-const CASCADE_KICK = 0.00112;
+const EVENT_VOL = 1.3; // 사건이 변동성에 곱하는 배수(vol AR 로 서서히 식는다)
+// 부호가 반반인 점프(급등·급락) — 단위당 발생률은 들뜬 정도(공포·탐욕)에 비례, 크기는 × MOVE_SCALE × 실효 변동성.
+// ⚠ 예전엔 공포장엔 급락만·탐욕장엔 급등만 났다(공포 게이지를 보고 같은 방향으로 타면 이겼다).
+const JUMP_RATE = 0.006;
+const JUMP_MIN = 0.01;
+const JUMP_RAND = 0.02;
 
-// 라운드넘버 자석이 잡아당기는 심리적 가격대(틱 개수 — 절대값이면 가격대가 바뀔 때 무의미해진다).
-// ⚠ 굵은 격자가 더 강하고 더 넓게 붙잡는다 — 1.00 은 1.003 보다 훨씬 중요한 자리다.
-const ROUND_MAGNETS: readonly { ticks: number; pull: number; zone: number }[] = [
-  { ticks: 500, pull: 0.3, zone: 0.006 }, // 1.00 / 1.05 — 큰 심리 가격
-  { ticks: 50, pull: 0.22, zone: 0.0035 }, // 1.000 / 1.005
+// 라운드넘버 — 심리적 가격대(틱 개수 — 절대값이면 가격대가 바뀔 때 무의미해진다). ⚠ 굵은 격자가 더 강하고 더 넓다 —
+// 1.00 은 1.003 보다 훨씬 중요한 자리다. ⚠ 2026-10-28: 끌어당기지 않고 그 근처에서 **변동성을 죽인다**(§ LEVEL_DAMP 와 같은 이유).
+const ROUND_MAGNETS: readonly { ticks: number; damp: number; zone: number }[] = [
+  { ticks: 500, damp: 0.3, zone: 0.006 }, // 1.00 / 1.05 — 큰 심리 가격
+  { ticks: 50, damp: 0.2, zone: 0.0035 }, // 1.000 / 1.005
 ];
 
 /** 한 주문에서 특정 봇이 상대편(maker)으로 잡은 체결의 합계 — 수수료(명목금액)와 재고(수량) 양쪽에 쓴다. */
@@ -1868,28 +1883,19 @@ export function nextMarketState(
     0.1 * Math.sqrt((1 - aV * aV) / (1 - 0.81)) * (Math.exp(gauss() * 0.45) - VOL_SHOCK_MEAN);
   if (Math.random() < 1 - Math.exp(-0.0202 * h)) vol *= 1.8 + Math.random() * 1.4;
   vol = clamp(vol, 0.35, 4.5);
-  // ⚠ 레버리지 효과 — 같은 크기라도 **떨어질 때가 오를 때보다 시끄럽다**. 공포 게이지로 이번 틱에만
+  // ⚠ 레버리지 효과 — 같은 크기라도 **떨어진 뒤가 오른 뒤보다 시끄럽다**. 공포 게이지로 이번 틱에만
   //    증폭하고(상태엔 안 저장) 넘긴다 — 저장하면 AR(1) 에 곱해져 공포가 이어지는 동안 기하급수로
   //    커지고 상한(clamp)에 붙어버린다. (세션 리듬은 더 이상 여기 없다 — 관심도가 속도로 가져간다.)
+  //    ⚠ 크기만 키운다 — 방향은 여전히 반반이다(§ 마팅게일 문단).
   const volEff = vol * (1 + 0.4 * fear) * coil;
 
-  // 2) 추세 지속(모멘텀) — 방향이 한 번 잡히면 감쇠하며 이어진다(반감기 ≈ 11단위).
-  const aD = DRIFT_PERSIST ** h;
-  let drift =
-    s.drift * aD + gauss() * DRIFT_NOISE * m * vol * Math.sqrt((1 - aD * aD) / (1 - DRIFT_PERSIST * DRIFT_PERSIST));
-
-  // 방향 뉴스(호재/악재) — 크기에 비례해 추세를 싣는다. 방향이 50:50 이라 장기 편향은 없다.
-  // (돌파 추격·손절 연쇄는 이번 틱 가격이 나온 뒤에 판정한다 — 아래 § 사건)
-  const newsKick = newsDir * NEWS_KICK * m * (news / Math.LN2);
-  drift = clamp(drift + newsKick, -0.02 * m, 0.02 * m); // 안전장치 — 사건이 겹쳐도 단위당 2%(×진폭)를 넘지 않는다
-
-  // 3) 군중 심리 — 최근 추세·과열도·고저점 대비 위치가 쌓여 탐욕/공포가 된다(국면 전이의 방아쇠).
-  //    ⚠ 여기에 **군집(herding)** 을 더했다: 무드는 자기 자신을 되먹여 한 번 쏠리면 한동안 유지된다
-  //    (s(1-s²) 라 극단에선 0 이 되어 포화 — 실효 지속계수 ≤ 0.96 이므로 발산 불가).
-  //    ⚠ business time 식: `s·a^h + push·(1−a^h)/(1−a)` — h=1 이면 예전 `s·a + push` 와 같다.
+  // 2) 군중 심리 — 최근 추세(군중이 체감하는 `drift`)·과열도·고저점 대비 위치가 쌓여 탐욕/공포가 된다(국면 전이의 방아쇠).
+  //    무드는 자기 자신을 되먹여(군집, herding) 한 번 쏠리면 한동안 유지된다(s(1-s²) 라 극단에선 0 이 되어 포화 — 실효
+  //    지속계수 ≤ 0.96 이므로 발산 불가). ⚠ business time 식: `s·a^h + push·(1−a^h)/(1−a)` — h=1 이면 `s·a + push`.
   //    가격 거리에 곱하는 계수(45, 1.6)는 ÷MOVE_SCALE — 진폭이 줄어도 심리는 같은 세기로 반응해야 한다.
+  //    ⚠ 심리는 가격을 움직이지 않는다(2026-10-28) — 변동성·거래량·호가 모양·체결 성격만 바꾼다.
   const herd = HERD_GAIN * s.sentiment * (1 - s.sentiment * s.sentiment);
-  const push = herd + (45 / m) * drift + (1.6 / m) * stretch + 0.05 * (greed - 1.2 * fear);
+  const push = herd + (TREND_MOOD / m) * s.drift + (1.6 / m) * stretch + 0.05 * (greed - 1.2 * fear);
   const aM = MOOD_PERSIST ** h;
   const sentiment = clamp(
     s.sentiment * aM + (push * (1 - aM)) / (1 - MOOD_PERSIST) + newsDir * NEWS_MOOD * Math.min(1, news / (2 * Math.LN2)),
@@ -1901,122 +1907,104 @@ export function nextMarketState(
   const P = REGIME_PARAMS[regime];
   if (regime !== s.regime) buzz += P.buzz; // 패닉·광기가 시작되면 사람이 몰린다
 
-  // 코일 해제 — 오래 눌려 있던 관망이 깨지는 순간 그 방향으로 추세가 실린다(수축 후 확장).
-  // ⚠ FOMO 킥과 같은 이유로 `drift` 에 꽂는다 — 한 틱만 튀면 다음 봉에 흔적이 없다.
+  // 코일 해제 — 오래 눌려 있던 관망이 깨지는 순간 **변동성이** 터진다(수축 후 확장, 방향은 반반 — § COIL_BURST).
   if (s.regime === 'calm' && regime !== 'calm') {
-    const dir = P.bias !== 0 ? Math.sign(P.bias) : sentiment >= 0 ? 1 : -1;
-    drift = clamp(drift + dir * COIL_RELEASE * m * Math.min(1, s.regimeTicks / COIL_FULL_TICKS), -0.02 * m, 0.02 * m);
+    const burst = COIL_BURST * Math.min(1, s.regimeTicks / COIL_FULL_TICKS);
+    vol = clamp(vol * (1 + burst), 0.35, 4.5);
+    buzz += 0.4 * burst;
   }
 
-  // 4) 평균회귀 — **움직이는 적정가**(anchor, 수 분짜리 EMA) 기준. 벌어질수록 3차로 강해진다.
-  //    ⚠ 특정 가격대(예전의 1 USDT)로 돌아가는 힘은 없다 — 적정가 자체가 가격을 따라가므로 "많이 올랐다"는
-  //    감각만 남고 "원래 가격"은 없다.
-  //    ⚠⚠ **되돌림의 거리는 로그로 잰다**(2026-09-10) — 산술 과열은 위아래가 비대칭이라 스윙이 커질수록
-  //    복원력이 아래쪽에 더 세게 걸려 가격에 하락 편향이 생긴다.
-  //    ⚠ 심리·국면 판정은 산술 `stretch` 를 그대로 쓴다 — 그쪽 임계값이 산술 기준으로 튜닝돼 있다.
-  //    ⚠ 큰 h 에서 한 틱에 적정가를 넘어가 반대편으로 튕기지 않게, 되돌림은 남은 거리를 넘지 못한다.
-  const logStretch = Math.log(s.ref / anchor);
-  let revert = -(REVERT_LIN * logStretch + (REVERT_CUBE / (m * m)) * logStretch ** 3) * h;
-  if (Math.abs(revert) > Math.abs(logStretch)) revert = -logStretch;
-
-  // 5) 라운드넘버 자석 — 심리적 지지/저항 근처에서 잠시 머뭇거린다.
-  //    단 무드가 극단이면 그런 자리는 그냥 뚫고 지나간다(확신에 찬 군중은 저항을 안 본다).
-  //    ⚠ 격자가 **둘**이다(2026-09-07): 1.00/1.05 같은 큰 자리가 1.002/1.003 보다 훨씬 강하게 붙잡는다.
-  //    ⚠ 격자 간격은 실제 가격(틱 개수)이라 그대로 두고, 붙잡는 **영향권**만 진폭에 맞춰 줄인다.
+  // 3) 머뭇거림 — 라운드넘버와 전 고점·전 저점 근처에서 **움직임이 작아진다**(§ LEVEL_DAMP). 가격이 그 근처에 오래 머물러
+  //    차트엔 지지·저항으로 보이지만, 어느 쪽으로 빠질지는 반반이다. 무드가 극단이면(확신에 찬 군중) 그런 자리를 안 본다.
+  //    ⚠ 격자 간격은 실제 가격(틱 개수)이라 그대로 두고, 영향권만 진폭에 맞춰 줄인다.
   const doubt = 1 - Math.abs(sentiment);
-  let magnet = 0;
+  let damp = 1;
   for (const g of ROUND_MAGNETS) {
     const stepPx = g.ticks * virtualTick(s.ref);
-    const toRound = (Math.round(s.ref / stepPx) * stepPx - s.ref) / s.ref;
-    if (Math.abs(toRound) < g.zone * m) magnet += toRound * Math.min(1, g.pull * doubt * h);
+    const dist = Math.abs(Math.round(s.ref / stepPx) * stepPx - s.ref) / s.ref;
+    const zoneR = g.zone * m;
+    if (dist < zoneR) damp *= 1 - g.damp * doubt * (1 - dist / zoneR);
   }
-
-  // 5b) 전 고점·전 저점의 마찰(§ LEVEL_ZONE) — 사람이 차트에서 제일 많이 하는 행동.
   const gapUp = (peak - s.ref) / s.ref; // 전 고점까지 남은 거리(>0 이면 고점 아래)
   const gapDown = (s.ref - trough) / s.ref;
   const zone = LEVEL_ZONE * m;
   const dead = LEVEL_DEAD * m;
-  let level = 0;
-  if (gapUp > dead && gapUp < zone) level -= LEVEL_FRICTION * m * (1 - gapUp / zone) * doubt;
-  if (gapDown > dead && gapDown < zone) level += LEVEL_FRICTION * m * (1 - gapDown / zone) * doubt;
+  if (gapUp > dead && gapUp < zone) damp *= 1 - LEVEL_DAMP * (1 - gapUp / zone) * doubt;
+  if (gapDown > dead && gapDown < zone) damp *= 1 - LEVEL_DAMP * (1 - gapDown / zone) * doubt;
 
-  // 6) 확신(conviction) — 국면 드리프트는 군중이 그 방향으로 쏠려 있을수록 세진다. 같은 rally 라도
-  //    "다들 사고 있는 rally"가 더 가파르다.
-  const conviction = 1 + 0.9 * clamp(sentiment * Math.sign(P.bias), 0, 1);
-
-  // 7) 이번 틱 수익률 = (추세·마찰·국면 bias) × h + 되돌림 + 자석 + 노이즈×√h.
-  //    팻테일(가끔 평소의 2~4배)은 **노이즈에만** 곱한다 — 예전처럼 ret 전체에 곱하면 국면 bias 까지 부풀어
-  //    방향 있는 국면의 기대수익이 조용히 바뀐다. 팻테일도 급등락 점프도 관심을 끈다(buzz).
-  //    ⚠ 순수 노이즈(TICK_NOISE)는 방향이 없어서 키워봐야 봉만 지저분해진다 — 다이내믹함은 위의
-  //    drift·국면 bias·사건에서 나온다.
-  const noise = gauss() * TICK_NOISE * m * volEff * P.volMult * Math.sqrt(h);
-  let ret = (drift + level + P.bias * m * conviction - DRIFT_TRIM * m) * h + revert + magnet + noise;
+  // 4) 이번 틱 수익률 — ⚠⚠ **기대값이 정확히 0** 이다(§ 마팅게일 문단). 모든 항이 부호 대칭이고, 상태(국면·심리·게이지·
+  //    레벨)는 크기에만 곱해진다. 그래서 `E[다음 공정가] = 지금 공정가` 이고 유저가 볼 수 있는 어떤 신호로도 방향 엣지가 없다.
+  //    ⚠ 새 항을 더할 땐 부호를 상태에서 정하지 말 것 — 정하는 순간 그 상태를 읽는 사람이 돈을 번다.
+  //    · 노이즈: 단위당 sd = TICK_NOISE × 진폭 × 실효 변동성 × 국면 배수 × 머뭇거림, × √h
+  //    · 팻테일(가끔 평소의 2~4배) — 노이즈에만 곱한다(부호와 독립)
+  //    · 점프(급등·급락) — 들뜬 시장(공포·탐욕)일수록 잦고, 부호는 반반
+  //    · 방향 뉴스 — 그 자리에서 한 번에 반영된다(부호는 위에서 반반으로 뽑았다)
+  const sigma = TICK_NOISE * m * volEff * P.volMult * damp * Math.min(VOL_INTEREST_CAP, (interest / VOL_INTEREST_REF) ** VOL_INTEREST_GAIN);
+  let noise = gauss() * sigma * Math.sqrt(h);
   if (Math.random() < 1 - Math.exp(-0.0253 * h)) {
-    ret *= 2 + Math.random() * 2;
+    noise *= 2 + Math.random() * 2;
     buzz += FAT_TAIL_BUZZ;
   }
-  //    급락·급등 점프도 비대칭이다 — 공포장의 급락(투매 flush)이 탐욕장의 급등(숏스퀴즈)보다 크고 잦다.
-  if (fear > 0.5 && Math.random() < 1 - Math.exp(-0.008 * h)) {
-    ret -= (0.004 + 0.009 * Math.random()) * m * volEff;
-    buzz += JUMP_BUZZ;
-  } else if (greed > 0.6 && Math.random() < 1 - Math.exp(-0.005 * h)) {
-    ret += (0.004 + 0.007 * Math.random()) * m * volEff;
+  let ret = noise;
+  if (Math.random() < 1 - Math.exp(-JUMP_RATE * (0.3 + fear + greed) * h)) {
+    ret += (Math.random() < 0.5 ? -1 : 1) * (JUMP_MIN + JUMP_RAND * Math.random()) * m * volEff;
     buzz += JUMP_BUZZ;
   }
+  if (newsDir !== 0) ret += newsDir * NEWS_JUMP * (news / Math.LN2);
+  ret = clamp(ret, -0.5, 0.5); // 안전장치(대칭 — 기대값을 건드리지 않는다)
 
   // ⚠ 다음 공정가. **틱에 스냅하지 않는다**(§ BotState.ref) — 한산한 틱은 한 틱보다 작게 움직이는데 매번
   //   반올림하면 그 이동이 전부 버려져 가격이 얼어붙는다. 반올림은 D1 에 쓸 때(ref_price)만 한다.
   //   클램프는 **시세 범위가 아니라 0·Infinity 만 막는 안전장치**다(§ _shared.VIRTUAL_PRICE_MIN).
   const ref = clamp(s.ref * (1 + ret), VIRTUAL_PRICE_MIN, VIRTUAL_PRICE_MAX);
 
+  // 군중이 체감하는 추세 — 실현 수익률의 지수평균(단위당). h→0 이면 (1−a^h)/h → −ln a 라 한산한 틱도 잘 정의된다.
+  const aD = TREND_PERSIST ** h;
+  const drift = clamp(s.drift * aD + (h > 0 ? ((1 - aD) / h) * ret : 0), -0.02 * m, 0.02 * m);
+
   // § 사건 — 최근 고점 돌파(FOMO 추격매수)와 최근 저점 붕괴(손절 연쇄). 실제 차트에서 사람이 읽는 사건은
-  //   대부분 이 둘이다. ⚠ **연쇄가 추격보다 크고 자주** 터진다(계단으로 오르고 엘리베이터로 떨어진다). 그
-  //   방향으로 이미 쏠려 있을 때만 발동하므로 평상시엔 아무 일도 안 일어난다.
-  //   ⚠⚠ 킥은 `ret` 이 아니라 **`drift` 에 꽂는다**(2026-08-26) — 그 틱에만 더하면 한 틱 튀고 끝나서 다음
-  //   봉이면 흔적이 없었다. drift 에 넣으면 감쇠하며 이어져 "돌파 후 추격"처럼 보인다(다음 틱부터 반영).
-  //   ⚠⚠ **발동 확률은 "이번 틱에 전 고점(저점)을 넘어선 거리"에 비례한다**(2026-09-23). 예전엔 "지금 정확히
-  //   고점에 있나"(ref ≥ peak)라는 **한 점 조건**이었는데, 한 점에 있을 확률은 틱이 굵을수록 커진다 — 같은
-  //   시장인데 cron(5초 틱)이 폴링(1초 틱)보다 사건을 더 많이 만들었고, 손절 연쇄 쪽이 더 크니 **안 볼 때만
-  //   하락 편향**(하루 −1.7%)이 생겼다(sim 대조: 사건을 끄면 두 틱 간격의 편향이 같아진다). 돌파한 거리의
-  //   누적은 연속 시간에서 잘 정의되는 양(고점 기억의 상승분)이라 틱 간격과 무관하다 — "뚫은 만큼 추격이
-  //   붙는다". 비율(FOMO_RATE/CASCADE_RATE)은 예전 모델의 사건 빈도(1000단위당 5.5 / 6.8)에 맞췄다.
-  //   발동률은 게이지에 비례하고(이미 달아올랐을 때 터진다), 터지면 관심을 끈다(buzz).
+  //   대부분 이 둘이다. 그 방향으로 이미 쏠려 있을 때만 발동하므로 평상시엔 아무 일도 안 일어난다.
+  //   ⚠⚠ 2026-10-28: 사건은 **변동성·관심도**로만 드러난다(§ EVENT_VOL) — 예전의 drift 킥은 "뚫리면 따라 타기" 엣지였다.
+  //   ⚠ 발동 확률은 "이번 틱에 전 고점(저점)을 넘어선 거리"에 비례한다(2026-09-23) — 한 점 조건(ref ≥ peak)은 틱이
+  //   굵을수록 참일 확률이 커서 cron(5초 틱)과 폴링(1초 틱)의 사건 빈도가 달랐다. 돌파 거리의 누적은 틱 간격과 무관하다.
   const brokeUp = Math.max(0, ref - peak) / peak / m; // 진폭 무관(예전 단위)으로 잰 돌파 거리
   const brokeDown = Math.max(0, trough - ref) / trough / m;
   let event = 0;
   if (brokeUp > 0 && s.sentiment > 0.22 && Math.random() < 1 - Math.exp(-FOMO_RATE * brokeUp * (0.55 + 1.1 * greed))) {
     event = 1;
-    drift = clamp(drift + FOMO_KICK * m * (0.5 + Math.random()) * volEff, -0.02 * m, 0.02 * m);
-    buzz += EVENT_BUZZ;
   } else if (
     brokeDown > 0 &&
     s.sentiment < -0.22 &&
     Math.random() < 1 - Math.exp(-CASCADE_RATE * brokeDown * (0.55 + 1.1 * fear))
   ) {
     event = -1;
-    drift = clamp(drift - CASCADE_KICK * m * (0.5 + Math.random()) * volEff, -0.02 * m, 0.02 * m);
+  }
+  if (event !== 0) {
+    vol = clamp(vol * EVENT_VOL, 0.35, 4.5);
     buzz += EVENT_BUZZ;
   }
 
-  // 8) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증(공포가 거래를 만든다).
+  // 5) 거래량은 움직임 크기와 국면에 반응한다 — 큰 봉엔 큰 거래량, 패닉엔 폭증(공포가 거래를 만든다).
   //    ⚠ 움직임 크기는 business time 기준으로 잰다(|ret|/√h) — 벽시계로 재면 관심도가 높은 틱이 "큰 움직임"
-  //    으로 이중 계상된다(관심도는 이미 체결 건수로 거래량에 들어간다).
+  //    으로 이중 계상된다(관심도는 이미 체결 건수로 거래량에 들어간다). 기준 폭은 노이즈 단위(TICK_NOISE)에 묶는다.
   //    ⚠ 탐욕 쪽에도 배수를 준다(2026-08-26) — "급등하면 매수도 많이 붙어야" 급등처럼 보인다.
-  const intensity = clamp(0.5 + Math.abs(ret) / (0.003 * m * Math.sqrt(Math.max(h, 0.05))), 0.45, 6);
+  const intensity = clamp(0.5 + Math.abs(ret) / (VOLUME_MOVE_UNIT * TICK_NOISE * m * Math.sqrt(Math.max(h, 0.05))), 0.45, 6);
   const nextAnchor = anchor + (ref - anchor) * (1 - (1 - ANCHOR_FOLLOW) ** h);
   // 호가 깊이의 비대칭 — 공포장엔 매수벽이 걷히고 매도벽이 쌓인다(그래서 같은 크기 시장가 매도라도
-  // 패닉 때 훨씬 깊게 파고든다). 탐욕장은 반대. 심리가 가격뿐 아니라 유동성으로도 드러나는 부분이다.
+  // 패닉 때 훨씬 깊게 파고든다). 탐욕장은 반대. 심리가 유동성으로 드러나는 부분이다.
+  // ⚠ 공정가는 이걸 모른다 — 유저 시장가의 체결 비용만 달라진다(다음 방향과는 무관).
   const lean = clamp(sentiment, -1, 1);
   const decay = 1 - (1 - EXTREME_DECAY) ** h;
-  // 관심도는 사건으로 튄다(다음 틱부터 반영). 화제성에도 조금 남는다 — 큰 일이 있던 날은 하루 종일 붐빈다.
-  // ⚠⚠ **이미 관심이 높을수록 사건 하나가 더하는 관심은 줄어든다**(BUZZ_SAT). 사건은 business time 으로
-  // 일어나므로(관심도가 높을수록 초당 사건이 많다) 그대로 두면 "관심 → 사건 → 관심"이 스스로 커지는 폭주가
-  // 된다 — 첫 구현에서 관심도가 상한(10)에 붙어 한 주 내내 과열이었다(Hawkes 과정의 분기비 > 1). 포화를 걸면
-  // 관심도가 높을 때 초당 사건 충격이 일정해져 목표로 되돌아가는 힘을 이기지 못한다(모두가 이미 보고 있는
-  // 시장에선 돌파 하나가 새로 부르는 사람이 적다).
+  // 관심도는 사건으로 튄다(다음 틱부터 반영). ⚠⚠ **이미 관심이 높을수록 사건 하나가 더하는 관심은 줄어든다**(BUZZ_SAT).
+  // 사건은 business time 으로 일어나므로(관심도가 높을수록 초당 사건이 많다) 그대로 두면 "관심 → 사건 → 관심"이 스스로
+  // 커지는 폭주가 된다 — 첫 구현에서 관심도가 상한(10)에 붙어 한 주 내내 과열이었다(Hawkes 과정의 분기비 > 1).
   const buzzEff = (buzz * BUZZ_SAT) / (BUZZ_SAT + interest);
   const nextInterest = clamp(interest * Math.exp(buzzEff), INTEREST_MIN, INTEREST_MAX);
   const nextHype = clamp(Math.exp(logH), 0.2, 5);
+  // 체결 방향(테이커) — **이번 틱의 움직임 그 자체**에서 나온다(사는 쪽이 몰려서 올랐다). 크게 움직인 틱일수록 한쪽으로
+  // 쏠리고, 군중 무드가 조금 얹힌다. ⚠ 2026-10-28 전엔 국면마다 고정 편향(takerBias, 공포장 −0.46)이 있었다 — 가격 방향과
+  // 무관하게 테이프만 한쪽으로 쏠렸다. 이 값은 테이프 라벨·체결가 바운스에만 쓰이고 공정가는 건드리지 않는다.
+  const z = ret / Math.max(1e-12, sigma * Math.sqrt(Math.max(h, 1e-6)));
   return {
     next: {
       ref,
@@ -2034,7 +2022,7 @@ export function nextMarketState(
     },
     ret,
     sizeMult: P.sizeMult * intensity * (1 + 0.5 * fear + 0.4 * greed) * coil * FLOW_NORM,
-    buyProb: clamp(0.5 + P.takerBias + 0.18 * lean + (ret >= 0 ? 0.18 : -0.18), 0.05, 0.95),
+    buyProb: clamp(0.5 + 0.32 * Math.tanh(0.9 * z) + 0.08 * lean, 0.05, 0.95),
     // 변동성이 크면 마켓메이커가 물러나 호가가 벌어진다(국면 배수까지 곱하되 상한을 둔다 — 안 두면
     // 투매 때 깊은 레벨이 몇 %씩 벌어져 시장가 슬리피지가 비현실적으로 커진다). 한산할 땐 경쟁하는
     // 마켓메이커가 적어 조금 벌어진다(QUIET_SPREAD).
@@ -2100,6 +2088,9 @@ interface TickResult {
   actor: string;
   /** 사다리를 건너뛴 틱이면 그 몫(§ LadderDebt) — 다음 틱에 넘긴다. 사다리를 만든 틱은 `null`(다 갚았다). */
   debt: LadderDebt | null;
+  /** 이 틱 뒤의 **체결 가능한 가격**(유저 벽 안으로 가둔 공정가) — D1 의 `ref_price`·마크·트리거 경로는 이 값이다.
+   * `next.ref` 는 벽과 무관하게 흐르는 공정가다(§ simulateTick 벽 문단, 2026-10-28). 벽이 없으면 둘이 같다. */
+  px: number;
 }
 
 /** 버스트에서 **사다리를 건너뛴 틱들이 남긴 몫**(2026-10-01, cron CPU 초과 수정 — § runBotTicks).
@@ -2151,7 +2142,7 @@ export function simulateTick(
 ): TickResult {
   // ⚠ 벽시계와 **이 틱이 덮는 초**를 심리 모델에 넘긴다 — 하루 리듬과 관심도(§ 관심도)가 이 값으로 결정된다.
   const step = nextMarketState(prev, now, dtSec);
-  const candidateRef = step.next.ref;
+  const latent = step.next.ref; // 공정가 — 벽과 무관하게 흐른다(아래 ⚠⚠⚠ 2026-10-28)
   const actor = BOT_USER_IDS[Math.floor(Math.random() * BOT_USER_IDS.length)];
 
   // ⚠ 유저가 걸어둔 지정가 "벽"을 존중한다(가짜 high 버그 수정). 랜덤워크 기준가가 유저의 최우선 매도벽
@@ -2167,7 +2158,14 @@ export function simulateTick(
   // ⚠⚠ 벽은 **걸려 있는 유저 지정가 전부**다(§ pickWalls, 2026-10-02) — 현재가보다 위의 매수·아래의 매도도 포함한다. 예전엔
   // marketable 주문을 뺐다(2026-07-24, "시세 1.0 에 0.5 청산 예약 하나로 시장이 0.5 로 끌려간다") — 하지만 걸려 있다는 건 사다리를
   // 다 먹고도 남았다는 뜻이라 그 주문이 곧 최우선호가이고, 빼면 봇이 그 주문을 건너뛰고 너머에서 봇끼리 체결했다(제보: 0.7 에 1조 개
-  // 매수를 걸어도 0.68 에 체결). 끌려가는 게 실제 거래소의 결과다 — 그 가격 너머엔 유동성이 없다. 교착은 아래 흡수 호가가 푼다.
+  // 매수를 걸어도 0.68 에 체결). 교착은 아래 흡수 호가가 푼다.
+  // ⚠⚠⚠ **벽이 가두는 건 체결 가능한 가격(`ref` = px)이지 공정가(`latent`)가 아니다**(2026-10-28). 예전엔 공정가 자체를 벽에 붙여
+  // 다음 틱이 거기서 다시 출발했다 — 벽 아래로 갈 움직임이 통째로 버려지니 가격이 **반사벽**처럼 튕겼고, 그 결과 ①롱을 들고 바로
+  // 아래에 매수벽을 깔면 하락이 그 벽에서 멈췄고 ②양쪽에 벽을 깔면 가격이 그 사이에 갇혀 매수벽에서 사고 매도벽에서 파는 왕복이
+  // 공짜 돈이 됐다(벽 체결엔 역선택이 없었다). 지금은 공정가가 벽과 무관하게 계속 흐르고(상태 `ref`·D1 `fair`), 체결·사다리·마크만
+  // 벽 안에 둔다. 공정가가 벽 너머로 반 스프레드 넘게 가면 그 벽은 **비싼 매수(싼 매도)** 라 봇이 벽을 통째로 받아가고(실거래소에서
+  // 모두가 그 매수에 던지는 것과 같다 — § deep), 벽이 사라지면 가격이 공정가로 간다. "0.7 매수가 남아 있는 한 0.7 아래 체결은 없다"는
+  // 그대로다 — 달라진 건 그 매수가 시장보다 비싸면 먼저 다 채워진다는 것이다.
   const walls = pickWalls(wallRows, prev.ref);
   const wallAsk: number | null = walls.ask ? walls.ask.price : null;
   const wallAskSize = walls.ask ? walls.ask.size : 0;
@@ -2175,7 +2173,11 @@ export function simulateTick(
   const wallBid: number | null = walls.bid ? walls.bid.price : null;
   const wallBidSize = walls.bid ? walls.bid.size : 0;
   const wallBidReady = walls.bid ? walls.bid.readyAt : 0;
-  let ref = candidateRef;
+  /** 공정가 → 이 틱의 벽 안 가격(체결 가능한 가격). */
+  const insideWalls = (p: number) => (wallAsk != null && p > wallAsk ? wallAsk : wallBid != null && p < wallBid ? wallBid : p);
+  // 직전 틱의 체결 가능한 가격 — 이번 틱 체결은 여기서 출발한다(공정가가 벽 너머에 있었으면 벽 가격에서).
+  const prevPx = insideWalls(prev.ref);
+  let ref = latent;
   let press: 'up' | 'down' | null = null;
   if (wallAsk != null && ref > wallAsk) {
     ref = roundOx(wallAsk);
@@ -2266,7 +2268,7 @@ export function simulateTick(
   // 첫 프린트가 곧바로 다시 뽑으므로 이 초기값 자체는 쓰이지 않는다(쪼개진 주문이 아닐 때는 매 건 새로 뽑는다).
   let flowSide: 'buy' | 'sell' = Math.random() < step.buyProb ? 'buy' : 'sell';
   const half = MICRO_HALF_SPREAD * step.spreadMult; // 최우선호가의 half-spread(사다리 최상단과 같은 값)
-  let mid = prev.ref; // 호가 중간값 — 흐름이 밀고(시장충격) 목표 경로가 되돌린다(§ MICRO_MID_FOLLOW)
+  let mid = prevPx; // 호가 중간값 — 흐름이 밀고(시장충격) 목표 경로가 되돌린다(§ MICRO_MID_FOLLOW)
   // mid 가 목표 경로를 따라가는 속도를 **건수와 무관하게** 맞춘다 — 기준(MICRO_FOLLOW_REF건) 틱에서 건당
   // MICRO_MID_FOLLOW 이고, 건수가 적으면 건당 더 많이 따라간다. 안 그러면 체결이 1건뿐인 한산한 틱에서
   // 그 한 건이 목표의 35% 지점에 찍혀 차트가 공정가보다 늘 한 박자 늦는다.
@@ -2278,7 +2280,7 @@ export function simulateTick(
   let sliceSide: 'buy' | 'sell' = 'buy';
   for (let i = 0; i < nTrades; i++) {
     const progress = (i + 1) / nTrades;
-    const walk = prev.ref + (ref - prev.ref) * progress;
+    const walk = prevPx + (ref - prevPx) * progress;
     // ① 테이커 방향 + ⑤ 주문 쪼개기 — 쪼개진 주문이 흐르는 중이면 방향·수량이 부모에 묶이고, 아니면
     //    새로 뽑는다(그때 낮은 확률로 새 부모 주문이 시작된다).
     // ⚠ 수량을 **가격보다 먼저** 뽑는다 — 큰 체결일수록 사다리를 깊이 파고들어 가격을 밀어낸다.
@@ -2364,7 +2366,7 @@ export function simulateTick(
     tape.push({ price, size: sz, takerSide, createdAt: now + Math.round((i * (TICK_PRINT_SPAN_MS - 1)) / Math.max(1, nTrades - 1)) });
   }
 
-  const next: BotState = { ...step.next, ref };
+  const next: BotState = step.next; // ⚠ 공정가(latent) 그대로 — 벽에 가둔 값(ref)을 넣으면 반사벽이 된다(§ 위 벽 문단)
   const bar = printed > 0 ? { open, high, low, close, volume, buy: buyVolume, sell: volume - buyVolume } : null;
   // 규칙 ①의 "지나간 범위" — 체결 범위에 새 공정가를 더한다(체결이 0건이면 공정가 한 점). 호가가 새 공정가를
   // 넘어 교차된 채 남지 않게 하는 것이 곧 역전 방지다. 버스트에서 사다리를 건너뛴 틱들의 범위·교체 속도도
@@ -2379,7 +2381,7 @@ export function simulateTick(
   const pace = step.bookPace + (debt ? debt.pace : 0);
   if (opts.skipBook) {
     // 버스트의 중간 틱 — 사다리는 마지막 틱이 이 몫까지 합쳐 한 번에 만든다(§ LadderDebt).
-    return { next, tape, book: prevBook, bar, notional: notionalSum, actor, debt: { passLow, passHigh, pace } };
+    return { next, tape, book: prevBook, bar, notional: notionalSum, actor, debt: { passLow, passHigh, pace }, px: ref };
   }
 
   // ── 사다리는 매 틱 다시 태어나지 않는다 — 살아남은 주문 위에 새 호가를 얹는다(2026-09-08) ──────
@@ -2521,9 +2523,19 @@ export function simulateTick(
   // ⚠ 두 조건에서만 낸다: (1) 봇 자기 호가와 교차하지 않을 때(벽이 실제로 최우선일 때 — 아니면 시장가로 봇 매수·매도를 오가는
   //    공짜 차익이 생긴다), (2) 그 가격의 유저 주문이 **지금 체결될 수 있을 때**(재체결 간격 § PARTIAL_FILL_COOLDOWN_MS). (2)가 없으면
   //    간격을 기다리는 동안 호가창에 "0.7 매도 물량"이 보이는데 내 0.7 매수는 안 채워지는 모습이 된다 — 그동안의 흐름은 그냥 사라진다.
+  // ⚠⚠ **deep** — 공정가가 벽 너머로 반 스프레드보다 멀리 가 있으면(2026-10-28) 그 벽은 시장보다 비싼 매수(싼 매도)다. 그땐 갉지 않고
+  //    **벽 전부**를 받아간다(실거래소라면 모두가 그 매수에 던진다) — 벽이 사라지면 다음 틱부터 가격이 공정가로 가고, 벽에 체결된
+  //    쪽이 그 차이(역선택)를 진다. 예전처럼 공정가를 벽에 붙여 두면 벽 체결엔 역선택이 없어 벽 왕복이 공짜 돈이었다(§ 위 벽 문단).
+  //    ⚠ 재체결 간격(readyAt)은 그대로 지킨다 — 그동안(최대 5초)은 가격이 벽에 붙어 있다.
   const bite = clamp(step.h, 0.15, 3);
-  const sellToBid = (press === 'down' ? wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment) * bite : 0) + absorbedAtBid;
-  const buyFromAsk = (press === 'up' ? wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment) * bite : 0) + absorbedAtAsk;
+  const deepBid = press === 'down' && wallBid != null && latent < wallBid * (1 - half);
+  const deepAsk = press === 'up' && wallAsk != null && latent > wallAsk * (1 + half);
+  const sellToBid =
+    (press === 'down' ? (deepBid ? wallBidSize : wallAbsorbSize(wallBidSize, step.next.regime, step.next.sentiment) * bite) : 0) +
+    absorbedAtBid;
+  const buyFromAsk =
+    (press === 'up' ? (deepAsk ? wallAskSize : wallAbsorbSize(wallAskSize, step.next.regime, step.next.sentiment) * bite) : 0) +
+    absorbedAtAsk;
   const botBestBid = book.bids.reduce((m, l) => Math.max(m, l.price), -Infinity);
   const botBestAsk = book.asks.reduce((m, l) => Math.min(m, l.price), Infinity);
   if (wallBid != null && sellToBid >= 1 && wallBidReady <= now && botBestBid < wallBid) {
@@ -2535,7 +2547,7 @@ export function simulateTick(
   // 가격 우선순위대로 정렬해 둔다 — 매칭(makerLevels)도 호가창 표시도 이 순서를 그대로 쓴다.
   book.bids.sort((a, b) => b.price - a.price);
   book.asks.sort((a, b) => a.price - b.price);
-  return { next, tape, book, bar, notional: notionalSum, actor, debt: null };
+  return { next, tape, book, bar, notional: notionalSum, actor, debt: null, px: ref };
 }
 
 // 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
@@ -2568,11 +2580,13 @@ interface BotStateRow {
 }
 
 function toBotState(row: BotStateRow | null, ref: number): BotState {
-  // ⚠ 반올림 전 공정가(fair)는 **ref_price 가 그 값의 반올림일 때만** 이어 쓴다. 유저 체결(시장가·청산·SL/TP)은
-  // ref_price 만 바꾸고 fair 는 모르므로, 둘이 어긋났다면 그 사이 유저가 가격을 옮긴 것이다 — 그땐 ref_price 에서
-  // 다시 시작해야 유저의 시장충격이 다음 봇 틱에 지워지지 않는다(별도 동기화 없이 자기 검증).
+  // ⚠⚠ 공정가(fair)는 ref_price(체결 가능한 가격)와 **달라도 된다**(2026-10-28) — 유저 벽이 체결 가격을 가두는 동안 공정가는 벽
+  // 너머로 흐른다(§ simulateTick 벽 문단). 예전엔 "ref_price 가 fair 의 반올림일 때만" 이어 썼는데(유저 체결이 ref_price 만 바꿨기
+  // 때문), 그 검사가 있으면 벽에 가둔 틱마다 공정가가 벽 가격으로 되돌아가 반사벽이 그대로 남는다. 그래서 유저 체결이 ref_price 를
+  // 옮길 때 **fair 도 같은 비율로** 옮기게 했다(§ FAIR_FOLLOW_SQL) — 시장충격은 둘 다에 남고, 벽 너머의 차이는 보존된다.
+  // 둘이 두 배 넘게 어긋나는 건 어떤 경로로도 나올 수 없는 값이라(옛 행·버그) 그때만 ref_price 에서 다시 시작한다.
   const fair = row?.fair ?? 0;
-  const start = fair > 0 && roundOx(fair) === ref ? fair : ref;
+  const start = fair > 0 && fair < ref * 2 && fair > ref / 2 ? fair : ref;
   return {
     ref: start,
     drift: row?.drift ?? 0,
@@ -2687,6 +2701,7 @@ async function runBotTicks(
   let carried: BotBook = parseBook(row?.book_json);
   let book: BotBook | null = null;
   let debt: LadderDebt | null = null; // 사다리를 건너뛴 중간 틱들의 몫(§ LadderDebt) — 마지막 틱이 갚는다
+  let px = state.ref; // 마지막 틱 뒤의 체결 가능한 가격(벽 안) — D1 ref_price 로 커밋한다(§ TickResult.px)
   let notional = 0;
   const closed: { code: string; bar: LiveBar }[] = [];
   const path: number[] = []; // 이 실행이 지나온 기준가들 — 트리거를 여러 지점에서 평가하는 데 쓴다
@@ -2723,7 +2738,8 @@ async function runBotTicks(
     }
     notional += r.notional;
     if (r.bar) closed.push(...accrueLive(live, r.bar, ts)); // 체결이 없던 틱은 캔들을 건드리지 않는다
-    path.push(roundOx(r.next.ref)); // 트리거는 D1 의 ref_price 와 같은 반올림 값으로 판정한다
+    px = r.px;
+    path.push(roundOx(r.px)); // 트리거는 D1 의 ref_price 와 같은 반올림 값(체결 가능한 가격 — 벽 안)으로 판정한다
   }
   if (!book) return { path, ctx: { book: null, tape: null, pendings, live: null, ref: null, mark: null } };
 
@@ -2782,7 +2798,7 @@ async function runBotTicks(
       'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, interest=?, hype=?, fair=?, book_version=book_version+1 WHERE id=? AND last_run=? AND ref_price=? AND book_version=? AND COALESCE(length(tape_json),0)=?',
     ).bind(
       lastTs,
-      roundOx(state.ref), // 바깥(체결가·마크·트리거)은 틱 격자 위의 값만 본다(§ BotState.ref)
+      roundOx(px), // 바깥(체결가·마크·트리거)은 틱 격자 위의 **벽 안** 값만 본다(§ BotState.ref, TickResult.px)
       state.drift,
       state.vol,
       state.sentiment,
@@ -2799,7 +2815,7 @@ async function runBotTicks(
       pendTicks,
       state.interest,
       state.hype,
-      state.ref, // 반올림 전 공정가 — 다음 실행이 이어 쓴다(§ toBotState)
+      state.ref, // 반올림 전·벽과 무관한 공정가 — 다음 실행이 이어 쓴다(§ toBotState)
       pair,
       guard.lastRun,
       guard.ref,
@@ -2829,8 +2845,8 @@ async function runBotTicks(
   return {
     path,
     ctx: touched
-      ? { book: null, tape: null, pendings: null, live, ref: null, mark: roundOx(state.ref) }
-      : { book, tape: displayTape(tapeJson), pendings, live, ref: roundOx(state.ref), mark: roundOx(state.ref) },
+      ? { book: null, tape: null, pendings: null, live, ref: null, mark: roundOx(px) }
+      : { book, tape: displayTape(tapeJson), pendings, live, ref: roundOx(px), mark: roundOx(px) },
   };
 }
 
@@ -2999,7 +3015,7 @@ export async function recordVirtualFill(
     userTapeStmt(env, pair, [{ price, size }], takerSide, now),
     // 유저 체결은 관심을 끈다(§ interestBumpOf) — 같은 upsert 에 컬럼 하나가 붙을 뿐이라 행·문장 증가 0.
     env.DB.prepare(
-      `INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price, ${INTEREST_BUMP_SQL}`,
+      `INSERT INTO spot_bot_state (id, last_run, ref_price) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET ref_price = excluded.ref_price, ${FAIR_FOLLOW_SQL}, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, price, interestBumpOf(size)),
     ...candleUpsertOne(env, pair, price, size, takerSide, now), // 영속 캔들 갱신
     // 이 경로(호가창 walking 을 안 타는 SL/TP 정산 등)의 상대편도 봇이다 — 재고/현금/수수료를 똑같이 정산한다.
@@ -3041,6 +3057,8 @@ const MAKER_SNAPSHOT_LIMIT = 60; // 스냅샷으로 읽어오는 봇 호가 레�
 // 적정가 자체를 옮긴다 — 유저 체결가 방향으로 anchor 를 절반쯤 당겨 시장충격이 "굳게" 한다(나머지 절반은
 // 평균회귀로 서서히 되돌아옴 = 현실적인 임팩트 감쇠). 봇↔봇 합성체결엔 적용 안 함.
 // ⚠ 기준선 tether 가 없으므로(2026-09-23) 유저가 옮긴 가격은 그 자리에서 새 출발점이 된다 — 끌려 돌아갈 곳이 없다.
+// ⚠ 2026-10-28 부터 가격엔 되돌림 자체가 없다(§ 마팅게일 문단) — anchor 는 군중 심리(과열 판정)에만 쓰이므로 이 값은 이제
+//   "큰 체결 뒤 군중이 새 가격을 얼마나 빨리 받아들이나"만 정한다. 시장충격은 기준가(와 공정가, § FAIR_FOLLOW_SQL)에 그대로 남는다.
 const ANCHOR_TRADE_PULL = 0.5;
 
 /** 이 체결을 **덮친 쪽**(taker). 유저가 시장가/marketable 지정가로 들어가면 'user', 이미 걸려 있던
@@ -3194,7 +3212,7 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
     // 체결 테이프는 walking 한 가격대별로 여러 줄(상한 USER_PRINT_MAX), 캔들은 walking 구간의 OHLC.
     userTapeStmt(env, pair, prints, tapeSide, now),
     env.DB.prepare(
-      `INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, ${INTEREST_BUMP_SQL}`,
+      `INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, ${FAIR_FOLLOW_SQL}, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, roundOx(fillAvg), interestBumpOf(filled)),
     ...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled, ...sideVol(tapeSide, filled) }, now),
     // 체결 이력(주문내역)엔 이번 호출의 총 체결을 가중평균가로 1건 기록.
@@ -3368,7 +3386,7 @@ export async function matchMarketOxOrder(
   stmts.push(userTapeStmt(env, pair, prints, isLong ? 'buy' : 'sell', now));
   stmts.push(
     env.DB.prepare(
-      `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${INTEREST_BUMP_SQL}`,
+      `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${FAIR_FOLLOW_SQL}, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, newRef, newAnchor, interestBumpOf(filled)),
   );
   stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled, ...sideVol(isLong ? 'buy' : 'sell', filled) }, now));
@@ -3509,7 +3527,7 @@ async function closePositionAgainstBook(
   stmts.push(userTapeStmt(env, pair, prints, tapeSide, now));
   stmts.push(
     env.DB.prepare(
-      `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${INTEREST_BUMP_SQL}`,
+      `INSERT INTO spot_bot_state (id,last_run,ref_price,anchor) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, anchor=excluded.anchor, ${FAIR_FOLLOW_SQL}, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, newRef, newAnchor, interestBumpOf(filled)),
   );
   stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled, ...sideVol(tapeSide, filled) }, now));

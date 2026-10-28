@@ -1,7 +1,8 @@
 /**
  * 유저 벽 관통 점검 — `npm run check:walls`.
  *
- * 걸려 있는 유저 지정가는 봇 가격의 경계다(§ spot.ts pickWalls, 2026-10-02): 유저 매수가 B 에 걸려 있으면 봇 체결·기준가·봇 매수호가는
+ * 걸려 있는 유저 지정가는 봇 가격의 경계다(§ spot.ts pickWalls, 2026-10-02): 유저 매수가 B 에 걸려 있으면 봇 체결·기준가(체결 가능한 가격 px — 공정가는
+ * 벽 너머로 흐를 수 있다, 2026-10-28)·봇 매수호가는
  * B 아래로 내려가지 않고(봇 매도호가는 B 에만 — 흡수 호가), 매도 A 는 그 반대다. 예전엔 "현재가보다 위의 매수"를 벽에서 빼서, 0.7 에
  * 1조 개 매수를 걸어도 봇끼리 0.68 에 체결했다(제보). 이 스크립트는 `simulateTick` 을 여러 상황으로 수만 틱 돌려 그 불변식을 센다.
  * 위반이 하나라도 있으면 exit 1.
@@ -44,8 +45,9 @@ function run(name: string, ref0: number, sentiment: number, regime: string, wall
       if (!isFinite(t.price) || !(t.price > 0)) r.nan++;
       if (!crossedUsers && ((bid && t.price <= bid.price) || (ask && t.price >= ask.price))) r.through++;
     }
-    const ref = res.next.ref;
-    if (!isFinite(ref)) r.nan++;
+    // ⚠ 벽이 가두는 건 **체결 가능한 가격**(res.px)이다 — 공정가(res.next.ref)는 벽 너머로 흐를 수 있다(2026-10-28, § spot.ts 벽 문단).
+    const ref = res.px;
+    if (!isFinite(ref) || !isFinite(res.next.ref)) r.nan++;
     if (!crossedUsers && ((bid && ref < bid.price - 1e-12) || (ask && ref > ask.price + 1e-12))) r.refThrough++;
     // 흡수 호가 = 벽 가격과 정확히 같은 반대편 봇 호가. 나머지 봇 호가는 유저 주문과 교차하면 안 된다 — 유저 매수 B 이하의 봇 매도,
     // 유저 매도 A 이상의 봇 매수(그 물량은 유저 주문이 받았어야 한다). B 보다 비싼 봇 매수·A 보다 싼 봇 매도는 더 좋은 호가라 괜찮다.
