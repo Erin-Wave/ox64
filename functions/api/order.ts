@@ -21,6 +21,8 @@ import {
   clampOrderSize,
   sizeEps,
   roundVirtual,
+  virtualTick,
+  KRW_SYMBOLS,
   quoteOf,
   balColOf,
   NO_MARK_MSG,
@@ -135,15 +137,29 @@ interface Leg {
   size: number;
 }
 
-/** 분할 지정가의 다리 — 시작가→끝가를 count 등분(양 끝 포함)하고 총 수량을 균등 분배한다. 가상 코인은 틱(유효숫자 4자리)에
- * 맞춰 반올림하고, 반올림으로 같은 가격이 된 다리는 하나로 합친다(같은 가격 두 줄은 의미가 없다). 실제 코인 지정가는
- * 반올림하지 않는다(단일 지정가와 같다) — 나눗셈 먼지만 턴다. */
-function rangeLegs(start: number, end: number, count: number, total: number, isOx: boolean): Leg[] {
+/** 분할 지정가 다리 간격의 하한 — 가격의 0.1%(또는 호가 단위 중 큰 쪽). 이보다 촘촘하면 다리가 사실상 한 가격이라 나눌 의미가 없다. */
+const RANGE_STEP_FRAC = 0.001;
+
+/** 분할 수 자동 결정(2026-11-02, "분할 수는 입력받지 말고 시작가·끝가로 역계산" 요청) — 유저는 시작가·끝가·수량만 넣는다.
+ * 다리 간격이 max(호가 단위, 가격의 0.1%) 이상이 되도록 `범위 ÷ 간격 + 1`건, 상한은 남은 대기 주문 자리(slots).
+ * 클라(OrderPanel autoSplitCount)가 같은 식으로 미리보기를 보여주지만 **결정은 여기서** 한다(남은 자리를 정확히 아는 쪽). */
+function autoRangeCount(start: number, end: number, tick: number, slots: number): number {
+  const lo = Math.min(start, end);
+  const step = Math.max(tick, lo * RANGE_STEP_FRAC);
+  const n = step > 0 ? Math.floor(Math.abs(end - start) / step + 1e-9) + 1 : 1;
+  return Math.max(1, Math.min(MAX_OPEN_ORDERS, slots, n));
+}
+
+/** 분할 지정가의 다리 — 시작가→끝가를 count 등분(양 끝 포함)하고 총 수량을 균등 분배한다. 가격은 호가 단위에 맞춘다 — 가상 코인은
+ * 유효숫자 4자리(roundVirtual), 실제 코인은 클라가 보낸 그 코인의 소수 자릿수(`tickDp`, 없으면 반올림 없이 나눗셈 먼지만 턴다).
+ * 반올림으로 같은 가격이 된 다리는 하나로 합친다(같은 가격 두 줄은 의미가 없다). count 1 = 시작가 한 줄. */
+function rangeLegs(start: number, end: number, count: number, total: number, isOx: boolean, tickDp: number | null): Leg[] {
   const per = total / count;
   const byPrice = new Map<number, number>();
   for (let i = 0; i < count; i++) {
-    const raw = start + ((end - start) * i) / (count - 1);
-    const price = isOx ? roundVirtual(raw) : Number(raw.toPrecision(12));
+    const raw = count > 1 ? start + ((end - start) * i) / (count - 1) : start;
+    const price = isOx ? roundVirtual(raw) : tickDp != null ? Number(raw.toFixed(tickDp)) : Number(raw.toPrecision(12));
+    if (!(price > 0)) continue;
     byPrice.set(price, (byPrice.get(price) ?? 0) + per);
   }
   return [...byPrice].map(([price, size]) => ({ price, size }));
@@ -167,7 +183,8 @@ async function placeLimitLegs(
   symbol: string,
   side: string,
   leverage: number,
-  legs: Leg[],
+  /** 다리 목록, 또는 남은 대기 주문 자리 수를 받아 다리를 만드는 함수(분할 지정가 — 분할 수를 자리에 맞춰 자동으로 정한다). */
+  legsOf: Leg[] | ((slots: number) => Leg[] | string),
   stopLoss: number | null,
   takeProfit: number | null,
 ): Promise<string | { notice?: string }> {
@@ -182,6 +199,19 @@ async function placeLimitLegs(
       .first<{ n: number; reserved: number }>();
   const agg0 = await pendAgg();
   if ((agg0?.n ?? 0) >= MAX_OPEN_ORDERS) return `대기 주문은 ${MAX_OPEN_ORDERS}개까지입니다`;
+  let legs: Leg[];
+  if (typeof legsOf === 'function') {
+    // 남은 자리 = 상한 − 지금 걸린 주문. 이 코인에 포지션이 있으면 1자리 남긴다 — 반대 포지션을 덮는 다리 하나가 청산 줄 + 진입 줄로
+    // 쪼개질 수 있다. ⚠ 방향과 무관하게 "포지션이 있으면"으로 판정하는 이유: 주문 패널 미리보기(OrderPanel autoSplitCount)는 롱/숏 중
+    // 무엇을 누를지 모르는 채로 분할 수를 보여주므로, 같은 규칙이어야 화면에 보인 건수와 실제 건수가 같다.
+    const held = await heldPositions(env, uid, symbol);
+    const slots = MAX_OPEN_ORDERS - (agg0?.n ?? 0) - (held.length > 0 ? 1 : 0);
+    if (slots < 1) return `대기 주문은 ${MAX_OPEN_ORDERS}개까지입니다 (지금 ${agg0?.n ?? 0}개)`;
+    const built = legsOf(slots);
+    if (typeof built === 'string') return built;
+    legs = built;
+  } else legs = legsOf;
+  if (legs.length === 0) return '수량 오류';
   const byFillOrder = [...legs].sort((a, b) => (side === 'long' ? b.price - a.price : a.price - b.price));
 
   // ⚠⚠ 가상 코인: **지금 크로스되는 몫은 즉시 체결**(IOC)하고 나머지만 대기로 건다 — 실제 거래소의 marketable 지정가와 같다.
@@ -624,31 +654,36 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const size = clampOrderSize(Number(body.size)); // limitRange 면 총 수량
     if (badSize(size)) return bad('수량 오류');
 
-    let legs: Leg[];
+    const stopLoss = num(body.stopLoss);
+    const takeProfit = num(body.takeProfit);
+    // 모든 다리에 같은 SL/TP 가 걸린다 — 다리마다 그 지정가 기준으로 맞아야 한다(롱: 손절 < 모든 지정가 < 익절).
+    const slTpOk = (legs: Leg[]) => legs.every((l) => validSlTp(side, l.price, stopLoss, takeProfit));
+
+    let legsOf: Leg[] | ((slots: number) => Leg[] | string);
     if (body.action === 'limitOpen') {
       let limitPrice = Number(body.limitPrice);
       if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
       // OX 는 4자리 틱(0.0001) 정합성 유지 — 유저가 더 세밀한 지정가를 넣어도 호가창/체결이 4자리를 넘지 않게.
       if (isOx) limitPrice = roundVirtual(limitPrice);
-      legs = [{ price: limitPrice, size }];
+      legsOf = [{ price: limitPrice, size }];
+      if (!slTpOk(legsOf)) return bad(SLTP_MSG);
     } else {
+      // 분할 지정가 — 유저는 시작가·끝가·총 수량만 준다. 분할 수는 남은 대기 주문 자리에 맞춰 여기서 정한다(§ autoRangeCount).
       const start = Number(body.startPrice);
       const end = Number(body.endPrice);
-      const count = Math.round(Number(body.count));
       if (!(start > 0) || !isFinite(start)) return bad('시작가 오류');
       if (!(end > 0) || !isFinite(end)) return bad('끝가 오류');
-      if (!(count >= 2 && count <= MAX_OPEN_ORDERS)) return bad(`분할 수는 2~${MAX_OPEN_ORDERS}`);
-      legs = rangeLegs(start, end, count, size, isOx);
+      // 실제 코인의 호가 단위(소수 자릿수)는 클라가 안다(바이낸스 tickSize) — 다리 가격을 거기 맞출 뿐이라 돈과 무관한 값이다.
+      const dpRaw = Math.round(Number(body.tickDp));
+      const tickDp = !isOx && dpRaw >= 0 && dpRaw <= 12 ? dpRaw : null;
+      const tick = isOx ? virtualTick(Math.min(start, end)) : tickDp != null ? 10 ** -tickDp : 0;
+      if (!slTpOk([{ price: start, size }, { price: end, size }])) return bad(SLTP_MSG); // 다리는 전부 이 둘 사이
+      legsOf = (slots) => rangeLegs(start, end, autoRangeCount(start, end, tick, slots), size, isOx, tickDp);
     }
-
-    const stopLoss = num(body.stopLoss);
-    const takeProfit = num(body.takeProfit);
-    // 모든 다리에 같은 SL/TP 가 걸린다 — 다리마다 그 지정가 기준으로 맞아야 한다(롱: 손절 < 모든 지정가 < 익절).
-    if (legs.some((l) => !validSlTp(side, l.price, stopLoss, takeProfit))) return bad(SLTP_MSG);
 
     // ⚠ 가상 코인은 이 요청에서 즉시 체결(쿼리 ~25)까지 할 수 있어, 앞의 트리거 평가는 강제청산만(체결 몫 0 — 걸린 지정가·SL/TP 는 다음
     // 폴링 ≈1초에서). 안 그러면 트리거 체결 하나 + 즉시 체결 + 대기 주문 기록이 요청당 쿼리 50 을 넘을 수 있다(§6).
-    const placed = await placeLimitLegs(env, uid, marks, symbol, side, leverage, legs, stopLoss, takeProfit);
+    const placed = await placeLimitLegs(env, uid, marks, symbol, side, leverage, legsOf, stopLoss, takeProfit);
     if (typeof placed === 'string') return bad(placed);
     return json({ ...(await loadState(env, uid, marks, since)), notice: placed.notice });
   }
@@ -674,6 +709,25 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (res[1].meta.changes !== 1) return bad('주문이 방금 체결되거나 취소됐습니다', 409);
 
     return json(await loadState(env, uid, marks, since));
+  }
+
+  // 미체결 전부 취소(2026-11-02) — 진입 지정가에 잠긴 증거금은 각자 지갑(USDT·원화)으로 돌려주고, 지정가 청산(margin 0)은 그냥 지운다.
+  // ⚠ 환불액은 cancelLimit 과 같은 원칙으로 **지워지는 그 순간의 행**에서 읽는다(한 batch = 한 트랜잭션) — 그 사이 체결된 몫은 이미
+  // 행에서 빠져 있으므로 두 번 돌려주지 않는다. 문장 수는 주문 수와 무관하게 2개(§6).
+  if (body.action === 'cancelAllLimits') {
+    const marks = await checkTriggers(env, uid);
+    const krw = KRW_SYMBOLS.map(() => '?').join(',');
+    const res = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE users SET
+           balance = balance + (SELECT COALESCE(SUM(margin), 0) FROM pending_orders WHERE user_id = ? AND symbol NOT IN (${krw})),
+           krw_balance = krw_balance + (SELECT COALESCE(SUM(margin), 0) FROM pending_orders WHERE user_id = ? AND symbol IN (${krw}))
+         WHERE id = ?`,
+      ).bind(uid, ...KRW_SYMBOLS, uid, ...KRW_SYMBOLS, uid),
+      env.DB.prepare('DELETE FROM pending_orders WHERE user_id = ?').bind(uid),
+    ]);
+    const n = res[1].meta.changes ?? 0;
+    return json({ ...(await loadState(env, uid, marks, since)), notice: n > 0 ? `미체결 ${n}건을 모두 취소했습니다` : '취소할 미체결 주문이 없습니다' });
   }
 
   // 미체결(지정가) 주문의 지정가·수량 수정. 진입 지정가는 증거금을 재계산해 델타만큼 잔고를 원자 조정

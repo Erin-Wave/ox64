@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { tradeHotkeyAllowed } from '@/hotkeys';
-import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
+import { useMarketStore, selectLastPrice, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { fmtMoney, fmtMoneyShort, fmtNumInput, unfmtNum, fmtFeeRate, fmtQtyShort, fmtQty } from '@/format';
-import { baseOf, quoteOf, USDT_KRW } from '@/symbols';
+import { baseOf, isVirtualSymbol, quoteOf, USDT_KRW } from '@/symbols';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit' | 'conditional';
@@ -22,9 +22,16 @@ const MIN_COOLDOWN_SEC = 5;
  * 슬라이더만 올리면 서버가 "레버리지 1~250" 으로 거부하고, 서버만 올리면 화면에서 못 고른다. */
 const MAX_LEVERAGE = 250;
 
-/** 분할 지정가 최대 개수 — 서버 대기 주문 상한(functions/api/order.ts `MAX_OPEN_ORDERS`)과 같은 값. 이미 걸린 주문이 있으면
- * 서버가 "지금 N개 · 이 주문 M줄"로 거부한다(반대 포지션을 덮는 몫은 청산 줄로 하나 더 생길 수 있다). */
-const MAX_SPLIT = 20;
+/** 대기 주문 상한 — 서버(functions/api/order.ts `MAX_OPEN_ORDERS`)와 같은 값. 분할 지정가의 자동 분할 수가 남은 자리까지만 간다. */
+const MAX_OPEN = 20;
+/** 분할 지정가 자동 분할 수 — **서버 autoRangeCount 와 같은 식**(미리보기용, 실제 결정은 서버가 남은 자리를 보고 한다).
+ * 다리 간격 ≥ max(호가 단위, 가격의 0.1%) → `범위 ÷ 간격 + 1`건, 상한은 남은 대기 주문 자리. */
+const RANGE_STEP_FRAC = 0.001;
+function autoSplitCount(start: number, end: number, tick: number, slots: number): number {
+  const step = Math.max(tick, Math.min(start, end) * RANGE_STEP_FRAC);
+  const n = step > 0 ? Math.floor(Math.abs(end - start) / step + 1e-9) + 1 : 1;
+  return Math.max(1, Math.min(MAX_OPEN, slots, n));
+}
 /** 분할 간격 표시 — 유효숫자 6자리(나눗셈 먼지만 턴다). */
 const trimStep = (n: number) => String(Number(n.toPrecision(6)));
 
@@ -61,11 +68,11 @@ export default function OrderPanel() {
   const [pct, setPct] = useState(0); // 수량 슬라이더(가용 잔고*레버리지 대비 비중, 0~100)
   const [leverage, setLeverage] = useState(10);
   const [limitPrice, setLimitPrice] = useState('');
-  // 분할 지정가 — 시작가~끝가를 splitCount 등분(양 끝 포함)하고 총 수량을 균등 분배해 한 번에 건다(서버 action 'limitRange').
+  // 분할 지정가 — 시작가~끝가 사이에 총 수량을 균등 분배해 한 번에 건다(서버 action 'limitRange'). ⚠ 분할 수는 입력받지 않는다 —
+  // 유저는 시작가·끝가·수량만 넣고, 분할 수는 범위에서 자동으로 정해진다(§ autoSplitCount, 결정은 서버).
   const [split, setSplit] = useState(false);
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
-  const [splitCount, setSplitCount] = useState('5');
   // 차트·호가 클릭 가격을 받을 지정가 칸(분할이면 시작가/끝가 중 마지막으로 누른 칸).
   const [limitField, setLimitField] = useState<'start' | 'end'>('start');
   const [triggerPrice, setTriggerPrice] = useState(''); // 조건부 주문 트리거 가격
@@ -162,7 +169,13 @@ export default function OrderPanel() {
   // 분할 지정가 — 다리들의 평균가(균등 분배라 명목가 = 총 수량 × 평균가). 둘 중 하나만 있으면 그 값.
   const startNum = Number(rangeStart) || 0;
   const endNum = Number(rangeEnd) || 0;
-  const countNum = Math.round(Number(splitCount) || 0);
+  const pendingCount = useTradingStore((s) => s.pendingOrders.length);
+  const precisions = useMarketStore((s) => s.precisions);
+  const virtual = isVirtualSymbol(symbol);
+  const tickDp = precisionOf(precisions, symbol); // 이 코인의 호가 소수 자릿수(실제 코인은 바이낸스 tickSize, 가상은 가격에서 파생)
+  // 남은 대기 주문 자리 — 보유 포지션이 있으면 반대 주문 다리 하나가 청산 줄 + 진입 줄로 쪼개질 수 있어 1자리 남긴다(서버와 같은 규칙).
+  const slots = MAX_OPEN - pendingCount - (positions.some((p) => p.symbol === symbol) ? 1 : 0);
+  const countNum = startNum > 0 && endNum > 0 && slots > 0 ? autoSplitCount(startNum, endNum, 10 ** -tickDp, slots) : 0;
   const splitOn = effectiveTab === 'limit' && split;
   const rangeAvg = startNum > 0 && endNum > 0 ? (startNum + endNum) / 2 : startNum || endNum;
   const refPrice =
@@ -208,8 +221,8 @@ export default function OrderPanel() {
     }
     const { stopLoss: sl, takeProfit: tp } = parseSlTp();
     if (splitOn) {
-      if (!(startNum > 0) || !(endNum > 0) || !(countNum >= 2 && countNum <= MAX_SPLIT)) return;
-      limitRange({ symbol, side, size: sz, leverage, startPrice: startNum, endPrice: endNum, count: countNum, stopLoss: sl, takeProfit: tp });
+      if (!(startNum > 0) || !(endNum > 0)) return;
+      limitRange({ symbol, side, size: sz, leverage, startPrice: startNum, endPrice: endNum, tickDp: virtual ? undefined : tickDp, stopLoss: sl, takeProfit: tp });
       return;
     }
     if (effectiveTab === 'limit') {
@@ -400,23 +413,21 @@ export default function OrderPanel() {
                   </div>
                 ))}
               </div>
-              <div className="mt-1.5 flex items-center gap-2">
-                <label className="shrink-0 text-[10px] text-muted">분할 수</label>
-                <div className="flex w-16 items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-                  <input
-                    value={splitCount}
-                    onChange={(e) => setSplitCount(e.target.value.replace(/[^0-9]/g, '').slice(0, 2))}
-                    inputMode="numeric"
-                    title={`2~${MAX_SPLIT}개`}
-                    className="w-full min-w-0 bg-transparent px-2 py-1 text-center text-xs font-semibold text-text outline-none"
-                  />
-                </div>
-                <span className="min-w-0 truncate text-[10px] text-muted">
-                  {startNum > 0 && endNum > 0 && countNum >= 2 && countNum <= MAX_SPLIT
-                    ? `${countNum}건 × ${orderSize > 0 ? fmtQtyShort(orderSize / countNum, 9) : '—'} ${coin} · 간격 ${fmtNumInput(trimStep(Math.abs(endNum - startNum) / (countNum - 1)))}`
-                    : `2~${MAX_SPLIT}건 · 시작가·끝가 포함 등간격`}
-                </span>
-              </div>
+              <p className="mt-1.5 truncate text-[10px] text-muted" title="분할 수는 시작가·끝가 범위로 자동으로 정해집니다(다리 간격은 가격의 0.1% 또는 호가 단위 이상, 남은 대기 주문 자리까지)">
+                {startNum > 0 && endNum > 0 ? (
+                  slots < 1 ? (
+                    <span className="text-down">대기 주문 자리가 없습니다 (최대 {MAX_OPEN}개)</span>
+                  ) : (
+                    <>
+                      자동 <span className="font-semibold text-text">{countNum}건</span>
+                      {` × ${orderSize > 0 ? fmtQtyShort(orderSize / countNum, 9) : '—'} ${coin}`}
+                      {countNum > 1 && ` · 간격 ${fmtNumInput(trimStep(Math.abs(endNum - startNum) / (countNum - 1)))}`}
+                    </>
+                  )
+                ) : (
+                  '시작가·끝가·수량만 넣으면 분할 수는 자동으로 정해집니다'
+                )}
+              </p>
             </>
           )}
         </div>

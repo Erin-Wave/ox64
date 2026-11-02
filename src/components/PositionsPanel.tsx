@@ -62,6 +62,7 @@ export default function PositionsPanel() {
   const closePosition = useTradingStore((s) => s.closePosition);
   const limitClose = useTradingStore((s) => s.limitClose);
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
+  const cancelAllLimits = useTradingStore((s) => s.cancelAllLimits);
   const cancelConditional = useTradingStore((s) => s.cancelConditional);
   const editConditional = useTradingStore((s) => s.editConditional);
   const editLimit = useTradingStore((s) => s.editLimit);
@@ -848,6 +849,23 @@ export default function PositionsPanel() {
           </div>
         ))}
 
+      {/* 미체결 전부 취소 — 잠긴 증거금은 각 지갑으로 환불된다(서버 cancelAllLimits). 실수 방지로 확인창. PC·모바일 공통 한 줄. */}
+      {tab === 'pending' && pendingOrders.length > 0 && (
+        <div className="flex items-center justify-between gap-2 border-b border-border/60 px-3 py-1.5 text-[11px]">
+          <span className="text-muted">
+            미체결 {pendingOrders.length}건
+            {pendingOrders.some((o) => o.reduceOnly) && ` · 지정가 청산 ${pendingOrders.filter((o) => o.reduceOnly).length}건 포함`}
+          </span>
+          <button
+            onClick={() => {
+              if (window.confirm(`미체결 주문 ${pendingOrders.length}건을 모두 취소할까요? (잠긴 증거금은 돌려받습니다)`)) void cancelAllLimits();
+            }}
+            className="shrink-0 rounded border border-border px-2 py-1 text-muted transition hover:border-down hover:text-down"
+          >
+            전부 취소
+          </button>
+        </div>
+      )}
       {tab === 'pending' &&
         (pendingOrders.length === 0 ? (
           empty('미체결 지정가 주문이 없습니다')

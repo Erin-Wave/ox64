@@ -251,11 +251,15 @@ export default function Chart() {
     };
     if (!chart || !c || !optsRef.current.pendingLine) return clear();
     const axisW = chart.priceScale('right').width();
+    // ⚠ priceToCoordinate 는 화면 밖 가격도 좌표를 **외삽해** 돌려준다 — 그대로 그리면 멀리 걸린 주문(분할 지정가 등)의 X 버튼이
+    // 차트 영역 밖으로 삐져나와 아래 주문·포지션 패널 위에 떠 있었다(모바일에서 특히, 2026-11-02). 차트 안(시간축 위)에 보이는 것만.
+    const paneH = (containerRef.current?.clientHeight ?? 0) - chart.timeScale().height();
+    const visible = (y: number | null): y is number => y != null && y >= 0 && y <= paneH;
     const next: PendBtn[] = [];
     for (const o of pendingOrders) {
       if (o.symbol !== symbol) continue;
       const y = c.priceToCoordinate(o.limitPrice);
-      if (y == null) continue;
+      if (!visible(y)) continue;
       next.push({
         id: o.id,
         top: y as number,
@@ -269,7 +273,7 @@ export default function Chart() {
     for (const c2 of conditionalOrders) {
       if (c2.symbol !== symbol) continue;
       const y = c.priceToCoordinate(c2.triggerPrice);
-      if (y == null) continue;
+      if (!visible(y)) continue;
       next.push({
         id: c2.id,
         top: y as number,

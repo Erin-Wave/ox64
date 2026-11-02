@@ -211,7 +211,8 @@ export const api = {
     stopLoss?: number | null;
     takeProfit?: number | null;
   }) => orderReq({ action: 'limitOpen', ...p }),
-  /** 분할 지정가 — 시작가~끝가를 count 등분(양 끝 포함), 총 수량(size)을 균등 분배해 한 번에 건다(서버가 다리를 만든다). */
+  /** 분할 지정가 — 시작가~끝가 사이에 총 수량(size)을 균등 분배해 한 번에 건다. **분할 수는 서버가 정한다**(간격 ≥ max(호가 단위,
+   * 가격의 0.1%), 남은 대기 주문 자리까지). tickDp = 실제 코인 호가 소수 자릿수(다리 가격을 거기 맞춘다). */
   limitRange: (p: {
     symbol: string;
     side: Side;
@@ -219,12 +220,14 @@ export const api = {
     leverage: number;
     startPrice: number;
     endPrice: number;
-    count: number;
+    tickDp?: number;
     stopLoss?: number | null;
     takeProfit?: number | null;
   }) => orderReq({ action: 'limitRange', ...p }),
   cancelLimit: (pendingId: string) =>
     orderReq({ action: 'cancelLimit', pendingId }),
+  /** 미체결 전부 취소(잠긴 증거금은 각 지갑으로 환불). */
+  cancelAllLimits: () => orderReq({ action: 'cancelAllLimits' }),
   editLimit: (pendingId: string, p: { limitPrice?: number; size?: number }) =>
     orderReq({ action: 'editLimit', pendingId, ...p }),
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) =>
