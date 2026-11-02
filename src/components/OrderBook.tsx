@@ -8,6 +8,7 @@ import { bithumbOrderbookStream } from '@/services/bithumb';
 import { fmtMoney, fmtMoneyShort, fmtPct, fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
 import { useDayStats } from '@/hooks/useDayStats';
+import { useIsDesktop } from '@/hooks/useIsDesktop';
 
 const EMPTY_TRADES: TickerTrade[] = [];
 // 수량은 세자리 콤마로. 큰 물량(≥1000)은 소수 1자리, 작은 물량은 최대 4자리(뒤 0 은 자동으로 떨어짐).
@@ -161,21 +162,6 @@ function strengthAt(trades: TickerTrade[], i: number): Strength {
           Math.min(1, Math.log1p((z - STRENGTH_KNEE_Z) / STRENGTH_TAIL_T) / STRENGTH_TAIL_DEN);
   const step = Math.min(STRENGTH_MAX_LEVEL, Math.round(raw));
   return { lvl: price >= center ? step : -step, ref: center };
-}
-
-/** 화면이 PC 폭(Tailwind `md` = 768px)인지. ⚠ App.tsx 의 2열 그리드 분기와 **같은 경계**를 써야 한다 —
- * 어긋나면 사이드바가 아직 안 생긴 좁은 화면에서 호가·체결을 세로로 쌓아 화면을 통째로 밀어낸다. */
-function useIsDesktop(): boolean {
-  const query = '(min-width: 768px)';
-  const [is, setIs] = useState(() => window.matchMedia(query).matches);
-  useEffect(() => {
-    const mq = window.matchMedia(query);
-    const onChange = () => setIs(mq.matches);
-    onChange(); // 마운트 사이에 회전/리사이즈가 있었을 수 있다
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
-  return is;
 }
 
 /** 호가창 + 체결내역 탭. 배치는 설정(bookLayout) — 좌우: 매수(좌)·매도(우) 2열, 각 열 최우선호가가 맨 위 /

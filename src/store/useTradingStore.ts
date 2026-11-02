@@ -91,6 +91,18 @@ interface TradingState {
     stopLoss?: number | null;
     takeProfit?: number | null;
   }) => Promise<void>;
+  /** 분할 지정가(시작가~끝가 count 등분, 총 수량 균등 분배) */
+  limitRange: (p: {
+    symbol: string;
+    side: Side;
+    size: number;
+    leverage: number;
+    startPrice: number;
+    endPrice: number;
+    count: number;
+    stopLoss?: number | null;
+    takeProfit?: number | null;
+  }) => Promise<void>;
   cancelLimit: (pendingId: string) => Promise<void>;
   editLimit: (pendingId: string, p: { limitPrice?: number; size?: number }) => Promise<void>;
   setSlTp: (positionId: string, p: { stopLoss: number | null; takeProfit: number | null }) => Promise<void>;
@@ -440,6 +452,8 @@ export const useTradingStore = create<TradingState>((set) => ({
 
   limitOpen: ({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit }) =>
     action(set, () => api.limitOpen({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit })),
+
+  limitRange: (p) => action(set, () => api.limitRange(p)),
 
   cancelLimit: (pendingId) => action(set, () => api.cancelLimit(pendingId)),
 

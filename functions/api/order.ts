@@ -24,11 +24,19 @@ import {
   quoteOf,
   balColOf,
   NO_MARK_MSG,
-  positionAddStmts,
   positionClaimStmt,
   claimThenSettle,
   guardStmt,
   guardedBatch,
+  heldPositions,
+  splitHeld,
+  planRealEntry,
+  entryNotice,
+  qtyText,
+  userPositions,
+  unrealizedOf,
+  vipOf,
+  type D1PreparedStatement,
   type Env,
   type PositionRow,
   type PendingRow,
@@ -40,7 +48,13 @@ import { autoWritesBlocked } from '../_budget';
 
 const ENTRY_BLOCKED_MSG =
   '오늘 서버 사용량이 무료 한도의 안전선에 닿아 새 진입을 잠시 멈췄습니다. 청산·취소·SL/TP 는 그대로 됩니다. 한국시간 오전 9시에 풀립니다.';
-import { matchLimitPendingAgainstBook, matchMarketOxOrder, marketCloseOxPosition, matchReduceOnlyOxPending } from './spot';
+import {
+  matchLimitPendingAgainstBook,
+  matchMarketOxOrder,
+  marketCloseOxPosition,
+  matchReduceOnlyOxPending,
+  crossingOxPendings,
+} from './spot';
 
 const SLTP_MSG = 'SL/TP 값이 올바르지 않습니다 (롱: 손절가 < 현재가 < 익절가, 숏은 반대)';
 /** 선점(compare-and-swap)이 빗나갔을 때 — 그 사이 다른 체결·청산·수정이 같은 행을 바꿨다. 최신 상태를 보고 다시 하면 된다. */
@@ -54,6 +68,8 @@ const MAX_OPEN_ORDERS = 20;
  *   { action: 'open',       symbol, side, size, leverage, stopLoss?, takeProfit? }
  *   { action: 'close',      positionId, size? }   // size 생략/전체수량=전량 청산, 그보다 작으면 부분 청산
  *   { action: 'limitOpen',  symbol, side, size, leverage, limitPrice, stopLoss?, takeProfit? }
+ *   { action: 'limitRange', symbol, side, size(총 수량), leverage, startPrice, endPrice, count(2~20), stopLoss?, takeProfit? }  // 분할 지정가
+ *   ⚠ 원웨이 모드 — 반대 포지션이 있으면 진입 주문은 그걸 먼저 줄인다(§ _shared planRealEntry · placeLimitLegs)
  *   { action: 'cancelLimit', pendingId }
  *   { action: 'setSlTp',    positionId, stopLoss: number|null, takeProfit: number|null }
  *
@@ -102,24 +118,196 @@ function noMarginMsg(available: number, price: number, leverage: number, feeRate
   return `증거금이 부족합니다 (최대 약 ${n} 개)`;
 }
 
-/** 서버 문구용 수량 — 유효숫자 12자리(부동소수 먼지만 털고 남은 수량은 정확히), 아주 큰 값은 지수. */
-function qtyText(n: number): string {
-  return n >= 1e15 ? n.toExponential(4) : Number(n.toPrecision(12)).toLocaleString('en-US', { maximumFractionDigits: 8 });
-}
-/** 시장가가 요청 수량을 다 못 채웠을 때 응답에 싣는 안내(`notice`) — 에러가 아니다(체결된 만큼은 반영됐다).
- * ⚠ 시장가는 **호가에 있는 물량만** 체결한다(2026-10-02, § spot.ts "호가에 있는 물량만" · § _shared fetchBook). 안내가 없으면
- * 1e20 개를 눌렀는데 75 개만 들어간 걸 알 방법이 없다. */
-function openShortNotice(requested: number, filled: number, why: 'liquidity' | 'margin' | undefined): string | undefined {
-  if (!why || filled >= requested - sizeEps(requested)) return undefined;
-  return why === 'liquidity'
-    ? `호가 물량이 부족해 ${qtyText(filled)} 개만 체결됐습니다 (주문 ${qtyText(requested)} 개 · 나머지는 취소)`
-    : `증거금 한도까지 ${qtyText(filled)} 개만 체결됐습니다 (주문 ${qtyText(requested)} 개)`;
-}
+// 시장가가 요청 수량을 다 못 채웠거나 반대 포지션을 줄였을 때의 안내(`notice`)는 § _shared entryNotice — 에러가 아니다.
+// ⚠ 시장가는 **호가에 있는 물량만** 체결한다(2026-10-02, § spot.ts "호가에 있는 물량만" · § _shared fetchBook). 안내가 없으면
+// 1e20 개를 눌렀는데 75 개만 들어간 걸 알 방법이 없다.
 function closeShortNotice(requested: number, filled: number, left: number): string | undefined {
   if (filled >= requested - sizeEps(requested)) return undefined;
   return `호가 물량이 부족해 ${qtyText(filled)} 개만 청산됐습니다 — 남은 ${qtyText(left)} 개는 포지션에 그대로 있습니다`;
 }
 const NO_BOOK_MSG = '호가를 받지 못했습니다 — 잠시 후 다시 시도해 주세요';
+/** 진입 batch 가 가드에 걸렸다 — 그 사이 잔고가 바뀌었거나(증거금 부족) 다른 주문이 반대 포지션을 열었다(원웨이 가드, § _shared positionAddStmts). */
+const RACE_MSG = '증거금이 부족하거나 방금 다른 주문과 겹쳤습니다 — 최신 상태를 확인하고 다시 시도해 주세요';
+
+/** 지정가 한 줄(가격·수량). */
+interface Leg {
+  price: number;
+  size: number;
+}
+
+/** 분할 지정가의 다리 — 시작가→끝가를 count 등분(양 끝 포함)하고 총 수량을 균등 분배한다. 가상 코인은 틱(유효숫자 4자리)에
+ * 맞춰 반올림하고, 반올림으로 같은 가격이 된 다리는 하나로 합친다(같은 가격 두 줄은 의미가 없다). 실제 코인 지정가는
+ * 반올림하지 않는다(단일 지정가와 같다) — 나눗셈 먼지만 턴다. */
+function rangeLegs(start: number, end: number, count: number, total: number, isOx: boolean): Leg[] {
+  const per = total / count;
+  const byPrice = new Map<number, number>();
+  for (let i = 0; i < count; i++) {
+    const raw = start + ((end - start) * i) / (count - 1);
+    const price = isOx ? roundVirtual(raw) : Number(raw.toPrecision(12));
+    byPrice.set(price, (byPrice.get(price) ?? 0) + per);
+  }
+  return [...byPrice].map(([price, size]) => ({ price, size }));
+}
+
+/**
+ * 지정가 다리들을 건다(단일 지정가 = 다리 1개, 분할 지정가 = 여러 개).
+ * ⚠⚠ 원웨이: 반대 포지션이 있으면 그걸 덮는 몫은 **지정가 청산(reduce-only, 증거금 0)** 으로, 넘치는 몫만 증거금을 잠그는 진입
+ * 주문으로 건다 — 롱을 들고 숏 지정가를 거는 건 "청산 예약"이지 새 위험이 아니다(전량 증거금을 잠그면 증거금을 다 쓴 롱을
+ * 지정가로 정리할 수 없다). 덮을 수 있는 양 = 포지션 − 이미 걸린 지정가 청산(limitClose 와 같은 규칙).
+ * 덮는 몫은 **먼저 체결될 다리부터**(매수는 높은 가격, 매도는 낮은 가격) 배정하고, 같은 가격에선 청산 줄을 먼저 넣는다(rowid 순 =
+ * 평가 순). 평가 쪽도 reduce-only 를 먼저 본다(§ _trading runTriggers · spot sweepRestingOxPendings) — 진입 줄이 먼저 체결되면
+ * 그 줄이 포지션을 줄여 버려 청산 줄이 고아가 되고, 뒤집기(롱→숏)가 평탄으로 끝난다.
+ * 체결 시점에 포지션이 바뀌어 있어도 안전하다: 진입 줄은 체결 때 다시 넷팅하고(§ _shared planRealEntry 등), 청산 줄은 대상이
+ * 없으면 정리된다. 반환: 실패 사유(문자열) 또는 { notice }.
+ */
+async function placeLimitLegs(
+  env: Env,
+  uid: string,
+  marks: Record<string, number>,
+  symbol: string,
+  side: string,
+  leverage: number,
+  legs: Leg[],
+  stopLoss: number | null,
+  takeProfit: number | null,
+): Promise<string | { notice?: string }> {
+  const col = balColOf(symbol);
+  const name = (s: string) => (s === 'long' ? '롱' : '숏');
+  // 대기 주문 수 + 이 포지션에 이미 걸린 지정가 청산 합 — 한 쿼리로(요청당 쿼리 50, §6).
+  const pendAgg = () =>
+    env.DB.prepare(
+      'SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN symbol = ? AND side = ? AND reduce_only = 1 THEN size END), 0) AS reserved FROM pending_orders WHERE user_id = ?',
+    )
+      .bind(symbol, side, uid)
+      .first<{ n: number; reserved: number }>();
+  const agg0 = await pendAgg();
+  if ((agg0?.n ?? 0) >= MAX_OPEN_ORDERS) return `대기 주문은 ${MAX_OPEN_ORDERS}개까지입니다`;
+  const byFillOrder = [...legs].sort((a, b) => (side === 'long' ? b.price - a.price : a.price - b.price));
+
+  // ⚠⚠ 가상 코인: **지금 크로스되는 몫은 즉시 체결**(IOC)하고 나머지만 대기로 건다 — 실제 거래소의 marketable 지정가와 같다.
+  // 대기 줄로 먼저 넣으면 다음 봇 틱에서 "유저 지정가 = 벽" 규칙(§ spot pickWalls)이 기준가를 그 지정가까지 밀어, 시장가보다 훨씬
+  // 불리한 **자기 지정가**에 흡수 체결됐다(현재가 1.57 에 1.644 매수 지정가 → 1.644 체결, 로컬 재현). 즉시 체결은 시장가 매칭에
+  // 가격 상한만 둔 것이라 원웨이 넷팅(반대 포지션 먼저)·크로스 증거금 판정이 시장가와 똑같다. ⚠ 한 요청엔 **가장 먼저 체결될 다리
+  // 하나만**(체결 하나가 쿼리 ~25, §6) — 분할 지정가가 현재가를 넘나들면 나머지 크로스 다리는 대기로 들어가 자기 지정가에 체결된다.
+  let iocNote: string | undefined;
+  let firstDone = false;
+  if (isVirtualSymbol(symbol)) {
+    const first = byFillOrder[0];
+    const crossing = await crossingOxPendings(env, [{ id: 'ioc', symbol, side, limit_price: first.price } as PendingRow]);
+    if (crossing.has('ioc')) {
+      const uPnL0 = unrealizedOf(await userPositions(env, uid), marks, 'USDT');
+      if (!isFinite(uPnL0)) return NO_MARK_MSG;
+      const r = await matchMarketOxOrder(env, symbol, uid, side, first.size, leverage, stopLoss, takeProfit, uPnL0, undefined, first.price);
+      if (r.filled > 0) {
+        const left = first.size - r.filled;
+        firstDone = left <= sizeEps(first.size);
+        first.size = Math.max(0, left);
+        marks[symbol] = r.avgPrice;
+        iocNote = `즉시 체결 ${qtyText(r.filled)} 개` + (r.reduced > 0 ? ` — ${entryNotice(side, r.filled, r.reduced, r.opened, r.closedSide)}` : '');
+      }
+    }
+  }
+  const resting = byFillOrder.filter((l, i) => !(i === 0 && firstDone) && l.size > 0);
+  if (resting.length === 0) return { notice: iocNote };
+
+  const [user, mine, agg] = await Promise.all([
+    env.DB.prepare(`SELECT ${col} AS bal FROM users WHERE id = ?`).bind(uid).first<{ bal: number }>(),
+    userPositions(env, uid),
+    iocNote ? pendAgg() : Promise.resolve(agg0),
+  ]);
+  if (!user) return '로그인이 필요합니다';
+  const { opp } = splitHeld(
+    mine.filter((p) => p.symbol === symbol),
+    side,
+  );
+  let cover = opp ? Math.max(0, opp.size - (agg?.reserved ?? 0)) : 0;
+
+  type Row = Leg & { id: string; reduce: boolean; margin: number };
+  const rows: Row[] = [];
+  for (const l of resting) {
+    const r = Math.min(l.size, cover);
+    if (r > sizeEps(l.size)) {
+      rows.push({ ...l, size: r, id: crypto.randomUUID(), reduce: true, margin: 0 });
+      cover -= r;
+    }
+    const o = l.size - (r > sizeEps(l.size) ? r : 0);
+    if (o > sizeEps(l.size)) rows.push({ ...l, size: o, id: crypto.randomUUID(), reduce: false, margin: (l.price * o) / leverage });
+  }
+  if (rows.length === 0) return iocNote ? { notice: iocNote } : '수량 오류';
+  // ⚠ 즉시 체결이 이미 됐으면 그 뒤의 실패는 에러가 아니라 안내다(체결된 만큼은 반영됐다) — 나머지를 못 건 이유만 붙인다.
+  const fail = (why: string) => (iocNote ? { notice: `${iocNote} · 나머지는 걸지 못했습니다: ${why}` } : why);
+  // 대기 주문 개수 상한 — 한 유저가 수백 개를 걸면 매 평가가 그만큼 일을 한다(요청당 D1 쿼리 50, §6).
+  const n = agg?.n ?? 0;
+  if (n + rows.length > MAX_OPEN_ORDERS) {
+    return fail(
+      n >= MAX_OPEN_ORDERS
+        ? `대기 주문은 ${MAX_OPEN_ORDERS}개까지입니다`
+        : `대기 주문은 ${MAX_OPEN_ORDERS}개까지입니다 (지금 ${n}개 · 이 주문 ${rows.length}줄)`,
+    );
+  }
+
+  const margin = rows.reduce((a, r) => a + r.margin, 0);
+  const openQty = rows.reduce((a, r) => a + (r.reduce ? 0 : r.size), 0);
+  const avgOpenPx = openQty > 0 ? (margin * leverage) / openQty : 0;
+  let uPnL = 0;
+  let available = 0;
+  if (margin > 0) {
+    // 크로스: 가용 = 여유잔고 + 그 지갑 포지션 미실현손익. 지정가도 이 가용 안에서 증거금을 잠근다.
+    uPnL = unrealizedOf(mine, marks, quoteOf(symbol));
+    if (!isFinite(uPnL)) return fail(NO_MARK_MSG);
+    available = (user.bal ?? 0) + uPnL;
+    if (margin > available) return fail(noMarginMsg(available, avgOpenPx, leverage, 0));
+  }
+
+  const now = Date.now();
+  // 다중행 INSERT — 문장 수가 다리 수와 무관하게(8줄/문장, 바운드 파라미터 100 한도) 거의 상수다(§6 invocation당 쿼리 50).
+  const inserts: D1PreparedStatement[] = [];
+  for (let i = 0; i < rows.length; i += 8) {
+    const rs = rows.slice(i, i + 8);
+    inserts.push(
+      env.DB.prepare(
+        `INSERT INTO pending_orders (id, user_id, symbol, side, size, leverage, limit_price, margin, stop_loss, take_profit, created_at, reduce_only) VALUES ${rs.map(() => '(?,?,?,?,?,?,?,?,?,?,?,?)').join(',')}`,
+      ).bind(
+        ...rs.flatMap((r) => [
+          r.id,
+          uid,
+          symbol,
+          side,
+          r.size,
+          r.reduce ? opp!.leverage : leverage,
+          r.price,
+          r.margin,
+          r.reduce ? null : stopLoss,
+          r.reduce ? null : takeProfit,
+          now,
+          r.reduce ? 1 : 0,
+        ]),
+      ),
+    );
+  }
+  // ⚠⚠ 증거금 잠금(차감) + 가드 + 주문을 **한 batch** 로(2026-10-01). 예전엔 둘을 한 batch 에 넣고 가드 결과를 안 봐서
+  // 0행이어도 주문이 생겼다 — 동시에 여러 번 보내면 증거금 없는 주문이 생기고, **취소하면 안 낸 증거금이 환불**됐다.
+  const stmts =
+    margin > 0
+      ? [env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(margin, uid, margin, -uPnL), guardStmt(env), ...inserts]
+      : inserts;
+  if (!(await guardedBatch(env, stmts))) return fail(noMarginMsg(available, avgOpenPx, leverage, 0));
+  // (가상 코인의 크로스 몫은 위에서 이미 즉시 체결했다 — 여기 걸린 줄은 대기다. 실제 코인은 다음 평가에서 mark 크로스로 체결된다.)
+
+  const reduced = rows.reduce((a, r) => a + (r.reduce ? r.size : 0), 0);
+  const parts: string[] = iocNote ? [iocNote] : [];
+  if (reduced > 0 && opp) {
+    parts.push(
+      `보유 ${name(opp.side)} ${qtyText(reduced)} 개는 지정가 청산(증거금 없음)으로` +
+        (openQty > 0 ? `, ${qtyText(openQty)} 개는 ${name(side)} 진입으로 걸었습니다` : ' 걸었습니다'),
+    );
+  } else if (legs.length > 1) {
+    parts.push(`분할 지정가 ${rows.length}건을 걸었습니다`);
+  } else if (iocNote) {
+    parts.push(`나머지 ${qtyText(openQty)} 개는 지정가로 대기합니다`);
+  }
+  return { notice: parts.length ? parts.join(' · ') : undefined };
+}
 
 /** 무한(반복) 조건부 옵션 파싱 — conditionalOpen/editConditional 이 공유한다.
  * 필드가 `undefined`(=아예 안 보냄)면 prev 값을 유지하고, `null`/`''` 이면 "해제"로 본다.
@@ -199,7 +387,10 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
 
   // ⚠ 오늘 D1 쓰기가 운영 상한(무료 한도의 95%)에 가까우면 **새 위험을 여는 주문만** 받지 않는다(§ _budget ENTRY_BLOCK_DAY_ROWS).
   // 청산·지정가 청산·취소·수정·SL/TP 는 그대로 — 포지션을 줄이는 길은 막지 않는다. 판정은 isolate 캐시(60초)라 D1 읽기는 거의 0.
-  if ((body.action === 'open' || body.action === 'limitOpen' || body.action === 'conditionalOpen') && (await autoWritesBlocked(env, 'entry')))
+  if (
+    (body.action === 'open' || body.action === 'limitOpen' || body.action === 'limitRange' || body.action === 'conditionalOpen') &&
+    (await autoWritesBlocked(env, 'entry'))
+  )
     return bad(ENTRY_BLOCKED_MSG, 429);
 
   // 지정가/SL·TP/강제청산 체크는 각 액션 안에서 호출한다(수동 액션과 레이스 방지). 반환된 마크가격
@@ -226,16 +417,24 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
       // 두 번 읽던 자리다. 무료 플랜은 invocation 당 D1 쿼리가 50 뿐이라(§6) 대량 시장가에선 이 한 개가
       // 한도를 넘기는 마지막 한 개가 될 수 있다(§ spot.ts userTradeStmts).
       const ref = marks[symbol] ?? (await fetchPrice(env, symbol));
-      if (!validSlTp(side, ref, stopLoss, takeProfit)) return bad(SLTP_MSG);
       // 크로스: 여유잔고 + 전 포지션 미실현손익까지 증거금으로 walking 체결에 쓸 수 있게 uPnL 을 넘긴다.
-      // (가상 코인은 USDT 지갑 — 원화 포지션 손익은 섞지 않는다)
-      const uPnL = await unrealizedTotal(env, uid, marks, 'USDT');
+      // (가상 코인은 USDT 지갑 — 원화 포지션 손익은 섞지 않는다). 포지션은 한 번만 읽어 SL/TP 판정에도 쓴다.
+      const mine = await userPositions(env, uid);
+      const uPnL = unrealizedOf(mine, marks, 'USDT');
       if (!isFinite(uPnL)) return bad(NO_MARK_MSG);
-      const { filled, avgPrice, reason, short } = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
+      // SL/TP 는 새로 여는 몫이 있을 때만 의미가 있다(원웨이 — 반대 포지션을 줄이기만 하는 주문이면 무시된다).
+      const opp = mine.find((p) => p.symbol === symbol && p.side !== side);
+      const opens = !opp || size > opp.size + sizeEps(opp.size);
+      if (opens && !validSlTp(side, ref, stopLoss, takeProfit)) return bad(SLTP_MSG);
+      const r = await matchMarketOxOrder(env, symbol, uid, side, size, leverage, stopLoss, takeProfit, uPnL);
       // 사유를 구분해서 답한다 — 잔고 레이스로 못 넣은 걸 "호가 물량이 없다"로 답하면 원인을 오해한다.
-      if (!(filled > 0)) return bad(reason === 'margin' ? '증거금이 부족합니다 (잔고가 방금 바뀌었을 수 있습니다)' : '체결 가능한 호가 물량이 없습니다');
-      marks[symbol] = avgPrice || ref;
-      return json({ ...(await loadState(env, uid, marks, since)), notice: openShortNotice(size, filled, short) });
+      if (!(r.filled > 0)) {
+        return r.reason === 'changed'
+          ? bad(CHANGED_MSG, 409)
+          : bad(r.reason === 'margin' ? RACE_MSG : '체결 가능한 호가 물량이 없습니다');
+      }
+      marks[symbol] = r.avgPrice || ref;
+      return json({ ...(await loadState(env, uid, marks, since)), notice: entryNotice(side, size, r.reduced, r.opened, r.closedSide, r.short) });
     }
 
     // 실제 코인: 트리거 평가·mark·호가창을 병렬로 받아 롱/숏 버튼 지연을 줄인다. 셋 다 끝난 뒤에야 잔고/기존포지션을
@@ -245,10 +444,12 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     if (!book) return bad(NO_BOOK_MSG);
 
     // ⚠ 원화 심볼은 원화 지갑에서 증거금·수수료가 나간다(§ _shared quoteOf) — 컬럼을 하드코딩하지 말 것.
+    // 잔고와 요율(누적 거래대금)은 같은 users 행 — 한 번에. 이 심볼의 포지션은 양방향을 한 번에(원웨이 넷팅 + 레버리지 고정).
     const col = balColOf(symbol);
-    const user = await env.DB.prepare(`SELECT id, name, ${col} AS bal FROM users WHERE id = ?`)
-      .bind(uid)
-      .first<{ bal: number }>();
+    const [user, held] = await Promise.all([
+      env.DB.prepare(`SELECT ${col} AS bal, total_volume FROM users WHERE id = ?`).bind(uid).first<{ bal: number; total_volume: number }>(),
+      heldPositions(env, uid, symbol),
+    ]);
     if (!user) return bad('unauthorized', 401);
 
     // 크로스 마진 가용 증거금 = 여유잔고 + 전 포지션 미실현손익. 이익 중이면 그 미실현이익까지 새
@@ -256,59 +457,46 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 잔고 차감 가드는 balance - margin >= -uPnL (⟺ available >= margin) 로 원자적으로 막는다.
     const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(symbol));
     if (!isFinite(uPnL)) return bad(NO_MARK_MSG); // 시세 모르는 포지션의 손실을 0 으로 치고 새 위험을 받지 않는다
-    const available = (user.bal ?? 0) + uPnL;
     // 수수료 = 명목금액(체결가×수량) × VIP 등급 수수료율. 진입 시엔 증거금과 **함께** 차감해야
     // 원자 가드가 성립한다(따로 빼면 증거금은 통과하고 수수료만 실패하는 틈이 생긴다).
-    const feeRate = await feeRateOf(env, uid);
+    const feeRate = vipOf(user.total_volume ?? 0).rate;
 
-    // 같은 심볼·같은 방향으로 이미 보유 중인 포지션이 있으면 새 행을 또 만들지 않고 그 포지션에
-    // 물타기/불타기 방식으로 합친다(평단가 재계산) — 거래소들의 "원웨이 모드"와 동일한 동작.
-    // 레버리지는 최초 진입 때 값으로 고정(포지션 하나에 레버리지가 섞이면 증거금 계산이 불가능해짐).
-    // ⚠ 여기서 읽는 건 레버리지뿐이다 — 합치기 자체는 SQL 이 상대값으로 한다(§ _shared positionAddStmts).
-    const existing = await env.DB.prepare(
-      'SELECT leverage FROM positions WHERE user_id = ? AND symbol = ? AND side = ? ORDER BY opened_at LIMIT 1',
-    )
-      .bind(uid, symbol, side)
-      .first<{ leverage: number }>();
-    const effLev = existing ? existing.leverage : leverage;
-    // ⚠ SL/TP 는 **지금 가격** 기준(롱: 손절 < 현재가 < 익절). 물타기면 새로 준 값만 바뀌고 안 준 쪽은 기존 값이 남는다.
-    if (!validSlTp(side, price, stopLoss, takeProfit)) return bad(SLTP_MSG);
-
-    // ── 호가창 walking: ① 물량만큼으로 자르고 ② 그 수량도 mark 로 따져 감당 못 하면 예전처럼 거부("최대 약 N 개") ③ 실제
-    //    호가 가격(슬리피지 포함)으로 다시 먹되 가용 안에서만 — 슬라이더 100% 처럼 mark 로 딱 맞춘 주문이 슬리피지만큼 모자라
-    //    통째로 거부되지 않고 감당되는 만큼 들어간다. ──
-    const levels = takeSideOf(book, side === 'long');
-    const depth = walkBook(levels, size);
-    if (!(depth.filled > 0)) return bad('체결 가능한 호가 물량이 없습니다');
-    if (price * depth.filled * (1 / effLev + feeRate) > available) return bad(noMarginMsg(available, price, effLev, feeRate));
-    const w = walkBook(levels, depth.filled, available * (1 - 1e-6), (p) => p / effLev + p * feeRate);
-    if (!(w.filled > 0)) return bad(noMarginMsg(available, price, effLev, feeRate));
-    const filled = w.filled;
-    const fillPx = w.cost / filled; // 가중평균 체결가
-    const notional = w.cost;
-    const fee = notional * feeRate;
-    const margin = notional / effLev;
-
-    const now = Date.now();
-    // ⚠⚠ 잔고 차감(크로스 가드) + 가드 + 포지션·원장을 **한 batch** 로(2026-10-01). 예전엔 이 가드를 포지션 INSERT 와 같은
-    // batch 에 넣고 끝난 뒤에 `changes` 를 봤는데, D1 batch 는 0행 UPDATE 를 실패로 보지 않아서(§4) **가드가 실패해도
-    // 포지션이 그대로 생겼다** — 잔고만큼의 주문을 동시에 두 번 보내면 하나는 공짜 포지션이었다(감사: 돈이 생기는 구멍).
-    // 가드 문장(§ _shared guardStmt)이 차감 실패 시 batch 전체를 되돌린다.
-    const ok = await guardedBatch(env, [
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(margin + fee, uid, margin + fee, -uPnL),
-      guardStmt(env),
-      ...feeAccrualStmts(env, uid, symbol, 'open', notional, feeRate, fee, now),
-      ...positionAddStmts(env, { uid, symbol, side, price: fillPx, size: filled, leverage: effLev, margin, stopLoss, takeProfit, now }),
-      env.DB.prepare(
-        'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      ).bind(crypto.randomUUID(), uid, symbol, side, fillPx, filled, effLev, 'open', null, now),
-    ]);
-    if (!ok) return bad(noMarginMsg(available, price, effLev, feeRate));
+    // ⚠⚠ 원웨이(§ _shared planRealEntry): 반대 포지션이 있으면 그걸 먼저 줄이고(증거금 불필요), 다 닫은 뒤 남는 수량만 연다.
+    // 같은 방향이면 그 포지션에 합친다(평단 재계산, 레버리지는 최초 진입 값 고정 — 합치기는 SQL 상대값, § positionAddStmts).
+    // 호가창 walking: ① 물량만큼으로 자르고 ② 순수 진입이면 그 수량도 mark 로 따져 감당 못 하면 거부("최대 약 N 개") ③ 실제 호가
+    // 가격(슬리피지 포함)으로 다시 먹되 가용 안에서만. 잔고 차감(크로스 가드)·선점·포지션·원장은 **한 batch** 다(2026-10-01, 가드 문장).
+    const plan = planRealEntry(env, {
+      uid,
+      symbol,
+      side,
+      size,
+      leverage,
+      stopLoss,
+      takeProfit,
+      levels: takeSideOf(book, side === 'long'),
+      mark: price,
+      bal: user.bal ?? 0,
+      uPnL,
+      feeRate,
+      held,
+      strict: true,
+      now: Date.now(),
+    });
+    const effLev = plan.noMargin?.effLev ?? leverage;
+    if (plan.noMargin) return bad(noMarginMsg(plan.noMargin.available, price, effLev, feeRate));
+    if (!(plan.reduced + plan.opened > 0)) return bad('체결 가능한 호가 물량이 없습니다');
+    // ⚠ SL/TP 는 **지금 가격** 기준(롱: 손절 < 현재가 < 익절) — 새로 여는 몫이 있을 때만 의미가 있다(줄이기만이면 무시).
+    if (plan.opened > 0 && !validSlTp(side, price, stopLoss, takeProfit)) return bad(SLTP_MSG);
+    if (!(await guardedBatch(env, plan.stmts))) {
+      return plan.reduced > 0 ? bad(CHANGED_MSG, 409) : bad(RACE_MSG);
+    }
 
     // 화면 시세는 mark 그대로(체결가는 슬리피지만큼 불리하다 — 그 차이가 곧 진입 직후의 미실현손익이다).
     marks[symbol] = price;
-    const why = depth.filled < size - sizeEps(size) ? 'liquidity' : w.budgetCut ? 'margin' : undefined;
-    return json({ ...(await loadState(env, uid, marks, since)), notice: openShortNotice(size, filled, why) });
+    return json({
+      ...(await loadState(env, uid, marks, since)),
+      notice: entryNotice(side, size, plan.reduced, plan.opened, plan.closedSide, plan.why),
+    });
   }
 
   if (body.action === 'close') {
@@ -422,60 +610,47 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     return json(await loadState(env, uid, marks, since));
   }
 
-  if (body.action === 'limitOpen') {
-    const marks = await checkTriggers(env, uid);
+  // 지정가 진입 — 한 가격(limitOpen) 또는 **분할 지정가**(limitRange: 시작가~끝가를 count 등분, 총 수량을 균등 분배).
+  // 둘 다 "다리(leg) 목록"으로 바꿔 같은 배치 코드(placeLimitLegs)를 탄다.
+  if (body.action === 'limitOpen' || body.action === 'limitRange') {
     const { symbol, side } = body;
-    const size = clampOrderSize(Number(body.size));
     const leverage = Math.round(Number(body.leverage));
-    let limitPrice = Number(body.limitPrice);
     if (!isSymbol(symbol)) return bad('알 수 없는 심볼');
+    // (체결 몫: 가상 코인은 0 — 아래 placeLimitLegs 주석)
+    const marks = await checkTriggers(env, uid, undefined, isVirtualSymbol(symbol) ? { q: 0 } : undefined);
     if (side !== 'long' && side !== 'short') return bad('방향 오류');
-    if (badSize(size)) return bad('수량 오류');
     if (!(leverage >= 1 && leverage <= 250)) return bad('레버리지 1~250');
-    if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
-    // OX 는 4자리 틱(0.0001) 정합성 유지 — 유저가 더 세밀한 지정가를 넣어도 호가창/체결이 4자리를 넘지 않게.
-    if (isVirtualSymbol(symbol)) limitPrice = roundVirtual(limitPrice);
+    const isOx = isVirtualSymbol(symbol);
+    const size = clampOrderSize(Number(body.size)); // limitRange 면 총 수량
+    if (badSize(size)) return bad('수량 오류');
+
+    let legs: Leg[];
+    if (body.action === 'limitOpen') {
+      let limitPrice = Number(body.limitPrice);
+      if (!(limitPrice > 0) || !isFinite(limitPrice)) return bad('지정가 오류');
+      // OX 는 4자리 틱(0.0001) 정합성 유지 — 유저가 더 세밀한 지정가를 넣어도 호가창/체결이 4자리를 넘지 않게.
+      if (isOx) limitPrice = roundVirtual(limitPrice);
+      legs = [{ price: limitPrice, size }];
+    } else {
+      const start = Number(body.startPrice);
+      const end = Number(body.endPrice);
+      const count = Math.round(Number(body.count));
+      if (!(start > 0) || !isFinite(start)) return bad('시작가 오류');
+      if (!(end > 0) || !isFinite(end)) return bad('끝가 오류');
+      if (!(count >= 2 && count <= MAX_OPEN_ORDERS)) return bad(`분할 수는 2~${MAX_OPEN_ORDERS}`);
+      legs = rangeLegs(start, end, count, size, isOx);
+    }
 
     const stopLoss = num(body.stopLoss);
     const takeProfit = num(body.takeProfit);
-    if (!validSlTp(side, limitPrice, stopLoss, takeProfit)) return bad(SLTP_MSG);
+    // 모든 다리에 같은 SL/TP 가 걸린다 — 다리마다 그 지정가 기준으로 맞아야 한다(롱: 손절 < 모든 지정가 < 익절).
+    if (legs.some((l) => !validSlTp(side, l.price, stopLoss, takeProfit))) return bad(SLTP_MSG);
 
-    const margin = (limitPrice * size) / leverage;
-    const col = balColOf(symbol);
-    const user = await env.DB.prepare(`SELECT id, name, ${col} AS bal FROM users WHERE id = ?`)
-      .bind(uid)
-      .first<{ bal: number }>();
-    if (!user) return bad('unauthorized', 401);
-    // 크로스: 가용 = 여유잔고 + 그 지갑 포지션 미실현손익. 지정가도 이 가용 안에서 증거금을 잠근다.
-    const uPnL = await unrealizedTotal(env, uid, marks, quoteOf(symbol));
-    if (!isFinite(uPnL)) return bad(NO_MARK_MSG);
-    const available = (user.bal ?? 0) + uPnL;
-    if (margin > available) return bad(noMarginMsg(available, limitPrice, leverage, 0));
-    // 대기 주문 개수 상한 — 한 유저가 수백 개를 걸면 매 평가가 그만큼 일을 한다(요청당 D1 쿼리 50, §6).
-    const openCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM pending_orders WHERE user_id = ?').bind(uid).first<{ n: number }>();
-    if ((openCount?.n ?? 0) >= MAX_OPEN_ORDERS) return bad(`대기 주문은 ${MAX_OPEN_ORDERS}개까지입니다`);
-
-    const now = Date.now();
-    const pendingId = crypto.randomUUID();
-    // ⚠⚠ 증거금 잠금(차감) + 가드 + 주문을 **한 batch** 로(2026-10-01). 예전엔 둘을 한 batch 에 넣고 가드 결과를 안 봐서
-    // 0행이어도 주문이 생겼다 — 동시에 여러 번 보내면 증거금 없는 주문이 생기고, **취소하면 안 낸 증거금이 환불**됐다.
-    const ok = await guardedBatch(env, [
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(margin, uid, margin, -uPnL),
-      guardStmt(env),
-      env.DB.prepare(
-        'INSERT INTO pending_orders (id, user_id, symbol, side, size, leverage, limit_price, margin, stop_loss, take_profit, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-      ).bind(pendingId, uid, symbol, side, size, leverage, limitPrice, margin, stopLoss, takeProfit, now),
-    ]);
-    if (!ok) return bad(noMarginMsg(available, limitPrice, leverage, 0));
-
-    // OX/USDT: 제출 즉시 봇 호가창에 walking 매칭한다 — 크로스되는 실제 물량만 실제 호가 가격에
-    // 체결하고, 못 채운 잔량은 pending 에 그대로 남아 대기(다음 유동성/틱에서 이어서 체결). 실제
-    // 거래소처럼 marketable 지정가가 호가창에 유령으로 남거나 유령가격에 전량 체결되지 않게 한다.
-    if (isVirtualSymbol(symbol)) {
-      await matchLimitPendingAgainstBook(env, pendingId);
-    }
-
-    return json(await loadState(env, uid, marks, since));
+    // ⚠ 가상 코인은 이 요청에서 즉시 체결(쿼리 ~25)까지 할 수 있어, 앞의 트리거 평가는 강제청산만(체결 몫 0 — 걸린 지정가·SL/TP 는 다음
+    // 폴링 ≈1초에서). 안 그러면 트리거 체결 하나 + 즉시 체결 + 대기 주문 기록이 요청당 쿼리 50 을 넘을 수 있다(§6).
+    const placed = await placeLimitLegs(env, uid, marks, symbol, side, leverage, legs, stopLoss, takeProfit);
+    if (typeof placed === 'string') return bad(placed);
+    return json({ ...(await loadState(env, uid, marks, since)), notice: placed.notice });
   }
 
   if (body.action === 'cancelLimit') {

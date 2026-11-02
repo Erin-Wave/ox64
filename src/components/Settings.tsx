@@ -393,6 +393,26 @@ export default function Settings({ onClose }: { onClose: () => void }) {
                   </button>
                 ))}
               </div>
+              {/* 포지션 모드 — 원웨이 고정(2026-11-02). 헷지 모드는 서버가 지원하지 않으므로 선택지 자체를 두지 않는다(보여만 준다). */}
+              <h3 className="mb-2 mt-4 text-xs font-semibold text-muted">포지션 모드</h3>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="rounded-lg bg-accent/15 px-3 py-2.5 ring-1 ring-accent">
+                  <div className="text-sm font-bold text-accent">원웨이</div>
+                  <div className="mt-0.5 text-[11px] text-muted">한 코인에 한 방향 포지션</div>
+                </div>
+                <div
+                  aria-disabled="true"
+                  title="헷지 모드는 지원하지 않습니다"
+                  className="cursor-not-allowed rounded-lg bg-panel2 px-3 py-2.5 opacity-40 ring-1 ring-border"
+                >
+                  <div className="text-sm font-bold text-muted">헷지</div>
+                  <div className="mt-0.5 text-[11px] text-muted">지원하지 않음</div>
+                </div>
+              </div>
+              <p className="mt-2 text-[11px] leading-snug text-muted">
+                롱을 들고 있을 때 숏을 주문하면 <span className="text-text">롱 수량부터 줄어듭니다</span>(증거금 불필요). 롱을 다 닫고도
+                남는 수량만 숏으로 열립니다. 지정가도 같아서, 보유 포지션을 덮는 몫은 지정가 청산으로 걸립니다.
+              </p>
             </section>
           )}
         </div>

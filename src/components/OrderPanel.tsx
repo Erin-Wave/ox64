@@ -3,7 +3,7 @@ import { tradeHotkeyAllowed } from '@/hotkeys';
 import { useMarketStore, selectLastPrice } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
-import { fmtMoney, fmtMoneyShort, fmtNumInput, unfmtNum, fmtFeeRate } from '@/format';
+import { fmtMoney, fmtMoneyShort, fmtNumInput, unfmtNum, fmtFeeRate, fmtQtyShort, fmtQty } from '@/format';
 import { baseOf, quoteOf, USDT_KRW } from '@/symbols';
 import type { Side } from '@/types';
 
@@ -22,6 +22,12 @@ const MIN_COOLDOWN_SEC = 5;
  * 슬라이더만 올리면 서버가 "레버리지 1~250" 으로 거부하고, 서버만 올리면 화면에서 못 고른다. */
 const MAX_LEVERAGE = 250;
 
+/** 분할 지정가 최대 개수 — 서버 대기 주문 상한(functions/api/order.ts `MAX_OPEN_ORDERS`)과 같은 값. 이미 걸린 주문이 있으면
+ * 서버가 "지금 N개 · 이 주문 M줄"로 거부한다(반대 포지션을 덮는 몫은 청산 줄로 하나 더 생길 수 있다). */
+const MAX_SPLIT = 20;
+/** 분할 간격 표시 — 유효숫자 6자리(나눗셈 먼지만 턴다). */
+const trimStep = (n: number) => String(Number(n.toPrecision(6)));
+
 /** 주문 패널 (OKX 스타일). 체결가는 서버가 결정.
  * Easy 모드: 시장가만. Standard 모드: 시장가 + 지정가 + SL/TP. */
 export default function OrderPanel() {
@@ -34,6 +40,7 @@ export default function OrderPanel() {
   const tradingMode = useSettingsStore((s) => s.tradingMode);
   const openMarket = useTradingStore((s) => s.openMarket);
   const limitOpen = useTradingStore((s) => s.limitOpen);
+  const limitRange = useTradingStore((s) => s.limitRange);
   const conditionalOpen = useTradingStore((s) => s.conditionalOpen);
   const balance = useTradingStore((s) => s.balance);
   const krwBalance = useTradingStore((s) => s.krwBalance);
@@ -54,6 +61,13 @@ export default function OrderPanel() {
   const [pct, setPct] = useState(0); // 수량 슬라이더(가용 잔고*레버리지 대비 비중, 0~100)
   const [leverage, setLeverage] = useState(10);
   const [limitPrice, setLimitPrice] = useState('');
+  // 분할 지정가 — 시작가~끝가를 splitCount 등분(양 끝 포함)하고 총 수량을 균등 분배해 한 번에 건다(서버 action 'limitRange').
+  const [split, setSplit] = useState(false);
+  const [rangeStart, setRangeStart] = useState('');
+  const [rangeEnd, setRangeEnd] = useState('');
+  const [splitCount, setSplitCount] = useState('5');
+  // 차트·호가 클릭 가격을 받을 지정가 칸(분할이면 시작가/끝가 중 마지막으로 누른 칸).
+  const [limitField, setLimitField] = useState<'start' | 'end'>('start');
   const [triggerPrice, setTriggerPrice] = useState(''); // 조건부 주문 트리거 가격
   const [triggerDir, setTriggerDir] = useState<TriggerDir>('above'); // 이 가격 이상/이하가 되면 시장가 진입
   // 무한(반복) 조건부 — 체결돼도 주문이 사라지지 않는다. 기본 'continuous' 는 조건이 참인 **동안 계속**
@@ -91,6 +105,8 @@ export default function OrderPanel() {
     prevSymbolRef.current = symbol;
     const fill = lastPrice ? String(lastPrice) : '';
     setLimitPrice(effectiveTab === 'limit' ? fill : '');
+    setRangeStart(effectiveTab === 'limit' && split ? fill : '');
+    setRangeEnd('');
     setTriggerPrice(effectiveTab === 'conditional' ? fill : '');
     setRearmPrice('');
     setRepeating(false); // 무한 반복도 끈다 — 새 코인에서 조건이 즉시 참이면 5초마다 계속 사들인다
@@ -127,8 +143,15 @@ export default function OrderPanel() {
   useEffect(() => {
     if (chartClickNonce === 0 || chartClickPrice == null || !standard) return;
     if (priceTarget !== '') return;
-    if (tab === 'limit') setLimitPrice(String(chartClickPrice));
-    else if (tab === 'conditional') setTriggerPrice(String(chartClickPrice));
+    if (tab === 'limit') {
+      if (!split) setLimitPrice(String(chartClickPrice));
+      else if (limitField === 'end') setRangeEnd(String(chartClickPrice));
+      else {
+        // 시작가를 찍으면 다음 클릭은 끝가로 — 차트에서 두 번 찍어 범위를 잡는다.
+        setRangeStart(String(chartClickPrice));
+        setLimitField('end');
+      }
+    } else if (tab === 'conditional') setTriggerPrice(String(chartClickPrice));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartClickNonce]);
 
@@ -136,9 +159,15 @@ export default function OrderPanel() {
   // 결제통화 — 원화 심볼은 **원화 지갑**으로 거래한다(증거금·수수료·가용 전부 원). 금액 표기 단위도 이것.
   const quote = quoteOf(symbol);
   const quoteDigits = quote === 'KRW' ? 0 : 2; // 금액 입력칸 소수 자릿수(원은 정수)
+  // 분할 지정가 — 다리들의 평균가(균등 분배라 명목가 = 총 수량 × 평균가). 둘 중 하나만 있으면 그 값.
+  const startNum = Number(rangeStart) || 0;
+  const endNum = Number(rangeEnd) || 0;
+  const countNum = Math.round(Number(splitCount) || 0);
+  const splitOn = effectiveTab === 'limit' && split;
+  const rangeAvg = startNum > 0 && endNum > 0 ? (startNum + endNum) / 2 : startNum || endNum;
   const refPrice =
     effectiveTab === 'limit'
-      ? Number(limitPrice) || lastPrice
+      ? (split ? rangeAvg : Number(limitPrice)) || lastPrice
       : effectiveTab === 'conditional'
         ? Number(triggerPrice) || lastPrice
         : lastPrice;
@@ -178,6 +207,11 @@ export default function OrderPanel() {
       return;
     }
     const { stopLoss: sl, takeProfit: tp } = parseSlTp();
+    if (splitOn) {
+      if (!(startNum > 0) || !(endNum > 0) || !(countNum >= 2 && countNum <= MAX_SPLIT)) return;
+      limitRange({ symbol, side, size: sz, leverage, startPrice: startNum, endPrice: endNum, count: countNum, stopLoss: sl, takeProfit: tp });
+      return;
+    }
     if (effectiveTab === 'limit') {
       const lp = Number(limitPrice);
       if (!lp || lp <= 0) return;
@@ -307,17 +341,84 @@ export default function OrderPanel() {
       {/* 지정가 */}
       {effectiveTab === 'limit' && (
         <div>
-          <label className="mb-1 block text-xs text-muted">지정가</label>
-          <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
-            <input
-              value={fmtNumInput(limitPrice)}
-              onChange={(e) => setLimitPrice(unfmtNum(e.target.value))}
-              onFocus={() => setPriceTarget('')} // 차트 클릭 가격을 이 칸으로 되돌린다
-              inputMode="decimal"
-              className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none"
-            />
-            <span className="px-3 text-xs text-muted">{quote}</span>
+          <div className="mb-1 flex items-center justify-between">
+            <label className="text-xs text-muted">{split ? '분할 지정가 (범위)' : '지정가'}</label>
+            <label
+              className="flex cursor-pointer items-center gap-1.5 text-[11px] text-muted"
+              title="시작가~끝가 사이를 같은 간격으로 나눠 지정가 여러 개를 한 번에 겁니다(총 수량은 균등 분배)"
+            >
+              <input
+                type="checkbox"
+                checked={split}
+                onChange={(e) => {
+                  const on = e.target.checked;
+                  setSplit(on);
+                  // 켤 때 시작가는 지금 지정가(없으면 현재가)로 채워 둔다 — 끝가만 정하면 된다(다음 차트 클릭도 끝가로).
+                  const start = rangeStart || limitPrice || (lastPrice ? String(lastPrice) : '');
+                  if (on && !rangeStart) setRangeStart(start);
+                  setLimitField(on && start ? 'end' : 'start');
+                }}
+                className="accent-up"
+              />
+              분할 주문
+            </label>
           </div>
+          {!split ? (
+            <div className="flex items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+              <input
+                value={fmtNumInput(limitPrice)}
+                onChange={(e) => setLimitPrice(unfmtNum(e.target.value))}
+                onFocus={() => setPriceTarget('')} // 차트 클릭 가격을 이 칸으로 되돌린다
+                inputMode="decimal"
+                className="w-full bg-transparent px-3 py-1.5 text-sm font-semibold text-text outline-none"
+              />
+              <span className="px-3 text-xs text-muted">{quote}</span>
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-2">
+                {(['start', 'end'] as const).map((f) => (
+                  <div key={f}>
+                    <label className="mb-0.5 block text-[10px] text-muted">{f === 'start' ? '시작가' : '끝가'}</label>
+                    <div
+                      className={`flex items-center rounded-md bg-panel2 ring-1 focus-within:ring-elevated ${
+                        limitField === f ? 'ring-accent/60' : 'ring-border'
+                      }`}
+                    >
+                      <input
+                        value={fmtNumInput(f === 'start' ? rangeStart : rangeEnd)}
+                        onChange={(e) => (f === 'start' ? setRangeStart : setRangeEnd)(unfmtNum(e.target.value))}
+                        onFocus={() => {
+                          setPriceTarget(''); // 차트 클릭 가격을 이 칸으로
+                          setLimitField(f);
+                        }}
+                        inputMode="decimal"
+                        placeholder={f === 'start' ? '시작가' : '끝가'}
+                        className="w-full min-w-0 bg-transparent px-2.5 py-1.5 text-sm font-semibold text-text outline-none placeholder:text-muted"
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-1.5 flex items-center gap-2">
+                <label className="shrink-0 text-[10px] text-muted">분할 수</label>
+                <div className="flex w-16 items-center rounded-md bg-panel2 ring-1 ring-border focus-within:ring-elevated">
+                  <input
+                    value={splitCount}
+                    onChange={(e) => setSplitCount(e.target.value.replace(/[^0-9]/g, '').slice(0, 2))}
+                    inputMode="numeric"
+                    title={`2~${MAX_SPLIT}개`}
+                    className="w-full min-w-0 bg-transparent px-2 py-1 text-center text-xs font-semibold text-text outline-none"
+                  />
+                </div>
+                <span className="min-w-0 truncate text-[10px] text-muted">
+                  {startNum > 0 && endNum > 0 && countNum >= 2 && countNum <= MAX_SPLIT
+                    ? `${countNum}건 × ${orderSize > 0 ? fmtQtyShort(orderSize / countNum, 9) : '—'} ${coin} · 간격 ${fmtNumInput(trimStep(Math.abs(endNum - startNum) / (countNum - 1)))}`
+                    : `2~${MAX_SPLIT}건 · 시작가·끝가 포함 등간격`}
+                </span>
+              </div>
+            </>
+          )}
         </div>
       )}
 
@@ -472,7 +573,13 @@ export default function OrderPanel() {
       <div>
         <div className="mb-1 flex items-center justify-between">
           <span className="text-xs text-muted">
-            레버리지 <span className="text-[10px] text-muted">· 크로스</span>
+            레버리지{' '}
+            <span
+              className="text-[10px] text-muted"
+              title="원웨이 모드 — 한 코인엔 한 방향 포지션만 둡니다. 롱을 들고 숏을 주문하면 롱부터 줄이고, 다 닫은 뒤 남는 수량만 숏으로 엽니다(헷지 모드는 지원하지 않습니다)."
+            >
+              · 크로스 · 원웨이
+            </span>
             {existingPosition && <span className="ml-1 text-[10px] text-accent">(포지션 보유 중 고정)</span>}
           </span>
           <span className="rounded bg-panel2 px-2 py-0.5 text-xs font-bold text-accent">크로스 {leverage}x</span>
@@ -573,6 +680,20 @@ export default function OrderPanel() {
       <div className="space-y-0.5 rounded-md bg-panel2 p-2 text-xs">
         {/* ⚠ 금액은 전부 fmtUsdShort — 고배율 대량 주문이면 명목가가 1e20 을 넘어 이 좁은 칸을 부순다.
             정확한 값은 title 툴팁으로 남긴다(§format.fmtUsdShort). */}
+        {existingPosition && (
+          // 원웨이 — 반대 방향 주문은 이 포지션부터 줄인다(서버 넷팅, functions/_shared planRealEntry). 무엇이 일어날지 미리 보이게.
+          <div
+            className="flex justify-between gap-2"
+            title={`원웨이 모드 — ${existingPosition.side === 'long' ? '숏' : '롱'} 주문은 이 포지션부터 줄이고(증거금 불필요), 다 닫은 뒤 남는 수량만 새로 엽니다`}
+          >
+            <span className="shrink-0 text-muted">보유 (원웨이)</span>
+            <span className={`truncate ${existingPosition.side === 'long' ? 'text-up' : 'text-down'}`}>
+              {existingPosition.side === 'long' ? '롱' : '숏'}{' '}
+              <span title={fmtQty(existingPosition.size)}>{fmtQtyShort(existingPosition.size, 9)}</span> {coin}
+              <span className="ml-1 text-[10px] text-muted">· {existingPosition.side === 'long' ? '숏' : '롱'}은 청산부터</span>
+            </span>
+          </div>
+        )}
         <div className="flex justify-between gap-2">
           <span className="shrink-0 text-muted">가용 (크로스)</span>
           <span className="truncate text-text" title={`${fmtMoney(available, quote)} ${quote}`}>

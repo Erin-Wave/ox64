@@ -630,11 +630,14 @@ export async function fetchPrices(env: Env, symbols: string[], seed?: Record<str
  * 소스가 멈춘 동안 모르는 손실을 무시하고 새 주문이 크로스 가드를 통과했다. 호출자는 `isFinite` 가 아니면 새 위험을
  * 받지 말 것(`/api/convert` 는 이미 그렇게 한다). */
 export async function unrealizedTotal(env: Env, uid: string, marks: Record<string, number>, quote: Quote): Promise<number> {
-  const positions = (
-    await env.DB.prepare('SELECT symbol, side, entry_price, size FROM positions WHERE user_id = ?')
-      .bind(uid)
-      .all<PositionRow>()
-  ).results;
+  return unrealizedOf(await userPositions(env, uid), marks, quote);
+}
+/** 이 유저의 전 포지션(전 심볼·양방향). unrealizedTotal 과 같은 한 쿼리 — 행이 더 필요한 호출부가 직접 쓴다. */
+export async function userPositions(env: Env, uid: string): Promise<PositionRow[]> {
+  return (await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()).results;
+}
+/** 순수 계산판 — 시세 모르는 포지션이 있으면 NaN(§ unrealizedTotal). */
+export function unrealizedOf(positions: PositionRow[], marks: Record<string, number>, quote: Quote): number {
   let u = 0;
   for (const p of positions) {
     // ⚠ 지갑별 크로스 — 다른 통화 포지션의 손익은 이 지갑의 담보가 아니다(단위부터 다르다).
@@ -685,7 +688,7 @@ export async function guardedBatch(env: Env, stmts: D1PreparedStatement[]): Prom
 //   ① 늘리기는 `positionAddStmts` — SQL 이 **상대값**으로 합치고 없을 때만 새로 연다(한 트랜잭션).
 //   ② 줄이기·지우기는 `positionClaimStmt`(읽은 값 그대로일 때만 바뀌는 선점) + 가드 + 정산을 **한 batch** 로(`claimThenSettle`).
 
-/** 체결분을 같은 심볼·방향 포지션에 **합치거나**(물타기) 없으면 **새로 연다** — 문장 2개, 읽어 둔 포지션에 기대지 않는다.
+/** 체결분을 같은 심볼·방향 포지션에 **합치거나**(물타기) 없으면 **새로 연다** — 문장 3개(합치기·새로 열기·원웨이 가드), 읽어 둔 포지션에 기대지 않는다.
  * ① 가장 오래된 같은 방향 포지션에 상대값으로 합친다(SET 의 우변은 전부 갱신 전 값이라 평단 계산이 정확하다).
  * ② 그런 포지션이 없을 때만 새 행을 넣는다. 둘은 같은 batch(=트랜잭션) 안에서 차례로 돌아 다른 요청이 끼지 못한다.
  * 합칠 때 레버리지는 기존 행 값이 그대로 남는다(호출자는 증거금을 그 레버리지로 계산해 넘긴다 — 차감한 금액 그대로).
@@ -730,6 +733,13 @@ export function positionAddStmts(
       a.symbol,
       a.side,
     ),
+    // ⚠⚠ 원웨이 가드(2026-11-02) — 이 batch 가 끝날 때 **반대 방향 포지션이 남아 있으면 통째로 되돌린다**. 넷팅은 읽은 포지션으로
+    // 계획하므로, 무포지션에서 롱·숏을 정확히 동시에 보내면(두 탭·연타) 둘 다 "반대 없음"으로 읽고 각자 열어 헷지가 생길 수 있었다.
+    // 반대 포지션을 다 닫는 넷팅(DELETE)은 이 문장보다 앞에 있으므로 통과한다. 되돌려진 쪽은 다시 내면 넷팅된다.
+    // 호출부는 전부 guardedBatch/claimThenSettle 로 실행한다(가드 중단 = false).
+    env.DB.prepare(
+      "SELECT json(CASE WHEN EXISTS (SELECT 1 FROM positions WHERE user_id = ? AND symbol = ? AND side != ?) THEN 'ox64-guard' ELSE '1' END)",
+    ).bind(a.uid, a.symbol, a.side),
   ];
 }
 
@@ -769,6 +779,223 @@ export function pendingClaimStmt(env: Env, p: PendingRow): D1PreparedStatement {
  * 정산 중 오류도 batch 전체가 롤백되므로 "선점만 되고 정산은 안 된" 상태가 생기지 않는다(§ 가드 문장). */
 export function claimThenSettle(env: Env, claims: D1PreparedStatement[], settle: D1PreparedStatement[]): Promise<boolean> {
   return guardedBatch(env, [...claims.flatMap((c) => [c, guardStmt(env)]), ...settle]);
+}
+
+// ── 원웨이 모드(2026-11-02) ─────────────────────────────────────────────────────────────────────
+// ⚠⚠ 한 심볼엔 **한 방향 포지션만** 둔다. 예전엔 롱을 들고 숏을 누르면 숏 포지션이 따로 열려(헷지 모드) 롱·숏이 같이 쌓였다.
+// 지금은 모든 진입 체결(시장가·지정가·조건부, 가상·실제 — 5개 함수)이 **반대 포지션을 먼저 줄이고**, 다 닫은 뒤 남는 수량만
+// 새 방향으로 연다(거래소들의 원웨이 모드). 줄이는 몫은 환급이라 증거금이 들지 않는다 — 증거금 판정·감당 클램프는 **여는 몫에만**.
+// 줄이기는 청산과 똑같이 선점(positionClaimStmt) + 가드로 하고 주문내역엔 kind='close'(실현손익 포함)로 남긴다.
+// 반대 포지션을 다 닫았을 때 여는 몫의 크로스 가용 = 지금 가용 + 돌려받는 증거금 + (실현손익 − 그 몫의 mark 미실현) − 청산 수수료.
+// 옛 데이터(롱·숏이 둘 다 열린 계정)도 그대로 돈다 — 새 주문이 반대쪽부터 줄이고 남는 건 같은 쪽에 합친다(positionAddStmts).
+// ⚠ 새 진입 경로를 만들면 반드시 이 넷팅을 거칠 것 — 안 거치면 그 경로로만 헷지 포지션이 다시 생긴다.
+
+/** 이 심볼의 포지션(양방향, 오래된 순) — 반대 포지션과 같은 방향 레버리지를 **한 쿼리로** 본다. */
+export async function heldPositions(env: Env, uid: string, symbol: string): Promise<PositionRow[]> {
+  return (
+    await env.DB.prepare('SELECT * FROM positions WHERE user_id = ? AND symbol = ? ORDER BY opened_at').bind(uid, symbol).all<PositionRow>()
+  ).results;
+}
+/** 반대 포지션(줄일 대상)과 같은 방향 포지션(합칠 대상, 레버리지 고정) — 각각 가장 오래된 것. */
+export function splitHeld(held: PositionRow[], side: string): { opp: PositionRow | null; same: PositionRow | null } {
+  return { opp: held.find((p) => p.side !== side) ?? null, same: held.find((p) => p.side === side) ?? null };
+}
+
+/** 반대 포지션 줄이기 한 건 — 체결 수량·명목금액에서 잘라낼 몫과 실현손익을 낸다(전량이면 잠긴 증거금 전액). */
+export interface NetCut {
+  pos: PositionRow;
+  cut: PositionCut;
+  pnl: number;
+  price: number; // 가중평균 체결가
+}
+export function netCutOf(pos: PositionRow, filled: number, cost: number): NetCut {
+  const full = filled >= pos.size - sizeEps(pos.size);
+  const size = full ? pos.size : filled;
+  const price = cost / filled;
+  return {
+    pos,
+    cut: { size, margin: full ? pos.margin : (pos.margin * size) / pos.size, full },
+    pnl: (price - pos.entry_price) * size * (pos.side === 'long' ? 1 : -1),
+    price,
+  };
+}
+/** 줄인 몫의 mark 기준 미실현손익 — 크로스 가용(잔고 + 미실현)에서 빼야 한다(실현돼 잔고로 들어가므로 두 번 세지 않게). */
+export const netCutUpnl = (n: NetCut, mark: number): number => (mark - n.pos.entry_price) * n.cut.size * (n.pos.side === 'long' ? 1 : -1);
+
+/** 주문내역 한 줄. */
+export function orderRowStmt(
+  env: Env,
+  uid: string,
+  symbol: string,
+  side: string,
+  price: number,
+  size: number,
+  leverage: number,
+  kind: string,
+  pnl: number | null,
+  now: number,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+  ).bind(crypto.randomUUID(), uid, symbol, side, price, size, leverage, kind, pnl, now);
+}
+
+/** 호가 앞에서부터 qty 만큼 먹은 **뒤의** 호가(순수 계산) — 반대 포지션을 닫은 뒤 여는 몫은 그 다음 단계부터 먹는다. */
+export function dropLevels(levels: BookLevels, qty: number): BookLevels {
+  const out: BookLevels = [];
+  let left = qty;
+  for (const [price, q] of levels) {
+    if (left > 0) {
+      if (q <= left) {
+        left -= q;
+        continue;
+      }
+      out.push([price, q - left]);
+      left = 0;
+      continue;
+    }
+    out.push([price, q]);
+  }
+  return out;
+}
+
+/** 실제 코인 시장가 진입(원웨이 넷팅 포함)의 계획 — 순수 계산이고 실행할 문장을 돌려준다(D1 읽기 없음).
+ * order.ts `open` 과 조건부 체결(§ _trading settleConditionalOrder)이 **이 함수 하나**를 쓴다.
+ * 문장 순서: [반대 포지션 선점 + 가드] → [잔고(여는 몫이 있으면 크로스 가드 + 가드)] → 부기·포지션·주문내역.
+ * 호출부가 뒤에 자기 선점(조건부 체결 기록 등)을 붙여 같은 guardedBatch 로 실행한다. */
+export interface RealEntryPlan {
+  stmts: D1PreparedStatement[];
+  reduced: number; // 반대 포지션에서 줄인 수량
+  opened: number; // 새로 열거나 같은 방향에 합친 수량
+  closedSide: string | null; // 줄인 포지션의 방향
+  why?: 'liquidity' | 'margin'; // 요청을 다 못 채운 이유
+  /** 순수 진입(반대 포지션 없음)인데 mark 로 따져도 감당 못 한다 — 호출부가 "최대 약 N 개"로 거부(strict 일 때만) */
+  noMargin?: { available: number; effLev: number };
+}
+export function planRealEntry(
+  env: Env,
+  a: {
+    uid: string;
+    symbol: string;
+    side: string;
+    size: number;
+    leverage: number;
+    stopLoss: number | null;
+    takeProfit: number | null;
+    levels: BookLevels; // 먹을 쪽 호가(takeSideOf)
+    mark: number; // 이 심볼 mark — 증거금 안내·줄인 몫의 미실현 계산용
+    bal: number; // 그 지갑 잔고
+    uPnL: number; // 그 지갑 미실현손익 합(줄이기 전)
+    feeRate: number;
+    held: PositionRow[]; // heldPositions
+    strict: boolean;
+    now: number;
+  },
+): RealEntryPlan {
+  const { uid, symbol, side, size, feeRate, now } = a;
+  const { opp, same } = splitHeld(a.held, side);
+  const effLev = same ? same.leverage : a.leverage; // 물타기면 기존 레버리지 고정
+  const col = balColOf(symbol);
+  const claims: D1PreparedStatement[] = [];
+  const rest: D1PreparedStatement[] = [];
+  let levels = a.levels;
+  let reduceCash = 0; // 줄인 몫이 잔고에 돌려주는 돈(증거금 + 실현손익 − 청산 수수료)
+  let uPnLAfter = a.uPnL;
+  let net: NetCut | null = null;
+  let why: 'liquidity' | 'margin' | undefined;
+  let openWant = size;
+
+  if (opp) {
+    const want = Math.min(size, opp.size);
+    const w = walkBook(levels, want);
+    if (w.filled > 0) {
+      net = netCutOf(opp, w.filled, w.cost);
+      const notional = net.price * net.cut.size;
+      const fee = notional * feeRate;
+      claims.push(positionClaimStmt(env, uid, opp, net.cut), guardStmt(env));
+      reduceCash = net.cut.margin + net.pnl - fee;
+      uPnLAfter = a.uPnL - netCutUpnl(net, a.mark);
+      rest.push(
+        ...feeAccrualStmts(env, uid, symbol, 'close', notional, feeRate, fee, now),
+        orderRowStmt(env, uid, symbol, opp.side, net.price, net.cut.size, opp.leverage, 'close', net.pnl, now),
+      );
+      levels = dropLevels(levels, w.filled);
+    }
+    // 반대 포지션을 다 닫았을 때만 남는 수량을 연다(모자라면 호가가 먼저 끝난 것).
+    if (net?.cut.full) openWant = size - net.cut.size;
+    else {
+      openWant = 0;
+      if (w.filled < want - sizeEps(want)) why = 'liquidity';
+    }
+  }
+
+  let opened = 0;
+  let openCost = 0;
+  if (openWant > sizeEps(size)) {
+    const available = a.bal + uPnLAfter + reduceCash;
+    const perUnit = (p: number) => p / effLev + p * feeRate;
+    // ① 물량만큼으로 자르고 ② (순수 진입이면) 그 수량도 mark 로 따져 감당 못 하면 거부("최대 약 N 개") ③ 실제 호가 가격(슬리피지 포함)
+    // 으로 다시 먹되 가용 안에서만 — 슬라이더 100% 처럼 mark 로 딱 맞춘 주문이 슬리피지만큼 모자라 통째로 거부되지 않게.
+    const depth = walkBook(levels, openWant);
+    if (depth.filled > 0) {
+      if (a.strict && !net && a.mark * depth.filled * (1 / effLev + feeRate) > available) {
+        return { stmts: [], reduced: 0, opened: 0, closedSide: null, noMargin: { available, effLev } };
+      }
+      // 여유는 각 항의 크기에 비례(줄인 몫의 실현손익·미실현이 크게 상쇄돼도 아래 크로스 가드가 부동소수 오차로 실패하지 않게).
+      const slack = 1e-6 * (Math.abs(a.bal) + Math.abs(uPnLAfter) + Math.abs(reduceCash));
+      const w = walkBook(levels, depth.filled, available - slack, perUnit);
+      if (w.filled > 0) {
+        opened = w.filled;
+        const fillPx = w.cost / w.filled;
+        const margin = w.cost / effLev;
+        const fee = w.cost * feeRate;
+        openCost = margin + fee;
+        rest.push(
+          ...feeAccrualStmts(env, uid, symbol, 'open', w.cost, feeRate, fee, now),
+          ...positionAddStmts(env, { uid, symbol, side, price: fillPx, size: opened, leverage: effLev, margin, stopLoss: a.stopLoss, takeProfit: a.takeProfit, now }),
+          orderRowStmt(env, uid, symbol, side, fillPx, opened, effLev, 'open', null, now),
+        );
+      }
+      why = depth.filled < openWant - sizeEps(openWant) ? 'liquidity' : w.budgetCut || !(w.filled > 0) ? 'margin' : undefined;
+    } else why = 'liquidity';
+    if (!net && !(opened > 0) && a.strict) return { stmts: [], reduced: 0, opened: 0, closedSide: null, noMargin: depth.filled > 0 ? { available, effLev } : undefined };
+  }
+
+  // 잔고 — 여는 몫이 있으면 크로스 가드(잔고 − 여는 비용 + 돌려받는 돈 >= −줄인 뒤의 미실현), 줄이기만이면 그냥 더한다(환급).
+  const delta = reduceCash - openCost;
+  const bal: D1PreparedStatement[] =
+    opened > 0
+      ? [env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ? AND ${col} + ? >= ?`).bind(delta, uid, delta, -uPnLAfter), guardStmt(env)]
+      : net
+        ? [env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(delta, uid)]
+        : [];
+  return { stmts: [...claims, ...bal, ...rest], reduced: net?.cut.size ?? 0, opened, closedSide: net ? net.pos.side : null, why };
+}
+
+/** 원웨이 체결 안내(`notice`) — 반대 포지션을 줄였거나 요청을 다 못 채웠을 때. 에러가 아니다(체결된 만큼은 반영됐다). */
+export function entryNotice(side: string, requested: number, reduced: number, opened: number, closedSide: string | null, why?: 'liquidity' | 'margin'): string | undefined {
+  const name = (s: string | null) => (s === 'long' ? '롱' : '숏');
+  const parts: string[] = [];
+  if (reduced > 0) {
+    parts.push(
+      opened > 0
+        ? `보유 ${name(closedSide)} ${qtyText(reduced)} 개를 청산하고 ${name(side)} ${qtyText(opened)} 개를 열었습니다`
+        : `보유 ${name(closedSide)} 포지션에서 ${qtyText(reduced)} 개를 줄였습니다`,
+    );
+  }
+  const filled = reduced + opened;
+  if (why && filled < requested - sizeEps(requested)) {
+    parts.push(
+      why === 'liquidity'
+        ? `호가 물량이 부족해 주문 ${qtyText(requested)} 개 중 ${qtyText(filled)} 개만 체결됐습니다 (나머지는 취소)`
+        : `증거금 한도까지 ${qtyText(filled)} 개만 체결됐습니다 (주문 ${qtyText(requested)} 개)`,
+    );
+  }
+  return parts.length ? parts.join(' · ') : undefined;
+}
+/** 서버 문구용 수량 — 유효숫자 12자리(부동소수 먼지만 털고), 아주 큰 값은 지수. */
+export function qtyText(n: number): string {
+  return n >= 1e15 ? n.toExponential(4) : Number(n.toPrecision(12)).toLocaleString('en-US', { maximumFractionDigits: 8 });
 }
 
 // ── D1 행 → 클라이언트 응답 형태 ────────────────────────────────

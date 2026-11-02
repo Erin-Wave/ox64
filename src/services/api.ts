@@ -211,6 +211,18 @@ export const api = {
     stopLoss?: number | null;
     takeProfit?: number | null;
   }) => orderReq({ action: 'limitOpen', ...p }),
+  /** 분할 지정가 — 시작가~끝가를 count 등분(양 끝 포함), 총 수량(size)을 균등 분배해 한 번에 건다(서버가 다리를 만든다). */
+  limitRange: (p: {
+    symbol: string;
+    side: Side;
+    size: number;
+    leverage: number;
+    startPrice: number;
+    endPrice: number;
+    count: number;
+    stopLoss?: number | null;
+    takeProfit?: number | null;
+  }) => orderReq({ action: 'limitRange', ...p }),
   cancelLimit: (pendingId: string) =>
     orderReq({ action: 'cancelLimit', pendingId }),
   editLimit: (pendingId: string, p: { limitPrice?: number; size?: number }) =>

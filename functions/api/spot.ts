@@ -25,6 +25,11 @@ import {
   pendingClaimStmt,
   guardStmt,
   guardedBatch,
+  heldPositions,
+  splitHeld,
+  netCutOf,
+  netCutUpnl,
+  orderRowStmt,
 } from '../_shared';
 import { autoWritesBlocked, meterStmt, meterReadStmt, primeMeter } from '../_budget';
 
@@ -3120,36 +3125,72 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
   //        claim + 포지션 SELECT + batch 를 최대 500회 왕복해서, 체결 하나가 D1 쿼리 수백 개를 먹었다
   //        (invocation당 1,000 한도를 혼자 태울 수 있었다). 지금은 시장가 경로와 같은 "스냅샷 → 메모리
   //        walking → 단일 batch" 패턴이다. 포지션은 레버리지만 본다(합치기는 SQL 이 한다). ──
-  const [existing, me, bookRow] = await Promise.all([
-    env.DB.prepare('SELECT leverage FROM positions WHERE user_id=? AND symbol=? AND side=? ORDER BY opened_at LIMIT 1')
-      .bind(p.user_id, pair, p.side)
-      .first<{ leverage: number }>(),
+  // ⚠⚠ 원웨이(§ _shared 원웨이 모드): 이 심볼의 포지션을 양방향으로 한 번에 읽는다 — 반대 포지션(opp)이 있으면 walking 의 앞
+  // 부분이 그걸 먼저 줄이고(그 몫에 잠가 둔 증거금은 전부 돌려준다), 다 닫은 뒤 남는 수량만 연다. 같은 방향은 레버리지만 본다.
+  const [held, me, bookRow] = await Promise.all([
+    heldPositions(env, p.user_id, pair),
     // 잔고(추가 증거금 한도)와 요율은 같은 users 행 — 한 번에(요율은 이 주문 전체에 한 번만 확정, 청크마다 읽으면 도중에 등급이 바뀐다)
     env.DB.prepare('SELECT balance, total_volume FROM users WHERE id=?').bind(p.user_id).first<{ balance: number; total_volume: number }>(),
     env.DB.prepare(`SELECT ${BOOK_COLS} FROM spot_bot_state WHERE id=?`).bind(pair).first<BookRow>(),
   ]);
   const limitFeeRate = vipOf(me?.total_volume ?? 0).rate;
-  const effLev = existing ? existing.leverage : p.leverage; // 물타기 시 기존 레버리지 고정
+  const { opp, same } = splitHeld(held, p.side);
+  const effLev = same ? same.leverage : p.leverage; // 물타기 시 기존 레버리지 고정
+  const dirOpp = opp?.side === 'long' ? 1 : -1;
   const book = parseBook(bookRow?.book_json);
   // ⚠⚠ 증거금은 **실제 체결가 기준**이어야 한다(2026-10-01). 주문 때는 지정가 기준으로 잠갔으므로, 지정가보다 유리하게 체결되면
   // (숏을 더 비싸게 · 레버리지가 더 낮은 기존 포지션에 합침) 잠근 것보다 더 든다. 그 차이를 안 걷으면 **레버리지 상한이 뚫린다** —
   // 1e-12 에 숏 지정가를 걸면 잠그는 돈이 ≈0 인데 매수호가 전부(~1.0)에 체결돼 증거금 없는 포지션이 생겼다(감사). 그래서 추가분은
   // 지금 잔고(현금, 보수적으로 미실현이익 제외) 안에서만 걷고, 모자라면 **감당되는 만큼만** 체결한다(나머지는 대기).
   const lockedPerUnit = p.limit_price / p.leverage;
-  const extraBudget = Math.max(0, me?.balance ?? 0) * (1 - 1e-9);
-  let marginDelta = 0; // 잠근 증거금 − 실제 증거금(+ 환불 / − 추가로 걷을 돈)
+  let extraBudget = opp ? 0 : Math.max(0, me?.balance ?? 0) * (1 - 1e-9); // 반대 포지션이 있으면 그걸 다 닫은 순간 다시 잰다
+  let budgetReady = !opp;
+  let marginDelta = 0; // 잠근 증거금 − 실제 증거금(+ 환불 / − 추가로 걷을 돈). 줄이는 몫은 잠근 것 전부가 환불이다.
+  let openDelta = 0; // 그중 여는 몫의 것(추가로 걷을 돈이 있었나 — 가드 여부)
 
   // ── 2) 지정가를 크로스하는 레벨만, 있는 물량만 메모리에서 walking(최우선호가보다 유리하게는 안 삼). ──
-  let filled = 0;
-  let cost = 0;
+  let reduceLeft = opp ? opp.size : 0;
+  let rFilled = 0;
+  let rCost = 0;
+  let rPnl = 0;
+  let oFilled = 0;
+  let oCost = 0;
   let openPx = 0;
   let high = 0;
   let low = Infinity;
   let lastPx = 0;
   let remaining = p.size;
   const walked: { price: number; size: number }[] = []; // 체결 테이프에 찍을 실제 체결들(가격대별)
+  const record = (level: BookLevel, take: number) => {
+    level.size -= take;
+    remaining -= take;
+    walked.push({ price: level.price, size: take });
+    if (openPx === 0) openPx = level.price;
+    high = Math.max(high, level.price);
+    low = Math.min(low, level.price);
+    lastPx = level.price;
+  };
   for (const level of makerLevels(book, makerSide, p.limit_price)) {
     if (remaining <= EPS) break;
+    if (level.size <= EPS) continue;
+    if (reduceLeft > EPS) {
+      const t = Math.min(remaining, level.size, reduceLeft);
+      marginDelta += t * lockedPerUnit; // 줄이는 몫엔 증거금이 안 든다 — 잠가 둔 것 전부 환불
+      rFilled += t;
+      rCost += level.price * t;
+      rPnl += (level.price - opp!.entry_price) * t * dirOpp;
+      reduceLeft -= t;
+      record(level, t);
+      if (remaining <= EPS || level.size <= EPS || reduceLeft > EPS) continue;
+    }
+    if (opp && !budgetReady) {
+      // 반대 포지션을 다 닫았다(reduceLeft 소진 + 이 단계에 물량·주문이 남음) — 추가 증거금 한도에 돌려받는 현금(증거금 + 실현손익 −
+      // 청산 수수료)을 더한다. ⚠ 0 으로 자르지 않는다 — 큰 손실을 실현해 현금이 음수가 되면 여는 몫은 추가 증거금을 한 푼도 못 쓰고
+      // (아래 가드와 같은 식), 그래야 가드가 줄이는 몫까지 통째로 되돌려 청산이 영영 막히는 일이 없다.
+      const terms = [me?.balance ?? 0, opp.margin, rPnl, rCost * limitFeeRate];
+      extraBudget = terms[0] + terms[1] + terms[2] - terms[3] - 1e-9 * terms.reduce((a, v) => a + Math.abs(v), 0);
+      budgetReady = true;
+    }
     let take = Math.min(remaining, level.size);
     if (take <= EPS) continue;
     const dPerUnit = lockedPerUnit - level.price / effLev; // 이 레벨 1개당 증거금 차이(+ 환불 / − 추가)
@@ -3160,25 +3201,25 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
       if (!(take > EPS)) break;
     }
     marginDelta += take * dPerUnit;
-    level.size -= take;
-    remaining -= take;
-    filled += take;
-    cost += level.price * take;
-    walked.push({ price: level.price, size: take });
-    if (openPx === 0) openPx = level.price;
-    high = Math.max(high, level.price);
-    low = Math.min(low, level.price);
-    lastPx = level.price;
+    openDelta += take * dPerUnit;
+    oFilled += take;
+    oCost += level.price * take;
+    record(level, take);
     if (capped) break;
   }
+  const filled = rFilled + oFilled;
   if (filled <= EPS) return 0; // 크로스되는 봇 호가 없음(또는 추가 증거금을 하나도 감당 못 함) → 잔량은 그대로 대기
 
-  // ── 3) 증거금 정산 — 포지션 증거금 = 실제 체결가 기준(cost/effLev). 잠근 금액과의 차액(marginDelta)은 환불하거나(+) 추가로
+  // ── 3) 증거금 정산 — 포지션 증거금 = 실제 체결가 기준(oCost/effLev). 잠근 금액과의 차액(marginDelta)은 환불하거나(+) 추가로
   //        걷는다(−, 아래 가드). 예전엔 추가분을 못 걷으면 전량을 지정가로 바꿔 정산했다(실제로 먹은 호가와 장부 가격이 달랐다). ──
-  const locked = lockedPerUnit * filled; // 이 체결분에 대해 주문 시점에 잠가둔 증거금
+  const locked = lockedPerUnit * filled; // 이 체결분에 대해 주문 시점에 잠가둔 증거금(줄인 몫 포함)
+  const cost = rCost + oCost;
   const fillAvg = cost / filled;
-  const posMargin = cost / effLev;
-  const feeTotal = cost * limitFeeRate;
+  const opens = oFilled > EPS;
+  const posMargin = oCost / effLev;
+  const rFee = rCost * limitFeeRate;
+  const oFee = oCost * limitFeeRate;
+  const net = opp && rFilled > EPS ? netCutOf(opp, rFilled, rCost) : null;
 
   // ── 4) 선점 + 나머지를 **한 batch** 로. 주문을 읽은 그대로일 때만(수량·증거금·지정가 CAS) 줄이거나 지우고, 가드가 그걸
   //        확인한다 — 유저 폴링과 cron sweep 이 같은 주문을 동시에 집었거나 그 사이 수정·취소됐으면 batch 전체가 되돌려진다. ──
@@ -3193,54 +3234,61 @@ export async function matchLimitPendingAgainstBook(env: Env, pendingId: string, 
           'UPDATE pending_orders SET size=?, margin=?, last_fill_at=? WHERE id=? AND user_id=? AND size=? AND margin=? AND limit_price=?',
         ).bind(newPendingSize, Math.max(0, p.margin - locked), now, p.id, p.user_id, p.size, p.margin, p.limit_price);
   const prints = splitPrints(walked);
-  const stmts: D1PreparedStatement[] = [
-    claim,
-    guardStmt(env),
-    bookWriteStmt(env, pair, book, bookRow?.book_version ?? 0),
-    ...positionAddStmts(env, {
-      uid: p.user_id,
-      symbol: pair,
-      side: p.side,
-      price: fillAvg,
-      size: filled,
-      leverage: effLev,
-      margin: posMargin,
-      stopLoss: p.stop_loss,
-      takeProfit: p.take_profit,
-      now,
-    }),
+  const stmts: D1PreparedStatement[] = [claim, guardStmt(env)];
+  // 반대 포지션 선점(읽은 수량·증거금 그대로일 때만 줄인다) — 그 사이 다른 청산·체결이 바꿨으면 batch 전체가 되돌려지고 주문은 대기.
+  if (net) stmts.push(positionClaimStmt(env, p.user_id, net.pos, net.cut), guardStmt(env));
+  stmts.push(bookWriteStmt(env, pair, book, bookRow?.book_version ?? 0));
+  if (opens) {
+    stmts.push(
+      ...positionAddStmts(env, {
+        uid: p.user_id,
+        symbol: pair,
+        side: p.side,
+        price: oCost / oFilled,
+        size: oFilled,
+        leverage: effLev,
+        margin: posMargin,
+        stopLoss: p.stop_loss,
+        takeProfit: p.take_profit,
+        now,
+      }),
+    );
+  }
+  stmts.push(
     // 체결 테이프는 walking 한 가격대별로 여러 줄(상한 USER_PRINT_MAX), 캔들은 walking 구간의 OHLC.
     userTapeStmt(env, pair, prints, tapeSide, now),
     env.DB.prepare(
       `INSERT INTO spot_bot_state (id,last_run,ref_price) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET ref_price=excluded.ref_price, ${FAIR_FOLLOW_SQL}, ${INTEREST_BUMP_SQL}`,
     ).bind(pair, now, roundOx(fillAvg), interestBumpOf(filled)),
     ...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled, ...sideVol(tapeSide, filled) }, now),
-    // 체결 이력(주문내역)엔 이번 호출의 총 체결을 가중평균가로 1건 기록.
-    env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
-      crypto.randomUUID(),
-      p.user_id,
-      pair,
-      p.side,
-      fillAvg,
-      filled,
-      effLev,
-      'open',
-      null,
-      now,
-    ),
-    ...feeAccrualStmts(env, p.user_id, pair, 'open', cost, limitFeeRate, feeTotal, now, prints.length),
-  ];
-  // 지정가도 체결 시점에 수수료를 뗀다. 증거금 차액과 상계해 한 번의 잔고 조정으로 처리한다.
-  // ⚠ 추가 증거금이 필요하면(marginDelta < 0) **그 몫만** 가드한다 — 지금 잔고가 그만큼 있어야 하고(읽은 뒤 바뀌었으면 batch 전체가
-  // 되돌려진다), 수수료는 가드하지 않는다(실제 코인 지정가와 같다 — 잔고를 다 잠근 주문도 체결은 돼야 한다, 모자라면 강제청산이 처리).
-  const net = marginDelta - feeTotal;
-  if (marginDelta < -EPS) {
+  );
+  // 체결 이력(주문내역)엔 이번 호출의 체결을 가중평균가로 — 줄인 몫(close, 실현손익)과 연 몫(open)을 따로 1건씩.
+  if (net) {
     stmts.push(
-      env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=? AND balance+? >= 0').bind(net, p.user_id, marginDelta),
+      orderRowStmt(env, p.user_id, pair, net.pos.side, net.price, net.cut.size, net.pos.leverage, 'close', net.pnl, now),
+      ...feeAccrualStmts(env, p.user_id, pair, 'close', rCost, limitFeeRate, rFee, now, prints.length),
+    );
+  }
+  if (opens) {
+    stmts.push(
+      orderRowStmt(env, p.user_id, pair, p.side, oCost / oFilled, oFilled, effLev, 'open', null, now),
+      ...feeAccrualStmts(env, p.user_id, pair, 'open', oCost, limitFeeRate, oFee, now, prints.length),
+    );
+  }
+  // 지정가도 체결 시점에 수수료를 뗀다. 증거금 차액(+ 줄인 몫의 환급)과 상계해 한 번의 잔고 조정으로 처리한다.
+  // ⚠ 여는 몫에 추가 증거금이 필요하면(openDelta < 0) 그걸 가드한다 — 지금 잔고(+ 줄인 몫이 돌려주는 현금)가 그만큼 있어야 하고(읽은 뒤
+  // 바뀌었으면 batch 전체가 되돌려진다), 수수료는 가드하지 않는다(실제 코인 지정가와 같다 — 잔고를 다 잠근 주문도 체결은 돼야 한다,
+  // 모자라면 강제청산이 처리).
+  const reduceCash = net ? net.cut.margin + net.pnl - rFee : 0;
+  const guardAmt = marginDelta + reduceCash;
+  const delta = guardAmt - oFee;
+  if (openDelta < -EPS) {
+    stmts.push(
+      env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=? AND balance+? >= 0').bind(delta, p.user_id, guardAmt),
       guardStmt(env),
     );
-  } else if (Math.abs(net) > EPS) {
-    stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(net, p.user_id));
+  } else if (Math.abs(delta) > EPS) {
+    stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(delta, p.user_id));
   }
   // 유저가 롱(매수)이면 봇이 판 쪽(sell) — 봇 현금 +, 재고 −.
   const limitMakerFills = new Map<string, BotFill>();
@@ -3267,17 +3315,28 @@ export async function matchMarketOxOrder(
   tp: number | null,
   floorPnL = 0, // 크로스 가용 = 여유잔고 + floorPnL(전 포지션 미실현손익). balance 는 -floorPnL 까지 허용.
   extra?: (filled: number) => D1PreparedStatement[],
-): Promise<{ filled: number; avgPrice: number; reason?: 'liquidity' | 'margin'; short?: 'liquidity' | 'margin' }> {
+  /** 가격 상한(매수)·하한(매도) — 주면 그보다 불리한 호가는 안 먹는다. marketable 지정가의 "즉시 체결 몫"(§ order.ts placeLimitLegs)용. */
+  limitPrice: number | null = null,
+): Promise<{
+  filled: number;
+  avgPrice: number;
+  reason?: 'liquidity' | 'margin' | 'changed';
+  short?: 'liquidity' | 'margin';
+  reduced: number; // 반대 포지션에서 줄인 수량(원웨이)
+  opened: number; // 새로 열거나 같은 방향에 합친 수량
+  closedSide: string | null;
+}> {
   const isLong = side === 'long';
   const openMakerSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'; // 봇이 잡는 쪽(롱 진입이면 봇이 매도)
+  const none = (reason: 'liquidity' | 'margin' | 'changed') => ({ filled: 0, avgPrice: 0, reason, reduced: 0, opened: 0, closedSide: null });
 
   // ── 1) 필요한 값을 몇 번의 read 로 한 번에 확보(예전엔 청크마다 read/batch 왕복이라 대량이 느리고
   //        리쿼트와 경합해 정체됐다). 수수료율은 주문 전체에 한 번만 확정(청크마다 등급이 바뀌지 않게). ──
-  // 포지션은 레버리지만 본다(합치기는 SQL 이 상대값으로 한다 — § _shared positionAddStmts).
-  const existing0 = await env.DB.prepare('SELECT leverage FROM positions WHERE user_id=? AND symbol=? AND side=? ORDER BY opened_at LIMIT 1')
-    .bind(uid, pair, side)
-    .first<{ leverage: number }>();
-  const effLev = existing0 ? existing0.leverage : leverage; // 물타기 시 기존 레버리지 고정
+  // ⚠⚠ 원웨이(§ _shared 원웨이 모드): 이 심볼의 포지션을 양방향으로 한 번에 읽는다 — 반대 포지션(opp)이 있으면 walking 의 앞
+  // 부분이 그걸 먼저 줄이고(증거금 불필요), 다 닫은 뒤 남는 수량만 연다. 같은 방향(same)은 레버리지만 본다(합치기는 SQL 상대값).
+  const held = await heldPositions(env, uid, pair);
+  const { opp, same } = splitHeld(held, side);
+  const effLev = same ? same.leverage : leverage; // 물타기 시 기존 레버리지 고정
   // ⚠ 잔고와 요율은 **같은 users 행**이라 한 번에 읽는다 — 예전엔 feeRateOf(total_volume) 와 balance 를
   // 따로 읽어 같은 행을 두 번 조회했다(§6 "같은 걸 한 요청 안에서 두 번 읽지 않는다"). 무료 플랜은
   // invocation 당 쿼리가 50 뿐이라 이런 한 개가 실제로 체결 성패를 가른다.
@@ -3292,11 +3351,14 @@ export async function matchMarketOxOrder(
     .first<{ ref_price: number; anchor: number } & BookRow>();
   const est = st?.ref_price ?? 1;
 
-  // 감당 가능 수량으로 목표를 먼저 클램프(부풀린 평단→즉시 강제청산 방지, 기존 로직 유지).
+  // 감당 가능 수량으로 목표를 먼저 클램프(부풀린 평단→즉시 강제청산 방지, 기존 로직 유지). 반대 포지션을 줄이는 몫은 증거금이
+  // 들지 않으므로 클램프 밖이고, 그걸 다 닫으면 그 증거금도 여는 몫의 가용으로 돌아온다(정밀한 판정은 아래 walking 이 한다).
   const perUnitEst = est / effLev + est * feeRate;
-  const affordableUnits = perUnitEst > 0 ? ((bal0 + floorPnL) * 0.999) / perUnitEst : 0;
-  const target = Math.min(size, Math.max(0, affordableUnits));
-  if (target <= EPS) return { filled: 0, avgPrice: 0, reason: 'margin' };
+  const reduceCap = opp ? Math.min(size, opp.size) : 0;
+  const availEst = bal0 + floorPnL + (opp && size > opp.size ? opp.margin : 0);
+  const affordableUnits = perUnitEst > 0 ? Math.max(0, availEst * 0.999) / perUnitEst : 0;
+  const target = Math.min(size, reduceCap + affordableUnits);
+  if (target <= EPS) return none('margin');
 
   // ── 2) 위에서 함께 읽어온 봇 사다리를 메모리에서 walking(청크마다 왕복하지 않는다). 사다리가 끝나면 거기서 멈춘다
   //        (§ 위 "호가에 있는 물량만" — 봇이 잔량을 받아 주는 합성 흡수는 없다). ──
@@ -3304,7 +3366,7 @@ export async function matchMarketOxOrder(
   type MemFill = { level: BookLevel; makerUserId: string; price: number; size: number };
   const planned: MemFill[] = [];
   let remaining = target;
-  for (const level of makerLevels(book, openMakerSide, null).slice(0, MAKER_SNAPSHOT_LIMIT)) {
+  for (const level of makerLevels(book, openMakerSide, limitPrice).slice(0, MAKER_SNAPSHOT_LIMIT)) {
     if (remaining <= EPS) break;
     const take = Math.min(remaining, level.size);
     if (take <= EPS) continue;
@@ -3316,11 +3378,19 @@ export async function matchMarketOxOrder(
   //        마지막 체결은 감당 가능한 만큼만 잘라낸다). 봇별 정산·소비할 실제 호가·OHLC 를 함께 누적.
   //  ⚠ budget 은 가용의 딱 100% 가 아니라 아주 살짝 아래로 둔다 — 감당분에 정확히 맞추면 아래 차감의
   //     원자 가드(balance - 총비용 >= -floorPnL)가 부동소수 오차로 실패해 체결이 통째로 0 이 된다. ──
-  const avail = bal0 + floorPnL;
-  const budget = avail * (1 - 1e-6);
-  let filled = 0;
-  let cost = 0;
-  let feeTotal = 0;
+  // 줄이는 몫(rX)과 여는 몫(oX)을 따로 센다. 줄이는 몫은 감당 제약이 없고(환급), 여는 몫은 가용(budget) 안에서만.
+  const dirOpp = opp?.side === 'long' ? 1 : -1;
+  let reduceLeft = reduceCap;
+  let rFilled = 0;
+  let rCost = 0;
+  let rPnl = 0;
+  let rFee = 0;
+  // 여는 몫의 가용 — 반대 포지션이 없으면 지금 가용, 있으면 그걸 다 닫은 순간 다시 잰다(아래).
+  let budget = opp ? 0 : (bal0 + floorPnL) * (1 - 1e-6);
+  let budgetReady = !opp;
+  let oFilled = 0;
+  let oCost = 0;
+  let oFee = 0;
   let spent = 0;
   let openPx = 0;
   let high = 0;
@@ -3329,9 +3399,41 @@ export async function matchMarketOxOrder(
   const makerFills = new Map<string, BotFill>();
   const settled: { price: number; size: number }[] = []; // 체결 테이프에 찍을 실제 체결들(가격대별)
   let marginCut = false; // 가용이 사다리보다 먼저 끝났나(못 채운 이유 구분용)
+  const take = (f: MemFill, sz: number) => {
+    if (openPx === 0) openPx = f.price;
+    high = Math.max(high, f.price);
+    low = Math.min(low, f.price);
+    lastPx = f.price;
+    addBotFill(makerFills, f.makerUserId, f.price * sz, sz);
+    settled.push({ price: f.price, size: sz });
+    f.level.size -= sz; // 실제 사다리 물량 소비(참조라 그대로 book 에 반영된다)
+  };
   for (const f of planned) {
+    let left = f.size;
+    if (reduceLeft > EPS) {
+      const t = Math.min(left, reduceLeft);
+      rFilled += t;
+      rCost += f.price * t;
+      rPnl += (f.price - opp!.entry_price) * t * dirOpp;
+      rFee += f.price * t * feeRate;
+      take(f, t);
+      reduceLeft -= t;
+      left -= t;
+      if (left <= EPS) continue;
+    }
+    if (!budgetReady) {
+      // 반대 포지션을 다 닫았다(reduceLeft 소진 + 이 단계에 물량이 남음) — 여는 몫의 가용 = 지금 가용 + 돌려받는 증거금 +
+      // (실현손익 − 그 몫이 가용에 이미 들어 있던 미실현) − 청산 수수료.
+      if (rFilled < opp!.size - sizeEps(opp!.size)) break; // (size < opp.size 면 여기 오지 않는다 — 방어)
+      const cutUpnl = (est - opp!.entry_price) * opp!.size * dirOpp;
+      // ⚠ 여유는 **각 항의 크기**에 비례해 뺀다 — 실현손익과 미실현이 둘 다 크고 서로 상쇄되면(1e20 수량 등) 합에 비례한 여유로는
+      // 부동소수 오차를 못 덮어 아래 크로스 가드가 매번 실패한다(같은 주문을 다시 내도 계속 "겹쳤습니다").
+      const terms = [bal0, floorPnL, opp!.margin, rPnl, cutUpnl, rFee];
+      budget = terms[0] + terms[1] + terms[2] + terms[3] - terms[4] - terms[5] - 1e-6 * terms.reduce((a, v) => a + Math.abs(v), 0);
+      budgetReady = true;
+    }
     const perUnit = f.price / effLev + f.price * feeRate;
-    let sz = f.size;
+    let sz = left;
     if (spent + sz * perUnit > budget) {
       marginCut = true;
       const afford = (budget - spent) / perUnit;
@@ -3340,48 +3442,52 @@ export async function matchMarketOxOrder(
     }
     if (sz <= EPS) break;
     spent += sz * perUnit;
-    filled += sz;
-    cost += f.price * sz;
-    feeTotal += f.price * sz * feeRate;
-    if (openPx === 0) openPx = f.price;
-    high = Math.max(high, f.price);
-    low = Math.min(low, f.price);
-    lastPx = f.price;
-    addBotFill(makerFills, f.makerUserId, f.price * sz, sz);
-    settled.push({ price: f.price, size: sz });
-    f.level.size -= sz; // 실제 사다리 물량 소비(참조라 그대로 book 에 반영된다)
-    if (sz < f.size - EPS) break; // 가용 소진 — 여기서 멈춤
+    oFilled += sz;
+    oCost += f.price * sz;
+    oFee += f.price * sz * feeRate;
+    take(f, sz);
+    if (sz < left - EPS) break; // 가용 소진 — 여기서 멈춤
   }
-  if (filled <= EPS) return { filled: 0, avgPrice: 0, reason: marginCut ? 'margin' : 'liquidity' };
+  const filled = rFilled + oFilled;
+  if (filled <= EPS) return none(marginCut ? 'margin' : 'liquidity');
   // 요청을 다 못 채웠으면 그 이유 — 사다리가 먼저 끝났으면 호가 물량, 아니면 증거금 한도(감당 클램프 포함).
   const short: 'liquidity' | 'margin' | undefined =
     filled >= size - sizeEps(size) ? undefined : !marginCut && remaining > EPS ? 'liquidity' : 'margin';
 
+  const cost = rCost + oCost;
   const avgPrice = cost / filled;
-  const totalMargin = cost / effLev; // Σ(price*size)/effLev
+  const net = opp && rFilled > EPS ? netCutOf(opp, rFilled, rCost) : null;
+  const opens = oFilled > EPS;
+  const openMargin = oCost / effLev; // Σ(price*size)/effLev
   const newRef = roundOx(avgPrice); // ⚠ 기준가 = 가중평균가(§ 위 "유저 체결 뒤 기준가")
   const anchor0 = st?.anchor && st.anchor > 0 ? st.anchor : est;
   const newAnchor = roundOx(anchor0 + (newRef - anchor0) * ANCHOR_TRADE_PULL); // 유저 임팩트가 적정가를 끌어당김
   const now = Date.now();
 
-  // ── 4) 한 batch 로 적용 — 잔고 차감(크로스 가드) + 가드가 맨 앞이다. 읽은 뒤 잔고가 바뀌어(동시 폴링의 트리거 체결·
-  //        강제청산 등) 가드에 걸리면 통째로 되돌려지고 'margin' 을 돌려준다 — 호출부가 "호가가 없어서"로 오해하지 않게
-  //        사유를 구분한다. target 을 이미 감당분으로 잘랐으니 보통은 통과한다. ──
-  const stmts: D1PreparedStatement[] = [
-    env.DB.prepare('UPDATE users SET balance=balance-? WHERE id=? AND balance-? >= ?').bind(
-      totalMargin + feeTotal,
-      uid,
-      totalMargin + feeTotal,
-      -floorPnL,
-    ),
-    guardStmt(env),
-    // 소비한 사다리를 best-effort 로 되쓴다(그 사이 재호가가 있었으면 0행이어도 무방 — 봇은 무한 유동성이라
-    // 환불/재시도 없이 체결은 그대로 성립. 이 best-effort 가 예전 claim-실패-스핀 정체를 없앤 그 원칙이다).
-    bookWriteStmt(env, pair, book, st?.book_version ?? 0),
-    ...positionAddStmts(env, { uid, symbol: pair, side, price: avgPrice, size: filled, leverage: effLev, margin: totalMargin, stopLoss: sl, takeProfit: tp, now }),
-  ];
+  // ── 4) 한 batch 로 적용 — [반대 포지션 선점 + 가드] → [잔고(여는 몫이 있으면 크로스 가드 + 가드)] 가 맨 앞이다. 읽은 뒤 잔고·
+  //        포지션이 바뀌어(동시 폴링의 트리거 체결·강제청산·다른 탭의 청산 등) 가드에 걸리면 통째로 되돌려지고 사유를 돌려준다 —
+  //        호출부가 "호가가 없어서"로 오해하지 않게. target 을 이미 감당분으로 잘랐으니 보통은 통과한다. ──
+  const stmts: D1PreparedStatement[] = [];
+  if (net) stmts.push(positionClaimStmt(env, uid, opp!, net.cut), guardStmt(env));
+  const reduceCash = net ? net.cut.margin + net.pnl - rFee : 0;
+  const delta = reduceCash - (opens ? openMargin + oFee : 0);
+  if (opens) {
+    // 크로스 가드: 잔고 + delta >= −(줄인 뒤의 미실현). 줄인 몫의 미실현은 실현돼 잔고로 들어가므로 floor 에서 뺀다.
+    const floorAfter = floorPnL - (net ? netCutUpnl(net, est) : 0);
+    stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=? AND balance+? >= ?').bind(delta, uid, delta, -floorAfter), guardStmt(env));
+  } else {
+    stmts.push(env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(delta, uid));
+  }
+  // 소비한 사다리를 best-effort 로 되쓴다(그 사이 재호가가 있었으면 0행이어도 무방 — 봇은 무한 유동성이라
+  // 환불/재시도 없이 체결은 그대로 성립. 이 best-effort 가 예전 claim-실패-스핀 정체를 없앤 그 원칙이다).
+  stmts.push(bookWriteStmt(env, pair, book, st?.book_version ?? 0));
+  if (opens) {
+    stmts.push(
+      ...positionAddStmts(env, { uid, symbol: pair, side, price: oCost / oFilled, size: oFilled, leverage: effLev, margin: openMargin, stopLoss: sl, takeProfit: tp, now }),
+    );
+  }
   // 체결 테이프는 **walking 한 가격대별로 여러 줄**(§ userTapeStmt) — 예전엔 1건으로 집계해서 큰
-  // 시장가가 "한 줄에 몇 백만 개"로 찍혔다. 봇 상대라 counterparty 는 표시용.
+  // 시장가가 "한 줄에 몇 백만 개"로 찍혔다. 봇 상대라 counterparty 는 표시용. 줄이는 몫·여는 몫 모두 같은 방향의 테이커다.
   const prints = splitPrints(settled);
   stmts.push(userTapeStmt(env, pair, prints, isLong ? 'buy' : 'sell', now));
   stmts.push(
@@ -3390,25 +3496,22 @@ export async function matchMarketOxOrder(
     ).bind(pair, now, newRef, newAnchor, interestBumpOf(filled)),
   );
   stmts.push(...candleUpsertStmts(env, pair, { open: openPx, high, low, close: roundOx(lastPx), volume: filled, ...sideVol(isLong ? 'buy' : 'sell', filled) }, now));
-  stmts.push(
-    env.DB.prepare('INSERT INTO orders (id,user_id,symbol,side,price,size,leverage,kind,pnl,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(
-      crypto.randomUUID(),
-      uid,
-      pair,
-      side,
-      avgPrice,
-      filled,
-      effLev,
-      'open',
-      null,
-      now,
-    ),
-  );
-  stmts.push(...feeAccrualStmts(env, uid, pair, 'open', cost, feeRate, feeTotal, now, prints.length));
+  if (net) {
+    stmts.push(
+      orderRowStmt(env, uid, pair, opp!.side, net.price, net.cut.size, opp!.leverage, 'close', net.pnl, now),
+      ...feeAccrualStmts(env, uid, pair, 'close', rCost, feeRate, rFee, now, prints.length),
+    );
+  }
+  if (opens) {
+    stmts.push(
+      orderRowStmt(env, uid, pair, side, oCost / oFilled, oFilled, effLev, 'open', null, now),
+      ...feeAccrualStmts(env, uid, pair, 'open', oCost, feeRate, oFee, now, prints.length),
+    );
+  }
   stmts.push(...(await botFillStmts(env, pair, makerFills, openMakerSide, now)));
   if (extra) stmts.push(...extra(filled));
-  if (!(await guardedBatch(env, stmts))) return { filled: 0, avgPrice: 0, reason: 'margin' };
-  return { filled, avgPrice, short };
+  if (!(await guardedBatch(env, stmts))) return none(net ? 'changed' : 'margin');
+  return { filled, avgPrice, short, reduced: net?.cut.size ?? 0, opened: oFilled, closedSide: net ? opp!.side : null };
 }
 
 /**
@@ -3608,7 +3711,10 @@ async function sweepRestingOxPendings(env: Env, pair: string, pendings: PendingL
   const nibbling = live.some((p) => p.last_fill_at != null);
   const throttled = nibbling && (await autoWritesBlocked(env, 'nibble'));
   // 첫 체결(아직 한 번도 안 채워진 주문)을 앞세운다 — 상한에 걸려 미뤄지는 건 "이미 조금씩 채워지는 중"인 쪽이어야 한다.
-  for (const p of [...live].sort((a, b) => (a.last_fill_at == null ? 0 : 1) - (b.last_fill_at == null ? 0 : 1))) {
+  // 그다음은 지정가 청산(reduce-only) 먼저 — 원웨이에서 같은 가격의 "포지션 덮는 청산 줄 + 넘치는 진입 줄"(§ order.ts placeLimitLegs)은
+  // 청산 줄이 먼저 체결돼야 뒤집기(롱→숏)가 된다(진입 줄이 먼저면 그게 포지션을 줄여 청산 줄이 고아가 된다).
+  const rank = (p: PendingLite) => (p.last_fill_at == null ? 0 : 2) + (p.reduce_only ? 0 : 1);
+  for (const p of [...live].sort((a, b) => rank(a) - rank(b))) {
     if (fills >= MAX_SWEEP_FILLS) break; // 나머지는 다음 틱에서(§ MAX_SWEEP_FILLS)
     // ⚠ 첫 체결은 절대 늦추지 않는다(last_fill_at == null) — 유저가 방금 낸 주문이 즉시 체결되는 체감은
     // 이 사이트가 여러 번 튜닝해온 핵심이다. 하한은 **재체결**에만 건다.

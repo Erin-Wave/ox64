@@ -555,3 +555,26 @@ RangeError 로 화면이 통째로 죽는다 — `virtualPrecision(1e-12)=15` �
   24/26% · 상승틱 매수라벨 85% · 호가 역전 0. `check:walls` 7개 상황 위반 0. 로컬 `wrangler pages dev` + D1: 시장가 뒤 ref_price·fair 가
   같은 비율로 이동(SQL 정상), 현재가 +0.3% 매수 지정가 → 일부 체결 후 벽으로 남음 → 대기 5초 동안 ref_price 는 벽·fair 는 아래로 흐름 →
   봇이 벽 3만 개를 통째로 받아가고 가격이 공정가로 복귀. 타입체크(functions·cron·scripts·src) 통과.
+
+## 원웨이 포지션 모드 · 분할 지정가 · 모바일 포지션 카드 — 2026-11-02
+
+- 요청: "지정가에서 시작가·끝가 범위로 분할 주문", "지금 헷지 모드인데 원웨이로 — 설정에서도 헷지 못 켜게, 롱 들고 숏 치면 롱에서 수량이
+  까이게", "모바일에서 오픈포지션·거래내역이 가로로 길어 계속 좌우 스크롤 — 여러 줄로(PC 는 그대로)".
+- 원웨이: 진입 체결 5개 함수(`planRealEntry` 신설 — order.ts open·실제 조건부 공용 / `settleLimitOpen` / `matchMarketOxOrder` /
+  `matchLimitPendingAgainstBook`)가 같은 심볼의 반대 포지션을 먼저 줄이고(선점 + 가드, kind='close' 기록) 다 닫은 뒤 남는 수량만 연다.
+  여는 몫의 가용 = 가용 + 돌려받는 증거금 + (실현 − 그 몫의 mark 미실현) − 청산 수수료. `positionAddStmts` 끝에 원웨이 가드(반대 포지션이
+  남으면 롤백). 설정 거래 탭에 포지션 모드 원웨이(헷지 비활성 표시), 주문 패널에 "보유 (원웨이) · 반대는 청산부터".
+- 지정가 배치(`placeLimitLegs`): 반대 포지션을 덮는 몫은 reduce-only 줄(증거금 0), 넘치는 몫만 진입 줄. 덮는 몫은 먼저 체결될 다리부터,
+  평가는 reduce-only 먼저(runTriggers·sweepRestingOxPendings 정렬). 가상 코인 marketable 다리는 `matchMarketOxOrder(…, limitPrice)` 로 즉시
+  체결 — 처음엔 대기 줄로 넣었더니 다음 틱의 벽 규칙 때문에 1.57 시장에서 1.644 매수 지정가가 1.644 에 체결됐다(로컬 재현 → 수정).
+  분할 지정가 = `limitRange`(count 2~20 등분, 다중행 INSERT).
+- 모바일: `PositionsPanel` 이 md 미만에서 카드(머리줄 심볼·방향|손익, 가격 3칸, 수량·SL/TP, 청산 조작). 셀 렌더 함수를 표와 공유.
+  `useIsDesktop` 을 `hooks/` 로 빼 OrderBook 과 공유.
+- 검증(로컬 `wrangler pages dev` + D1, OX·BTC 각각): 롱 100 → 숏 40(롱 60, close 기록) → 숏 100(롱 청산 + 숏 40), 지정가 롱 60(숏 40 덮는
+  청산 줄 margin 0 + 진입 20), 분할 5건(높은 가격 2건이 청산 줄), marketable 지정가 뒤집기(OX 즉시 1.57 체결·대기 0 / BTC 다음 평가),
+  조건부 즉시 발동 뒤집기, 증거금 95% 쓴 롱 → 같은 수량 숏 지정가 = 청산 줄로 수락 — 전부 통과, 평가자산은 수수료·슬리피지만큼만 감소.
+  동시성: 롱 100 에 숏 40 시장가 6개 동시 → 성공 수 × 40 만큼 정확히 감소·장부(open Σ − close Σ = 보유) 일치, 무포지션 롱·숏 동시 →
+  BTC 에서 경합 발생 시 한쪽 롤백(헷지 0건). `check:walls` 7개 상황 위반 0. 헤드리스 Chrome 390px: 4개 탭 가로 넘침 0(편집 모드 포함),
+  1440px 표 그대로. 타입체크(functions·cron·src) 통과.
+- 남은 것: 실제 코인 marketable 지정가는 예전처럼 다음 평가에서 **지정가 그대로** 체결된다(mark 크로스 → 지정가, 시장가보다 불리할 수 있음).
+

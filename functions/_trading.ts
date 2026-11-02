@@ -36,6 +36,12 @@ import {
   claimThenSettle,
   guardStmt,
   guardedBatch,
+  heldPositions,
+  splitHeld,
+  netCutOf,
+  orderRowStmt,
+  planRealEntry,
+  vipOf,
 } from './_shared';
 import { autoWritesBlocked } from './_budget';
 import {
@@ -426,24 +432,39 @@ async function settleReduceOnlyClose(env: Env, uid: string, p: PendingRow, mark:
  * 사실상 없고, 모자라면 크로스 평가자산이 줄어 강제청산이 처리한다. */
 async function settleLimitOpen(env: Env, uid: string, p: PendingRow): Promise<void> {
   const now = Date.now();
-  const feeRate = await feeRateOf(env, uid);
-  const notional = p.limit_price * p.size;
-  const fee = notional * feeRate;
+  const [feeRate, held] = await Promise.all([feeRateOf(env, uid), heldPositions(env, uid, p.symbol)]);
   const col = balColOf(p.symbol);
-  await claimThenSettle(
-    env,
-    [pendingClaimStmt(env, p)],
-    [
-      env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ?`).bind(fee, uid),
-      ...feeAccrualStmts(env, uid, p.symbol, 'open', notional, feeRate, fee, now),
+  const L = p.limit_price;
+  // ⚠⚠ 원웨이(§ _shared 원웨이 모드): 반대 포지션이 있으면 먼저 줄인다(지정가에, 청산과 같은 선점 + 가드). 그 몫에 잠가 둔
+  // 증거금은 돌려주고, 다 닫은 뒤 남는 수량만 연다(잠근 증거금 중 그 몫이 포지션으로 옮겨 간다).
+  const { opp } = splitHeld(held, p.side);
+  const r = opp ? Math.min(p.size, opp.size) : 0;
+  const net = opp && r > 0 ? netCutOf(opp, r, L * r) : null;
+  const o = net?.cut.full ? p.size - net.cut.size : net ? 0 : p.size;
+  const opens = o > sizeEps(p.size);
+  const openMargin = opens ? (p.margin * o) / p.size : 0;
+  const rFee = net ? L * net.cut.size * feeRate : 0;
+  const oFee = opens ? L * o * feeRate : 0;
+  // 잔고 = 줄인 몫(증거금 + 실현손익 − 수수료) + 쓰지 않은 잠금(= 잠근 것 − 포지션으로 옮긴 것) − 여는 몫 수수료.
+  const delta = (net ? net.cut.margin + net.pnl - rFee : 0) + (p.margin - openMargin) - oFee;
+  const settle: D1PreparedStatement[] = [env.DB.prepare(`UPDATE users SET ${col} = ${col} + ? WHERE id = ?`).bind(delta, uid)];
+  if (net) {
+    settle.push(
+      ...feeAccrualStmts(env, uid, p.symbol, 'close', L * net.cut.size, feeRate, rFee, now),
+      orderRowStmt(env, uid, p.symbol, net.pos.side, L, net.cut.size, net.pos.leverage, 'close', net.pnl, now),
+    );
+  }
+  if (opens) {
+    settle.push(
+      ...feeAccrualStmts(env, uid, p.symbol, 'open', L * o, feeRate, oFee, now),
       ...positionAddStmts(env, {
         uid,
         symbol: p.symbol,
         side: p.side,
-        price: p.limit_price,
-        size: p.size,
+        price: L,
+        size: o,
         leverage: p.leverage,
-        margin: p.margin,
+        margin: openMargin,
         stopLoss: p.stop_loss,
         takeProfit: p.take_profit,
         now,
@@ -453,9 +474,11 @@ async function settleLimitOpen(env: Env, uid: string, p: PendingRow): Promise<vo
       env.DB.prepare(
         `INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at)
          VALUES (?,?,?,?,?,?,COALESCE((SELECT leverage FROM positions WHERE user_id = ? AND symbol = ? AND side = ? ORDER BY opened_at LIMIT 1), ?),?,?,?)`,
-      ).bind(crypto.randomUUID(), uid, p.symbol, p.side, p.limit_price, p.size, uid, p.symbol, p.side, p.leverage, 'open', null, now),
-    ],
-  );
+      ).bind(crypto.randomUUID(), uid, p.symbol, p.side, L, o, uid, p.symbol, p.side, p.leverage, 'open', null, now),
+    );
+  }
+  // 주문(과 줄일 포지션)을 **선점한 뒤에만** 정산한다 — 둘 중 하나라도 빗나가면 batch 전체가 되돌려지고 다음 평가에서 다시 본다.
+  await claimThenSettle(env, [pendingClaimStmt(env, p), ...(net ? [positionClaimStmt(env, uid, net.pos, net.cut)] : [])], settle);
 }
 
 /** 이 구간에 SL/TP 가 걸렸나 — 롱은 저가가 SL 을, 고가가 TP 를 건드렸는지(숏은 반대). 둘 다 걸렸으면 SL 이 먼저다
@@ -612,39 +635,37 @@ async function settleConditionalOrder(
 
   // 실제 코인 — 서버가 받은 거래소 호가창을 먹으며 시장가 진입(2026-10-02, 예전엔 mark 한 값에 수량 무제한). 있는 물량만,
   // 가용 증거금(크로스) 안에서만 체결하고 못 채운 잔량은 조건을 살려둔다(1회성은 size 차감). 호가창을 못 받았으면 이번엔 쉰다.
-  const [book, user, existing] = await Promise.all([
+  // 원웨이 — 반대 포지션이 있으면 먼저 줄이고(증거금 불필요) 다 닫은 뒤 남는 수량만 연다(§ _shared planRealEntry, 시장가 진입과 같은 함수).
+  const [book, user, held] = await Promise.all([
     fetchBook(c.symbol).catch(() => null),
-    env.DB.prepare(`SELECT ${balColOf(c.symbol)} AS bal FROM users WHERE id = ?`).bind(uid).first<{ bal: number }>(), // 원화 심볼이면 원화 지갑
-    env.DB.prepare('SELECT leverage FROM positions WHERE user_id = ? AND symbol = ? AND side = ? ORDER BY opened_at LIMIT 1')
-      .bind(uid, c.symbol, c.side)
-      .first<{ leverage: number }>(),
+    // 원화 심볼이면 원화 지갑. 요율(누적 거래대금)도 같은 행이라 한 번에.
+    env.DB.prepare(`SELECT ${balColOf(c.symbol)} AS bal, total_volume FROM users WHERE id = ?`).bind(uid).first<{ bal: number; total_volume: number }>(),
+    heldPositions(env, uid, c.symbol),
   ]);
   if (!book || !user) return;
-  const feeRate = await feeRateOf(env, uid);
-  const col = balColOf(c.symbol);
-  const effLev = existing ? existing.leverage : c.leverage; // 물타기 시 기존 포지션 레버리지 고정
-  const available = (user.bal ?? 0) + uPnL;
-  const w = walkBook(takeSideOf(book, c.side === 'long'), c.size, available * 0.999, (p) => p / effLev + p * feeRate);
-  const fillSize = w.filled;
+  const plan = planRealEntry(env, {
+    uid,
+    symbol: c.symbol,
+    side: c.side,
+    size: c.size,
+    leverage: c.leverage,
+    stopLoss: null,
+    takeProfit: null,
+    levels: takeSideOf(book, c.side === 'long'),
+    mark: marks[c.symbol],
+    bal: user.bal ?? 0,
+    uPnL,
+    feeRate: vipOf(user.total_volume ?? 0).rate,
+    held,
+    strict: false,
+    now,
+  });
+  const fillSize = plan.reduced + plan.opened;
   if (fillSize <= EPS) return; // 가용이 부족하거나 호가가 비어 하나도 못 삼 → 조건 유지, 다음 평가 재시도
-
-  const price = w.cost / fillSize; // 가중평균 체결가
-  const notional = w.cost;
-  const margin = notional / effLev;
-  const fee = notional * feeRate;
-  // 잔고 차감(크로스 가드) · 이 주문의 체결 기록(선점) · 포지션 · 원장을 **한 batch** 로 — 가드 둘 중 하나라도 걸리면
+  // 잔고(크로스 가드) · 선점 · 포지션 · 원장 + 이 주문의 체결 기록(선점)을 **한 batch** 로 — 가드 중 하나라도 걸리면
   // (가용 부족·다른 평가가 먼저 처리) 통째로 되돌려져 조건은 그대로 남는다(§ _shared 가드 문장).
-  await guardedBatch(env, [
-    env.DB.prepare(`UPDATE users SET ${col} = ${col} - ? WHERE id = ? AND ${col} - ? >= ?`).bind(margin + fee, uid, margin + fee, -uPnL),
-    guardStmt(env),
-    ...conditionalFillStmts(env, uid, c, fillSize, now),
-    // (예산 계량은 feeAccrualStmts 가 한다 — 여기 또 넣으면 이중 계산)
-    ...feeAccrualStmts(env, uid, c.symbol, 'open', notional, feeRate, fee, now),
-    ...positionAddStmts(env, { uid, symbol: c.symbol, side: c.side, price, size: fillSize, leverage: effLev, margin, stopLoss: null, takeProfit: null, now }),
-    env.DB.prepare(
-      'INSERT INTO orders (id, user_id, symbol, side, price, size, leverage, kind, pnl, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-    ).bind(crypto.randomUUID(), uid, c.symbol, c.side, price, fillSize, effLev, 'open', null, now),
-  ]);
+  // (예산 계량은 feeAccrualStmts 가 한다 — 여기 또 넣으면 이중 계산)
+  await guardedBatch(env, [...plan.stmts, ...conditionalFillStmts(env, uid, c, fillSize, now)]);
 }
 
 // 반환값 = 이번에 받아온 마크가격 맵(loadState 로 넘겨 클라가 서버와 동일한 시세로 청산가/평가자산을
@@ -757,7 +778,10 @@ async function runTriggers(
   const refillBlocked =
     oxPend.some((p) => p.last_fill_at != null && crossing.has(p.id)) && (await autoWritesBlocked(env, 'nibble'));
 
-  for (const p of pendings) {
+  // ⚠ 지정가 청산(reduce-only)을 진입 지정가보다 **먼저** 본다(원웨이, 2026-11-02). 같은 평가에서 둘 다 걸리면(롱을 덮는 숏 청산 줄 +
+  // 넘치는 숏 진입 줄, § order.ts placeLimitLegs) 진입 줄이 먼저 체결돼 포지션을 줄여 버리면 청산 줄이 고아가 되고 뒤집기가 평탄으로 끝난다.
+  const ordered = [...pendings].sort((a, b) => (b.reduce_only ? 1 : 0) - (a.reduce_only ? 1 : 0));
+  for (const p of ordered) {
     const mark = prices[p.symbol];
     if (mark == null) continue;
 
