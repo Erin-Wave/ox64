@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { tradeHotkeyAllowed } from '@/hotkeys';
+import { useIsDesktop } from '@/hooks/useIsDesktop';
+import TradeToasts from '@/components/TradeToasts';
 import { useMarketStore, selectLastPrice, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
@@ -53,6 +55,7 @@ export default function OrderPanel() {
   const krwBalance = useTradingStore((s) => s.krwBalance);
   const error = useTradingStore((s) => s.error);
   const notice = useTradingStore((s) => s.notice);
+  const desktop = useIsDesktop(); // 메시지 자리 — PC 인라인 / 모바일 토스트(아래)
   const positions = useTradingStore((s) => s.positions);
   const markPrices = useTradingStore((s) => s.markPrices);
   const feeRate = useTradingStore((s) => s.feeRate);
@@ -736,10 +739,15 @@ export default function OrderPanel() {
         </div>
       </div>
 
-      {error && (
-        <p className="rounded-md bg-downDim px-2.5 py-1.5 text-xs text-down">{error}</p>
+      {/* 메시지 — PC 는 버튼 위 인라인(버튼이 패널 바닥에 붙어 있어 안 밀린다), 모바일은 토스트(끼워 넣으면 롱/숏 버튼이 밀려 오탭) */}
+      {desktop ? (
+        <>
+          {error && <p className="rounded-md bg-downDim px-2.5 py-1.5 text-xs text-down">{error}</p>}
+          {notice && <p className="rounded-md border border-border bg-panel2 px-2.5 py-1.5 text-xs text-text">{notice}</p>}
+        </>
+      ) : (
+        <TradeToasts error={error} notice={notice} />
       )}
-      {notice && <p className="rounded-md border border-border bg-panel2 px-2.5 py-1.5 text-xs text-text">{notice}</p>}
 
       {/* 롱/숏 — 처리 중에도 눌린다(누른 만큼 차례로 나간다, § submit) */}
       <div className="mt-auto grid grid-cols-2 gap-2">
