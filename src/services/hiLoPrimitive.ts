@@ -4,7 +4,9 @@
 //   구간을 읽어 봉을 훑으면 따로 구독할 이벤트가 없다(매물대와 달리 지표 설정·레전드와 엮인 상태가 없다). 보이는 봉 수만큼의 선형
 //   탐색이라(기본 ~38봉, 최대 수천) 프레임당 비용은 무시할 만하다.
 // - 라벨은 봉이 화면 오른쪽 절반이면 왼쪽으로, 왼쪽 절반이면 오른쪽으로 뻗는다(차트 밖·가격축 쪽으로 삐져나가지 않게).
-// - zOrder 'top' = 캔들 위(라벨이 캔들에 가려지지 않게).
+// - zOrder 'top' = 캔들 위(라벨이 캔들에 가려지지 않게). 글자는 차트 배경색 테두리(halo)를 둘러 캔들·지표선 위에서도 읽히게.
+// - 왼쪽 위 OHLCV 레전드와 겹치지 않게 하는 건 여기가 아니라 Chart 다 — 레전드 높이만큼 캔들 가격축 위 여백(scaleMargins.top)을
+//   늘려 가장 높은 꼬리가 레전드 아래에서 시작하게 한다(모바일처럼 레전드가 여러 줄로 접힐 때 특히).
 import type {
   IChartApi,
   ISeriesApi,
@@ -40,9 +42,11 @@ const FONT = "10px 'Proxima Nova', sans-serif";
 class HiLoRenderer implements ISeriesPrimitivePaneRenderer {
   private readonly marks: Mark[];
   private readonly color: string;
-  constructor(marks: Mark[], color: string) {
+  private readonly halo: string;
+  constructor(marks: Mark[], color: string, halo: string) {
     this.marks = marks;
     this.color = color;
+    this.halo = halo;
   }
   draw(target: DrawTarget) {
     target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
@@ -52,8 +56,7 @@ class HiLoRenderer implements ISeriesPrimitivePaneRenderer {
       ctx.font = FONT;
       ctx.textBaseline = 'middle';
       ctx.fillStyle = this.color;
-      ctx.strokeStyle = this.color;
-      ctx.lineWidth = 1;
+      ctx.lineJoin = 'round';
       for (const m of this.marks) {
         if (m.y < 0 || m.y > H || m.x < 0 || m.x > W) continue; // 가격축을 끌어 꼬리 끝이 화면 밖이면 안 그린다
         const left = m.x > W / 2; // 오른쪽 절반의 봉은 라벨을 왼쪽으로
@@ -63,12 +66,19 @@ class HiLoRenderer implements ISeriesPrimitivePaneRenderer {
         // 글자가 위아래로 잘리지 않게 세로 중심만 살짝 안쪽으로(선은 꼬리 끝 그대로)
         const ty = Math.min(H - 6, Math.max(6, m.y));
         const y = Math.round(m.y) + 0.5; // 1px 선이 두 줄로 번지지 않게
+        ctx.strokeStyle = this.color;
+        ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(x0, y);
         ctx.lineTo(x1, y);
         ctx.stroke();
         ctx.textAlign = left ? 'right' : 'left';
-        ctx.fillText(m.text, x1 + dir * GAP, ty);
+        const tx = x1 + dir * GAP;
+        // 배경색 테두리 먼저 — 글자가 캔들 몸통·격자·지표선을 지나가도 끊겨 보이지 않게
+        ctx.strokeStyle = this.halo;
+        ctx.lineWidth = 3;
+        ctx.strokeText(m.text, tx, ty);
+        ctx.fillText(m.text, tx, ty);
       }
       ctx.restore();
     });
@@ -77,12 +87,13 @@ class HiLoRenderer implements ISeriesPrimitivePaneRenderer {
 
 class HiLoPaneView implements ISeriesPrimitivePaneView {
   marks: Mark[] = [];
-  color = '#7c828b';
+  color = '#d1d4dc';
+  halo = '#0b0d0f';
   zOrder(): SeriesPrimitivePaneViewZOrder {
     return 'top';
   }
   renderer(): ISeriesPrimitivePaneRenderer | null {
-    return this.marks.length ? new HiLoRenderer(this.marks, this.color) : null;
+    return this.marks.length ? new HiLoRenderer(this.marks, this.color, this.halo) : null;
   }
 }
 
@@ -114,9 +125,11 @@ export class HiLoPrimitive implements ISeriesPrimitive<Time> {
     this.enabled = on;
     this.requestUpdate?.();
   }
-  setColor(color: string) {
-    if (this.view.color === color) return;
+  /** 글자·선 색과 글자 테두리(= 차트 배경) 색 — 테마가 바뀌면 Chart 가 다시 부른다 */
+  setColors(color: string, halo: string) {
+    if (this.view.color === color && this.view.halo === halo) return;
     this.view.color = color;
+    this.view.halo = halo;
     this.requestUpdate?.();
   }
   updateAllViews() {

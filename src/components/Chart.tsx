@@ -48,14 +48,32 @@ const IND_COLORS = ['#f0b90b', '#4a90e2', '#c77dff', '#00c076', '#ff6b6b', '#3bb
 // 차트 캔버스 색(배경/격자/축 텍스트/캔들) — UI 크롬은 index.css 의 CSS 변수로,
 // Lightweight Charts 는 캔버스 렌더링이라 여기서 별도로 applyOptions() 해줘야 함.
 // 라이트/고대비는 사이트 테마 고정 배색, 다크일 때만 거래소 프리셋(바이낸스/OKX/트레이딩뷰)으로 세분화.
-type ChartColors = { bg: string; text: string; grid: string; border: string; up: string; down: string };
-const LIGHT_THEME: ChartColors = { bg: '#ffffff', text: '#6b727a', grid: '#e7e9ec', border: '#d6dadf', up: '#00875c', down: '#d1293f' };
-const HIGH_CONTRAST_THEME: ChartColors = { bg: '#000000', text: '#c8c8c8', grid: '#333333', border: '#ffffff', up: '#00ff80', down: '#ff1744' };
+// mark = 차트 위에 얹는 최고·최저가 라벨 글자색 — 축 글자(text)는 회색이라 캔들 사이에선 잘 안 보였다(제보) → 다크는 밝은 흰색, 라이트는 진한 먹색.
+type ChartColors = { bg: string; text: string; mark: string; grid: string; border: string; up: string; down: string };
+const LIGHT_THEME: ChartColors = { bg: '#ffffff', text: '#6b727a', mark: '#1e2329', grid: '#e7e9ec', border: '#d6dadf', up: '#00875c', down: '#d1293f' };
+const HIGH_CONTRAST_THEME: ChartColors = { bg: '#000000', text: '#c8c8c8', mark: '#ffffff', grid: '#333333', border: '#ffffff', up: '#00ff80', down: '#ff1744' };
 const DARK_SCHEMES: Record<ChartColorScheme, ChartColors> = {
-  binance: { bg: '#0b0d0f', text: '#7c828b', grid: '#191c21', border: '#282c33', up: '#0ecb81', down: '#f6465d' },
-  okx: { bg: '#14151a', text: '#76808f', grid: '#1d1f26', border: '#2f333d', up: '#00b897', down: '#ff5b5b' },
-  tradingview: { bg: '#131722', text: '#787b86', grid: '#1e222d', border: '#2a2e39', up: '#26a69a', down: '#ef5350' },
+  binance: { bg: '#0b0d0f', text: '#7c828b', mark: '#d5d8dc', grid: '#191c21', border: '#282c33', up: '#0ecb81', down: '#f6465d' },
+  okx: { bg: '#14151a', text: '#76808f', mark: '#d5d8dc', grid: '#1d1f26', border: '#2f333d', up: '#00b897', down: '#ff5b5b' },
+  tradingview: { bg: '#131722', text: '#787b86', mark: '#d1d4dc', grid: '#1e222d', border: '#2a2e39', up: '#26a69a', down: '#ef5350' },
 };
+
+// 캔들 가격축 위 여백(scaleMargins.top) — 왼쪽 위 OHLCV 레전드 높이만큼 늘려 가장 높은 꼬리(최고가 라벨)가 레전드 아래에서 시작하게 한다.
+// 모바일처럼 폭이 좁으면 레전드가 2~3줄로 접혀 6% 여백으로는 최고가 라벨이 레전드 글자와 겹쳤다(제보).
+const TOP_MARGIN_MIN = 0.06;
+const TOP_MARGIN_MAX = 0.35; // 지표가 많아 레전드가 길게 접혀도 캔들이 납작해지지 않게
+const LEGEND_GAP_PX = 10; // 레전드 아래 끝 ~ 가장 높은 꼬리(라벨 글자 반 높이 + 여유)
+// 차트 클릭(→ 지정가 입력)은 이만큼 미뤘다가 보낸다 — 더블클릭(전체화면)의 첫 클릭이 지정가를 덮어쓰지 않게.
+const CLICK_DEFER_MS = 250;
+
+/** 전체화면 들어가기/나오기 아이콘 */
+function FullscreenIcon({ exit }: { exit: boolean }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      {exit ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
+    </svg>
+  );
+}
 function chartColors(theme: 'dark' | 'light' | 'high-contrast', colorScheme: ChartColorScheme): ChartColors {
   if (theme === 'light') return LIGHT_THEME;
   if (theme === 'high-contrast') return HIGH_CONTRAST_THEME;
@@ -182,6 +200,17 @@ export default function Chart() {
   const refreshProfilesRef = useRef<() => void>(() => {});
   // 보이는 구간 최고·최저가 라벨(OKX 식) — 계산·그리기 전부 프리미티브 안(팬·줌·새 봉마다 LWC 가 다시 부른다)
   const hiLoPrimRef = useRef<HiLoPrimitive | null>(null);
+  // 캔들 가격축 여백 — top 은 레전드 높이에서(fitTopMargin), bottom 은 하단 패널 스택에서(syncIndicators) 따로 정해 한 번에 적용
+  const legendRef = useRef<HTMLDivElement>(null);
+  const marginsRef = useRef({ top: TOP_MARGIN_MIN, bottom: 0.04 });
+  const topPendingRef = useRef(false);
+  const fitTopMarginRef = useRef<() => void>(() => {});
+  // 전체화면(차트 더블클릭) — 차트만 화면 전체에. 브라우저 전체화면은 되는 곳에서만(아이폰 사파리는 CSS 로만 덮는다)
+  const [expanded, setExpanded] = useState(false);
+  const expandedRef = useRef(false);
+  expandedRef.current = expanded;
+  const browserFsRef = useRef(false);
+  const toggleExpandedRef = useRef<() => void>(() => {});
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const volMap = useRef<Map<number, number>>(new Map());
@@ -323,6 +352,55 @@ export default function Chart() {
   };
   repositionCountdownRef.current = repositionCountdown;
 
+  // 캔들 가격축 여백 적용 — top 과 bottom 이 합쳐 1 을 넘으면 LWC 가 거부하므로 top 을 깎는다(하단 패널이 많을 때)
+  const applyRightMargins = () => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const { top, bottom } = marginsRef.current;
+    chart.priceScale('right').applyOptions({ scaleMargins: { top: Math.min(top, 0.9 - bottom), bottom } });
+    requestAnimationFrame(() => repositionCountdownRef.current()); // 축이 다시 잡힌 뒤 카운트다운·X 버튼 위치
+  };
+  // 레전드 높이 → 위 여백. ⚠ 크로스헤어로 봉을 훑는 동안엔 바꾸지 않는다 — 레전드 값 길이에 따라 줄 수가 오가면
+  // 마우스를 움직일 때마다 캔들이 위아래로 튄다. 미뤄 뒀다가 크로스헤어가 빠질 때 반영.
+  const fitTopMargin = () => {
+    if (hovering.current) {
+      topPendingRef.current = true;
+      return;
+    }
+    topPendingRef.current = false;
+    const chart = chartRef.current;
+    const box = containerRef.current;
+    if (!chart || !box) return;
+    const paneH = box.clientHeight - chart.timeScale().height();
+    if (paneH <= 0) return;
+    const lg = legendRef.current;
+    const legendBottom = lg && lg.offsetHeight > 0 ? lg.offsetTop + lg.offsetHeight : 0;
+    const top = Math.min(TOP_MARGIN_MAX, Math.max(TOP_MARGIN_MIN, (legendBottom + LEGEND_GAP_PX) / paneH));
+    if (Math.abs(top - marginsRef.current.top) < 0.002) return;
+    marginsRef.current.top = top;
+    applyRightMargins();
+  };
+  fitTopMarginRef.current = fitTopMargin;
+
+  // 전체화면 토글 — ⚠ requestFullscreen 은 사용자 입력 처리 중에만 허용되므로 이펙트가 아니라 여기(더블클릭·버튼 핸들러)서 부른다.
+  // 문서 전체를 브라우저 전체화면으로 올리고 차트는 CSS 로 화면을 덮는다 — 차트 엘리먼트만 올리면 그 위에 뜨는 모달(리필 등)이 안 보인다.
+  const toggleExpanded = () => {
+    if (!expandedRef.current) {
+      setExpanded(true);
+      expandedRef.current = true; // fullscreenchange 가 리렌더보다 먼저 와도 맞게
+      const el = document.documentElement;
+      if (!document.fullscreenElement && typeof el.requestFullscreen === 'function') {
+        el.requestFullscreen().catch(() => {}); // 막히면 CSS 로 덮은 것만으로 충분
+      }
+    } else {
+      setExpanded(false);
+      expandedRef.current = false;
+      if (browserFsRef.current && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      browserFsRef.current = false;
+    }
+  };
+  toggleExpandedRef.current = toggleExpanded;
+
   // ── 차트 생성 (1회) ──────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current) return;
@@ -364,7 +442,7 @@ export default function Chart() {
       candles: () => candlesRef.current,
       format: (v) => fmtPriceShort(v, precRef.current, 9),
     });
-    hiLoPrim.setColor(initTheme.text);
+    hiLoPrim.setColors(initTheme.mark, initTheme.bg);
     hiLoPrim.setEnabled(useChartStore.getState().hiLoMarks);
     candle.attachPrimitive(hiLoPrim);
     hiLoPrimRef.current = hiLoPrim;
@@ -387,6 +465,8 @@ export default function Chart() {
         const l = candlesRef.current.at(-1);
         if (l) setLegend(l);
         setIndLegend(lastIndLegend());
+        // 훑는 동안 미뤄 둔 위 여백 — 레전드가 마지막 봉 값으로 다시 그려진 뒤에 잰다
+        if (topPendingRef.current) requestAnimationFrame(() => fitTopMarginRef.current());
         return;
       }
       const d = param.seriesData.get(c) as CandlestickData | undefined;
@@ -431,15 +511,30 @@ export default function Chart() {
     });
 
     // 차트 클릭 → 클릭한 y좌표의 가격을 지정가 주문 입력에 흘려보낸다(OrderPanel 이 구독).
+    // ⚠ 잠깐(CLICK_DEFER_MS) 미뤘다가 보낸다 — 더블클릭(전체화면)이면 LWC 가 첫 번째만 클릭으로 주므로, 바로 보내면
+    // 전체화면으로 들어가는 것만으로 지정가 탭의 가격이 덮어써졌다. 더블클릭이 오면 대기 중인 클릭을 버린다.
+    let clickTimer = 0;
     chart.subscribeClick((param) => {
       const c = candleRef.current;
       if (!c || !param.point) return;
       const raw = c.coordinateToPrice(param.point.y);
       if (raw == null) return;
-      useMarketStore.getState().setChartClickPrice(Number(raw.toFixed(precRef.current)));
+      const price = Number(raw.toFixed(precRef.current));
+      window.clearTimeout(clickTimer);
+      clickTimer = window.setTimeout(() => {
+        clickTimer = 0;
+        useMarketStore.getState().setChartClickPrice(price);
+      }, CLICK_DEFER_MS);
+    });
+    // 더블클릭(모바일은 더블탭) → 전체화면 토글. 가격축·시간축 더블클릭은 LWC 의 축 리셋이고 여기로 안 온다.
+    chart.subscribeDblClick(() => {
+      window.clearTimeout(clickTimer);
+      clickTimer = 0;
+      toggleExpandedRef.current();
     });
 
     return () => {
+      window.clearTimeout(clickTimer);
       if (profileRaf) cancelAnimationFrame(profileRaf);
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onProfileRange);
       chart.remove();
@@ -467,7 +562,7 @@ export default function Chart() {
       timeScale: { borderColor: c.border },
     });
     candle.applyOptions({ upColor: c.up, downColor: c.down, wickUpColor: c.up, wickDownColor: c.down });
-    hiLoPrimRef.current?.setColor(c.text);
+    hiLoPrimRef.current?.setColors(c.mark, c.bg);
     // ⚠ 거래량 막대는 색이 각 데이터 포인트에 박혀 있어서 applyOptions 로는 안 바뀐다 — 테마가 바뀌면
     // 전체를 새 색으로 다시 그려야 캔들과 싱크가 유지된다(안 하면 테마 전환 직후 거래량만 옛 색).
     syncIndicators();
@@ -483,6 +578,38 @@ export default function Chart() {
   useEffect(() => {
     hiLoPrimRef.current?.setEnabled(opts.hiLoMarks);
   }, [opts.hiLoMarks]);
+
+  // 레전드가 접히거나(폭·지표 수) 차트 높이가 바뀌면(분할선·전체화면·회전) 위 여백을 다시 잰다
+  useEffect(() => {
+    const ro = new ResizeObserver(() => fitTopMarginRef.current());
+    if (legendRef.current) ro.observe(legendRef.current);
+    if (containerRef.current) ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  // 전체화면: 브라우저 전체화면을 Esc 등으로 빠져나오면 차트도 원래 자리로. CSS 로만 덮은 경우(아이폰)는 Esc 로 닫는다.
+  useEffect(() => {
+    const onFs = () => {
+      if (document.fullscreenElement) {
+        // 들어가는 사이에 다시 더블클릭해 이미 나왔으면 브라우저 전체화면도 되돌린다(차트는 제자리인데 화면만 꽉 찬 상태 방지)
+        if (!expandedRef.current) document.exitFullscreen().catch(() => {});
+        else browserFsRef.current = true;
+      } else if (browserFsRef.current) {
+        browserFsRef.current = false;
+        setExpanded(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFs);
+    return () => document.removeEventListener('fullscreenchange', onFs);
+  }, []);
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !document.fullscreenElement && !document.querySelector('[role="dialog"]')) setExpanded(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [expanded]);
 
   // ── 매물대(가격대별 거래량) — 보이는 봉 구간을 다시 세어 프리미티브에 넘긴다 ──────────
   // indicatorDefs 에 profile 이 있는 지표만(타입 분기 없음). 새 봉·지표 설정(syncIndicators 끝)과 팬·줌(보이는 구간 변화)에서 부른다.
@@ -637,7 +764,9 @@ export default function Chart() {
     const volH = o.volume ? 0.15 : 0;
     const paneH = panes.length ? Math.min(0.16, 0.55 / panes.length) : 0;
     const total = volH + paneH * panes.length;
-    chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.06, bottom: Math.max(0.04, total + 0.02) } });
+    // 위 여백은 레전드 높이에서(fitTopMargin) — 여기선 아래만 바꾸고 함께 적용
+    marginsRef.current.bottom = Math.max(0.04, total + 0.02);
+    applyRightMargins();
     panes.forEach((ind, i) => {
       chart.priceScale(ind.id).applyOptions({
         scaleMargins: { top: 1 - volH - (panes.length - i) * paneH, bottom: volH + (panes.length - i - 1) * paneH },
@@ -1194,7 +1323,9 @@ export default function Chart() {
   const chgPct = legend && legend.open ? ((legend.close - legend.open) / legend.open) * 100 : null;
 
   return (
-    <div className="flex h-full flex-col">
+    // 전체화면이면 화면 전체를 덮는다(z-[45] = 토스트(z-40) 위·모달(z-50) 아래 — 리필 팝업 등은 그대로 위에 뜬다).
+    // 컴포넌트를 다른 곳으로 옮기지 않고 CSS 만 바꾼다 — 포털로 옮기면 다시 마운트되어 차트를 새로 만든다.
+    <div className={expanded ? 'fixed inset-0 z-[45] flex flex-col overscroll-contain bg-bg' : 'flex h-full flex-col'}>
       {/* 툴바 */}
       <div className="flex items-center gap-2 border-b border-border bg-panel px-2 py-1.5">
         {/* 타임프레임 — 즐겨찾기(★)만 가로로, 나머지는 ▾ 목록(트레이딩뷰식). 원화 심볼(빗썸)은 1초봉이 없어 뺀다 */}
@@ -1331,52 +1462,64 @@ export default function Chart() {
 
         {/* 실시간 시계(KST) — 우측 구석 */}
         <Clock className="ml-auto text-xs font-semibold text-muted" />
+        {/* 전체화면 — 차트 더블클릭(모바일 더블탭)과 같다. 아이폰처럼 Esc 가 없는 곳은 이 버튼으로 나온다 */}
+        <button
+          onClick={toggleExpanded}
+          className="shrink-0 rounded p-1 text-muted transition hover:bg-panel2 hover:text-text"
+          title={expanded ? '전체화면 종료 (Esc · 차트 더블클릭)' : '전체화면 (차트 더블클릭)'}
+          aria-label={expanded ? '전체화면 종료' : '전체화면'}
+          aria-pressed={expanded}
+        >
+          <FullscreenIcon exit={expanded} />
+        </button>
       </div>
 
       {/* 차트 영역 */}
       <div className="relative flex-1">
-        {/* OHLCV 레전드 */}
-        {legend && (
-          <div className="pointer-events-none absolute left-2 top-1.5 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px]">
-            <span className="font-semibold text-text">{pairLabel(symbol)}</span>
-            <span className="text-muted">{fmtKst(legend.time, subMinute)}</span>
-            {/* 레전드도 축약 — 좁은 한 줄에 OHLCV + 인디케이터가 다 들어가서 한 값만 길어도 줄이 깨진다 */}
-            <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.open, prec, 9)}</span></span>
-            <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.high, prec, 9)}</span></span>
-            <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.low, prec, 9)}</span></span>
-            <span className="text-muted">
-              종{' '}
-              <span className={up ? 'text-up' : 'text-down'}>
-                {fmtPrice(legend.close, prec)}
-                {chgPct != null && ` (${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%)`}
-              </span>
-            </span>
-            <span className="text-muted">거래량 <span className="text-text">{fmtQtyShort(legend.volume, 9)}</span></span>
-            {opts.indicators.map((ind, idx) => {
-              if (!ind.visible) return null;
-              const val = indLegend[ind.id];
-              if (!val) return null;
-              const def = INDICATOR_DEFS[ind.type];
-              const parts: string[] = [];
-              for (const ln of def.lines) {
-                if (ln.legend === false) continue;
-                const v = val[ln.key];
-                if (v == null) continue;
-                const txt = fmtIndValue(ln.format ?? def.format, v, prec);
-                parts.push(ln.label ? `${ln.label} ${txt}` : txt);
-              }
-              if (parts.length === 0) return null;
-              const st = def.states ? val[def.states.key] : undefined;
-              const stLabel = st != null ? def.states?.labels[st] : undefined;
-              return (
-                <span key={ind.id} style={{ color: IND_COLORS[idx % IND_COLORS.length] }}>
-                  {indicatorTitle(ind.type, ind.params)} {parts.join(' ')}
-                  {stLabel && <span className="font-semibold" style={{ color: stLabel.color }}> · {stLabel.text}</span>}
+        {/* OHLCV 레전드 — 틀은 늘 두고(높이를 재서 캔들 위 여백을 맞춘다, fitTopMargin) 내용만 조건부 */}
+        <div ref={legendRef} className="pointer-events-none absolute left-2 top-1.5 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px]">
+          {legend && (
+            <>
+              <span className="font-semibold text-text">{pairLabel(symbol)}</span>
+              <span className="text-muted">{fmtKst(legend.time, subMinute)}</span>
+              {/* 레전드도 축약 — 좁은 한 줄에 OHLCV + 인디케이터가 다 들어가서 한 값만 길어도 줄이 깨진다 */}
+              <span className="text-muted">시 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.open, prec, 9)}</span></span>
+              <span className="text-muted">고 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.high, prec, 9)}</span></span>
+              <span className="text-muted">저 <span className={up ? 'text-up' : 'text-down'}>{fmtPriceShort(legend.low, prec, 9)}</span></span>
+              <span className="text-muted">
+                종{' '}
+                <span className={up ? 'text-up' : 'text-down'}>
+                  {fmtPrice(legend.close, prec)}
+                  {chgPct != null && ` (${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%)`}
                 </span>
-              );
-            })}
-          </div>
-        )}
+              </span>
+              <span className="text-muted">거래량 <span className="text-text">{fmtQtyShort(legend.volume, 9)}</span></span>
+              {opts.indicators.map((ind, idx) => {
+                if (!ind.visible) return null;
+                const val = indLegend[ind.id];
+                if (!val) return null;
+                const def = INDICATOR_DEFS[ind.type];
+                const parts: string[] = [];
+                for (const ln of def.lines) {
+                  if (ln.legend === false) continue;
+                  const v = val[ln.key];
+                  if (v == null) continue;
+                  const txt = fmtIndValue(ln.format ?? def.format, v, prec);
+                  parts.push(ln.label ? `${ln.label} ${txt}` : txt);
+                }
+                if (parts.length === 0) return null;
+                const st = def.states ? val[def.states.key] : undefined;
+                const stLabel = st != null ? def.states?.labels[st] : undefined;
+                return (
+                  <span key={ind.id} style={{ color: IND_COLORS[idx % IND_COLORS.length] }}>
+                    {indicatorTitle(ind.type, ind.params)} {parts.join(' ')}
+                    {stLabel && <span className="font-semibold" style={{ color: stLabel.color }}> · {stLabel.text}</span>}
+                  </span>
+                );
+              })}
+            </>
+          )}
+        </div>
         {/* 다음 봉 카운트다운 — 트레이딩뷰처럼 우측 가격축의 현재가 티커(마지막 봉 종가 라벨) 바로 아래 */}
         {opts.showCountdown && countdown && countdownPos && (
           <div
