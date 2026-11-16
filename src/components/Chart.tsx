@@ -29,6 +29,7 @@ import {
   type ProfileDraw,
 } from '@/services/indicatorDefs';
 import { ProfilePrimitive, type ProfileLayer } from '@/services/profilePrimitive';
+import { HiLoPrimitive } from '@/services/hiLoPrimitive';
 import { api } from '@/services/api';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useChartStore, type IndicatorConfig, type ChartColorScheme } from '@/store/useChartStore';
@@ -179,6 +180,8 @@ export default function Chart() {
   const profilePrimRef = useRef<ProfilePrimitive | null>(null);
   const profileSigRef = useRef('');
   const refreshProfilesRef = useRef<() => void>(() => {});
+  // 보이는 구간 최고·최저가 라벨(OKX 식) — 계산·그리기 전부 프리미티브 안(팬·줌·새 봉마다 LWC 가 다시 부른다)
+  const hiLoPrimRef = useRef<HiLoPrimitive | null>(null);
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const volMap = useRef<Map<number, number>>(new Map());
@@ -357,6 +360,14 @@ export default function Chart() {
     const profilePrim = new ProfilePrimitive();
     candle.attachPrimitive(profilePrim);
     profilePrimRef.current = profilePrim;
+    const hiLoPrim = new HiLoPrimitive({
+      candles: () => candlesRef.current,
+      format: (v) => fmtPriceShort(v, precRef.current, 9),
+    });
+    hiLoPrim.setColor(initTheme.text);
+    hiLoPrim.setEnabled(useChartStore.getState().hiLoMarks);
+    candle.attachPrimitive(hiLoPrim);
+    hiLoPrimRef.current = hiLoPrim;
     // 팬·줌으로 보이는 구간이 바뀌면 매물대를 다시 센다 — 이벤트가 한 프레임에 여러 번 와도 한 번만
     let profileRaf = 0;
     const onProfileRange = () => {
@@ -435,6 +446,7 @@ export default function Chart() {
       chartRef.current = null;
       candleRef.current = null;
       profilePrimRef.current = null;
+      hiLoPrimRef.current = null;
       profilesRef.current.clear();
       profileSigRef.current = '';
       indSeriesRef.current.clear();
@@ -455,6 +467,7 @@ export default function Chart() {
       timeScale: { borderColor: c.border },
     });
     candle.applyOptions({ upColor: c.up, downColor: c.down, wickUpColor: c.up, wickDownColor: c.down });
+    hiLoPrimRef.current?.setColor(c.text);
     // ⚠ 거래량 막대는 색이 각 데이터 포인트에 박혀 있어서 applyOptions 로는 안 바뀐다 — 테마가 바뀌면
     // 전체를 새 색으로 다시 그려야 캔들과 싱크가 유지된다(안 하면 테마 전환 직후 거래량만 옛 색).
     syncIndicators();
@@ -466,6 +479,10 @@ export default function Chart() {
   useEffect(() => {
     chartRef.current?.applyOptions({ timeScale: { secondsVisible: subMinute } });
   }, [subMinute]);
+
+  useEffect(() => {
+    hiLoPrimRef.current?.setEnabled(opts.hiLoMarks);
+  }, [opts.hiLoMarks]);
 
   // ── 매물대(가격대별 거래량) — 보이는 봉 구간을 다시 세어 프리미티브에 넘긴다 ──────────
   // indicatorDefs 에 profile 이 있는 지표만(타입 분기 없음). 새 봉·지표 설정(syncIndicators 끝)과 팬·줌(보이는 구간 변화)에서 부른다.
@@ -1206,6 +1223,7 @@ export default function Chart() {
                     ['positionLine', '포지션 평단선'],
                     ['slTpLines', 'SL/TP 수평선'],
                     ['pendingLine', '지정가 주문선 (수량)'],
+                    ['hiLoMarks', '최고·최저가 표시'],
                     ['orderBook', '호가창'],
                   ] as const
                 ).map(([k, label]) => (

@@ -33,6 +33,7 @@ type BoolFlag =
   | 'positionLine'
   | 'slTpLines'
   | 'pendingLine'
+  | 'hiLoMarks'
   | 'orderBook'
   | 'bookTogether'
   | 'tradeFilterOn'
@@ -60,6 +61,8 @@ interface ChartState {
   positionLine: boolean;
   slTpLines: boolean;
   pendingLine: boolean;
+  // 보이는 구간의 최고가·최저가를 그 봉의 꼬리 끝에 작게(OKX 식, services/hiLoPrimitive.ts)
+  hiLoMarks: boolean;
   orderBook: boolean;
   // 호가창·체결내역이 한 화면에 보여줄 행 수(5~50). 각 열의 높이를 rows × 행높이로 잡아 스크롤 없이
   // 딱 그만큼 보이게 한다 — 예전엔 max-h-40(=10행) 고정이라 더 깊은 호가를 보려면 매번 스크롤해야 했다.
@@ -119,14 +122,14 @@ function load(): Partial<ChartState> {
   }
 }
 function persist(s: ChartState) {
-  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook } = s;
+  const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, hiLoMarks, orderBook } = s;
   const { bookRows, bookTogether, bookUnit, bookLayout, visibleBars, colorScheme, indicators, favIntervals } = s;
   const { tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength } = s;
   try {
     localStorage.setItem(
       KEY,
       JSON.stringify({
-        showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, orderBook,
+        showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, hiLoMarks, orderBook,
         bookRows, bookTogether, bookUnit, bookLayout, visibleBars, colorScheme, indicators, favIntervals,
         tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength,
       }),
@@ -194,6 +197,7 @@ export const useChartStore = create<ChartState>((set, get) => ({
   positionLine: saved.positionLine ?? true,
   slTpLines: saved.slTpLines ?? true,
   pendingLine: saved.pendingLine ?? true,
+  hiLoMarks: saved.hiLoMarks ?? true,
   orderBook: saved.orderBook ?? true,
   bookRows: clampRows(saved.bookRows ?? BOOK_ROWS_DEFAULT),
   bookTogether: saved.bookTogether ?? false,
