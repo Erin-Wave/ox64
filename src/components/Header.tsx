@@ -8,6 +8,7 @@ import SymbolSelect from '@/components/SymbolSelect';
 import Logo from './Logo';
 import VipBadge from './VipBadge';
 import { useEquity } from '@/hooks/useEquity';
+import { useDayStats } from '@/hooks/useDayStats';
 
 export default function Header({
   onOpenRank,
@@ -51,6 +52,10 @@ export default function Header({
   const hasKrw = krwBalance !== 0 || positions.some((p) => quoteOf(p.symbol) === 'KRW');
   // 마지막 체결이 매수 테이커면 매수색, 매도 테이커면 매도색 — 아직 체결이 없으면 기본색.
   const priceColor = lastTakerSide === 'buy' ? 'text-up' : lastTakerSide === 'sell' ? 'text-down' : 'text-text';
+  // 오늘 등락률 = 현재가 ÷ 0시 기준가(전일 종가) — 호가창 가격 옆 등락률과 같은 기준(업비트·빗썸 "전일대비", § useDayStats).
+  // 받기는 호가창과 함께 한 번(useDayStats 캐시). 기준가를 아직 모르면 비운다.
+  const { ref: dayRef } = useDayStats(symbol);
+  const dayChg = lastPrice != null && dayRef ? ((lastPrice - dayRef) / dayRef) * 100 : null;
 
   return (
     <header className="flex items-center justify-between gap-2 border-b border-border bg-panel px-2 py-1.5 sm:gap-3 sm:px-4 sm:py-2">
@@ -66,8 +71,20 @@ export default function Header({
           title={lastPrice != null ? `${fmtPrice(lastPrice, precisionOf(precisions, symbol))} ${quoteOf(symbol)}` : undefined}
         >
           <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${connected ? 'bg-up' : 'bg-muted'}`} />
-          {/* 가격도 길면 축약 — OX 는 상한이 1e6 이지만 실제 코인/미래 코인까지 같은 규칙으로 둔다(§fmtPriceShort) */}
-          {lastPrice != null ? fmtPriceShort(lastPrice, precisionOf(precisions, symbol), 9) : '—'}
+          {/* 폰은 가격 아래 작게, PC 는 옆에 — 폰 헤더는 한 줄에 다 넣으면 가격이 잘린다 */}
+          <span className="flex min-w-0 flex-col leading-tight sm:flex-row sm:items-baseline sm:gap-2">
+            {/* 가격도 길면 축약 — OX 는 상한이 1e6 이지만 실제 코인/미래 코인까지 같은 규칙으로 둔다(§fmtPriceShort) */}
+            <span className="truncate">{lastPrice != null ? fmtPriceShort(lastPrice, precisionOf(precisions, symbol), 9) : '—'}</span>
+            {dayChg != null && (
+              <span
+                className={`text-[10px] font-semibold tabular-nums sm:text-xs ${dayChg >= 0 ? 'text-up' : 'text-down'}`}
+                title="오늘 등락률 — 전일 종가(한국시간 0시 가격) 대비"
+              >
+                {dayChg >= 0 ? '+' : ''}
+                {dayChg.toFixed(2)}%
+              </span>
+            )}
+          </span>
         </span>
       </div>
 

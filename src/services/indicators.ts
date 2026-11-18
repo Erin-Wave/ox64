@@ -61,6 +61,75 @@ export function emaOf(arr: Series, period: number): Series {
 export const sma = (closes: number[], period: number): Series => smaOf(closes, period);
 export const ema = (closes: number[], period: number): Series => emaOf(closes, period);
 
+/** null 이 섞인 배열의 가중이동평균(WMA) — 창 안 최근 값일수록 무게가 크다(오래된 것부터 1, 2, …, period).
+ * 창 안에 null 이 하나라도 있으면 null. 창을 한 칸 밀 때 가중합 = 이전 가중합 − 이전 단순합 + period × 새 값(O(n)). */
+export function wmaOf(arr: Series, period: number): Series {
+  const n = arr.length;
+  const out = nulls(n);
+  const p = Math.floor(period);
+  if (p < 1) return out;
+  const denom = (p * (p + 1)) / 2;
+  let run = 0; // i 에서 끝나는 연속 유효값 개수
+  let sum = 0;
+  let wsum = 0;
+  for (let i = 0; i < n; i++) {
+    const v = arr[i];
+    if (v == null) {
+      run = 0;
+      continue;
+    }
+    run++;
+    if (run < p) continue;
+    if (run === p) {
+      // 창이 처음 찼다 — 직접 센다
+      sum = 0;
+      wsum = 0;
+      for (let k = 0; k < p; k++) {
+        const x = arr[i - p + 1 + k] as number;
+        sum += x;
+        wsum += (k + 1) * x;
+      }
+    } else {
+      wsum = wsum - sum + p * v;
+      sum = sum - (arr[i - p] as number) + v;
+    }
+    out[i] = wsum / denom;
+  }
+  return out;
+}
+
+/** 헐 이동평균(HMA) = WMA(2·WMA(n/2) − WMA(n), √n) — 지연을 줄인 이동평균(트레이딩뷰 ta.hma 와 같은 식, 길이는 내림). */
+export function hmaOf(arr: Series, period: number): Series {
+  const p = Math.max(1, Math.floor(period));
+  const half = wmaOf(arr, Math.max(1, Math.floor(p / 2)));
+  const full = wmaOf(arr, p);
+  const diff: Series = half.map((h, i) => (h == null || full[i] == null ? null : 2 * h - (full[i] as number)));
+  return wmaOf(diff, Math.max(1, Math.floor(Math.sqrt(p))));
+}
+
+/** 창 안 최댓값·최솟값(창이 덜 찬 앞부분은 null) — 단조 덱으로 O(n). */
+export function rollingMax(arr: number[], period: number): Series {
+  return rolling(arr, period, (a, b) => a >= b);
+}
+export function rollingMin(arr: number[], period: number): Series {
+  return rolling(arr, period, (a, b) => a <= b);
+}
+function rolling(arr: number[], period: number, keep: (a: number, b: number) => boolean): Series {
+  const n = arr.length;
+  const out = nulls(n);
+  const p = Math.floor(period);
+  if (p < 1) return out;
+  const dq: number[] = []; // 인덱스 — 앞이 창 안의 극값
+  let head = 0;
+  for (let i = 0; i < n; i++) {
+    while (dq.length > head && !keep(arr[dq[dq.length - 1]], arr[i])) dq.pop();
+    dq.push(i);
+    if (dq[head] <= i - p) head++;
+    if (i >= p - 1) out[i] = arr[dq[head]];
+  }
+  return out;
+}
+
 export interface BollingerBands {
   basis: Series;
   upper: Series;
@@ -450,6 +519,10 @@ export interface SuperTrend {
   /** 하락 국면의 저항선 */
   down: Series;
 }
+/** 슈퍼트렌드 — 트레이딩뷰 ta.supertrend 와 같은 식. 밴드 = 중간가 ± mult × ATR 이고 추세 방향으로만 조여든다(직전 종가가 밴드를
+ * 뚫었을 때만 새로 잡는다). 하락 국면이면 종가가 **이번 봉의 (조여든) 윗밴드**를 넘을 때, 상승 국면이면 아랫밴드 밑으로 갈 때 뒤집힌다.
+ * ⚠ 예전엔 뒤집힘을 "직전 봉의 밴드"와 비교해서 조여든 만큼 늦게 뒤집혔다(트레이딩뷰·거래소 차트보다 한두 봉 늦는 일이 있었다).
+ * 첫 봉은 하락 국면에서 시작한다(트레이딩뷰와 같다). */
 export function supertrend(candles: Candle[], period = 10, mult = 3): SuperTrend {
   const n = candles.length;
   const up = nulls(n);
@@ -457,7 +530,7 @@ export function supertrend(candles: Candle[], period = 10, mult = 3): SuperTrend
   const a = atr(candles, period);
   let prevUpper = NaN;
   let prevLower = NaN;
-  let bull = true;
+  let bull = false;
   for (let i = 0; i < n; i++) {
     const at = a[i];
     if (at == null) continue;
@@ -465,13 +538,14 @@ export function supertrend(candles: Candle[], period = 10, mult = 3): SuperTrend
     const mid = (c.high + c.low) / 2;
     let upper = mid + mult * at;
     let lower = mid - mult * at;
-    const pc = i > 0 ? candles[i - 1].close : c.close;
-    // 밴드는 추세 방향으로만 조여든다(되돌아가지 않는다)
-    if (!Number.isNaN(prevLower) && pc > prevLower) lower = Math.max(lower, prevLower);
-    if (!Number.isNaN(prevUpper) && pc < prevUpper) upper = Math.min(upper, prevUpper);
-    if (Number.isNaN(prevUpper)) bull = c.close >= mid;
-    else if (bull && c.close < prevLower) bull = false;
-    else if (!bull && c.close > prevUpper) bull = true;
+    const first = Number.isNaN(prevUpper);
+    if (!first) {
+      const pc = candles[i - 1].close;
+      // 밴드는 추세 방향으로만 조여든다 — 직전 종가가 밴드를 뚫었을 때만 새 값으로
+      if (!(lower > prevLower || pc < prevLower)) lower = prevLower;
+      if (!(upper < prevUpper || pc > prevUpper)) upper = prevUpper;
+      bull = bull ? !(c.close < lower) : c.close > upper;
+    }
     prevUpper = upper;
     prevLower = lower;
     if (bull) up[i] = lower;
@@ -591,4 +665,262 @@ export function profileValues(p: PriceProfile, price?: number | null): Record<st
     }
   }
   return out;
+}
+
+// ── 2026-11-18 추가 지표 ─────────────────────────────────────────────────────────────────────────
+// 식은 트레이딩뷰·바이낸스 기본 지표와 같게 맞췄다(다른 곳과 값을 대조해 볼 수 있게). 워밍업 구간은 null.
+
+export interface Bands {
+  upper: Series;
+  basis: Series;
+  lower: Series;
+}
+
+/** 엔벨로프 — 이동평균(SMA)에서 위아래로 pct% 떨어진 선. */
+export function envelope(closes: number[], period = 20, pct = 2): Bands {
+  const basis = smaOf(closes, period);
+  const k = pct / 100;
+  return {
+    basis,
+    upper: basis.map((b) => (b == null ? null : b * (1 + k))),
+    lower: basis.map((b) => (b == null ? null : b * (1 - k))),
+  };
+}
+
+/** 켈트너 채널 — 중심 EMA(종가, period) ± mult × ATR(atrPeriod)(트레이딩뷰 기본: 20 · 2 · ATR 10). */
+export function keltner(candles: Candle[], period = 20, mult = 2, atrPeriod = 10): Bands {
+  const basis = emaOf(
+    candles.map((c) => c.close),
+    period,
+  );
+  const a = atr(candles, atrPeriod);
+  return {
+    basis,
+    upper: basis.map((b, i) => (b == null || a[i] == null ? null : b + mult * (a[i] as number))),
+    lower: basis.map((b, i) => (b == null || a[i] == null ? null : b - mult * (a[i] as number))),
+  };
+}
+
+/** 돈치안 채널 — 최근 period 봉의 최고 고가 · 최저 저가와 그 가운데. */
+export function donchian(candles: Candle[], period = 20): Bands {
+  const upper = rollingMax(
+    candles.map((c) => c.high),
+    period,
+  );
+  const lower = rollingMin(
+    candles.map((c) => c.low),
+    period,
+  );
+  return { upper, lower, basis: upper.map((u, i) => (u == null || lower[i] == null ? null : (u + (lower[i] as number)) / 2)) };
+}
+
+/** 일간 VWAP — 하루(한국시간 anchorHour 시 기준)마다 처음부터 다시 누적하는 거래량 가중 평균가(트레이딩뷰 VWAP 의 세션 앵커).
+ * anchorHour = 0 이면 한국시간 0시, 9 면 UTC 0시(바이낸스 일봉 경계). 봉 시작 시각으로 하루를 가른다 — 하루보다 긴 봉은 봉마다
+ * 새 하루라 그 봉의 대표가와 같아진다. 그날 거래량이 아직 0 이면 null. */
+export function sessionVwap(candles: Candle[], anchorHour = 0): Series {
+  const n = candles.length;
+  const out = nulls(n);
+  const shift = (9 - anchorHour) * 3600; // 유닉스 초 + 이만큼 = "그 시각이 하루의 0시"인 시계
+  let day = NaN;
+  let pv = 0;
+  let vol = 0;
+  for (let i = 0; i < n; i++) {
+    const c = candles[i];
+    const d = Math.floor((c.time + shift) / 86400);
+    if (d !== day) {
+      day = d;
+      pv = 0;
+      vol = 0;
+    }
+    const v = c.volume ?? 0;
+    pv += ((c.high + c.low + c.close) / 3) * v;
+    vol += v;
+    if (vol > 0) out[i] = pv / vol;
+  }
+  return out;
+}
+
+/** 스토캐스틱 RSI — RSI 를 스토캐스틱에 넣은 것: raw = (RSI − 최저 RSI)/(최고 − 최저)×100(stochPeriod 창), %K = SMA(raw, k), %D = SMA(%K, d).
+ * 창 안 RSI 가 전부 같으면(강한 추세에서 RSI 가 100 에 붙은 채) 직전 값을 잇는다 — 50 으로 두면 "중립"으로 읽힌다. */
+export function stochRsi(closes: number[], rsiPeriod = 14, stochPeriod = 14, kSmooth = 3, dPeriod = 3): Stoch {
+  const r = rsi(closes, rsiPeriod);
+  const n = r.length;
+  const raw = nulls(n);
+  const p = Math.max(1, Math.floor(stochPeriod));
+  let prev: number | null = null;
+  let run = 0;
+  for (let i = 0; i < n; i++) {
+    if (r[i] == null) {
+      run = 0;
+      continue;
+    }
+    run++;
+    if (run < p) continue;
+    let hh = -Infinity;
+    let ll = Infinity;
+    for (let j = i - p + 1; j <= i; j++) {
+      const x = r[j] as number;
+      if (x > hh) hh = x;
+      if (x < ll) ll = x;
+    }
+    const st: number | null = hh > ll ? (((r[i] as number) - ll) / (hh - ll)) * 100 : prev;
+    raw[i] = st;
+    prev = st;
+  }
+  const k = smaOf(raw, kSmooth);
+  return { k, d: smaOf(k, dPeriod) };
+}
+
+export interface Kdj {
+  k: Series;
+  d: Series;
+  j: Series;
+}
+/** KDJ(바이낸스·OKX 기본 9·3·3) — RSV = (종가 − n봉 최저)/(n봉 최고 − 최저)×100, K = (RSV + (m1−1)·K₋₁)/m1, D = (K + (m2−1)·D₋₁)/m2,
+ * J = 3K − 2D. K·D 는 50 에서 시작한다(중국식 SMA(x, m, 1)). J 는 0~100 밖으로 나갈 수 있다. */
+export function kdj(candles: Candle[], period = 9, m1 = 3, m2 = 3): Kdj {
+  const n = candles.length;
+  const out: Kdj = { k: nulls(n), d: nulls(n), j: nulls(n) };
+  const hh = rollingMax(
+    candles.map((c) => c.high),
+    period,
+  );
+  const ll = rollingMin(
+    candles.map((c) => c.low),
+    period,
+  );
+  let k = 50;
+  let d = 50;
+  for (let i = 0; i < n; i++) {
+    if (hh[i] == null || ll[i] == null) continue;
+    const range = (hh[i] as number) - (ll[i] as number);
+    const rsv = range > 0 ? ((candles[i].close - (ll[i] as number)) / range) * 100 : 50;
+    k = (rsv + (m1 - 1) * k) / m1;
+    d = (k + (m2 - 1) * d) / m2;
+    out.k[i] = k;
+    out.d[i] = d;
+    out.j[i] = 3 * k - 2 * d;
+  }
+  return out;
+}
+
+/** 자금 흐름 지수(MFI) — 대표가가 오른 봉의 (대표가×거래량) 합 ÷ 내린 봉의 합으로 만든 "거래량 실린 RSI"(0~100).
+ * 창 안에 오른 봉도 내린 봉도 없으면(거래가 없던 구간) null. */
+export function mfi(candles: Candle[], period = 14): Series {
+  const n = candles.length;
+  const out = nulls(n);
+  const p = Math.floor(period);
+  if (p < 1) return out;
+  const tp = candles.map((c) => (c.high + c.low + c.close) / 3);
+  const pos = new Array<number>(n).fill(0);
+  const neg = new Array<number>(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    const flow = tp[i] * (candles[i].volume ?? 0);
+    if (tp[i] > tp[i - 1]) pos[i] = flow;
+    else if (tp[i] < tp[i - 1]) neg[i] = flow;
+  }
+  let ps = 0;
+  let ns = 0;
+  for (let i = 1; i < n; i++) {
+    ps += pos[i];
+    ns += neg[i];
+    if (i > p) {
+      ps -= pos[i - p];
+      ns -= neg[i - p];
+    }
+    if (i < p) continue;
+    // 창을 밀며 더하고 빼서 생긴 부동소수 먼지(−1e-9 같은)는 0 으로
+    const tot = Math.abs(ps) + Math.abs(ns);
+    const P = ps > 1e-12 * tot ? ps : 0;
+    const N = ns > 1e-12 * tot ? ns : 0;
+    if (P + N <= 0) continue;
+    out[i] = N === 0 ? 100 : 100 - 100 / (1 + P / N);
+  }
+  return out;
+}
+
+/** 변화율(ROC) = (종가 − period 봉 전 종가) / period 봉 전 종가 × 100. */
+export function roc(closes: number[], period = 9): Series {
+  const out = nulls(closes.length);
+  const p = Math.max(1, Math.floor(period));
+  for (let i = p; i < closes.length; i++) {
+    const prev = closes[i - p];
+    if (prev !== 0) out[i] = ((closes[i] - prev) / prev) * 100;
+  }
+  return out;
+}
+
+/** TRIX — 로그 종가의 3중 EMA 가 한 봉에 변한 양 × 10,000(= 베이시스포인트, 트레이딩뷰 식) + 그 EMA(시그널). */
+export function trix(closes: number[], period = 15, signal = 9): { trix: Series; signal: Series } {
+  const logs: Series = closes.map((c) => (c > 0 ? Math.log(c) : null));
+  const e3 = emaOf(emaOf(emaOf(logs, period), period), period);
+  const t = nulls(closes.length);
+  for (let i = 1; i < closes.length; i++) if (e3[i] != null && e3[i - 1] != null) t[i] = 10000 * ((e3[i] as number) - (e3[i - 1] as number));
+  return { trix: t, signal: emaOf(t, signal) };
+}
+
+/** 차이킨 자금 흐름(CMF) = Σ(자금흐름 승수 × 거래량) / Σ거래량, 승수 = ((종가−저가) − (고가−종가)) / (고가−저가). −1~1, 거래량이 없으면 null. */
+export function cmf(candles: Candle[], period = 20): Series {
+  const n = candles.length;
+  const out = nulls(n);
+  const p = Math.floor(period);
+  if (p < 1) return out;
+  const mfv = new Array<number>(n);
+  const vol = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    const c = candles[i];
+    const v = c.volume ?? 0;
+    const range = c.high - c.low;
+    mfv[i] = range > 0 ? ((c.close - c.low - (c.high - c.close)) / range) * v : 0;
+    vol[i] = v;
+  }
+  let sm = 0;
+  let sv = 0;
+  for (let i = 0; i < n; i++) {
+    sm += mfv[i];
+    sv += vol[i];
+    if (i >= p) {
+      sm -= mfv[i - p];
+      sv -= vol[i - p];
+    }
+    if (i >= p - 1 && sv > 1e-12) out[i] = sm / sv;
+  }
+  return out;
+}
+
+/** 어썸 오실레이터(AO) = SMA(중간가, fast) − SMA(중간가, slow), 중간가 = (고가+저가)/2(빌 윌리엄스 5 · 34). */
+export function awesome(candles: Candle[], fast = 5, slow = 34): Series {
+  const mid = candles.map((c) => (c.high + c.low) / 2);
+  const f = smaOf(mid, fast);
+  const s = smaOf(mid, slow);
+  return f.map((v, i) => (v == null || s[i] == null ? null : v - (s[i] as number)));
+}
+
+/** 이격도 = 종가 / 이동평균(SMA) × 100 — 100 위면 평균보다 위로 벌어진 정도. */
+export function disparity(closes: number[], period = 20): Series {
+  const ma = smaOf(closes, period);
+  return ma.map((m, i) => (m == null || m === 0 ? null : (closes[i] / m) * 100));
+}
+
+/** 투자심리선 = 최근 period 봉 중 종가가 전 봉보다 오른 봉의 비율(%) — 75 이상 과열 · 25 이하 침체(국내 HTS 기본 10). */
+export function psychological(closes: number[], period = 10): Series {
+  const n = closes.length;
+  const out = nulls(n);
+  const p = Math.floor(period);
+  if (p < 1) return out;
+  let ups = 0;
+  for (let i = 1; i < n; i++) {
+    if (closes[i] > closes[i - 1]) ups++;
+    if (i > p && closes[i - p] > closes[i - p - 1]) ups--;
+    if (i >= p) out[i] = (ups / p) * 100;
+  }
+  return out;
+}
+
+/** 거래량 이동평균 — 거래량의 SMA(거래량 막대 위에 겹쳐 그린다). */
+export function volumeMa(candles: Candle[], period: number): Series {
+  return smaOf(
+    candles.map((c) => c.volume ?? 0),
+    period,
+  );
 }

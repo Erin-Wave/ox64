@@ -24,6 +24,11 @@ const MIN_COOLDOWN_SEC = 5;
  * 슬라이더만 올리면 서버가 "레버리지 1~250" 으로 거부하고, 서버만 올리면 화면에서 못 고른다. */
 const MAX_LEVERAGE = 250;
 
+/** 레버리지 빠른 선택 — 1~250 슬라이더는 폰에서 한 칸이 1px 남짓이라 20x 같은 값을 정확히 맞추기 어려웠다(2026-11-18). */
+const LEVERAGE_PRESETS = [1, 5, 10, 20, 50, 100, 125, 250];
+/** 비중 빠른 선택(가용 기준 %) */
+const PCT_PRESETS = [10, 25, 50, 75, 100];
+
 /** 대기 주문 상한 — 서버(functions/api/order.ts `MAX_OPEN_ORDERS`)와 같은 값. 분할 지정가의 자동 분할 수가 남은 자리까지만 간다. */
 const MAX_OPEN = 20;
 /** 분할 지정가 자동 분할 수 — **서버 autoRangeCount 와 같은 식**(미리보기용, 실제 결정은 서버가 남은 자리를 보고 한다).
@@ -307,7 +312,28 @@ export default function OrderPanel() {
 
   // 입력칸 표시값(콤마 포함) — amtInput 을 그대로 보여준다(왕복 재계산 안 함 → USDT 입력이 안 깨진다).
   const displaySize = fmtNumInput(amtInput);
-  const onSizeInput = (v: string) => setAmtInput(unfmtNum(v));
+  // 수량을 직접 치면 비중(%)도 그 수량에 맞춘다 — 예전엔 슬라이더가 마지막으로 끈 자리(또는 0%)에 머물러 "0% 인데 주문이 나간다"처럼
+  // 보였다. 가용을 넘으면 100 을 넘는 값으로 둬서 라벨이 빨갛게 넘친 걸 보여준다(슬라이더는 끝에 붙는다).
+  const pctOfAmount = (raw: string, u: Unit): number => {
+    const n = Number(raw);
+    if (!(n > 0) || !refPrice || !(available > 0)) return 0;
+    const coins = u === 'coin' ? n : n / refPrice;
+    return Math.round(((coins * refPrice * (1 / leverage + feeRate)) / (available * SAFETY)) * 100);
+  };
+  const onSizeInput = (v: string) => {
+    const raw = unfmtNum(v);
+    setAmtInput(raw);
+    setPct(pctOfAmount(raw, unit));
+  };
+  const pickPct = (v: number) => {
+    setPct(v);
+    applyPct(v / 100);
+  };
+  // 레버리지를 바꾸면 같은 수량의 증거금이 달라진다 — Standard 는 수량이 진실원본이라 비중 표시를 다시 맞춘다(Easy 는 비중이 진실원본)
+  useEffect(() => {
+    if (standard && amtInput) setPct(pctOfAmount(amtInput, unit));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leverage]);
   // 단위 전환 시 입력칸 값을 새 단위로 1회 환산한다(현재 수량 유지). 가격이 없으면 값만 유지.
   const toggleUnit = () => {
     const next: Unit = unit === 'coin' ? 'usdt' : 'coin';
@@ -596,7 +622,26 @@ export default function OrderPanel() {
             </span>
             {existingPosition && <span className="ml-1 text-[10px] text-accent">(포지션 보유 중 고정)</span>}
           </span>
-          <span className="rounded bg-panel2 px-2 py-0.5 text-xs font-bold text-accent">크로스 {leverage}x</span>
+          {/* − / + 로 1x 씩(슬라이더로는 한 칸을 맞추기 어렵다) */}
+          <span className="flex shrink-0 items-center gap-0.5">
+            <button
+              onClick={() => setLeverage((l) => Math.max(1, l - 1))}
+              disabled={!!existingPosition || leverage <= 1}
+              aria-label="레버리지 1 낮추기"
+              className="rounded px-1.5 text-sm leading-5 text-muted transition hover:bg-panel2 hover:text-text disabled:opacity-30"
+            >
+              −
+            </button>
+            <span className="rounded bg-panel2 px-2 py-0.5 text-xs font-bold tabular-nums text-accent">크로스 {leverage}x</span>
+            <button
+              onClick={() => setLeverage((l) => Math.min(MAX_LEVERAGE, l + 1))}
+              disabled={!!existingPosition || leverage >= MAX_LEVERAGE}
+              aria-label="레버리지 1 높이기"
+              className="rounded px-1.5 text-sm leading-5 text-muted transition hover:bg-panel2 hover:text-text disabled:opacity-30"
+            >
+              +
+            </button>
+          </span>
         </div>
         <input
           type="range"
@@ -607,6 +652,20 @@ export default function OrderPanel() {
           onChange={(e) => setLeverage(Number(e.target.value))}
           className="w-full accent-up disabled:opacity-40"
         />
+        <div className="mt-1 grid grid-cols-8 gap-0.5">
+          {LEVERAGE_PRESETS.map((v) => (
+            <button
+              key={v}
+              onClick={() => setLeverage(v)}
+              disabled={!!existingPosition}
+              className={`rounded py-0.5 text-[10px] font-semibold tabular-nums transition disabled:opacity-40 ${
+                leverage === v ? 'bg-elevated text-accent' : 'bg-panel2 text-muted hover:text-text'
+              }`}
+            >
+              {v}x
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* 수량 */}
@@ -635,21 +694,36 @@ export default function OrderPanel() {
         <div className={standard ? 'mt-1.5' : ''}>
           <div className="mb-1 flex items-center justify-between">
             <span className="text-[10px] text-muted">비중(가용 기준)</span>
-            <span className="rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold text-accent">{pct}%</span>
+            <span
+              className={`rounded bg-panel2 px-2 py-0.5 text-[11px] font-bold tabular-nums ${pct > 100 ? 'text-down' : 'text-accent'}`}
+              title={pct > 100 ? '가용 증거금보다 많은 수량입니다 — 이대로면 증거금 부족으로 거부되거나 일부만 체결됩니다' : undefined}
+            >
+              {pct > 100 ? '100%+' : `${pct}%`}
+            </span>
           </div>
           <input
             type="range"
             min={0}
             max={100}
-            value={pct}
+            value={Math.min(100, pct)}
             disabled={!refPrice}
-            onChange={(e) => {
-              const v = Number(e.target.value);
-              setPct(v);
-              applyPct(v / 100);
-            }}
+            onChange={(e) => pickPct(Number(e.target.value))}
             className="w-full accent-up disabled:opacity-40"
           />
+          <div className="mt-1 grid grid-cols-5 gap-0.5">
+            {PCT_PRESETS.map((v) => (
+              <button
+                key={v}
+                onClick={() => pickPct(v)}
+                disabled={!refPrice}
+                className={`rounded py-0.5 text-[10px] font-semibold tabular-nums transition disabled:opacity-40 ${
+                  pct === v ? 'bg-elevated text-accent' : 'bg-panel2 text-muted hover:text-text'
+                }`}
+              >
+                {v}%
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -756,14 +830,14 @@ export default function OrderPanel() {
           title="단축키 F9 (연타하면 누른 횟수만큼 주문)"
           className="rounded-md bg-up py-2 text-sm font-bold text-white transition hover:brightness-110 active:brightness-95"
         >
-          롱 · Buy <span className="ml-1 text-[10px] font-semibold opacity-70">F9</span>
+          롱 · Buy <span className="ml-1 hidden text-[10px] font-semibold opacity-70 md:inline">F9</span>
         </button>
         <button
           onClick={() => submit('short')}
           title="단축키 F10 (연타하면 누른 횟수만큼 주문)"
           className="rounded-md bg-down py-2 text-sm font-bold text-white transition hover:brightness-110 active:brightness-95"
         >
-          숏 · Sell <span className="ml-1 text-[10px] font-semibold opacity-70">F10</span>
+          숏 · Sell <span className="ml-1 hidden text-[10px] font-semibold opacity-70 md:inline">F10</span>
         </button>
       </div>
     </div>

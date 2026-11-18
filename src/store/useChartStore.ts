@@ -39,6 +39,16 @@ type BoolFlag =
   | 'tradeFilterOn'
   | 'tradeStrength';
 
+/** 차트에 그은 수평선(심볼별) — 지지·저항 표시용. alert 가 켜져 있으면 현재가가 선을 지날 때 한 번 알린다(PriceAlerts, 울리면 꺼진다).
+ * 이 브라우저에만 저장된다(서버·D1 과 무관) — 알림도 앱을 보고 있을 때만 울린다. */
+export interface HLine {
+  id: string;
+  price: number;
+  alert: boolean;
+}
+/** 심볼당 수평선 상한 — 가격축 라벨이 겹쳐 읽을 수 없게 되기 전에 */
+export const HLINES_MAX = 20;
+
 /** 체결 목록 필터 기준 — 수량(코인 개수) 또는 거래대금(가격×수량, USDT). */
 export type TradeFilterBasis = 'qty' | 'notional';
 
@@ -90,6 +100,13 @@ interface ChartState {
   indicators: IndicatorConfig[];
   // 차트 툴바에 가로로 늘어놓을 즐겨찾기 타임프레임(트레이딩뷰식) — 나머지는 ▾ 목록에서 고르고 ★ 로 고정한다.
   favIntervals: string[];
+  // 수평선(심볼 → 선 목록)
+  hLines: Record<string, HLine[]>;
+  addHLine: (symbol: string, price: number) => void;
+  removeHLine: (symbol: string, id: string) => void;
+  clearHLines: (symbol: string) => void;
+  /** 알림 켜기/끄기 — on 을 주면 그 값으로(알림이 울린 뒤 끌 때) */
+  setHLineAlert: (symbol: string, id: string, on?: boolean) => void;
   toggle: (k: BoolFlag) => void;
   toggleFavInterval: (code: string) => void;
   setBookRows: (n: number) => void;
@@ -98,7 +115,8 @@ interface ChartState {
   setTradeFilter: (patch: Partial<TradeFilter>) => void;
   setVisibleBars: (n: number) => void;
   setColorScheme: (cs: ChartColorScheme) => void;
-  addIndicator: (type: IndicatorType) => void;
+  /** 지표 추가 — params 를 주면 그 값으로(이평선 묶음처럼), 정의 범위로 자른다 */
+  addIndicator: (type: IndicatorType, params?: IndicatorParams) => void;
   removeIndicator: (id: string) => void;
   /** 파라미터 일부 변경(정의 범위로 클램프) */
   updateIndicator: (id: string, patch: IndicatorParams) => void;
@@ -123,14 +141,14 @@ function load(): Partial<ChartState> {
 }
 function persist(s: ChartState) {
   const { showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, hiLoMarks, orderBook } = s;
-  const { bookRows, bookTogether, bookUnit, bookLayout, visibleBars, colorScheme, indicators, favIntervals } = s;
+  const { bookRows, bookTogether, bookUnit, bookLayout, visibleBars, colorScheme, indicators, favIntervals, hLines } = s;
   const { tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength } = s;
   try {
     localStorage.setItem(
       KEY,
       JSON.stringify({
         showCountdown, volume, tradeMarkers, positionLine, slTpLines, pendingLine, hiLoMarks, orderBook,
-        bookRows, bookTogether, bookUnit, bookLayout, visibleBars, colorScheme, indicators, favIntervals,
+        bookRows, bookTogether, bookUnit, bookLayout, visibleBars, colorScheme, indicators, favIntervals, hLines,
         tradeFilterOn, tradeFilterBasis, tradeFilterMin, tradeFilterMax, tradeStrength,
       }),
     );
@@ -146,6 +164,21 @@ function cleanFavs(raw: unknown): string[] {
   if (!Array.isArray(raw)) return DEFAULT_FAV_INTERVALS;
   const set = new Set(raw.filter((x): x is string => typeof x === 'string'));
   return ALL_INTERVALS.map((i) => i.code).filter((c) => set.has(c));
+}
+
+/** 저장된 수평선 정리 — 형식이 틀린 항목·양수가 아닌 가격은 버리고 심볼당 상한까지만. */
+function cleanHLines(raw: unknown): Record<string, HLine[]> {
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, HLine[]> = {};
+  for (const [sym, arr] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(arr)) continue;
+    const lines = arr
+      .filter((l): l is HLine => !!l && typeof l === 'object' && typeof (l as HLine).id === 'string' && Number.isFinite((l as HLine).price) && (l as HLine).price > 0)
+      .slice(0, HLINES_MAX)
+      .map((l) => ({ id: l.id, price: l.price, alert: l.alert === true }));
+    if (lines.length) out[sym] = lines;
+  }
+  return out;
 }
 
 /** 저장값이 손으로 바뀌었거나(localStorage) 범위 밖이면 안전한 값으로 되돌린다 — 0/NaN 이 들어오면
@@ -212,6 +245,40 @@ export const useChartStore = create<ChartState>((set, get) => ({
   colorScheme: saved.colorScheme ?? 'binance',
   indicators: migrateIndicators(saved.indicators),
   favIntervals: cleanFavs(saved.favIntervals),
+  hLines: cleanHLines(saved.hLines),
+  addHLine: (symbol, price) => {
+    if (!(price > 0) || !Number.isFinite(price)) return;
+    set((s) => {
+      const cur = s.hLines[symbol] ?? [];
+      if (cur.length >= HLINES_MAX || cur.some((l) => l.price === price)) return s;
+      return { hLines: { ...s.hLines, [symbol]: [...cur, { id: nextId(), price, alert: false }] } };
+    });
+    persist(get());
+  },
+  removeHLine: (symbol, id) => {
+    set((s) => {
+      const next = (s.hLines[symbol] ?? []).filter((l) => l.id !== id);
+      const hLines = { ...s.hLines };
+      if (next.length) hLines[symbol] = next;
+      else delete hLines[symbol];
+      return { hLines };
+    });
+    persist(get());
+  },
+  clearHLines: (symbol) => {
+    set((s) => {
+      const hLines = { ...s.hLines };
+      delete hLines[symbol];
+      return { hLines };
+    });
+    persist(get());
+  },
+  setHLineAlert: (symbol, id, on) => {
+    set((s) => ({
+      hLines: { ...s.hLines, [symbol]: (s.hLines[symbol] ?? []).map((l) => (l.id === id ? { ...l, alert: on ?? !l.alert } : l)) },
+    }));
+    persist(get());
+  },
   toggleFavInterval: (code) => {
     set((s) => ({
       favIntervals: cleanFavs(s.favIntervals.includes(code) ? s.favIntervals.filter((c) => c !== code) : [...s.favIntervals, code]),
@@ -251,8 +318,13 @@ export const useChartStore = create<ChartState>((set, get) => ({
     set({ colorScheme: cs });
     persist(get());
   },
-  addIndicator: (type) => {
-    const cfg: IndicatorConfig = { id: nextId(), type, params: defaultParams(type), visible: true };
+  addIndicator: (type, init) => {
+    const params = defaultParams(type);
+    for (const [k, v] of Object.entries(init ?? {})) {
+      const c = clampParam(type, k, v);
+      if (c !== undefined) params[k] = c;
+    }
+    const cfg: IndicatorConfig = { id: nextId(), type, params, visible: true };
     set((s) => ({ indicators: [...s.indicators, cfg] }));
     persist(get());
   },

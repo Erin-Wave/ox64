@@ -20,10 +20,11 @@ import { klineStream } from '@/services/binanceWs';
 import { profileValues, type Series } from '@/services/indicators';
 import {
   INDICATOR_DEFS,
-  OVERLAY_TYPES,
-  OSCILLATOR_TYPES,
+  INDICATOR_TYPES_BY_GROUP,
   indicatorTitle,
   type IndicatorFormat,
+  type IndicatorLineDef,
+  type IndicatorParamDef,
   type IndicatorType,
   type LineStyleName,
   type ProfileDraw,
@@ -65,6 +66,22 @@ const TOP_MARGIN_MAX = 0.35; // 지표가 많아 레전드가 길게 접혀도 �
 const LEGEND_GAP_PX = 10; // 레전드 아래 끝 ~ 가장 높은 꼬리(라벨 글자 반 높이 + 여유)
 // 차트 클릭(→ 지정가 입력)은 이만큼 미뤘다가 보낸다 — 더블클릭(전체화면)의 첫 클릭이 지정가를 덮어쓰지 않게.
 const CLICK_DEFER_MS = 250;
+// 하단(오실레이터 패널 + 거래량)이 차트 높이에서 가져갈 수 있는 최대 몫 — 나머지(위 여백 포함)는 캔들 몫
+const BOTTOM_SHARE_MAX = 0.5;
+// 패널 맨 위 레전드 한 줄 높이(px) — 그 아래부터 선을 그린다
+const PANE_LEGEND_PX = 17;
+// 수평선(그리기 도구) 색 — 주문선(녹·적·앰버)과 겹치지 않는 파랑(트레이딩뷰 그리기 기본색)
+const HLINE_COLOR = '#2962ff';
+
+/** 수평선 그리기 아이콘 */
+function HLineIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+      <path d="M3 12h18" />
+      <circle cx="12" cy="12" r="2.5" fill="currentColor" />
+    </svg>
+  );
+}
 
 /** 전체화면 들어가기/나오기 아이콘 */
 function FullscreenIcon({ exit }: { exit: boolean }) {
@@ -122,8 +139,16 @@ const stateLine = (arr: Series, times: number[], state: Series, colors: string[]
     const c = st == null ? undefined : colors[st];
     return c ? { time: toChart(times[i]), value: v, color: c } : { time: toChart(times[i]), value: v };
   });
-const histData = (arr: Series, times: number[], up: string, down: string): (HistogramData | WhitespaceData)[] =>
-  arr.map((v, i) => (v == null ? { time: toChart(times[i]) } : { time: toChart(times[i]), value: v, color: v >= 0 ? up : down }));
+/** 히스토그램 — 'sign' 은 0 위아래(MACD), 'slope' 는 직전 막대보다 커졌나(AO, 같으면 하락색 — 트레이딩뷰와 같다). */
+const histData = (arr: Series, times: number[], up: string, down: string, mode: 'sign' | 'slope' = 'sign'): (HistogramData | WhitespaceData)[] => {
+  let prev: number | null = null;
+  return arr.map((v, i) => {
+    if (v == null) return { time: toChart(times[i]) };
+    const rising = mode === 'sign' ? v >= 0 : prev == null || v > prev;
+    prev = v;
+    return { time: toChart(times[i]), value: v, color: rising ? up : down };
+  });
+};
 /** 시간(초)으로 봉 인덱스를 찾는다(오름차순 이진 탐색, 없으면 −1). */
 const barIndexAt = (candles: Candle[], time: number): number => {
   let lo = 0;
@@ -152,9 +177,62 @@ const fmtIndValue = (fmt: IndicatorFormat, v: number, prec: number): string =>
       ? v.toFixed(1)
       : fmt === 'fixed2'
         ? v.toFixed(2)
-        : fmt === 'pct'
-          ? `${v.toFixed(0)}%`
-          : fmtQtyShort(v, 9);
+        : fmt === 'fixed3'
+          ? v.toFixed(3)
+          : fmt === 'pct'
+            ? `${v.toFixed(0)}%`
+            : // 거래량 계열(OBV·거래량 이평)은 유효숫자 5자리 — 이평이 13.005504 처럼 소수 8자리까지 늘어져 레전드가 길어졌다
+              fmtQtyShort(Number(v.toPrecision(5)), 9);
+/** 레전드 선 약어(파라미터에 따라 바뀌는 것 포함) */
+const lineLabel = (ln: IndicatorLineDef, params: Record<string, number>) => (ln.labelOf ? ln.labelOf(params) : ln.label);
+
+/** 이평선 묶음 빠른 추가(국내 거래소·HTS 에서 가장 흔한 조합) */
+const MA_SET = [5, 20, 60, 120];
+
+/** 지표 파라미터 입력칸. ⚠ 입력 중인 글자(draft)를 따로 들고 있다 — 예전엔 칸 값이 곧 스토어 값이라 칸을 비우는 순간 최솟값으로
+ * 바뀌어(20 을 지우면 1 → 이어 친 50 이 150) 소수("2." 을 치는 순간 0.5 로)를 칠 수 없었다. 범위 안의 값이면 치는 대로 바로 반영하고
+ * (차트가 따라 바뀐다), 칸을 떠날 때(포커스 해제·Enter) 범위로 잘라 확정한다. ↑/↓ 키는 step 만큼. */
+function ParamInput({ p, value, onCommit }: { p: IndicatorParamDef; value: number; onCommit: (v: number) => void }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const step = p.step ?? 1;
+  const decimals = (String(step).split('.')[1] ?? '').length;
+  const finish = () => {
+    if (draft == null) return;
+    const n = Number(draft);
+    if (draft.trim() !== '' && Number.isFinite(n)) onCommit(n); // 범위 밖이면 스토어가 잘라낸다
+    setDraft(null);
+  };
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={draft ?? String(value)}
+      onChange={(e) => {
+        const s = e.target.value;
+        setDraft(s);
+        const n = Number(s);
+        if (s.trim() !== '' && Number.isFinite(n) && n >= p.min && n <= p.max) onCommit(n);
+      }}
+      onFocus={(e) => e.target.select()}
+      onBlur={finish}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+        else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          const base = Number(draft ?? value);
+          const next = Number(((Number.isFinite(base) ? base : value) + (e.key === 'ArrowUp' ? step : -step)).toFixed(decimals));
+          const clamped = Math.min(p.max, Math.max(p.min, next));
+          setDraft(String(clamped));
+          onCommit(clamped);
+        }
+      }}
+      className="w-12 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border focus:ring-accent/60"
+      // 범위 밖 값은 칸을 떠날 때 잘리므로 범위를 같이 보여준다 — "2 이상 안 올라간다"가 버그로 안 보이게
+      title={`${p.label} · ${p.min}~${p.max}`}
+      aria-label={p.label}
+    />
+  );
+}
 
 /** 인디케이터 표시/숨김 아이콘(눈 / 빗금 친 눈). 이모지는 폰트에 따라 깨져서 인라인 SVG 로. */
 function EyeIcon({ off }: { off: boolean }) {
@@ -211,6 +289,14 @@ export default function Chart() {
   expandedRef.current = expanded;
   const browserFsRef = useRef(false);
   const toggleExpandedRef = useRef<() => void>(() => {});
+  // 수평선 그리기 — 켜면 다음 차트 클릭이 지정가 대신 그 가격에 수평선을 긋는다(한 번 긋고 꺼진다, Esc 취소)
+  const [drawMode, setDrawMode] = useState(false);
+  const drawModeRef = useRef(false);
+  drawModeRef.current = drawMode;
+  const hLineRefs = useRef<IPriceLine[]>([]);
+  // 과거로 스크롤해 마지막 봉이 화면 밖이면 "최신으로" 버튼
+  const [awayFromLatest, setAwayFromLatest] = useState(false);
+  const latestQuietUntilRef = useRef(0);
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const volMap = useRef<Map<number, number>>(new Map());
@@ -221,6 +307,15 @@ export default function Chart() {
   optsRef.current = opts;
   const syncIndicatorsRef = useRef<() => void>(() => {});
 
+  // 하단 패널 배치(syncIndicators 가 정한다) — 패널마다 제 이름·값을 그 패널 왼쪽 위에 붙인다(트레이딩뷰식). top = 그림 영역 높이 대비 0~1.
+  // ⚠ 예전엔 오실레이터 값까지 전부 맨 위 레전드 한 덩어리에 넣어서, 폰에서 지표 몇 개만 올려도 레전드가 여러 줄로 불어나 캔들을 덮었고
+  //   어느 패널이 어느 지표인지도 화면에 안 보였다(2026-11-18).
+  const [paneLayout, setPaneLayout] = useState<{ panes: { id: string; top: number }[]; volTop: number | null }>({ panes: [], volTop: null });
+  const paneSigRef = useRef('');
+  // 그림 영역(시간축 제외) 높이(px) — 패널 레전드 위치 계산용, 크기가 바뀔 때만(fitTopMargin)
+  const [plotH, setPlotH] = useState(0);
+  const plotHRef = useRef(0);
+  const applyPaneLayoutRef = useRef<() => void>(() => {});
   const [legend, setLegend] = useState<Candle | null>(null);
   const [indLegend, setIndLegend] = useState<Record<string, IndLegendValue>>({});
   const [countdown, setCountdown] = useState('');
@@ -235,7 +330,18 @@ export default function Chart() {
 
   // 미체결(지정가)·조건부 주문선 옆의 취소(X) 버튼 위치 — 각 주문 가격의 y좌표에 얹는다(카운트다운과 동일 패턴).
   // conditional=true 면 조건부(스탑) 주문(취소는 cancelConditional 로 라우팅, 앰버색으로 구분).
-  type PendBtn = { id: string; top: number; axisW: number; sell: boolean; reduceOnly: boolean; conditional: boolean; label: string };
+  type PendBtn = {
+    id: string;
+    top: number;
+    axisW: number;
+    sell: boolean;
+    reduceOnly: boolean;
+    conditional: boolean;
+    label: string;
+    /** 주문이 아니라 수평선(지우기 · 알림 버튼) */
+    hline?: boolean;
+    alert?: boolean;
+  };
   const [pendBtns, setPendBtns] = useState<PendBtn[]>([]);
   const pendBtnsRef = useRef<PendBtn[]>([]);
   const repositionPendBtnsRef = useRef<() => void>(() => {});
@@ -281,15 +387,18 @@ export default function Chart() {
         setPendBtns([]);
       }
     };
-    if (!chart || !c || !optsRef.current.pendingLine) return clear();
+    if (!chart || !c) return clear();
+    const showOrders = optsRef.current.pendingLine;
     const axisW = chart.priceScale('right').width();
     // ⚠ priceToCoordinate 는 화면 밖 가격도 좌표를 **외삽해** 돌려준다 — 그대로 그리면 멀리 걸린 주문(분할 지정가 등)의 X 버튼이
     // 차트 영역 밖으로 삐져나와 아래 주문·포지션 패널 위에 떠 있었다(모바일에서 특히, 2026-11-02). 차트 안(시간축 위)에 보이는 것만.
     const paneH = (containerRef.current?.clientHeight ?? 0) - chart.timeScale().height();
-    const visible = (y: number | null): y is number => y != null && y >= 0 && y <= paneH;
+    // 캔들 영역 아래(거래량·오실레이터 패널)에 걸린 선의 버튼은 그 패널 위에 떠서 이름·값을 가린다 — 캔들 영역 안에 보이는 것만
+    const candleBottom = paneH * (1 - marginsRef.current.bottom) + 2;
+    const visible = (y: number | null): y is number => y != null && y >= 0 && y <= candleBottom;
     const next: PendBtn[] = [];
     for (const o of pendingOrders) {
-      if (o.symbol !== symbol) continue;
+      if (!showOrders || o.symbol !== symbol) continue;
       const y = c.priceToCoordinate(o.limitPrice);
       if (!visible(y)) continue;
       next.push({
@@ -303,7 +412,7 @@ export default function Chart() {
       });
     }
     for (const c2 of conditionalOrders) {
-      if (c2.symbol !== symbol) continue;
+      if (!showOrders || c2.symbol !== symbol) continue;
       const y = c.priceToCoordinate(c2.triggerPrice);
       if (!visible(y)) continue;
       next.push({
@@ -318,11 +427,30 @@ export default function Chart() {
         } ${fmtQtyShort(c2.size, 9)}${c2.repeating && c2.repeatMode === 'rearm' && !c2.armed ? ' (재무장 대기)' : ''}`,
       });
     }
+    // 수평선 — 지우기(×)·알림(🔔) 버튼(주문선 표시 옵션과 무관)
+    for (const l of useChartStore.getState().hLines[symbol] ?? []) {
+      const y = c.priceToCoordinate(l.price);
+      if (!visible(y)) continue;
+      next.push({
+        id: l.id,
+        top: y as number,
+        axisW,
+        sell: false,
+        reduceOnly: false,
+        conditional: false,
+        hline: true,
+        alert: l.alert,
+        label: `수평선 ${fmtPrice(l.price, precRef.current)}`,
+      });
+    }
     const prev = pendBtnsRef.current;
-    // 개수·위치(±1px)·라벨이 그대로면 리렌더 생략
+    // 개수·위치(±1px)·라벨·알림이 그대로면 리렌더 생략
     const same =
       prev.length === next.length &&
-      prev.every((p, i) => p.id === next[i].id && Math.abs(p.top - next[i].top) < 1 && p.axisW === next[i].axisW && p.label === next[i].label);
+      prev.every(
+        (p, i) =>
+          p.id === next[i].id && Math.abs(p.top - next[i].top) < 1 && p.axisW === next[i].axisW && p.label === next[i].label && p.alert === next[i].alert,
+      );
     if (same) return;
     pendBtnsRef.current = next;
     setPendBtns(next);
@@ -363,15 +491,21 @@ export default function Chart() {
   // 레전드 높이 → 위 여백. ⚠ 크로스헤어로 봉을 훑는 동안엔 바꾸지 않는다 — 레전드 값 길이에 따라 줄 수가 오가면
   // 마우스를 움직일 때마다 캔들이 위아래로 튄다. 미뤄 뒀다가 크로스헤어가 빠질 때 반영.
   const fitTopMargin = () => {
+    const chart = chartRef.current;
+    const box = containerRef.current;
+    if (!chart || !box) return;
+    const paneH = box.clientHeight - chart.timeScale().height();
+    // 패널 레전드 위치는 크로스헤어와 무관하게 늘 맞춘다(패널 위 레전드 자리는 px 라 높이가 바뀌면 배치도 다시)
+    if (paneH > 0 && Math.abs(paneH - plotHRef.current) >= 1) {
+      plotHRef.current = paneH;
+      setPlotH(paneH);
+      applyPaneLayoutRef.current();
+    }
     if (hovering.current) {
       topPendingRef.current = true;
       return;
     }
     topPendingRef.current = false;
-    const chart = chartRef.current;
-    const box = containerRef.current;
-    if (!chart || !box) return;
-    const paneH = box.clientHeight - chart.timeScale().height();
     if (paneH <= 0) return;
     const lg = legendRef.current;
     const legendBottom = lg && lg.offsetHeight > 0 ? lg.offsetTop + lg.offsetHeight : 0;
@@ -456,6 +590,21 @@ export default function Chart() {
       });
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(onProfileRange);
+    // 마지막 봉이 화면 오른쪽 밖이면(과거를 보는 중) "최신으로" 버튼을 띄운다 — 폰에서 끌어서 되돌아오기가 번거롭다.
+    // ⚠ LWC 의 애니메이션(최신으로 이동·관성 스크롤)은 **마지막 위치를 구독에 알리지 않는다**(실측: 끝 직전 프레임 to=497.3, 마지막 봉 499 에서
+    //   멈춘 채 이벤트가 끊겼다) — 이벤트가 멎고 300ms 뒤 실제 구간을 한 번 더 읽는다. "최신으로"를 누른 뒤 이동하는 동안엔 띄우지 않는다.
+    let latestTimer = 0;
+    const checkLatest = () => {
+      const r = chart.timeScale().getVisibleLogicalRange();
+      const last = candlesRef.current.length - 1;
+      setAwayFromLatest(r != null && last > 0 && r.to < last - 1 && performance.now() > latestQuietUntilRef.current);
+    };
+    const onLatestRange = () => {
+      checkLatest();
+      window.clearTimeout(latestTimer);
+      latestTimer = window.setTimeout(checkLatest, 300);
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange(onLatestRange);
 
     chart.subscribeCrosshairMove((param) => {
       repositionCountdownRef.current(); // 마우스 이동(팬/줌 포함) 시 축 라벨 따라 위치 갱신
@@ -517,9 +666,20 @@ export default function Chart() {
     chart.subscribeClick((param) => {
       const c = candleRef.current;
       if (!c || !param.point) return;
+      // 캔들 영역 아래(거래량·오실레이터 패널)를 누른 건 가격 클릭이 아니다 — 예전엔 거기서도 캔들 축으로 외삽한 엉뚱한 가격이 지정가에 들어갔다
+      const ph = plotHRef.current;
+      if (ph > 0 && param.point.y > ph * (1 - marginsRef.current.bottom) + 2) return;
       const raw = c.coordinateToPrice(param.point.y);
       if (raw == null) return;
       const price = Number(raw.toFixed(precRef.current));
+      if (drawModeRef.current) {
+        // 수평선 그리기 — 이 클릭은 지정가로 보내지 않는다
+        window.clearTimeout(clickTimer);
+        clickTimer = 0;
+        useChartStore.getState().addHLine(useMarketStore.getState().symbol, price);
+        setDrawMode(false);
+        return;
+      }
       window.clearTimeout(clickTimer);
       clickTimer = window.setTimeout(() => {
         clickTimer = 0;
@@ -537,6 +697,8 @@ export default function Chart() {
       window.clearTimeout(clickTimer);
       if (profileRaf) cancelAnimationFrame(profileRaf);
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onProfileRange);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onLatestRange);
+      window.clearTimeout(latestTimer);
       chart.remove();
       chartRef.current = null;
       candleRef.current = null;
@@ -602,6 +764,33 @@ export default function Chart() {
     document.addEventListener('fullscreenchange', onFs);
     return () => document.removeEventListener('fullscreenchange', onFs);
   }, []);
+  useEffect(() => {
+    if (!drawMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setDrawMode(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [drawMode]);
+  // 심볼을 바꾸면 그리기 모드는 끈다(엉뚱한 코인에 선이 생기지 않게)
+  useEffect(() => setDrawMode(false), [symbol]);
+
+  // ── 수평선(그리기 도구) — 이 심볼의 선을 캔들 가격선으로 ──
+  const hLinesHere = opts.hLines[symbol];
+  useEffect(() => {
+    const c = candleRef.current;
+    if (!c) return;
+    for (const pl of hLineRefs.current) c.removePriceLine(pl);
+    hLineRefs.current = [];
+    for (const l of hLinesHere ?? []) {
+      hLineRefs.current.push(
+        // 제목은 비운다 — 선 오른쪽 끝(제목 자리)에 지우기·알림 버튼이 얹혀 가려진다. 알림 상태는 🔔 버튼 색으로 보인다
+        c.createPriceLine({ price: l.price, color: HLINE_COLOR, lineWidth: 1, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: '' }),
+      );
+    }
+    repositionPendBtnsRef.current(); // 지우기·알림 버튼 위치
+  }, [hLinesHere, symbol]);
+
   useEffect(() => {
     if (!expanded) return;
     const onKey = (e: KeyboardEvent) => {
@@ -677,6 +866,33 @@ export default function Chart() {
       indValuesRef.current.delete(id);
     }
 
+    // 거래량 히스토그램 — 최하단. ⚠ 지표 시리즈보다 **먼저** 만든다: LWC 는 나중에 만든 시리즈를 위에 그려서, 거래량 이평(pane
+    // 'volume')이 먼저 만들어지면 막대 뒤로 숨는다. 거래량을 껐다 다시 켜 막대가 새로 생기면 그 위의 지표 시리즈도 다시 만든다.
+    if (o.volume) {
+      if (!volRef.current) {
+        // lastValueVisible=true → 우측 축에 최신 거래량 티커(1.23M 형식) 표시
+        volRef.current = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: true });
+        for (const ind of o.indicators) {
+          if (INDICATOR_DEFS[ind.type].pane !== 'volume') continue;
+          const m = indSeriesRef.current.get(ind.id);
+          if (!m) continue;
+          for (const s of m.values()) chart.removeSeries(s);
+          indSeriesRef.current.delete(ind.id);
+        }
+      }
+      const vc = volColors(chartColors(useSettingsStore.getState().theme, o.colorScheme));
+      volRef.current.setData(
+        candles.map((c) => ({
+          time: toChart(c.time),
+          value: c.volume ?? 0,
+          color: c.close >= c.open ? vc.up : vc.down,
+        })) as HistogramData[],
+      );
+    } else if (volRef.current) {
+      chart.removeSeries(volRef.current);
+      volRef.current = null;
+    }
+
     // 레지스트리(indicatorDefs) 기반 — 여기엔 지표 타입 분기가 없다. 선 하나 = 시리즈 하나,
     // own 패널 지표는 priceScaleId = 지표 id 로 자기 축을 갖는다(아래 스택 배치).
     const themeColors = chartColors(useSettingsStore.getState().theme, o.colorScheme);
@@ -692,7 +908,11 @@ export default function Chart() {
         indSeriesRef.current.set(ind.id, found);
       }
       const series = found;
-      const scaleId = def.pane === 'own' ? ind.id : 'right';
+      // own = 자기 패널(축 id = 지표 id), volume = 거래량 막대의 축('vol'), 그 외 = 캔들 축
+      const scaleId = def.pane === 'own' ? ind.id : def.pane === 'volume' ? 'vol' : 'right';
+      // 거래량 위에 얹는 지표는 거래량을 끄면 같이 숨긴다 — 'vol' 축은 거래량이 켜져 있을 때만 맨 아래 15% 로 잡혀 있어서,
+      // 그대로 두면 축 여백이 없는 채로 캔들 영역 전체에 그려진다
+      const shown = ind.visible && (def.pane !== 'volume' || o.volume);
       const vals = def.compute(candles, ind.params);
       indValuesRef.current.set(ind.id, vals);
       def.lines.forEach((ln, li) => {
@@ -712,6 +932,8 @@ export default function Chart() {
               lastValueVisible: false,
               // 점 표시(Parabolic SAR): 선은 숨기고 점만 찍는다
               ...(ln.kind === 'dots' ? { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 2, crosshairMarkerVisible: false } : {}),
+              // 가격축 범위에서 빼는 선(엔벨로프 ±%) — null = 이 시리즈는 축 맞춤에 안 들어간다
+              ...(ln.autoscale === false ? { autoscaleInfoProvider: () => null } : {}),
             });
           }
           if (li === 0 && def.levels) {
@@ -724,7 +946,7 @@ export default function Chart() {
         const arr = vals[ln.key] ?? [];
         const t = arr.length > times.length ? extendTimes(times, arr.length - times.length, stepSec) : times;
         if (ln.kind === 'hist') {
-          (s as ISeriesApi<'Histogram'>).setData(histData(arr, t, histUp, histDown));
+          (s as ISeriesApi<'Histogram'>).setData(histData(arr, t, histUp, histDown, ln.histColor));
         } else if (ln.colorByState && def.states) {
           const colors = def.states.labels.map((l) => l.color);
           (s as ISeriesApi<'Line'>).setData(stateLine(arr, t, vals[def.states.key] ?? [], colors));
@@ -735,47 +957,54 @@ export default function Chart() {
           (s as ISeriesApi<'Line'>).applyOptions({ color });
         }
         // 숨김 ≠ 삭제. 시리즈·설정은 그대로 두고 visible 만 끈다(다시 켤 때 재생성 비용 0).
-        s.applyOptions({ visible: ind.visible });
+        s.applyOptions({ visible: shown });
       });
     });
 
-    // 거래량 히스토그램 — 최하단
-    if (o.volume) {
-      if (!volRef.current) {
-        // lastValueVisible=true → 우측 축에 최신 거래량 티커(1.23M 형식) 표시
-        volRef.current = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: true });
-      }
-      const vc = volColors(chartColors(useSettingsStore.getState().theme, o.colorScheme));
-      volRef.current.setData(
-        candles.map((c) => ({
-          time: toChart(c.time),
-          value: c.volume ?? 0,
-          color: c.close >= c.open ? vc.up : vc.down,
-        })) as HistogramData[],
-      );
-    } else if (volRef.current) {
-      chart.removeSeries(volRef.current);
-      volRef.current = null;
-    }
+    applyPaneLayout();
+    refreshProfiles(); // 봉·설정·색이 바뀌었다 — 매물대도 다시 센다
+  };
+  syncIndicatorsRef.current = syncIndicators;
 
-    // 하단 영역 스택 배치: [캔들] / [own 패널 지표들 — 보이는 것만] / [거래량]. 패널이 늘면 높이를 나눠 쓴다
-    // (숨긴 지표는 자리를 차지하지 않는다).
-    const panes = o.indicators.filter((i) => i.visible && INDICATOR_DEFS[i.type].pane === 'own');
-    const volH = o.volume ? 0.15 : 0;
-    const paneH = panes.length ? Math.min(0.16, 0.55 / panes.length) : 0;
+  // 하단 영역 스택 배치: [캔들] / [own 패널 지표들 — 보이는 것만] / [거래량]. 패널이 늘면 높이를 나눠 쓴다(숨긴 지표는 자리를 차지하지 않는다).
+  // ⚠ 하단(패널+거래량) 몫은 BOTTOM_SHARE_MAX 까지 — 예전 상한(패널만 55% + 거래량 15%)이면 오실레이터 셋에 캔들이 30% 남짓이었고, 폰에서
+  //   레전드 여백까지 빼면 캔들이 한 줄로 납작해졌다(2026-11-18). 패널이 셋 이상이면 거래량 몫도 15→10% 로 줄인다.
+  // 패널 맨 위 한 줄(≈15px)은 그 패널의 이름·값 자리라 선을 그 아래부터 그린다(px 로 잡으므로 높이가 바뀌면 다시 — fitTopMargin).
+  const applyPaneLayout = () => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const o = optsRef.current;
+    // 시리즈가 아직 없는 패널(막 추가돼 syncIndicators 전)은 축도 없다 — 빼고 잡는다(곧 syncIndicators 가 다시 부른다)
+    const panes = o.indicators.filter((i) => i.visible && INDICATOR_DEFS[i.type].pane === 'own' && indSeriesRef.current.has(i.id));
+    const vol = o.volume && volRef.current != null;
+    const volH = vol ? (panes.length >= 3 ? 0.1 : 0.15) : 0;
+    const paneH = panes.length ? Math.min(0.16, (BOTTOM_SHARE_MAX - volH) / panes.length) : 0;
     const total = volH + paneH * panes.length;
     // 위 여백은 레전드 높이에서(fitTopMargin) — 여기선 아래만 바꾸고 함께 적용
     marginsRef.current.bottom = Math.max(0.04, total + 0.02);
     applyRightMargins();
+    const ph = plotHRef.current;
+    const padTop = (h: number) => (ph > 0 ? Math.min(h * 0.4, PANE_LEGEND_PX / ph) : h * 0.2);
+    const padBot = (h: number) => (ph > 0 ? Math.min(h * 0.1, 3 / ph) : 0);
+    const layout = { panes: [] as { id: string; top: number }[], volTop: vol ? 1 - volH : null };
     panes.forEach((ind, i) => {
-      chart.priceScale(ind.id).applyOptions({
-        scaleMargins: { top: 1 - volH - (panes.length - i) * paneH, bottom: volH + (panes.length - i - 1) * paneH },
-      });
+      const top = 1 - volH - (panes.length - i) * paneH;
+      const bottom = volH + (panes.length - i - 1) * paneH;
+      chart.priceScale(ind.id).applyOptions({ scaleMargins: { top: top + padTop(paneH), bottom: bottom + padBot(paneH) } });
+      layout.panes.push({ id: ind.id, top });
     });
-    if (o.volume) chart.priceScale('vol').applyOptions({ scaleMargins: { top: 1 - volH, bottom: 0 } });
-    refreshProfiles(); // 봉·설정·색이 바뀌었다 — 매물대도 다시 센다
+    if (vol) {
+      // 거래량 이평이 있으면 그 레전드 자리만큼 막대를 내린다
+      const volLegend = o.indicators.some((i) => i.visible && INDICATOR_DEFS[i.type].pane === 'volume');
+      chart.priceScale('vol').applyOptions({ scaleMargins: { top: 1 - volH + (volLegend ? padTop(volH) : 0), bottom: 0 } });
+    }
+    const sig = JSON.stringify(layout);
+    if (sig !== paneSigRef.current) {
+      paneSigRef.current = sig;
+      setPaneLayout(layout);
+    }
   };
-  syncIndicatorsRef.current = syncIndicators;
+  applyPaneLayoutRef.current = applyPaneLayout;
 
   // ── 데이터 로드 + WS 구독 (symbol/interval 변경 시) ───────────
   useEffect(() => {
@@ -892,6 +1121,7 @@ export default function Chart() {
       let lastBarsSaveV = 0;
       const onRangeV = (range: { from: number; to: number } | null) => {
         repositionCountdownRef.current();
+        requestAnimationFrame(() => repositionCountdownRef.current()); // 가격축은 다음 프레임에 다시 맞춰진다(위 onRange 와 같은 이유)
         if (range && range.from < 10) loadOlder();
         if (range) {
           const now = Date.now();
@@ -1031,6 +1261,8 @@ export default function Chart() {
     let lastBarsSave = 0;
     const onRange = (range: { from: number; to: number } | null) => {
       repositionCountdownRef.current(); // 가로 팬/줌으로 가격축 스케일이 바뀌면 카운트다운 위치도 갱신
+      // ⚠ 가격축은 LWC 가 다음 프레임에 다시 맞춘다 — 그 뒤에 한 번 더(안 하면 1초 틱까지 주문 X·수평선 버튼이 옛 자리에 떠 있다)
+      requestAnimationFrame(() => repositionCountdownRef.current());
       if (range && range.from < 10) loadOlder();
       // 사용자가 확대/축소한 봉 개수를 기억해뒀다가 다음 접속 때 기본값으로 사용(과도한 쓰기 방지로 스로틀).
       if (range) {
@@ -1093,6 +1325,17 @@ export default function Chart() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, interval]);
+
+  // 지표 추가 직후 그 지표의 줄이 패널 아래쪽에 생긴다 — 모바일처럼 패널이 스크롤되면 화면 밖이라 "추가가 안 됐다"로 보였다
+  const optsListRef = useRef<HTMLDivElement>(null);
+  const indCountRef = useRef(opts.indicators.length);
+  useEffect(() => {
+    const grew = opts.indicators.length > indCountRef.current;
+    indCountRef.current = opts.indicators.length;
+    if (!grew || !showOpts) return;
+    const el = optsListRef.current;
+    if (el) requestAnimationFrame(() => el.lastElementChild?.scrollIntoView({ block: 'nearest' }));
+  }, [opts.indicators.length, showOpts]);
 
   // 인디케이터 추가/삭제/설정 변경, 거래량 토글 시 즉시 반영
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1318,6 +1561,32 @@ export default function Chart() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interval, symbol, opts.showCountdown]);
 
+  /** 지표 하나의 레전드 — `RSI(14) 52.3`. withTitle 이면 값이 아직 없어도(워밍업) 제목은 보인다(패널 이름표 역할). */
+  const indLegendNode = (ind: IndicatorConfig, idx: number, withTitle: boolean) => {
+    const def = INDICATOR_DEFS[ind.type];
+    const val = indLegend[ind.id];
+    const parts: string[] = [];
+    if (val) {
+      for (const ln of def.lines) {
+        if (ln.legend === false) continue;
+        const v = val[ln.key];
+        if (v == null) continue;
+        const txt = fmtIndValue(ln.format ?? def.format, v, prec);
+        const lab = lineLabel(ln, ind.params);
+        parts.push(lab ? `${lab} ${txt}` : txt);
+      }
+    }
+    if (parts.length === 0 && !withTitle) return null;
+    const st = val && def.states ? val[def.states.key] : undefined;
+    const stLabel = st != null ? def.states?.labels[st] : undefined;
+    return (
+      <span key={ind.id} style={{ color: IND_COLORS[idx % IND_COLORS.length] }}>
+        {indicatorTitle(ind.type, ind.params)} {parts.join(' ')}
+        {stLabel && <span className="font-semibold" style={{ color: stLabel.color }}> · {stLabel.text}</span>}
+      </span>
+    );
+  };
+
   const up = legend ? legend.close >= legend.open : true;
   // 종가 옆 변동률 = 그 봉의 (종가-시가)/시가 (레전드 상하 색과 동일 기준). hover 시 그 봉, 아니면 마지막 봉.
   const chgPct = legend && legend.open ? ((legend.close - legend.open) / legend.open) * 100 : null;
@@ -1326,8 +1595,9 @@ export default function Chart() {
     // 전체화면이면 화면 전체를 덮는다(z-[45] = 토스트(z-40) 위·모달(z-50) 아래 — 리필 팝업 등은 그대로 위에 뜬다).
     // 컴포넌트를 다른 곳으로 옮기지 않고 CSS 만 바꾼다 — 포털로 옮기면 다시 마운트되어 차트를 새로 만든다.
     <div className={expanded ? 'fixed inset-0 z-[45] flex flex-col overscroll-contain bg-bg' : 'flex h-full flex-col'}>
-      {/* 툴바 */}
-      <div className="flex items-center gap-2 border-b border-border bg-panel px-2 py-1.5">
+      {/* 툴바 — ⚠ relative: 모바일에선 드롭다운(지표·옵션, 타임프레임 목록)을 버튼이 아니라 이 툴바 폭에 맞춰 연다(버튼 기준 w-80 은
+          폰 화면 오른쪽 밖으로 잘려 체크박스가 아예 안 보였다, 2026-11-18). PC(md+)는 버튼 아래. */}
+      <div className="relative flex items-center gap-1.5 border-b border-border bg-panel px-2 py-1.5 sm:gap-2">
         {/* 타임프레임 — 즐겨찾기(★)만 가로로, 나머지는 ▾ 목록(트레이딩뷰식). 원화 심볼(빗썸)은 1초봉이 없어 뺀다 */}
         <IntervalPicker
           value={interval}
@@ -1335,37 +1605,49 @@ export default function Chart() {
           supports={(code) => quoteOf(symbol) !== 'KRW' || bithumbSupports(code)}
         />
 
-        <div className="relative">
+        <div className="shrink-0 md:relative">
+          {/* ⚠ 줄바꿈 금지 — 폰에서 "지표 · 옵션 ▾" 가 두 줄로 접혀 툴바가 두꺼워졌다. 좁은 화면은 "지표" 만 */}
           <button
             onClick={() => setShowOpts((v) => !v)}
-            className="rounded bg-panel2 px-2 py-1 text-xs text-text ring-1 ring-border transition hover:bg-elevated"
+            aria-expanded={showOpts}
+            className={`flex items-center gap-1 whitespace-nowrap rounded px-2 py-1 text-xs ring-1 ring-border transition hover:bg-elevated ${
+              showOpts ? 'bg-elevated text-text' : 'bg-panel2 text-text'
+            }`}
           >
-            지표 · 옵션 ▾
+            <span className="sm:hidden">지표</span>
+            <span className="hidden sm:inline">지표 · 옵션</span>
+            {opts.indicators.length > 0 && (
+              <span className="rounded bg-panel px-1 text-[10px] font-semibold tabular-nums text-accent">{opts.indicators.length}</span>
+            )}
+            <span className="text-muted">▾</span>
           </button>
           {showOpts && (
             <>
               <div className="fixed inset-0 z-20" onClick={() => setShowOpts(false)} />
-              <div className="absolute left-0 top-full z-30 mt-1 w-80 rounded-lg border border-border bg-panel p-1.5 shadow-2xl">
-                {(
-                  [
-                    ['volume', '거래량'],
-                    ['showCountdown', '다음 봉 카운트다운'],
-                    ['tradeMarkers', '내 매매 표시 (B/S)'],
-                    ['positionLine', '포지션 평단선'],
-                    ['slTpLines', 'SL/TP 수평선'],
-                    ['pendingLine', '지정가 주문선 (수량)'],
-                    ['hiLoMarks', '최고·최저가 표시'],
-                    ['orderBook', '호가창'],
-                  ] as const
-                ).map(([k, label]) => (
-                  <label
-                    key={k}
-                    className="flex cursor-pointer items-center justify-between rounded px-2 py-1.5 text-xs text-text hover:bg-panel2"
-                  >
-                    {label}
-                    <input type="checkbox" checked={opts[k]} onChange={() => opts.toggle(k)} className="accent-up" />
-                  </label>
-                ))}
+              <div className="absolute inset-x-1 top-full z-30 mt-1 max-h-[min(75vh,36rem)] overflow-y-auto overscroll-contain rounded-lg border border-border bg-panel p-1.5 shadow-2xl md:inset-x-auto md:left-0 md:w-[24rem]">
+                {/* 표시 옵션 — 폰은 두 칸으로(세로 길이 절반) */}
+                <div className="grid grid-cols-2 gap-x-1 md:grid-cols-1">
+                  {(
+                    [
+                      ['volume', '거래량'],
+                      ['showCountdown', '다음 봉 카운트다운'],
+                      ['tradeMarkers', '내 매매 표시 (B/S)'],
+                      ['positionLine', '포지션 평단선'],
+                      ['slTpLines', 'SL/TP 수평선'],
+                      ['pendingLine', '지정가 주문선 (수량)'],
+                      ['hiLoMarks', '최고·최저가 표시'],
+                      ['orderBook', '호가창'],
+                    ] as const
+                  ).map(([k, label]) => (
+                    <label
+                      key={k}
+                      className="flex cursor-pointer items-center justify-between gap-1 rounded px-2 py-1.5 text-xs text-text hover:bg-panel2"
+                    >
+                      <span className="min-w-0 truncate">{label}</span>
+                      <input type="checkbox" checked={opts[k]} onChange={() => opts.toggle(k)} className="shrink-0 accent-up" />
+                    </label>
+                  ))}
+                </div>
 
                 <div className="my-1 border-t border-border" />
                 <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">인디케이터</div>
@@ -1373,28 +1655,27 @@ export default function Chart() {
                 {opts.indicators.length === 0 && (
                   <div className="px-2 py-1.5 text-[11px] text-muted">추가된 인디케이터 없음</div>
                 )}
+                <div ref={optsListRef}>
                 {opts.indicators.map((ind, idx) => {
                   const def = INDICATOR_DEFS[ind.type];
                   return (
                     <div key={ind.id} className={`rounded hover:bg-panel2 ${ind.visible ? '' : 'opacity-50'}`}>
                       <div className="flex items-center gap-1 px-2 py-1 text-xs text-text">
                         <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: IND_COLORS[idx % IND_COLORS.length] }} />
-                        <span className="w-[4.6rem] shrink-0 truncate" title={`${def.name}${def.pane === 'own' ? ' · 별도 패널' : ''}`}>
+                        <span
+                          className="w-[4.6rem] shrink-0 truncate"
+                          title={`${def.name}${def.pane === 'own' ? ' · 아래 패널' : def.pane === 'volume' ? ' · 거래량 막대 위(거래량을 켜야 보입니다)' : ''}`}
+                        >
                           {def.label}
                         </span>
-                        <span className="flex flex-1 items-center justify-end gap-1">
+                        {/* 파라미터가 많으면(StochRSI 4개) 줄을 넘긴다 — 한 줄에 우겨 넣으면 패널이 가로로 밀린다 */}
+                        <span className="flex flex-1 flex-wrap items-center justify-end gap-1">
                           {def.params.map((p) => (
-                            <input
+                            <ParamInput
                               key={p.key}
-                              type="number"
-                              min={p.min}
-                              max={p.max}
-                              step={p.step ?? 1}
+                              p={p}
                               value={ind.params[p.key] ?? p.def}
-                              onChange={(e) => opts.updateIndicator(ind.id, { [p.key]: Number(e.target.value) })}
-                              className="w-12 rounded bg-panel2 px-1 py-0.5 text-right text-xs text-text outline-none ring-1 ring-border"
-                              // 범위 밖 값은 조용히 잘리므로(clampParam) 범위를 같이 보여준다 — "2 이상 안 올라간다"가 버그로 안 보이게
-                              title={`${p.label} · ${p.min}~${p.max}`}
+                              onCommit={(v) => opts.updateIndicator(ind.id, { [p.key]: v })}
                             />
                           ))}
                         </span>
@@ -1429,49 +1710,106 @@ export default function Chart() {
                     </div>
                   );
                 })}
+                </div>
 
-                {/* 추가 — 오버레이(캔들 위) / 오실레이터(별도 패널) 그룹. 값은 항상 '' 로 되돌려 같은 지표를 또 고를 수 있게 */}
+                {/* 추가 — 분류(이동평균·밴드·추세·오실레이터·거래량·변동성)별 묶음. 값은 항상 '' 로 되돌려 같은 지표를 또 고를 수 있게 */}
                 <select
                   value=""
                   onChange={(e) => {
                     const t = e.target.value as IndicatorType | '';
                     if (t) opts.addIndicator(t);
                   }}
-                  className="mt-1 w-full cursor-pointer rounded bg-panel2 px-2 py-1 text-[11px] font-semibold text-text outline-none ring-1 ring-border"
+                  className="mt-1 w-full cursor-pointer rounded bg-panel2 px-2 py-1.5 text-xs font-semibold text-text outline-none ring-1 ring-border"
                 >
                   <option value="">+ 인디케이터 추가…</option>
-                  <optgroup label="오버레이 (캔들 위)">
-                    {OVERLAY_TYPES.map((t) => (
-                      <option key={t} value={t}>
-                        {INDICATOR_DEFS[t].label} — {INDICATOR_DEFS[t].name}
-                      </option>
-                    ))}
-                  </optgroup>
-                  <optgroup label="오실레이터 (별도 패널)">
-                    {OSCILLATOR_TYPES.map((t) => (
-                      <option key={t} value={t}>
-                        {INDICATOR_DEFS[t].label} — {INDICATOR_DEFS[t].name}
-                      </option>
-                    ))}
-                  </optgroup>
+                  {INDICATOR_TYPES_BY_GROUP.map((g) => (
+                    <optgroup key={g.key} label={g.label}>
+                      {g.types.map((t) => (
+                        <option key={t} value={t}>
+                          {INDICATOR_DEFS[t].label} — {INDICATOR_DEFS[t].name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
                 </select>
+                {/* 이평선 묶음 — 이평을 네 번 추가하고 기간을 하나씩 고치지 않게(국내 거래소·HTS 기본 5·20·60·120) */}
+                <button
+                  onClick={() => MA_SET.forEach((n) => opts.addIndicator('sma', { period: n }))}
+                  className="mt-1 w-full rounded px-2 py-1 text-left text-[11px] text-muted transition hover:bg-panel2 hover:text-text"
+                  title="단순이동평균 5 · 20 · 60 · 120 을 한 번에 추가합니다"
+                >
+                  + 이평선 묶음 추가 (SMA {MA_SET.join(' · ')})
+                </button>
+
+                {/* 수평선 — 차트 위 버튼(×·🔔)은 작아서 폰에서 누르기 어렵다 — 여기서도 지우고 알림을 켠다 */}
+                <div className="my-1 border-t border-border" />
+                <div className="flex items-center justify-between px-2 py-1">
+                  <span className="text-[10px] font-semibold uppercase text-muted">수평선 · {pairLabel(symbol)}</span>
+                  {(hLinesHere?.length ?? 0) > 0 && (
+                    <button onClick={() => opts.clearHLines(symbol)} className="rounded px-1 text-[10px] text-muted hover:bg-panel2 hover:text-down">
+                      모두 지우기
+                    </button>
+                  )}
+                </div>
+                {(hLinesHere?.length ?? 0) === 0 ? (
+                  <div className="px-2 pb-1.5 text-[11px] leading-snug text-muted">
+                    툴바의 <span className="text-text">수평선</span> 버튼을 누른 뒤 차트에서 가격을 누르면 선을 긋습니다. 🔔 를 켜 두면 현재가가 그 선을
+                    지나갈 때 한 번 알려 줍니다(이 앱을 보고 있을 때만).
+                  </div>
+                ) : (
+                  [...(hLinesHere ?? [])]
+                    .sort((a, b) => b.price - a.price)
+                    .map((l) => (
+                      <div key={l.id} className="flex items-center gap-1 rounded px-2 py-1 text-xs text-text hover:bg-panel2">
+                        <span className="h-0.5 w-3 shrink-0 rounded" style={{ backgroundColor: HLINE_COLOR }} />
+                        <span className="flex-1 tabular-nums">{fmtPrice(l.price, prec)}</span>
+                        <button
+                          onClick={() => opts.setHLineAlert(symbol, l.id)}
+                          aria-pressed={l.alert}
+                          title={l.alert ? '알림 끄기' : '현재가가 이 선을 지나가면 알림(한 번)'}
+                          className={`rounded px-1.5 py-0.5 text-[11px] transition ${l.alert ? 'bg-[#2962ff] text-white' : 'text-muted hover:bg-elevated'}`}
+                        >
+                          🔔 {l.alert ? '켬' : '끔'}
+                        </button>
+                        <button onClick={() => opts.removeHLine(symbol, l.id)} title="지우기" className="shrink-0 rounded px-1 text-muted hover:bg-elevated hover:text-down">
+                          ✕
+                        </button>
+                      </div>
+                    ))
+                )}
               </div>
             </>
           )}
         </div>
 
-        {/* 실시간 시계(KST) — 우측 구석 */}
-        <Clock className="ml-auto text-xs font-semibold text-muted" />
-        {/* 전체화면 — 차트 더블클릭(모바일 더블탭)과 같다. 아이폰처럼 Esc 가 없는 곳은 이 버튼으로 나온다 */}
+        {/* 수평선 그리기 — 누른 뒤 차트를 누르면 그 가격에 선(지지·저항 표시, 🔔 로 가격 알림) */}
         <button
-          onClick={toggleExpanded}
-          className="shrink-0 rounded p-1 text-muted transition hover:bg-panel2 hover:text-text"
-          title={expanded ? '전체화면 종료 (Esc · 차트 더블클릭)' : '전체화면 (차트 더블클릭)'}
-          aria-label={expanded ? '전체화면 종료' : '전체화면'}
-          aria-pressed={expanded}
+          onClick={() => setDrawMode((v) => !v)}
+          aria-pressed={drawMode}
+          title={drawMode ? '수평선 그리기 취소 (Esc)' : '수평선 그리기 — 누른 뒤 차트에서 가격을 누르세요'}
+          aria-label="수평선 그리기"
+          className={`flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs ring-1 transition ${
+            drawMode ? 'bg-[#2962ff] text-white ring-[#2962ff]' : 'bg-panel2 text-muted ring-border hover:bg-elevated hover:text-text'
+          }`}
         >
-          <FullscreenIcon exit={expanded} />
+          <HLineIcon />
+          <span className="hidden lg:inline">수평선</span>
         </button>
+
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {/* 실시간 시계(KST) — 폰은 툴바가 좁아(타임프레임이 잘렸다) 숨긴다 */}
+          <Clock className="hidden text-xs font-semibold text-muted sm:inline" />
+          {/* 전체화면 — 차트 더블클릭(모바일 더블탭)과 같다. 아이폰처럼 Esc 가 없는 곳은 이 버튼으로 나온다 */}
+          <button
+            onClick={toggleExpanded}
+            className="shrink-0 rounded p-1 text-muted transition hover:bg-panel2 hover:text-text"
+            title={expanded ? '전체화면 종료 (Esc · 차트 더블클릭)' : '전체화면 (차트 더블클릭)'}
+            aria-label={expanded ? '전체화면 종료' : '전체화면'}
+            aria-pressed={expanded}
+          >
+            <FullscreenIcon exit={expanded} />
+          </button>
+        </div>
       </div>
 
       {/* 차트 영역 */}
@@ -1494,32 +1832,40 @@ export default function Chart() {
                 </span>
               </span>
               <span className="text-muted">거래량 <span className="text-text">{fmtQtyShort(legend.volume, 9)}</span></span>
-              {opts.indicators.map((ind, idx) => {
-                if (!ind.visible) return null;
-                const val = indLegend[ind.id];
-                if (!val) return null;
-                const def = INDICATOR_DEFS[ind.type];
-                const parts: string[] = [];
-                for (const ln of def.lines) {
-                  if (ln.legend === false) continue;
-                  const v = val[ln.key];
-                  if (v == null) continue;
-                  const txt = fmtIndValue(ln.format ?? def.format, v, prec);
-                  parts.push(ln.label ? `${ln.label} ${txt}` : txt);
-                }
-                if (parts.length === 0) return null;
-                const st = def.states ? val[def.states.key] : undefined;
-                const stLabel = st != null ? def.states?.labels[st] : undefined;
-                return (
-                  <span key={ind.id} style={{ color: IND_COLORS[idx % IND_COLORS.length] }}>
-                    {indicatorTitle(ind.type, ind.params)} {parts.join(' ')}
-                    {stLabel && <span className="font-semibold" style={{ color: stLabel.color }}> · {stLabel.text}</span>}
-                  </span>
-                );
-              })}
+              {/* 캔들 위에 겹치는 지표만 — 아래 패널·거래량 위 지표는 그 패널 왼쪽 위에(아래) */}
+              {opts.indicators.map((ind, idx) =>
+                ind.visible && INDICATOR_DEFS[ind.type].pane === 'overlay' ? indLegendNode(ind, idx, false) : null,
+              )}
             </>
           )}
         </div>
+        {/* 하단 패널마다 제 이름·값(트레이딩뷰식) + 패널 경계선 — 위치는 applyPaneLayout 이 정한 비율 × 그림 영역 높이 */}
+        {plotH > 0 &&
+          paneLayout.panes.map(({ id, top }, i) => {
+            const idx = opts.indicators.findIndex((x) => x.id === id);
+            if (idx < 0) return null;
+            const y = Math.round(top * plotH);
+            // 패널이 글자 한 줄보다 낮으면(패널을 열 개 넘게 올린 경우) 이름표끼리 겹친다 — 경계선만
+            const h = ((paneLayout.panes[i + 1]?.top ?? paneLayout.volTop ?? 1) - top) * plotH;
+            return (
+              <div key={id} className="pointer-events-none absolute inset-x-0 z-10" style={{ top: y }}>
+                <div className="h-px w-full bg-border/70" />
+                {/* 한 줄로 — 길면 가격축 앞에서 말줄임(패널 높이가 한 줄 몫뿐이라 접으면 선을 덮는다) */}
+                {h >= PANE_LEGEND_PX && (
+                  <div className="ml-2 mr-20 mt-0.5 truncate text-[11px] leading-[13px]">{indLegendNode(opts.indicators[idx], idx, true)}</div>
+                )}
+              </div>
+            );
+          })}
+        {plotH > 0 && paneLayout.volTop != null && opts.indicators.some((i) => i.visible && INDICATOR_DEFS[i.type].pane === 'volume') && (
+          <div className="pointer-events-none absolute inset-x-0 z-10" style={{ top: Math.round(paneLayout.volTop * plotH) }}>
+            <div className="ml-2 mr-20 mt-0.5 flex gap-x-3 overflow-hidden whitespace-nowrap text-[11px] leading-[13px]">
+              {opts.indicators.map((ind, idx) =>
+                ind.visible && INDICATOR_DEFS[ind.type].pane === 'volume' ? indLegendNode(ind, idx, true) : null,
+              )}
+            </div>
+          </div>
+        )}
         {/* 다음 봉 카운트다운 — 트레이딩뷰처럼 우측 가격축의 현재가 티커(마지막 봉 종가 라벨) 바로 아래 */}
         {opts.showCountdown && countdown && countdownPos && (
           <div
@@ -1536,8 +1882,29 @@ export default function Chart() {
           </div>
         )}
         {/* 미체결 지정가·조건부 주문선 옆 취소(X) 버튼 — 각 주문 가격의 y좌표, 우측 가격축 바로 왼쪽에 얹는다. */}
-        {opts.pendingLine &&
-          pendBtns.map((b) => (
+        {/* 수평선 — 가격축 바로 왼쪽에 지우기(×)와 알림(🔔) 버튼. 주문선(X)과 같은 자리 규칙(화면 안에 보이는 선만, repositionPendBtns) */}
+        {pendBtns.map((b) =>
+          b.hline ? (
+            <div key={b.id} className="absolute z-20 flex items-center gap-0.5" style={{ top: b.top - 8, right: b.axisW + 3 }}>
+              <button
+                onClick={() => opts.setHLineAlert(symbol, b.id)}
+                title={b.alert ? `${b.label} — 알림 끄기` : `${b.label} — 현재가가 이 선을 지나가면 알림(한 번)`}
+                aria-pressed={!!b.alert}
+                className={`pointer-events-auto flex h-4 w-4 items-center justify-center rounded-sm text-[9px] leading-none ring-1 transition ${
+                  b.alert ? 'bg-[#2962ff] text-white ring-[#2962ff]' : 'bg-[#2962ff]/15 text-[#5b8def] ring-[#2962ff]/40 hover:bg-[#2962ff]/40'
+                }`}
+              >
+                🔔
+              </button>
+              <button
+                onClick={() => opts.removeHLine(symbol, b.id)}
+                title={`${b.label} — 클릭하면 지움`}
+                className="pointer-events-auto flex h-4 w-4 items-center justify-center rounded-sm bg-[#2962ff]/15 text-[11px] font-bold leading-none text-[#5b8def] ring-1 ring-[#2962ff]/40 transition hover:bg-[#2962ff] hover:text-white"
+              >
+                ×
+              </button>
+            </div>
+          ) : (
             <button
               key={b.id}
               onClick={() => (b.conditional ? cancelConditional(b.id) : cancelLimit(b.id))}
@@ -1553,7 +1920,33 @@ export default function Chart() {
             >
               ×
             </button>
-          ))}
+          ),
+        )}
+        {/* 수평선 그리기 중 안내 */}
+        {drawMode && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-9 z-20 flex justify-center px-2">
+            <span className="rounded-md bg-[#2962ff] px-2.5 py-1 text-[11px] font-semibold text-white shadow-lg">
+              차트를 누르면 그 가격에 수평선을 긋습니다 · <span className="hidden sm:inline">Esc</span>
+              <span className="sm:hidden">버튼 다시 누르면</span> 취소
+            </span>
+          </div>
+        )}
+        {/* 최신으로 — 과거를 보다가 마지막 봉으로(트레이딩뷰의 실시간으로 이동) */}
+        {awayFromLatest && !drawMode && (
+          <button
+            onClick={() => {
+              // 이동 애니메이션(약 1초) 동안은 중간 위치 때문에 다시 뜨지 않게(§ checkLatest)
+              latestQuietUntilRef.current = performance.now() + 1100;
+              chartRef.current?.timeScale().scrollToRealTime();
+              setAwayFromLatest(false);
+            }}
+            title="최신 봉으로 이동"
+            style={{ right: (countdownPos?.width ?? 60) + 8 }}
+            className="absolute bottom-9 z-20 flex h-7 items-center gap-1 rounded-full bg-elevated/90 px-2.5 text-[11px] font-semibold text-text shadow-lg ring-1 ring-border transition hover:bg-elevated"
+          >
+            최신 <span aria-hidden>»</span>
+          </button>
+        )}
         <div ref={containerRef} className="absolute inset-0" />
       </div>
     </div>

@@ -73,6 +73,21 @@ async function loadBase(symbol: string): Promise<Base> {
   return { symbol, day, buy: v.buy, sell: v.sell, ref: v.open, liveAfter: now };
 }
 
+// 같은 심볼을 여러 곳(호가창 · 헤더 등락률)이 함께 쓰면 받기를 한 번으로 — 가상 코인은 서버 요청이다(§6). 날이 바뀌면 버린다.
+const BASE_TTL_MS = 45_000;
+const baseCache = new Map<string, { at: number; p: Promise<Base> }>();
+function loadBaseShared(symbol: string): Promise<Base> {
+  const now = Date.now();
+  const hit = baseCache.get(symbol);
+  if (hit && now - hit.at < BASE_TTL_MS && kstDayStart(hit.at) === kstDayStart(now)) return hit.p;
+  const p = loadBase(symbol);
+  baseCache.set(symbol, { at: now, p });
+  p.catch(() => {
+    if (baseCache.get(symbol)?.p === p) baseCache.delete(symbol); // 실패는 다음 주기에 다시
+  });
+  return p;
+}
+
 /** `active` 일 때만(호가·체결이 화면에 있을 때) 받는다. */
 export function useDayStats(symbol: string, trades: TickerTrade[] = EMPTY, active = true): DayStats {
   const [base, setBase] = useState<Base | null>(null);
@@ -89,7 +104,7 @@ export function useDayStats(symbol: string, trades: TickerTrade[] = EMPTY, activ
       // 탭이 숨어 있으면 건너뛴다(돌아오면 다음 주기에 받는다) — 가상 코인은 서버 요청이라 숨은 탭이 쓰면 안 된다(§6)
       if (!document.hidden) {
         try {
-          const b = await loadBase(symbol);
+          const b = await loadBaseShared(symbol);
           if (!stopped) setBase(b);
         } catch {
           /* 다음 주기에 다시 */

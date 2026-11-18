@@ -9,9 +9,11 @@ import Leaderboard from '@/components/Leaderboard';
 import Settings from '@/components/Settings';
 import VipModal from '@/components/VipModal';
 import RefillModal from '@/components/RefillModal';
+import PriceAlerts from '@/components/PriceAlerts';
 import { useTradingStore } from '@/store/useTradingStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useChartStore } from '@/store/useChartStore';
+import { INDICATOR_DEFS } from '@/services/indicatorDefs';
 import { useMarkPrices } from '@/hooks/useMarkPrices';
 import { useTriggerPoll } from '@/hooks/useTriggerPoll';
 import { useSpotPoll } from '@/hooks/useSpotPoll';
@@ -25,6 +27,10 @@ export default function App() {
   const authed = useTradingStore((s) => s.authed);
   const standard = useSettingsStore((s) => s.tradingMode) === 'standard';
   const orderBookOn = useChartStore((s) => s.orderBook);
+  // 모바일 차트 높이 — 아래 패널 지표(RSI·MACD 등)가 늘면 그만큼 키운다(45vh 에 패널 하나당 +8vh, 최대 69vh). 고정 45vh 였을 땐 오실레이터
+  // 두세 개만 올려도 캔들이 한 줄로 납작해졌다(2026-11-18). PC 는 그리드 행이 높이를 정하므로 무관(md:h-auto).
+  const ownPanes = useChartStore((s) => s.indicators.filter((i) => i.visible && INDICATOR_DEFS[i.type].pane === 'own').length);
+  const mobileChartVh = 45 + Math.min(3, ownPanes) * 8;
 
   const [showRank, setShowRank] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -80,7 +86,10 @@ export default function App() {
         style={{ gridTemplateRows: split.gridRows }}
         className="flex min-h-0 flex-1 flex-col overflow-y-auto md:grid md:grid-cols-[minmax(0,1fr)_18rem] md:overflow-hidden"
       >
-        <div className="h-[45vh] w-full shrink-0 md:col-start-1 md:row-start-1 md:h-auto md:min-h-0 md:shrink">
+        <div
+          style={{ '--chart-vh': `${mobileChartVh}vh` } as React.CSSProperties}
+          className="h-[var(--chart-vh)] w-full shrink-0 md:col-start-1 md:row-start-1 md:h-auto md:min-h-0 md:shrink"
+        >
           <Chart />
         </div>
 
@@ -111,6 +120,8 @@ export default function App() {
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
       {showVip && <VipModal onClose={() => setShowVip(false)} />}
       {broke && !refillDismissed && <RefillModal onClose={() => setRefillDismissed(true)} />}
+      {/* 차트 수평선 가격 알림(🔔 켠 선을 현재가가 지나가면 한 번) */}
+      <PriceAlerts />
     </div>
   );
 }

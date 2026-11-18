@@ -22,9 +22,10 @@ interface Stat {
 
 type SortKey = 'symbol' | 'price' | 'change';
 type SortDir = 'asc' | 'desc';
-type Filter = 'ALL' | SymbolCategory;
+type Filter = 'ALL' | 'FAV' | SymbolCategory;
 
 const FILTERS: { key: Filter; label: string }[] = [
+  { key: 'FAV', label: '★ 관심' },
   { key: 'ALL', label: '전체' },
   { key: 'USDT', label: 'USDT' },
   { key: 'KRW', label: 'KRW' },
@@ -39,7 +40,7 @@ const FILTER_KEY = 'ox64_symbol_filter_v1';
 function loadFilter(): Filter {
   try {
     const v = localStorage.getItem(FILTER_KEY);
-    return v === 'KRW' || v === 'USDT' || v === 'VIRTUAL' ? v : 'ALL';
+    return v === 'KRW' || v === 'USDT' || v === 'VIRTUAL' || v === 'FAV' ? v : 'ALL';
   } catch {
     return 'ALL';
   }
@@ -49,6 +50,24 @@ function saveFilter(f: Filter) {
     localStorage.setItem(FILTER_KEY, f);
   } catch {
     /* 저장 불가(사생활 보호 모드 등) — 이번 세션만 유지 */
+  }
+}
+
+// 관심(★) 심볼 — 이 브라우저에만 기억한다(서버·D1 과 무관). 모르는 심볼(목록에서 빠진 코인)은 버린다.
+const FAV_KEY = 'ox64_symbol_favs_v1';
+function loadFavs(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(FAV_KEY) || '[]');
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && ALL_SYMBOLS.includes(x)) : [];
+  } catch {
+    return [];
+  }
+}
+function saveFavs(f: string[]) {
+  try {
+    localStorage.setItem(FAV_KEY, JSON.stringify(f));
+  } catch {
+    /* 저장 불가 — 이번 세션만 */
   }
 }
 
@@ -84,20 +103,38 @@ export default function SymbolSelect() {
   const [sortDir, setSortDir] = useState<SortDir>('asc');
   const [filter, setFilterState] = useState<Filter>(loadFilter);
   const [query, setQuery] = useState('');
+  const [favs, setFavs] = useState<string[]>(loadFavs);
+  const [active, setActive] = useState(0); // 검색창에서 ↑/↓ 로 고르는 줄
   const searchRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const toggleFav = (s: string) =>
+    setFavs((cur) => {
+      const next = cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s];
+      saveFavs(next);
+      return next;
+    });
 
   const setFilter = (f: Filter) => {
     setFilterState(f);
     saveFilter(f);
   };
 
-  // 열 때마다 검색어를 비우고 검색창에 포커스 — 바로 타이핑해서 찾게.
+  // 열 때마다 검색어를 비우고 검색창에 포커스 — 바로 타이핑해서 찾게. ⚠ 터치 기기(폰)는 포커스하지 않는다 — 열자마자 화상 키보드가
+  // 올라와 목록의 절반을 가렸다(탭해서 고르려던 것뿐인데). 검색하려면 검색창을 누르면 된다.
   useEffect(() => {
     if (!open) return;
     setQuery('');
+    setActive(0);
+    if (!window.matchMedia('(pointer: fine)').matches) return;
     const t = window.setTimeout(() => searchRef.current?.focus(), 0);
     return () => window.clearTimeout(t);
   }, [open]);
+  // 검색어·분류가 바뀌면 맨 위 줄부터
+  useEffect(() => setActive(0), [query, filter]);
+  // ↑/↓ 로 고른 줄이 목록 밖이면 보이게
+  useEffect(() => {
+    if (open) listRef.current?.children[active]?.scrollIntoView({ block: 'nearest' });
+  }, [active, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -190,7 +227,9 @@ export default function SymbolSelect() {
   const statOf = (s: string): Stat | undefined =>
     isVirtualSymbol(s) ? virtualStats[s] : quoteOf(s) === 'KRW' ? krwStats[s] : stats[s];
 
-  const visible = ALL_SYMBOLS.filter((s) => (filter === 'ALL' || categoryOf(s) === filter) && matches(s, query));
+  const visible = ALL_SYMBOLS.filter(
+    (s) => (filter === 'ALL' || (filter === 'FAV' ? favs.includes(s) : categoryOf(s) === filter)) && matches(s, query),
+  );
   const sorted = visible.sort((a, b) => {
     // 이름·가격 정렬은 **분류(USDT → KRW → 가상)로 먼저 묶는다** — 원화와 USDT 가격은 단위가 달라 섞으면 무의미하고,
     // '전체'로 볼 때도 마켓별로 모여 있어야 찾기 쉽다. 24h 변동률(%)은 단위가 같아 분류를 넘어 비교한다.
@@ -242,8 +281,17 @@ export default function SymbolSelect() {
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && sorted[0]) pick(sorted[0]);
-                  else if (e.key === 'Escape') setOpen(false);
+                  if (e.key === 'Enter') {
+                    const s = sorted[active] ?? sorted[0];
+                    if (s) pick(s);
+                  } else if (e.key === 'Escape') setOpen(false);
+                  else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setActive((a) => Math.min(sorted.length - 1, a + 1));
+                  } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setActive((a) => Math.max(0, a - 1));
+                  }
                 }}
                 placeholder="심볼 검색 (BTC, 비트코인…)"
                 className="w-full rounded-md bg-panel2 px-2.5 py-1.5 text-xs text-text outline-none ring-1 ring-border placeholder:text-muted focus:ring-elevated"
@@ -275,33 +323,48 @@ export default function SymbolSelect() {
                 </button>
               </span>
             </div>
-            <div className="overflow-y-auto">
-              {sorted.length === 0 && <div className="px-3 py-4 text-center text-xs text-muted">검색 결과가 없습니다</div>}
-              {sorted.map((s) => {
+            {sorted.length === 0 && (
+              <div className="px-3 py-4 text-center text-xs text-muted">
+                {filter === 'FAV' && favs.length === 0 ? '심볼 왼쪽 ☆ 를 누르면 관심 심볼로 모아 볼 수 있습니다' : '검색 결과가 없습니다'}
+              </div>
+            )}
+            <div ref={listRef} className="overflow-y-auto">
+              {sorted.map((s, i) => {
                 const st = statOf(s);
                 const virtual = isVirtualSymbol(s);
                 const krw = quoteOf(s) === 'KRW';
                 const up = st ? st.changePct >= 0 : true;
+                const fav = favs.includes(s);
                 return (
-                  <button
+                  // 줄 = ★ 버튼 + 고르기 버튼(버튼 안에 버튼을 둘 수 없어 나란히)
+                  <div
                     key={s}
-                    onClick={() => pick(s)}
-                    className={`flex w-full items-center justify-between px-3 py-2 text-xs transition hover:bg-panel2 ${
-                      s === symbol ? 'bg-panel2' : ''
-                    }`}
+                    onMouseEnter={() => setActive(i)}
+                    className={`flex w-full items-center transition hover:bg-panel2 ${s === symbol ? 'bg-panel2' : i === active ? 'bg-panel2/60' : ''}`}
                   >
-                    <span className="flex min-w-0 items-center gap-1.5 font-semibold text-text">
-                      {pairLabel(s)}
-                      {virtual && <span className="rounded bg-accent/20 px-1 py-0.5 text-[9px] font-bold text-accent">가상</span>}
-                      {krw && KRW_NAMES[s] && <span className="truncate text-[10px] font-normal text-muted">{KRW_NAMES[s]}</span>}
-                    </span>
-                    <span className="flex shrink-0 items-center gap-2.5">
-                      <span className="text-text">{st ? fmtAdaptive(st.price, krw) : '—'}</span>
-                      <span className={`w-14 text-right ${up ? 'text-up' : 'text-down'}`}>
-                        {st ? `${up ? '+' : ''}${st.changePct.toFixed(2)}%` : '—'}
+                    <button
+                      onClick={() => toggleFav(s)}
+                      aria-pressed={fav}
+                      aria-label={fav ? `${pairLabel(s)} 관심 해제` : `${pairLabel(s)} 관심 추가`}
+                      title={fav ? '관심 해제' : '관심 심볼에 추가'}
+                      className={`shrink-0 py-2 pl-3 pr-1.5 text-sm leading-none transition ${fav ? 'text-[#f0b90b]' : 'text-muted/50 hover:text-muted'}`}
+                    >
+                      {fav ? '★' : '☆'}
+                    </button>
+                    <button onClick={() => pick(s)} className="flex min-w-0 flex-1 items-center justify-between py-2 pr-3 text-xs">
+                      <span className="flex min-w-0 items-center gap-1.5 font-semibold text-text">
+                        {pairLabel(s)}
+                        {virtual && <span className="rounded bg-accent/20 px-1 py-0.5 text-[9px] font-bold text-accent">가상</span>}
+                        {krw && KRW_NAMES[s] && <span className="truncate text-[10px] font-normal text-muted">{KRW_NAMES[s]}</span>}
                       </span>
-                    </span>
-                  </button>
+                      <span className="flex shrink-0 items-center gap-2.5">
+                        <span className="text-text">{st ? fmtAdaptive(st.price, krw) : '—'}</span>
+                        <span className={`w-14 text-right ${up ? 'text-up' : 'text-down'}`}>
+                          {st ? `${up ? '+' : ''}${st.changePct.toFixed(2)}%` : '—'}
+                        </span>
+                      </span>
+                    </button>
+                  </div>
                 );
               })}
             </div>

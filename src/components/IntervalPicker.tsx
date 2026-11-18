@@ -27,7 +27,8 @@ export default function IntervalPicker({
   return (
     <div className="flex min-w-0 items-center gap-0.5">
       {/* 즐겨찾기 바 — 좁으면 가로로 밀어서 본다(스크롤바 숨김). 드롭다운은 이 밖에 둬야 잘리지 않는다. */}
-      <div className="no-scrollbar flex min-w-0 items-center gap-0.5 overflow-x-auto">
+      {/* 폰: 오른쪽 끝을 흐리게 — 잘린 칸이 "밀어서 더 보기"로 읽히게(PC 는 다 들어가 흐림 없음) */}
+      <div className="no-scrollbar flex min-w-0 items-center gap-0.5 overflow-x-auto [-webkit-mask-image:linear-gradient(to_right,#000_calc(100%-14px),transparent)] [mask-image:linear-gradient(to_right,#000_calc(100%-14px),transparent)] md:[-webkit-mask-image:none] md:[mask-image:none]">
         {bar.map((it) => {
           const active = it.code === value;
           const pinned = favs.includes(it.code);
@@ -45,7 +46,8 @@ export default function IntervalPicker({
           );
         })}
       </div>
-      <div className="relative shrink-0">
+      {/* ⚠ 폰에선 목록을 버튼이 아니라 차트 툴바(relative) 왼쪽에 맞춰 연다 — 버튼 기준이면 즐겨찾기가 많을 때 화면 오른쪽 밖으로 잘린다 */}
+      <div className="shrink-0 md:relative">
         <button
           onClick={() => setOpen((v) => !v)}
           title="전체 타임프레임 · 즐겨찾기 편집"
@@ -57,7 +59,7 @@ export default function IntervalPicker({
         {open && (
           <>
             <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
-            <div className="absolute left-0 top-full z-30 mt-1 max-h-[70vh] w-52 overflow-y-auto rounded-lg border border-border bg-panel p-1.5 shadow-2xl">
+            <div className="absolute left-1 top-full z-30 mt-1 max-h-[70vh] w-52 overflow-y-auto overscroll-contain rounded-lg border border-border bg-panel p-1.5 shadow-2xl md:left-0">
               {INTERVAL_GROUPS.map((g) => {
                 const items = g.items.filter((it) => supports(it.code));
                 if (items.length === 0) return null;

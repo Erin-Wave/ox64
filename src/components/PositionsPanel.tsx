@@ -756,6 +756,37 @@ export default function PositionsPanel() {
         {tabBtn('history', '주문내역')}
       </div>
 
+      {/* 포지션 요약 — 지갑별 미실현 합계 + 전부 시장가 청산(거래소의 "모두 청산"). 실수 방지로 확인창. PC·모바일 공통 한 줄. */}
+      {tab === 'positions' && positions.length > 0 && (
+        <div className="flex items-center justify-between gap-2 border-b border-border/60 px-3 py-1.5 text-[11px]">
+          <span className="flex min-w-0 flex-wrap items-center gap-x-2 text-muted">
+            미실현 합계
+            {(['USDT', 'KRW'] as const).map((q) => {
+              const mine = positions.filter((p) => quoteOf(p.symbol) === q);
+              if (mine.length === 0) return null;
+              const vals = mine.map(unrealizedOf);
+              if (vals.some((v) => v == null)) return <span key={q}>— {q}</span>;
+              const sum = (vals as number[]).reduce((a, v) => a + v, 0);
+              return (
+                <span key={q} className={`font-semibold ${sum >= 0 ? 'text-up' : 'text-down'}`} title={`${fmtMoney(sum, q)} ${q}`}>
+                  {sum >= 0 ? '+' : ''}
+                  {fmtMoneyShort(sum, q, 9)} <span className="font-normal opacity-70">{q}</span>
+                </span>
+              );
+            })}
+          </span>
+          <button
+            onClick={() => {
+              if (window.confirm(`포지션 ${positions.length}개를 모두 시장가로 청산할까요?\n(호가 물량이 모자라면 일부만 청산되고 나머지는 남습니다)`)) {
+                for (const p of positions) closeAll(p.id);
+              }
+            }}
+            className="shrink-0 rounded border border-border px-2 py-1 text-muted transition hover:border-down hover:text-down"
+          >
+            전부 청산
+          </button>
+        </div>
+      )}
       {tab === 'positions' &&
         (positions.length === 0 ? (
           empty('보유 중인 포지션이 없습니다')
