@@ -63,6 +63,9 @@ export function useSpotPoll() {
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
       stop();
+      // 가상 코인을 떠날 때도 비운다 — 안 비우면 실제 코인을 보는 동안 옛 호가·체결이 스토어에 남아, 돌아왔을 때 첫 렌더가 그걸
+      // "지금 코인의 체결"로 읽었다(§ useTradeTape)
+      spotClear();
     };
   }, [active, symbol, interval, spotTick, spotClear]);
 }

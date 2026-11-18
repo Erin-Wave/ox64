@@ -237,10 +237,17 @@ function dripTrades(set: (s: Partial<TradingState>) => void, incoming: SpotTrade
   }
   const gap = Math.min(REVEAL_MAX_GAP_MS, Math.max(REVEAL_MIN_GAP_MS, Math.round(REVEAL_WINDOW_MS / fresh)));
   const per = Math.max(1, Math.ceil(fresh / Math.max(1, Math.floor(REVEAL_WINDOW_MS / gap))));
-  let hidden = fresh - per; // 첫 스텝은 즉시 — 목록이 굼뜨게 반응하지 않게
+  // ⚠ 같은 ms 의 체결은 한 스텝에 같이 보낸다(2026-11-18) — 봇 한 틱이 10건을 넘기면 10ms 창에 몰려 시각이 겹치는데(§ spot.ts
+  //   TICK_PRINT_SPAN_MS), 그 묶음이 스텝 경계에서 갈리면 체결 테이프(useMarketStore.mergeTrades)가 "마지막으로 받은 시각보다 나중"만
+  //   받아서 나머지를 영영 버렸다(20건 중 3건꼴). 경계를 더 새 쪽(앞)으로 당겨 묶음 전체가 함께 나오게 한다.
+  const alignTie = (h: number) => {
+    while (h > 0 && incoming[h - 1].createdAt === incoming[h].createdAt) h--;
+    return h;
+  };
+  let hidden = alignTie(fresh - per); // 첫 스텝은 즉시 — 목록이 굼뜨게 반응하지 않게
   set({ spotTrades: incoming.slice(hidden) });
   const step = () => {
-    hidden = Math.max(0, hidden - per);
+    hidden = alignTie(Math.max(0, hidden - per));
     set({ spotTrades: incoming.slice(hidden) });
     dripTimer = hidden > 0 ? window.setTimeout(step, gap) : undefined;
   };
@@ -260,6 +267,9 @@ function dripTrades(set: (s: Partial<TradingState>) => void, incoming: SpotTrade
 let lastActionAt = 0;
 // 로그아웃한 시각 — 그 전에 보낸 요청의 응답(폴링·줄에 남은 액션)이 늦게 와서 `authed: true` 로 옛 계정 화면을 되살리지 않게 버린다.
 let lastLogoutAt = 0;
+// 마지막으로 반영한 **폴링 계정 상태를 보낸 시각** — 폴링 둘(`refresh` · 통합 폴링 `spotTick` 의 state)이 겹치면 먼저 보낸 응답이 나중에
+// 도착해 더 새 상태를 덮을 수 있었다(방금 체결된 포지션이 몇 초 사라짐). 그보다 먼저 보낸 응답의 계정 상태는 버린다.
+let lastStateSentAt = 0;
 let actionChain: Promise<unknown> = Promise.resolve();
 let actionsQueued = 0;
 function enqueue<T>(set: (s: Partial<TradingState>) => void, run: () => Promise<T>): Promise<T> {
@@ -276,18 +286,21 @@ function action(set: (s: Partial<TradingState>) => void, call: () => Promise<App
   // ⚠ 에러는 **줄이 비어 있을 때 새로 시작한 액션**만 지운다(2026-10-01) — F9 세 번 중 두 번째가 실패했는데 세 번째가 성공하면서
   // 그 사유를 지워, 한 건이 안 들어간 걸 알 수 없었다.
   const fresh = actionsQueued === 0;
+  // ⚠ 로그아웃 판정은 **누른(줄 선) 시각**으로(2026-11-18) — 예전엔 차례가 온 순간의 `Date.now()` 와 비교해서 늘 "로그아웃 뒤"였다
+  //   (지나간 로그아웃 시각보다 지금이 항상 늦다). 앞 요청이 멈춘 사이 로그아웃하면 줄에 남은 주문이 그대로 나갔다(다른 이름으로
+  //   다시 로그인했으면 그 계정으로).
+  const queuedAt = Date.now();
   return enqueue(set, async () => {
-    const startedAt = Date.now();
-    if (startedAt < lastLogoutAt) return; // 로그아웃 전에 줄 선 액션 — 보내지 않는다
+    if (queuedAt < lastLogoutAt) return; // 로그아웃 전에 줄 선 액션 — 보내지 않는다
     if (fresh) set({ error: null, notice: null });
     try {
       const st = await call();
-      if (startedAt < lastLogoutAt) return; // 그 사이 로그아웃했다
+      if (queuedAt < lastLogoutAt) return; // 그 사이 로그아웃했다
       apply(set, st);
       lastActionAt = Date.now();
       if (st.notice) showNotice(set, st.notice);
     } catch (e) {
-      if (startedAt >= lastLogoutAt) showError(set, (e as Error).message);
+      if (queuedAt >= lastLogoutAt) showError(set, (e as Error).message);
     }
   });
 }
@@ -434,7 +447,9 @@ export const useTradingStore = create<TradingState>((set) => ({
       const since = useTradingStore.getState().orders[0]?.createdAt;
       const sentAt = Date.now();
       const st = await api.state(since);
-      if (sentAt < lastActionAt || sentAt < lastLogoutAt) return; // 그 사이 액션 응답이 더 새 상태를 넣었다(또는 로그아웃했다)
+      // 그 사이 액션 응답·나중에 보낸 폴링이 더 새 상태를 넣었다(또는 로그아웃했다)
+      if (sentAt < lastActionAt || sentAt < lastLogoutAt || sentAt < lastStateSentAt) return;
+      lastStateSentAt = sentAt;
       apply(set, st);
     } catch (e) {
       // 401(인증만료)일 때만 로그아웃. 일시적 네트워크/5xx 로는 세션을 끊지 않는다
@@ -473,18 +488,25 @@ export const useTradingStore = create<TradingState>((set) => ({
 
   refill: () => action(set, () => api.refill()),
 
-  convert: (from, amount) =>
-    enqueue(set, async () => {
+  // ⚠ 다른 액션과 같이 로그아웃 뒤 응답은 버리고(안 그러면 로그인 화면에 옛 계정이 되살아난다), 실패 사유는 8초 수명(`showError` —
+  //   예전엔 그냥 set 이라 모달을 닫은 뒤에도 주문 패널·토스트에 계속 남았다).
+  convert: (from, amount) => {
+    const queuedAt = Date.now();
+    return enqueue(set, async () => {
+      if (queuedAt < lastLogoutAt) return false;
       set({ error: null });
       try {
-        apply(set, await api.convert(from, amount));
+        const st = await api.convert(from, amount);
+        if (queuedAt < lastLogoutAt) return false;
+        apply(set, st);
         lastActionAt = Date.now();
         return true;
       } catch (e) {
-        set({ error: (e as Error).message });
+        if (queuedAt >= lastLogoutAt) showError(set, (e as Error).message);
         return false;
       }
-    }),
+    });
+  },
 
   // ⚠ 가상 코인이 둘 이상이면 심볼을 바꾼 직후 첫 폴링 응답이 오기 전까지 **이전 코인의 호가창이
   // 그대로 보인다**(EW 를 눌렀는데 OX 호가가 잠깐 보이는 식). 값이 아예 없는 게 틀린 값보다 낫다.
@@ -517,13 +539,17 @@ export const useTradingStore = create<TradingState>((set) => ({
     if (fresh) {
       tickKey = key;
       tickCount = 0;
+      lastNewestBar = 0;
+      refetchPrev = false;
     }
     const sec = intervalSec(interval);
     // ⚠ 평소엔 **진행 중인 봉 1개만**, 봉 경계를 넘었으면 그만큼 더(2026-10-01) — 예전엔 항상 3봉 이상이라 롤업 인터벌(30m ← 1m 30개)에서
     // 1초마다 원본 90행을 읽었다(한 사람이 14시간 켜 두면 하루 읽기 한도). 서버도 목표 봉 구간만 읽는다(§ spot.ts loadSpotCandlesPage).
     const nowSec = Date.now() / 1000;
     const crossed = Math.floor(nowSec / sec) - Math.floor(st.spotCandlesAt / 1000 / sec);
-    const bars = fresh || st.spotCandlesAt === 0 ? FULL_BARS : Math.min(FULL_BARS, Math.max(POLL_MIN_BARS, crossed + 1));
+    const bars =
+      fresh || st.spotCandlesAt === 0 ? FULL_BARS : Math.min(FULL_BARS, Math.max(POLL_MIN_BARS, crossed + 1, refetchPrev ? 2 : 1));
+    refetchPrev = false;
     const wantState = tickCount % STATE_EVERY === 0;
     tickCount++;
     const sentAt = Date.now();
@@ -536,13 +562,25 @@ export const useTradingStore = create<TradingState>((set) => ({
       });
       applySpot(set, r.market, pair);
       // 응답이 오는 사이 심볼·인터벌이 바뀌었으면(tickKey 가 이미 새 조합) 이 봉들은 이전 조합의 것이다
-      if (r.candles.length && tickKey === key) set({ spotCandles: r.candles, spotCandlesAt: Date.now(), spotCandlesKey: key });
+      if (r.candles.length && tickKey === key) {
+        // ⚠ 새 봉이 열렸다(서버 시계 기준) → 다음 폴링은 직전 봉까지 2봉을 받는다(2026-11-18). 몇 봉 받을지는 클라 시계·응답 **도착**
+        //   시각으로 정해서, 요청이 봉 경계에 걸치면(서버는 아직 이전 봉, 도착은 다음 봉) 이전 봉의 마지막 ~1초(그 사이 체결·종가)를
+        //   다시는 안 받았다. 한 번 더 받는 값은 원본 몇 행.
+        const newest = r.candles[r.candles.length - 1].time;
+        if (lastNewestBar && newest > lastNewestBar) refetchPrev = true;
+        lastNewestBar = newest;
+        set({ spotCandles: r.candles, spotCandlesAt: Date.now(), spotCandlesKey: key });
+      }
       // ⚠ 가상 코인의 현재가 = 서버 mark(봇 공정가) — 차트는 가상 코인에서 setPrice 를 하지 않는다(Chart.tsx).
       // 봉 종가(마지막 체결가)는 매수면 매도호가·매도면 매수호가에 찍혀 공정가와 반 스프레드쯤 다르고, 그걸
       // 헤더에 넣으면 3초마다 오는 markPrices 와 번갈아 **숫자가 깜빡인다**(고배율이면 손익도 같이 튄다).
       const mark = r.mark ?? r.candles.at(-1)?.close;
       if (typeof mark === 'number' && isFinite(mark) && mark > 0) useMarketStore.getState().setPrice(pair, mark);
-      if (r.state && sentAt >= lastActionAt && sentAt >= lastLogoutAt) apply(set, r.state); // 액션보다(로그아웃보다) 먼저 보낸 응답의 계정 상태는 버린다
+      // 액션보다(로그아웃보다·나중에 보낸 다른 폴링보다) 먼저 보낸 응답의 계정 상태는 버린다
+      if (r.state && sentAt >= lastActionAt && sentAt >= lastLogoutAt && sentAt >= lastStateSentAt) {
+        lastStateSentAt = sentAt;
+        apply(set, r.state);
+      }
     } catch {
       /* 다음 폴링에서 재시도 — 마지막 알려진 값 유지 */
     }
@@ -553,6 +591,8 @@ export const useTradingStore = create<TradingState>((set) => ({
 // 나는데, 이건 화면에 안 그려지는 순수 내부 상태다(캔들 요청 폭·계정 상태 주기 계산에만 쓴다).
 let tickKey = '';
 let tickCount = 0;
+let lastNewestBar = 0; // 직전 응답의 가장 새 봉 시각(초) — 커지면 서버에서 새 봉이 열린 것(§ spotTick refetchPrev)
+let refetchPrev = false; // 다음 폴링에서 직전 봉까지 한 번 더 받는다
 const FULL_BARS = 500; // 최초 로드 폭(차트가 왼쪽으로 스크롤하면 loadOlder 가 더 붙인다)
 const POLL_MIN_BARS = 1; // 같은 봉 안이면 진행 중인 봉 하나로 충분하다(경계를 넘으면 위에서 늘어난다)
 const STATE_EVERY = 3; // 3틱(≈3초)마다 계정 상태를 함께 받는다 — 예전 /api/state 폴링(2.5초)과 비슷

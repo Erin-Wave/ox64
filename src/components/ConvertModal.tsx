@@ -93,7 +93,11 @@ export default function ConvertModal({ onClose }: { onClose: () => void }) {
 
   return (
     <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
-      <div className="w-full max-w-sm rounded-2xl border border-border bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      {/* max-h + 스크롤 — 폰 가로처럼 키가 낮으면 제목·닫기·환전 버튼이 화면 밖으로 잘려 닿을 수 없었다 */}
+      <div
+        className="max-h-[90dvh] w-full max-w-sm overflow-y-auto rounded-2xl border border-border bg-panel p-5 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="mb-3 flex items-start justify-between gap-2">
           <div className="min-w-0">
             <h2 className="text-base font-extrabold text-text">환전</h2>

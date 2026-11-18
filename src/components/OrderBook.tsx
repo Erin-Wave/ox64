@@ -239,16 +239,23 @@ export default function OrderBook() {
   const lastTrade = trades[0];
   const lastBid = lastTrade && lastTrade.takerSide !== 'buy' ? snapToGrid(lastTrade.price, groupStep, 'down') : null;
   const lastAsk = lastTrade && lastTrade.takerSide !== 'sell' ? snapToGrid(lastTrade.price, groupStep, 'up') : null;
-  const insertBid = lastTrade?.takerSide === 'sell' ? lastBid : null;
-  const insertAsk = lastTrade?.takerSide === 'buy' ? lastAsk : null;
+  const aggAsks = useMemo(() => (activeBook ? aggregate(activeBook.asks, groupStep, 'ask') : []), [activeBook, groupStep]);
+  const aggBids = useMemo(() => (activeBook ? aggregate(activeBook.bids, groupStep, 'bid') : []), [activeBook, groupStep]);
+  // ⚠ 끼워 넣을 빈 행이 반대쪽 최우선 호가를 넘으면 넣지 않는다(2026-11-18) — 실제 코인은 호가가 200ms 로 솎여 체결이 먼저 오면
+  //   매도 쪽 빈 행이 최우선 매수 아래로 들어가 호가창이 교차돼 보였다(스프레드 0).
+  const insertBid = lastTrade?.takerSide === 'sell' && lastBid != null && (aggAsks.length === 0 || lastBid < aggAsks[0].price) ? lastBid : null;
+  const insertAsk = lastTrade?.takerSide === 'buy' && lastAsk != null && (aggBids.length === 0 || lastAsk > aggBids[0].price) ? lastAsk : null;
   const asks = useMemo(
-    () => (activeBook ? withLastTrade(aggregate(activeBook.asks, groupStep, 'ask'), 'ask', insertAsk).slice(0, rows) : []),
-    [activeBook, groupStep, rows, insertAsk],
+    () => (activeBook ? withLastTrade(aggAsks, 'ask', insertAsk).slice(0, rows) : []),
+    [activeBook, aggAsks, rows, insertAsk],
   );
   const bids = useMemo(
-    () => (activeBook ? withLastTrade(aggregate(activeBook.bids, groupStep, 'bid'), 'bid', insertBid).slice(0, rows) : []),
-    [activeBook, groupStep, rows, insertBid],
+    () => (activeBook ? withLastTrade(aggBids, 'bid', insertBid).slice(0, rows) : []),
+    [activeBook, aggBids, rows, insertBid],
   );
+  // 스프레드 = **실제 남은** 최우선 매도 − 매수(마지막 체결가 빈 행은 호가가 아니다 — 그걸 쓰면 가상 코인에서 늘 실제보다 좁게 보였다)
+  const bestAsk = asks.find((r) => !r.phantom);
+  const bestBid = bids.find((r) => !r.phantom);
 
   // 막대 길이·표시 수치는 고른 단위(수량/총금액)로 — 금액으로 보면 비싼 가격대의 같은 수량이 더 길게 보인다.
   const quote = quoteOf(symbol);
@@ -479,8 +486,8 @@ ${
             <span className={`ml-1 ${chgColor(chgOf(lastPrice))}`}>{chgText(chgOf(lastPrice))}</span>
           )}
         </span>
-        {bids[0] && asks[0] && (
-          <span className="text-[10px] text-muted">스프레드 {fmtPriceShort(Math.max(0, asks[0].price - bids[0].price), groupPrec, 9)}</span>
+        {bestBid && bestAsk && (
+          <span className="text-[10px] text-muted">스프레드 {fmtPriceShort(Math.max(0, bestAsk.price - bestBid.price), groupPrec, 9)}</span>
         )}
       </div>
       <div className="overflow-hidden" style={hgt(bidRows)}>

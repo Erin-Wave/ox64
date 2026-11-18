@@ -30,14 +30,19 @@ export function useTradeTape() {
 
   useEffect(() => {
     // ⚠⚠ spotTrades 가 **지금 심볼의 것일 때만** 얹는다. 심볼을 바꾼 직후 첫 렌더엔 spotTrades 가 아직
-    // 이전 코인의 목록이다(폴링의 spotClear 는 이 이펙트보다 늦게 돈다 / OX→BTC→EW 면 OX 목록이 그대로
-    // 남아 있다) — 대조 없이 병합하면 이전 코인의 체결이 새 코인의 버퍼에 들어가 영영 안 빠졌다.
-    if (!virtual || spotPair !== symbol) return;
+    // 이전 코인의 목록이다(OX→BTC→EW 면 OX 목록이 그대로 남아 있다) — 대조 없이 병합하면 이전 코인의 체결이 새 코인의 버퍼에
+    // 들어가 영영 안 빠졌다.
+    // ⚠⚠ 대조는 렌더 때 값이 아니라 **지금 스토어 값**으로(2026-11-18) — 같은 커밋에서 먼저 도는 useSpotPoll 이 spotClear 로 비웠어도
+    // 이 이펙트가 잡은 렌더 때 값은 그대로다. OX → BTC → OX 로 돌아오면 그 값이 몇 분 전 OX 목록이라 방금 비운 버퍼에 옛 체결이 다시
+    // 들어가 "시간이 끊긴 테이프"(강세/약세 잣대까지 옛 가격)가 됐다.
+    if (!virtual) return;
+    const st = useTradingStore.getState();
+    if (st.spotPair !== symbol) return;
     // ⚠ 갈아끼우지 않고 **새로 들어온 것만 얹는다**(mergeTrades) — 서버가 매 폴링 최근 50건만 주는데
     // 그대로 교체하면 버퍼가 영영 50건이라 체결 필터를 켰을 때 화면이 계속 빈다(§ MAX_TRADES).
     mergeTrades(
       symbol,
-      spotTrades.map((t) => ({ price: t.price, qty: t.size, takerSide: t.takerSide, time: t.createdAt })),
+      st.spotTrades.map((t) => ({ price: t.price, qty: t.size, takerSide: t.takerSide, time: t.createdAt })),
     );
   }, [virtual, symbol, spotPair, spotTrades, mergeTrades]);
 }

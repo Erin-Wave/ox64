@@ -149,23 +149,31 @@ const REQUEST_TIMEOUT_MS = 20_000;
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-  let res: Response;
+  const timedOut = () => new ApiError('응답이 너무 늦어 기다리지 않았습니다 — 처리됐을 수 있으니 목록을 확인하세요', 0);
+  // ⚠ 시간 제한은 **본문까지 다 읽을 때까지**(2026-11-18) — 예전엔 헤더가 오자마자 타이머를 풀어서, 헤더 뒤에 망이 끊기면(폰 망 전환)
+  //   `res.json()` 이 끝없이 기다렸고 거래 줄 전체(뒤의 주문·F8)가 멈췄다. 본문을 읽다 끊기면 그 실패를 `{}` 성공으로 삼키지 않는다.
   try {
-    res = await fetch(`/api${path}`, {
-      credentials: 'same-origin',
-      headers: { 'content-type': 'application/json' },
-      ...opts,
-      signal: ctrl.signal,
-    });
-  } catch (e) {
-    if (ctrl.signal.aborted) throw new ApiError('응답이 너무 늦어 기다리지 않았습니다 — 처리됐을 수 있으니 목록을 확인하세요', 0);
-    throw e;
+    let res: Response;
+    try {
+      res = await fetch(`/api${path}`, {
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        ...opts,
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      if (ctrl.signal.aborted) throw timedOut();
+      throw e;
+    }
+    const data = (await res.json().catch(() => {
+      if (ctrl.signal.aborted) throw timedOut();
+      return {};
+    })) as T & { error?: string };
+    if (!res.ok) throw new ApiError(data.error || `HTTP ${res.status}`, res.status);
+    return data;
   } finally {
     clearTimeout(timer);
   }
-  const data = (await res.json().catch(() => ({}))) as T & { error?: string };
-  if (!res.ok) throw new ApiError(data.error || `HTTP ${res.status}`, res.status);
-  return data;
 }
 
 // ── 주문내역 증분 조회 커서(§ functions/_shared.ts loadState ordersSince) ─────────────────────

@@ -33,6 +33,10 @@ export function useMarkPrices() {
   // 필요한 심볼 집합을 문자열 키로 만들어 의존성에 사용
   const posSymbols = positions.map((p) => p.symbol).join(',');
   const pendSymbols = pendingOrders.map((o) => o.symbol).join(',');
+  // 조건부 주문·주문내역의 심볼도 자릿수가 필요하다(2026-11-18) — 없으면 2자리로 떨어져 PEPE 트리거가 "≤ 0.00", 주문내역 체결가가 0.00 으로
+  // 보였다. 문자열로 골라 받아 목록이 바뀌어도 심볼 구성이 같으면 다시 그리지 않는다. 환전 기록(USDTKRW)은 거래 심볼이 아니다.
+  const condSymbols = useTradingStore((s) => [...new Set(s.conditionalOrders.map((c) => c.symbol))].join(','));
+  const histSymbols = useTradingStore((s) => [...new Set(s.orders.filter((o) => o.kind !== 'convert').map((o) => o.symbol))].join(','));
 
   // ── 가격 폴링 (현재 + 보유 포지션 심볼) ──
   // 원화 심볼이 하나라도 걸려 있거나 원화 잔고가 있으면 환율(USDT/KRW)도 받는다 — 합산 평가자산·환전 미리보기·
@@ -93,15 +97,28 @@ export function useMarkPrices() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, posSymbols, setPrice, needRate]);
 
-  // ── 가격 정밀도 확보 (현재 + 보유 + 미체결 심볼, 없는 것만 1회 조회) ──
+  // ── 가격 정밀도 확보 (현재 + 보유 + 미체결 + 조건부 + 주문내역 심볼, 없는 것만 1회 조회) ──
   useEffect(() => {
-    const syms = [...new Set([symbol, ...posSymbols.split(','), ...pendSymbols.split(',')].filter(Boolean))];
+    const syms = [
+      ...new Set(
+        [symbol, ...posSymbols.split(','), ...pendSymbols.split(','), ...condSymbols.split(','), ...histSymbols.split(',')].filter(Boolean),
+      ),
+    ];
     const have = useMarketStore.getState().precisions;
+    // 시세를 아직 모르는 가상·원화 심볼은 그 심볼의 주문 가격에서 자릿수를 어림한다(4자리 고정보다 정확 — 시세가 오면 setPrice 가 덮는다)
+    const hintOf = (s: string): number | undefined => {
+      const st = useTradingStore.getState();
+      return (
+        st.pendingOrders.find((o) => o.symbol === s)?.limitPrice ??
+        st.conditionalOrders.find((c) => c.symbol === s)?.triggerPrice ??
+        st.orders.find((o) => o.symbol === s)?.price
+      );
+    };
     for (const s of syms) {
       if (have[s] != null) continue;
       // 가상·원화 심볼은 거래소 tickSize 조회 대상이 아니다 — 가격에서 파생(setPrice 가 매 갱신 계산).
       if (isVirtualSymbol(s) || quoteOf(s) === 'KRW') {
-        const px = useMarketStore.getState().prices[s];
+        const px = useMarketStore.getState().prices[s] ?? hintOf(s);
         setPrecision(s, px ? virtualPrecision(px) : 4);
         continue;
       }
@@ -111,5 +128,5 @@ export function useMarkPrices() {
           /* 조회 실패 시 다음 변경 때 재시도 */
         });
     }
-  }, [symbol, posSymbols, pendSymbols, setPrecision]);
+  }, [symbol, posSymbols, pendSymbols, condSymbols, histSymbols, setPrecision]);
 }
