@@ -69,7 +69,7 @@ ox64/
     ├── main.tsx            pathname 으로 트레이딩·퍼즐(/b)·던전(/5m)·RTS(/s1)·상자깡(/c) 분기(라우터 없음, 동적 import). useSettingsStore 먼저 import(FOUC 방지). ⚠ /s1 만 StrictMode 안 씌움(이펙트 2회 실행이 rAF 루프를 두 벌 만든다)
     ├── index.css           Tailwind + 테마 CSS 변수 + @font-face + tabular-nums
     ├── types.ts            도메인 타입(Candle/Order/Position/PendingOrder/Side)
-    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + KRW_SYMBOLS(빗썸 원화 19종)/quoteOf/baseOf/**pairLabel**(화면 표기 'BTC/KRW' — `replace('USDT','')` 금지)/categoryOf + INTERVAL_GROUPS + KST_OFFSET(+9h)
+    ├── symbols.ts          심볼 38종(바이낸스∩OKX) + VIRTUAL_SYMBOLS/isVirtualSymbol + **VIRTUAL_LISTINGS/isListedNow**(상장 예정 — 서버 사본 `functions/_shared.ts` 와 같은 값) + KRW_SYMBOLS(빗썸 원화 19종)/quoteOf/baseOf/**pairLabel**(화면 표기 'BTC/KRW' — `replace('USDT','')` 금지)/categoryOf + INTERVAL_GROUPS + KST_OFFSET(+9h)
     ├── format.ts           fmtPrice/fmtVol/precisionFromTick + 축약 헬퍼(§6)
     ├── services/
     │   ├── binanceRest.ts  초기 과거봉(스팟 REST) + 한국시간 0시부터의 테이커 매수·매도량과 0시 가격(`fetchDaySince` — 15분봉 taker buy volume·0시 봉 시가, 체결강도·호가 등락률용)
@@ -101,6 +101,7 @@ ox64/
         ├── Logo.tsx            워드마크 — 15×3 픽셀아트 인라인 SVG(currentColor). 높이 3의 배수, 폭 w-auto(§6)
         ├── Login.tsx           이름+패스코드 로그인/가입
         ├── Header.tsx          심볼/현재가 + **오늘 등락률**(0시 기준가 대비 — 호가창 등락률과 같은 `useDayStats`, 폰은 가격 아래 작게)/평가자산/리필(평가자산≤0 일 때만)/랭킹/설정/로그아웃. 모바일은 "⋯" 더보기
+        ├── Listing.tsx         **가상 코인 상장 카운트다운**(OKX 식) — `useListing(symbol)`(상장 전이면 남은 초를 250ms 로 재 초가 바뀔 때만 다시 그림, 상장 예정이 없는 심볼은 타이머 없음) · `ListingOverlay`(차트 자리, ⚠ **z-[15]** = 차트 범례 z-10 위·드롭다운 배경 z-20 아래 — z-30 이면 심볼 목록을 가렸다) · `ListingCountdownText`(목록 줄·호가창·주문 패널). 시각이 되면 pending=false 로 다시 그려 `useSpotPoll` 이 저절로 시작한다(기기 시계 기준 — 서버가 몇 초 어긋난 요청은 빈 값·403)
         ├── PriceAlerts.tsx     수평선 가격 알림 — 🔔 켠 선을 현재가(`useMarketStore.prices`)가 **지나가면**(직전 값 < 선 ≤ 지금, 반대도) 토스트·짧은 소리·진동 후 그 선의 알림을 끈다(한 번만). 선 위에 정확히 있다 떠나는 건 안 울린다(현재가에 그은 직후 울리지 않게). 브라우저 안 알림이라 앱을 보고 있을 때만(서버 알림 아님). 폰=화면 아래, PC=차트 위, z-[48](전체화면 위·모달 아래)
         ├── SymbolSelect.tsx    실제 38종 + 가상 + 원화를 **같은 목록·같은 정렬**로 + 검색(심볼·'BTC/KRW'·한글명) + 분류 필터(전체/USDT/KRW/가상, localStorage). 이름·가격 정렬은 **분류(USDT→KRW→가상)로 먼저 묶고** 그 안에서 정렬(24h% 는 분류 무관). OX 가격=`/api/spot`, 원화=빗썸 직결, 24h변동=`?candles=1&interval=1h&limit=24`. `statOf(sym)` 이 소스만 분기. 가격 정렬은 원화를 뒤로 모은다(단위가 달라 섞으면 무의미). **★ 관심 심볼**(`ox64_symbol_favs_v1`, 필터 '★ 관심') — 줄 = ★ 버튼 + 고르기 버튼(버튼 안에 버튼 금지). PC 는 검색창 ↑/↓·Enter. ⚠ 열 때 검색창 자동 포커스는 `(pointer: fine)` 일 때만 — 폰은 화상 키보드가 목록 절반을 가렸다
         ├── OrderBook.tsx       호가/체결 탭. ⚠ 상하 배치 가운데 줄 **스프레드는 실제 남은 호가끼리**(마지막 체결가 빈 행 `phantom` 제외 — 가상 코인에서 늘 좁게 보였다), 빈 행이 반대쪽 최우선 호가를 넘으면 끼우지 않는다(실제 코인은 호가 솎음 200ms 사이 체결이 먼저 와 교차돼 보였다). 배치는 `bookLayout`(좌우 = 매수 좌·매도 우 / **상하 = 매도 위(최우선매도가 가운데 쪽, 뒤집어 아래 정렬)·현재가 줄·매수 아래**, 높이 = 행 수×2 + 22px). 수치는 `bookUnit`(코인 수량 ⇄ 총금액, 호가·체결 헤더 단위 버튼 — **체결 목록도 같은 단위**) — 묶을 때 총금액은 Σ가격×수량으로 따로 합산(묶음가×수량 근사 금지). **마지막 체결가 행에 테두리**(테이커 매수→매도 쪽 행, 매도→매수 쪽, 묶음이면 snapToGrid 로 같은 묶음; 그 호가가 체결로 다 먹혀 사라졌으면 **수량 "—" 빈 행을 가격 순서 제자리에 끼워 넣는다**(`withLastTrade`) — ⚠ 가상 코인은 체결이 그 단계를 소진한 뒤 사다리가 한 칸 너머에서 시작해서, 끼워 넣기 없이는 테두리가 0% 로 안 보였다(실제 코인은 90~100% 행이 남음). 방향 모르는 체결은 끼워 넣지 않음) — 체결 테이프 맨 앞 객체가 바뀔 때마다 overlay 의 key 를 올려 **같은 가격 연속 체결도 매번 깜빡**(`.trade-blink`, reduced-motion 이면 정지). **호가 목록 높이 = 실제 단계 수**(묶어보기·거래소 단계 상한으로 생긴 빈칸은 압축, `useStickyCount` — 늘 땐 즉시, 줄 땐 1.5초 유지, 심볼·묶음·행 수·배치가 바뀌면 즉시). 체결 목록은 여전히 고정 높이. 내 미체결 가격대 강조(서버 `mine`). 체결 행은 가격·수량 모두 테이커 방향 색. Standard+옵션(orderBook) 둘 다 켜야 표시. PC(md≥768)에서 `bookTogether` 면 호가·체결 상하 함께 — `useIsDesktop` 은 App.tsx 2열 분기와 **같은 경계**. ⚠ 훅을 `옵션 && useIsDesktop()` 처럼 단축 평가 뒤에 두면 훅 개수가 바뀌어 터진다. 높이=`행 수 × ROW_PX(16)` — ⚠ 체결은 **maxHeight 가 아니라 height 고정**(체결이 흘러들 때 패널이 오르내림), 호가는 실제 단계 수만큼이되 줄어들 땐 1.5초 기다린다(단계 수가 틱마다 흔들려도 안 오르내리게). 행 높이를 바꾸면 ROW_PX 도 같이. 강세/약세 레벨(tradeStrength): ⚠ 틱 방향이 아니라 **"이 가격이 싼가/비싼가"** — `strengthAt` 이 그 체결 **직전 120건의 중앙값/MAD(robust)** 대비 z(평균은 스윕 프린트가 잣대를 부풀림), z→레벨은 **꺾은선**(z=2.5 까지 선형 30, 위는 로그 압축으로 z=600 에서 50), 가격 칸 배경에 **왼쪽에서** 자라는 바. 수량 칸 막대는 레벨이 아니라 **체결 크기**(보이는 행 최대 = 전체 폭, 나머지 **정비례**, 값은 화면 단위 그대로 — 수량 또는 가격×수량, 색 = 테이커 방향 upDim/downDim)이고 **오른쪽에서** 자란다(전체 폭 = 가격 숫자 오른쪽 끝 바로 뒤 ~ 수량 숫자 오른쪽 끝 — 칸을 `-ml-2 pl-2` 로 열 간격만큼 늘린다, 행 gap 을 바꾸면 같이). 둘 다 `tradeStrength` 토글. 기준은 **trailing**(행마다 자기 시점), **표시할 행에 대해서만**, 창은 **필터 이전 원본 테이프**에서. **체결강도**(= **오늘(한국시간 0시부터)** 매수 체결량 합 ÷ 매도 체결량 합 × 100, 매일 0시 초기화 — 건수가 아니라 수량, 100% 초과 매수색·미만 매도색)는 체결 헤더에(16px), 계산은 `hooks/useDayStats.ts`. **호가 가격 오른쪽 = 0시 기준가(전일 종가) 대비 등락률**(가격과 같은 글자 크기)(부호 색, 배치와 무관하게 소수 2자리 — 좌우 배치(모바일)에서 칸이 좁으면 등락률이 먼저 잘리고 가격·수량은 다 보인다, 상하 배치 가운데 현재가 줄에도), 기준가를 모르면 비운다. ⚠ 클라 테이프 400건으로 세던 첫 구현은 고래 몇 건에 5~400% 를 오갔다 — 창을 줄이지 말 것. ⚠ 가상 코인은 봇이 공포 극단(sentiment −1)이면 `buyProb` 가 0.05~0.15 라 실제로 낮게 나온다(식이 아니라 봇 쪽 문제)
@@ -239,11 +240,12 @@ ox64/
 - 가격 정밀도 = 가격에서 파생(`virtualPrecision`, 유효숫자 4자리 = 빗썸 호가 단위와 일치). 지정가 반올림 없음(실제 코인과 같음). 레버리지 상한 250 동일.
 - 빗썸 봉은 **KST 정렬**(4시간봉 KST 0·4·8시, 일봉 KST 자정 — 바이낸스의 UTC 정렬과 다르다). 롤업도 KST 기준. `to` 파라미터는 존 표기 없는 KST 문자열만(Z·+09:00 은 400).
 
-### 가상 코인 — OX/USDT · EW/USDT (서버 = `functions/api/order.ts` + `functions/api/spot.ts`) — 실제 코인과 동일한 레버리지, 체결가만 봇이 생성
+### 가상 코인 — OX/USDT · EW/USDT · GN/USDT · GO/USDT (서버 = `functions/api/order.ts` + `functions/api/spot.ts`) — 실제 코인과 동일한 레버리지, 체결가만 봇이 생성
 
 > **상세는 [docs/VIRTUAL_COIN.md](docs/VIRTUAL_COIN.md)** — **관심도·business time·tether 제거(2026-09-23, 맨 앞 절이 우선)**, 봇 심리 모델(국면/탐욕·공포/세션/코일/저항·지지), 체결 미세구조(호가 바운스·flurry·스톱헌팅·아이스버그), 호가창 지속/취소(`prevBook`), 수량 계층 분포(`SIZE_TIERS`), `book_json`/`tape_json`/`live_json` 링 버퍼, 캔들 영속(`PERSIST_INTERVALS`/`open_at`·`close_at`), 벽 존중, 봇 수수료·재고 정산, 매칭 엔진(시장가/지정가/sweep/`Aggressor`), 유효숫자 4자리 틱. **그 파일이 규칙의 진실원본**이고 여기엔 손댈 때 반드시 지킬 것만 적는다.
 
-- 가상 코인은 2종이고 전부 **페어 파라미터**로 흐른다. 새 코인 추가 시 손댈 곳은 딱 셋 — `functions/api/spot.ts VIRTUAL_PAIRS`, `src/symbols.ts VIRTUAL_SYMBOLS`, D1 `spot_bot_state` 시작가 행. 그 외 심볼 하드코딩 금지. ⚠ **코인 하나의 값**(2026-11-20 실측·계산, 상세 §6 "5차"): 아무도 안 봐도 D1 쓰기 **하루 ~1,600행**(무료 한도의 1.6% — 분마다 상태 행 1) · DB **월 ~3MB**(1분봉) · cron 실행의 쿼리 2개(읽기 1 + 커밋 1, 무료 50/호출). **4코인까지는 구조 변경 없이** 들어가고(cron 의 체결 몫이 `_trading.ts CRON_FILL_Q = 42 − 4×코인 수` 로 스스로 줄어든다), 5코인부터는 봇 버스트와 트리거 평가를 DO 요청 둘로 나눠야 한다(docs/VIRTUAL_COIN.md "코인을 늘릴 때").
+- **⚠ 상장 예정(2026-11-20, GN 13:00 KST·10 USDT / GO 14:00 KST·361 USDT)** — 목록엔 미리 뜨고 그 시각에 저절로 열린다. 일정은 **두 곳**(`functions/_shared.ts VIRTUAL_LISTINGS` ↔ `src/symbols.ts VIRTUAL_LISTINGS`, 같은 값), D1 시작가 행은 `last_run = 상장 시각`·`ref_price = anchor = 상장가`. 상장 전엔: 새 진입 주문 403(`order.ts`, `notListedMsg`) · `/api/spot`·`?tick=` 은 빈 값(봇·D1 0) · cron 버스트에서 제외(읽기 batch 에도 안 넣는다) · 클라는 통합 폴링·체결강도 받기를 하지 않는다(`useListing`). 상장 순간엔 보는 사람의 첫 폴링(1초 안)이나 다음 cron(1분 안)이 상장가 행에서 시장을 연다(첫 실행의 경과 시간 = 지금 − 상장 시각). **새 코인을 예약 상장하려면** 위 두 곳에 일정 + 아래 세 곳 + 시작가 행(`last_run` = 상장 시각, ms)을 넣고 **상장 시각 전에 배포**. 지난 일정은 지워도 된다(없으면 "상장됨").
+- 가상 코인은 4종이고 전부 **페어 파라미터**로 흐른다. 새 코인 추가 시 손댈 곳은 딱 셋 — `functions/api/spot.ts VIRTUAL_PAIRS`, `src/symbols.ts VIRTUAL_SYMBOLS`, D1 `spot_bot_state` 시작가 행. 그 외 심볼 하드코딩 금지. ⚠ **코인 하나의 값**(2026-11-20 실측·계산, 상세 §6 "5차"): 아무도 안 봐도 D1 쓰기 **하루 ~1,600행**(무료 한도의 1.6% — 분마다 상태 행 1) · DB **월 ~3MB**(1분봉) · cron 실행의 쿼리 2개(읽기 1 + 커밋 1, 무료 50/호출). **4코인까지는 구조 변경 없이** 들어가고(cron 의 체결 몫이 `_trading.ts CRON_FILL_Q = 42 − 4×코인 수` 로 스스로 줄어든다), 5코인부터는 봇 버스트와 트리거 평가를 DO 요청 둘로 나눠야 한다(docs/VIRTUAL_COIN.md "코인을 늘릴 때").
 - OX 는 다른 38종과 **완전히 동일한 코드**(order.ts/OrderPanel/PositionsPanel 에 가상 분기 없음)로 거래되고, 유일한 차이는 체결가 소스(`fetchPrice` 의 `isVirtualSymbol` 분기 → 봇 기준가 `spot_bot_state.ref_price`).
 - **봇은 무한 유동성 공급자** — 호가 에스크로·잔고 가드를 절대 붙이지 않는다(음수 재고 정상). 체결 뒤 재고/현금 정산만 `botFillStmts` 로 합계 batch 1회. 봇은 `fee_ledger` 에 행을 남기지 않는다(카운터만).
 - **봇 경로에 "행을 남기는" 설계 금지** — 매 틱 교체되는 스냅샷(사다리·테이프·진행 중 캔들)은 상태 행의 JSON 칸(`book_json`/`tape_json`/`live_json`)에 담는다(쓰기 비용 0). 새 INSERT 를 넣을 땐 "누가 언제 지우나"를 반드시 같이 정할 것. 체결 테이프는 봇·유저 모두 `tape_json` 에(§ 위 유저 프린트).
@@ -813,12 +815,12 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 
 ## 11. 백로그 (열린 항목)
 
-> 완료된 작업 81건의 배경·수정 내용·검증 기록은 **[docs/HISTORY.md](docs/HISTORY.md)** 로 옮겼다.
+> 완료된 작업 82건의 배경·수정 내용·검증 기록은 **[docs/HISTORY.md](docs/HISTORY.md)** 로 옮겼다.
 > 규칙·불변식의 진실원본은 언제나 이 문서 본문(§2·§4·§6)이고, 이력은 "왜 그렇게 됐는지"를 되짚을 때만 연다.
 > ⚠ **새 작업을 끝내면 완료 기록은 HISTORY.md 에 쓰고, 이 문서에는 앞으로 지켜야 할 규칙만 남긴다** —
 > CLAUDE.md 는 매 세션 통째로 컨텍스트에 실리므로 이력이 쌓이면 그게 곧 매 세션의 고정 비용이 된다.
 
-- [ ] 가상 코인 3종 이상 추가 — 페어 파라미터화·봇 재고 분리는 끝났고(`VIRTUAL_PAIRS`/`bot_inventory`) `VIRTUAL_SYMBOLS`+`spot_bot_state` 시작가 행만 추가하면 된다. 값은 코인당 유휴 쓰기 하루 ~1,600행·DB 월 ~3MB(§4·§6 "5차") — **4코인까지는 그대로**, 5코인부터는 cron 의 봇 버스트와 트리거 평가를 DO 요청 둘로 나누는 작업이 먼저(호출당 쿼리 50)
+- [ ] 가상 코인 5종 이상 — 지금 4종(OX·EW·GN·GO)이 cron 실행 하나의 쿼리 한도(50)로 들어가는 끝이다(`_trading.ts CRON_FILL_Q = 42 − 4×코인 수` = 26, 가상 체결 하나 25 + 1). 더 넣으려면 cron 의 봇 버스트와 트리거 평가를 DO 요청 둘로 나누는 작업이 먼저(docs/VIRTUAL_COIN.md "코인을 늘릴 때"). 코인당 유휴 쓰기 하루 ~1,600행·DB 월 ~3MB
 - [ ] 1분봉 보존 기간 — 가상 코인 1분봉은 영구 보관이라 DB(무료 500MB)가 코인당 월 ~3MB 씩 자란다(묶음 이전 구간은 월 6.5MB). 코인을 많이 늘리면 "1분봉은 N일, 그 뒤는 1시간봉부터" 정책이 필요
 - [ ] 미니 RTS 확장(종족 추가, 유닛 다양화, 난이도 선택, 리플레이)
 - [ ] 상자깡(§10) 확장 — 재료 카테고리 추가, 상자 Lv4 이상, 도감 완성 보상. ⚠ 무엇을 얹든 `npm run sim:crate` 로 naive 70%/optimal 110% 를 다시 맞출 것

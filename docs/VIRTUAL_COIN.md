@@ -30,6 +30,10 @@
 >   ~3MB). 10코인이면 월 30MB — 1년쯤에 닿는다. 그 전에 "1분봉은 N일, 그 뒤는 1시간봉부터" 보존 정책을 넣을 것(CLAUDE.md §11).
 > - 추가 절차는 그대로 셋(`VIRTUAL_PAIRS` · `VIRTUAL_SYMBOLS` · `spot_bot_state` 시작가 행) + cron 재배포. 추가한 날
 >   `npm run d1:budget` 과 `wrangler tail` 의 durableObject `cpuTime` 을 볼 것.
+> - **예약 상장**(2026-11-20, GN·GO 가 처음): 위 셋 + 일정 두 곳(`functions/_shared.ts` ↔ `src/symbols.ts` `VIRTUAL_LISTINGS`, 같은 값) +
+>   시작가 행의 `last_run` 을 **상장 시각**(ms)으로. 상장 전엔 그 코인에 서버가 아무것도 하지 않고(주문 403, 조회 빈 값, cron 제외)
+>   클라도 폴링하지 않는다 — 카운트다운만 돈다(`src/components/Listing.tsx`). 상장 시각 전에 배포만 끝나 있으면 된다.
+>   ⚠ 4종이 지금 구조의 끝이다(위 "실제로 막히는 곳").
 
 > **⚠⚠ 2026-10-02: 합성 흡수(`synthMaker`)는 없어졌다** — 유저 시장가(진입·청산·SL/TP·조건부)는 봇 사다리에 있는 물량만 먹고 끝나면 멈춘다
 > (진입 잔량 버림, 청산 잔량은 포지션에 남음, CLAUDE.md §4 "시장가 = 호가창에 있는 물량만"). 아래에 `synthMaker`·"3% 시장충격 상한"·"대량 시장가
