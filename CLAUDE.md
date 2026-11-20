@@ -31,7 +31,7 @@
 ```
 ox64/
 ├── index.html              SPA 진입(다크). favicon + Proxima Nova + 구글 애드센스 로더(ca-pub-6831535776648677, 광고 단위 없음)
-├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB) 코드 관리 → Git 배포가 읽음
+├── wrangler.toml           Pages+Functions 설정. D1 바인딩(DB) 코드 관리 → Git 배포가 읽음 · **Smart Placement**(`[placement] mode="smart"`, 2026-11-20 — 함수를 D1 primary(서울 ICN) 가까이에서 돌려 DB 왕복을 줄인다. 확인 = 함수 응답 `cf-placement` 헤더)
 ├── schema.sql              D1 스키마(users/positions/orders/pending_orders/conditional_orders/spot_orders(폐기)/spot_trades/spot_candles/spot_candle_packs/spot_bot_state/usage_meter/puzzle_*/dungeon_*/crate_stats). wrangler d1 execute 로 적용
 ├── docs/HISTORY.md         완료된 작업의 배경·수정·검증 기록(규칙의 진실원본은 이 문서 본문)
 ├── scripts/                d1-budget.mjs(D1 예산 점검, §6) · sim-crate.ts(`npm run sim:crate` — 드롭 확률·가격·가치를 바꿨으면 반드시, §10) · sim-bot.ts(`npm run sim:bot` — 봇 심리·관심도 파라미터를 바꿨으면 반드시. 기본 1초 틱 7일=한 주. "시장처럼 보이는가"(봉 폭·관심도·테이프)를 1초·5초 틱 **둘 다**) · **sim-edge.ts(`npm run sim:edge` — 가격 모델을 바꿨으면 반드시. 차트 신호(모멘텀·이평 괴리·돌파·낙폭)와 봇 내부 상태로 미래 수익률을 맞혀 보는 엣지 점검. 합격 = 전부 0 과 구별 안 됨, §4 가상 코인)** · check-walls.ts(`npm run check:walls` — 봇 체결·기준가·호가가 유저 지정가를 관통하는지 7개 상황 × 2만 틱, 벽·체결 미세구조를 바꿨으면 반드시. 위반 0 이 합격) · check-candles.ts(`npm run check:candles` — 가상 코인 1분봉 묶음의 부호화 왕복·넘기기·네 출처 합치기를 느린 교과서 식과 대조, 캔들 저장 형식·넘기는 시점·합치는 규칙을 바꿨으면 반드시. 불일치 0 이 합격)

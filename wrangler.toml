@@ -9,3 +9,11 @@ compatibility_date = "2024-11-01"
 binding = "DB"                 # functions 코드의 env.DB
 database_name = "ox64"
 database_id = "f32f600e-49ad-4026-843f-84f34a62df3c"
+
+# ⚠ Smart Placement(2026-11-20) — 함수를 **DB(D1 primary = 서울 ICN) 가까이**에서 돌린다. 무료 플랜의 한국 트래픽은 홍콩·도쿄·미국 서부
+# 엣지로 가는 일이 흔한데, 함수가 그 엣지에서 돌면 DB 왕복 한 번이 50~150ms 라 주문 한 건(왕복 4번)이 그만큼 늦다. Cloudflare 가 트래픽을
+# 보고 몇 분~15분 뒤 적용하고, 느려지면 스스로 되돌린다. 확인: 함수 응답의 `cf-placement` 헤더(`remote-ICN` = 옮겨짐, `local-…` = 그대로).
+# 영향: `_routes.json` 의 함수 경로(/api/* 와 문서 경로 /, /b, /5m, /s1, /c)만 — JS·폰트 같은 정적 파일은 여전히 가까운 엣지에서 나간다.
+# 외부 시세(OKX·Coinbase·빗썸)도 옮겨진 곳에서 받는다(서울이면 빗썸엔 오히려 가깝다 — 홍콩 엣지 무응답 문제, CLAUDE.md §3).
+[placement]
+mode = "smart"
