@@ -188,23 +188,12 @@ export default function SymbolSelect() {
     const load = async () => {
       if (document.hidden) return; // 이건 Cloudflare 요청이다 — 숨은 탭에선 쓰지 않는다(위 둘은 거래소 직결이라 무관)
       try {
-        const entries = await Promise.all(
-          // 상장 전 코인은 봉이 없다 — 받지 않는다(서버도 빈 값을 준다)
-          VIRTUAL_SYMBOLS.filter((sym) => isListedNow(sym)).map(async (sym) => {
-            // ⚠ 현재가는 `spotState`(=/api/spot 호가창)가 아니라 **마지막 1시간봉의 종가**로 구한다
-            // (2026-08-14, 무료 플랜 전환 ②). 그 엔드포인트는 캔들 조회와 달리 **봇 틱을 굴린다** —
-            // 드롭다운을 열어둔 것만으로 코인 수 × 5초마다 봇이 돌아 쓰기가 나갔다(= cron 과 맞먹는 양).
-            // 마지막 1시간봉은 "진행 중인 봉"이라 그 종가가 곧 최근 체결가이므로 값은 동일하고,
-            // 요청 수도 코인당 2회 → 1회로 준다. (원래 이 값이 없을 때의 폴백이 바로 이 식이었다.)
-            const { candles } = await api.spotCandles(sym, '1h', 24);
-            const price = candles.length ? candles[candles.length - 1].close : null;
-            if (price == null) return null;
-            const ref = candles.length ? candles[0].open : price; // 가장 오래된(≈24h 전) 시가
-            return [sym, { price, changePct: ref > 0 ? ((price - ref) / ref) * 100 : 0 }] as const;
-          }),
-        );
+        // ⚠ 가상 코인 전부를 **한 요청**으로(2026-11-20, § functions/api/spot.ts loadVirtualStats) — 예전엔 코인마다 1시간봉 24개를 따로
+        // 받아 열어 둔 동안 5초마다 코인 수만큼 요청이 나갔다. 값(마지막 체결가 · 24시간 창의 첫 시가 대비)은 같다. 봇은 안 굴린다.
+        // 상장 전 코인은 서버가 빼고 준다.
+        const { stats } = await api.spotStats();
         if (!alive) return;
-        setVirtualStats(Object.fromEntries(entries.filter((e): e is NonNullable<typeof e> => e !== null)));
+        setVirtualStats(stats);
       } catch {
         /* 네트워크 오류 무시(다음 주기 재시도) */
       }

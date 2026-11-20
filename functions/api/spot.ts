@@ -67,6 +67,8 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     if (!sess) return bad('unauthorized', 401);
 
     const url = new URL(request.url);
+    // 심볼 선택기의 가상 코인 현재가·24h 변동 — **전 코인 한 요청**(2026-11-20, § loadVirtualStats). 봇은 굴리지 않는다.
+    if (url.searchParams.get('stats')) return json({ stats: await loadVirtualStats(env) });
     // ⚠ 페어는 반드시 화이트리스트로 검증한다 — 검증 없이 쓰면 임의 문자열로 spot_bot_state/spot_trades 에
     // 유령 페어를 만들 수 있다. 파라미터가 없으면 기본값(첫 가상 코인)으로 떨어져 구버전 클라와도 호환된다.
     const reqPair = url.searchParams.get('pair') || VIRTUAL_PAIRS[0];
@@ -316,6 +318,18 @@ const PACK_MS = 3_600_000; // 묶음 하나 = 한 시간(1분봉 60개 ≈ 4KB �
 const PACK_BARS = PACK_MS / PACK_SRC_MS;
 const packBucketOf = (ms: number) => Math.floor(ms / PACK_MS) * PACK_MS;
 
+// ── 1분봉 보관 기간(2026-11-20) ────────────────────────────────────────────────────────────────────────
+// 1분봉(과 그걸 굴려 만드는 3m·5m·15m·30m)은 **최근 90일만** 보여 주고, 그보다 오래된 건 정각마다 지운다(1h·1d 는 영구 — 하루 25행).
+// 묶음 한 행 = 한 시간치라 지우는 값이 한 시간에 행 하나(쓰기 2)뿐이다. 목적은 DB(무료 500MB)가 코인 수에 비례해 끝없이 자라지 않게
+// 하는 것 — 90일이면 코인당 ~10MB 에서 멈춘다.
+// ⚠ 묶음 이전(`PACK_START_MS` 앞)의 옛 1분 행(봇 봉 ~34만 행·~50MB)은 **지우지 않고 읽기에서만 숨긴다** — 행 하나를 지우는 데도
+// 쓰기 2(행 + PK 인덱스)라 다 지우면 ~68만 쓰기(하루 한도의 7배)다. 더는 늘지 않는 고정 용량이라 둔다. DB 가 모자라면 그때
+// `DELETE FROM spot_candles WHERE pair=? AND interval='1m' AND bucket < ?` 를 며칠에 걸쳐 시간 조각으로(하루 수만 행 이하).
+export const RETAIN_1M_MS = 90 * 86_400_000;
+const PACK_START_MS = Date.parse('2026-11-20T00:00:00Z');
+/** 1분봉을 보여 주는 하한(정각 정렬 — 3m~30m 목표 봉이 이 경계에 걸치지 않게). */
+export const retainFloor = (now: number) => packBucketOf(now - RETAIN_1M_MS);
+
 export function encodePackBar(b: LiveBar): string {
   return JSON.stringify([b.b / PACK_SRC_MS, b.o, b.h, b.l, b.c, b.v, (b.ot ?? b.b) - b.b, (b.ct ?? b.b) - b.b, b.bv ?? null, b.sv ?? null]);
 }
@@ -562,6 +576,62 @@ function fillEmptyBars(candles: SpotCandleOut[], sec: number, limit: number, now
   return out;
 }
 
+/** 심볼 선택기용 — **상장된 전 가상 코인**의 현재가(마지막 체결가)와 24시간 변동(2026-11-20).
+ * 예전엔 선택기가 코인마다 `?candles=1&interval=1h&limit=24` 를 따로 불러서, 열어 둔 동안 **5초마다 코인 수만큼** 요청이 나갔다(10종이면
+ * 초당 2요청 — 무료 요청 한도 10만/일을 코인 수에 비례해 먹는다). 지금은 한 요청 = D1 batch 한 번이고 코인마다 행 3개만 읽는다(상태 행 1 +
+ * 24시간 창의 가장 오래된·가장 새 1시간봉 1개씩 — 예전엔 코인마다 ~24행). 값은 예전 식과 같다: 가격 = 가장 늦게 찍힌 종가(봇의 진행 중
+ * 봉 ↔ 유저 체결이 쓴 이번 시간 행 중 늦은 쪽), 기준 = 24시간 창에서 가장 이른 시가. 봇은 굴리지 않는다(조회일 뿐). */
+export async function loadVirtualStats(env: Env): Promise<Record<string, { price: number; changePct: number }>> {
+  const pairs = VIRTUAL_PAIRS.filter((p) => isListed(p));
+  if (pairs.length === 0) return {};
+  const HOUR = 3_600_000;
+  const from = (Math.floor(Date.now() / HOUR) - 23) * HOUR; // 지금 시간 포함 24개 1시간봉 창
+  type Edge = { bucket: number; open: number; close: number; open_at: number; close_at: number };
+  const edge = (p: string, dir: 'ASC' | 'DESC') =>
+    env.DB.prepare(
+      `SELECT bucket, open, close, open_at, close_at FROM spot_candles WHERE pair = ? AND interval = '1h' AND bucket >= ? ORDER BY bucket ${dir} LIMIT 1`,
+    ).bind(p, from);
+  const res = await env.DB.batch([
+    env.DB.prepare(`SELECT id, ref_price, live_json FROM spot_bot_state WHERE id IN (${pairs.map(() => '?').join(',')})`).bind(...pairs),
+    ...pairs.flatMap((p) => [edge(p, 'ASC'), edge(p, 'DESC')]),
+  ]);
+  const rows = new Map((res[0].results as { id: string; ref_price: number; live_json: string | null }[]).map((r) => [r.id, r]));
+  const out: Record<string, { price: number; changePct: number }> = {};
+  pairs.forEach((p, i) => {
+    const st = rows.get(p);
+    const first = res[1 + i * 2].results[0] as Edge | undefined;
+    const last = res[2 + i * 2].results[0] as Edge | undefined;
+    const live = parseLive(st?.live_json)['1h'];
+    const liveIn = live && live.b >= from ? live : undefined;
+    // 가장 이른 시가 — 더 이른 버킷, 같은 버킷이면 더 일찍 찍힌 쪽(§ CANDLE_UPSERT_SQL 과 같은 규칙)
+    let open: number | undefined;
+    let openBucket = Infinity;
+    let openAt = Infinity;
+    const offerOpen = (bucket: number, at: number, v: number) => {
+      if (bucket < openBucket || (bucket === openBucket && at < openAt)) {
+        openBucket = bucket;
+        openAt = at;
+        open = v;
+      }
+    };
+    if (first) offerOpen(first.bucket, first.open_at || first.bucket, first.open);
+    if (liveIn) offerOpen(liveIn.b, liveIn.ot ?? liveIn.b, liveIn.o);
+    // 가장 늦은 종가
+    let price: number | undefined;
+    let closeAt = -Infinity;
+    if (last && (last.close_at || last.bucket) > closeAt) {
+      closeAt = last.close_at || last.bucket;
+      price = last.close;
+    }
+    if (liveIn && (liveIn.ct ?? liveIn.b) >= closeAt) price = liveIn.c;
+    price ??= st?.ref_price;
+    if (price == null || !(price > 0)) return;
+    const ref = open ?? price;
+    out[p] = { price, changePct: ref > 0 ? ((price - ref) / ref) * 100 : 0 };
+  });
+  return out;
+}
+
 const CANDLE_COLS = 'bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume';
 
 async function readSpotCandlesPage(
@@ -638,14 +708,14 @@ async function readSpotCandlesPage(
     let packs: PackRow[] = [];
     let pending: string | null = null;
     let lower = -Infinity;
+    // 1분봉 원본은 보관 기간(§ RETAIN_1M_MS) 안만 — 그 앞은 지웠거나(묶음 이후) 숨긴다(옛 행). 하한에 닿으면 "더 없음".
+    const floor = packed ? retainFloor(Date.now()) : -Infinity;
+    if (endTimeMs <= floor) return { candles: [], more: false };
     if (packed) {
       const res = await env.DB.batch([
-        env.DB.prepare('SELECT bucket, bars FROM spot_candle_packs WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?').bind(
-          pair,
-          srcCode,
-          endTimeMs,
-          packLimit,
-        ),
+        env.DB.prepare(
+          'SELECT bucket, bars FROM spot_candle_packs WHERE pair = ? AND interval = ? AND bucket < ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?',
+        ).bind(pair, srcCode, endTimeMs, floor, packLimit),
         // 대기 묶음에 endTimeMs 이전 봉이 있을 수 있다(막 만든 코인처럼 차트가 가진 봉이 한 시간도 안 될 때)
         env.DB.prepare('SELECT pack_json FROM spot_bot_state WHERE id = ?').bind(pair),
       ]);
@@ -657,14 +727,14 @@ async function readSpotCandlesPage(
       await env.DB.prepare(
         `SELECT ${CANDLE_COLS} FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?`,
       )
-        .bind(pair, srcCode, endTimeMs, Number.isFinite(lower) ? lower : 0, srcLimit)
+        .bind(pair, srcCode, endTimeMs, Math.max(0, lower, floor), srcLimit)
         .all<CandleRow>()
     ).results;
     // 어느 쪽이든 읽기 상한에 닿았으면 그 출처의 가장 오래된 봉 앞은 못 본 것이다 → 둘 다 다 본 구간(cover)만 쓴다.
     if (rows.length >= srcLimit) cover = rows[rows.length - 1].bucket;
     cover = Math.max(cover, lower);
-    asc = assembleSourceBars(rows, packs, pending, undefined, cover, endTimeMs);
-    more = Number.isFinite(cover);
+    asc = assembleSourceBars(rows, packs, pending, undefined, Math.max(cover, floor), endTimeMs);
+    more = Number.isFinite(cover); // 하한(floor)까지 다 읽었으면 -Infinity 그대로 → 더 없음
   }
   if (asc.length > srcLimit) {
     asc = asc.slice(-srcLimit);
@@ -2954,6 +3024,18 @@ async function runBotTicks(
   const pack = advancePack(row?.pack_json, closedMinutes, live[PACK_SRC]?.b ?? lastTs);
   for (const g of pack.flush) stmts.push(packFlushStmt(env, pair, g.bucket, g.bars, guard));
   flushed += pack.flush.length;
+  if (pack.flush.length) {
+    // 한 시간이 묶여 넘어가는 김에 보관 기간(§ RETAIN_1M_MS)이 지난 1분봉을 지운다 — 묶음 한 행(그 시간치) + 그 시간에 유저 체결이 남긴
+    // 1분 행(많아야 60). 멱등이라 커밋 가드가 필요 없다(경합에서 진 쪽이 지워도 같은 결과). 옛 1분 행(PACK_START_MS 앞)은 건드리지 않는다.
+    const cut = retainFloor(lastTs);
+    stmts.push(env.DB.prepare('DELETE FROM spot_candle_packs WHERE pair = ? AND interval = ? AND bucket < ?').bind(pair, PACK_SRC, cut));
+    if (cut > PACK_START_MS) {
+      stmts.push(
+        env.DB.prepare('DELETE FROM spot_candles WHERE pair = ? AND interval = ? AND bucket >= ? AND bucket < ?').bind(pair, PACK_SRC, PACK_START_MS, cut),
+      );
+    }
+    flushed += 2; // 계량 어림(묶음 행 1 = 쓰기 2)
+  }
 
   let pendNotional = (row?.pend_notional ?? 0) + notional;
   let pendRows = (row?.pend_rows ?? 0) + ROWS_PER_BOT_COMMIT + flushed * ROWS_PER_CANDLE_FLUSH;
