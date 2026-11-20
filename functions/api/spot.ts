@@ -287,52 +287,155 @@ const CANDLE_FLUSH_GUARDED_SQL = `INSERT INTO spot_candles (pair, interval, buck
          buy_volume = CASE WHEN excluded.buy_volume IS NULL THEN spot_candles.buy_volume ELSE COALESCE(spot_candles.buy_volume, 0) + excluded.buy_volume END,
          sell_volume = CASE WHEN excluded.sell_volume IS NULL THEN spot_candles.sell_volume ELSE COALESCE(spot_candles.sell_volume, 0) + excluded.sell_volume END`;
 
-/** 읽기 경로용 — 진행 중 버킷을 (이미 읽어온) 영속 봉 배열 뒤에 병합한다.
- * ⚠ 같은 버킷의 행이 이미 있을 수 있다(그 사이 **유저 체결**이 직접 upsert 했을 때) → 겹치면 합친다.
- * 두 쪽은 서로 다른 체결 묶음이라 volume 은 더하는 게 맞다(중복 아님).
- * ⚠ open/close 는 **시각으로** 가린다 — 커밋 경로(CANDLE_UPSERT_SQL)와 정확히 같은 규칙이어야 한다.
- * 안 그러면 버킷이 닫히는 순간(진행 중 → 테이블) 시가가 바뀌어 보인다. 진행 중인 봉은 거의 항상 봇이
- * 먼저 열었으므로(봇 틱은 버킷 맨 앞부터 돈다) 유저가 그 버킷에 시장가를 내도 시가는 그대로 유지된다. */
-function mergeLiveBar(asc: CandleRow[], live: LiveBar | undefined) {
-  if (!live) return asc;
-  const ot = live.ot ?? live.b;
-  const ct = live.ct ?? live.b;
-  const last = asc[asc.length - 1];
-  if (last && last.bucket === live.b) {
-    if (ot < last.open_at) {
-      last.open = live.o;
-      last.open_at = ot;
-    }
-    last.high = Math.max(last.high, live.h);
-    last.low = Math.min(last.low, live.l);
-    if (ct >= last.close_at) {
-      last.close = live.c;
-      last.close_at = ct;
-    }
-    last.volume += live.v;
-    last.buy_volume = addVol(last.buy_volume, live.bv);
-    last.sell_volume = addVol(last.sell_volume, live.sv);
-    return asc;
-  }
-  if (last && live.b < last.bucket) return asc; // 이미 넘어간 버킷(경합) — 무시
-  asc.push({
-    bucket: live.b,
-    open: live.o,
-    high: live.h,
-    low: live.l,
-    close: live.c,
-    volume: live.v,
-    open_at: ot,
-    close_at: ct,
-    buy_volume: live.bv ?? null,
-    sell_volume: live.sv ?? null,
-  });
-  return asc;
-}
-
 /** 방향별 거래량 합산 — NULL(방향 정보 없음)끼리면 NULL 을 유지한다(SQL 의 CASE 와 같은 규칙). */
 function addVol(a: number | null | undefined, b: number | null | undefined): number | null {
   return a == null && b == null ? null : (a ?? 0) + (b ?? 0);
+}
+
+// ── 닫힌 1분봉 묶음(2026-11-20, § D1 예산) ───────────────────────────────────────────────────────────
+// ⚠⚠ 왜: 봇이 닫힌 1분봉을 **분마다 `spot_candles` 한 행**으로 넘기던 것이 쓰기의 가장 큰 덩어리였다. 새 행은 2행(행 1 +
+// PK 인덱스 1)이라 코인 하나가 아무도 안 봐도 하루 2,880행 — prod 실측 7일에 이 문장이 39,996행으로 전체 쓰기(77,251)의 52%,
+// 아무도 없는 날 쓰기(하루 ~9,600행)의 60% 였다. 그런데 1분봉을 "분마다 한 행"으로 둘 이유가 없다(읽는 쪽은 늘 구간으로 읽는다).
+// 그래서 닫힌 1분봉은 상태 행의 `pack_json` 에 모았다가(매 커밋 어차피 쓰는 그 1행이라 쓰기 0) 그 시간이 끝나면 **한 시간치를
+// `spot_candle_packs` 한 행으로** 넘긴다 → 코인당 하루 2,880행 → 48행. 읽기도 준다(1분봉 500개 = 500행 → 9행), DB 도 봉당
+// ~150B → ~75B 로 덜 자란다(무료 플랜 500MB — 1분봉이 DB 의 거의 전부다).
+// ⚠ 유저 체결은 예전 그대로 `spot_candles` 에 분 단위 행으로 upsert 한다(체결이 있을 때만 드니 양이 적다). 그래서 1분봉의 출처는
+//   넷이다: ①분 단위 행(유저 체결 + 묶음 이전의 옛 봇 봉) ②묶음 테이블 ③대기 묶음(`pack_json`) ④진행 중 봉(`live_json`).
+//   `assembleSourceBars` 가 넷을 **같은 규칙**(§ CANDLE_UPSERT_SQL — 시가·종가는 찍힌 시각으로, 고저는 극값, 거래량은 합)으로 합친다.
+// ⚠ 1h·1d 는 묶지 않는다(코인당 하루 50행 — 묶을 값이 아니다). 묶는 인터벌은 `PACK_SRC` 하나.
+// 형식(한 봉): [분 번호(= 버킷 ÷ 60000), 시가, 고가, 저가, 종가, 거래량, 시가 시각 − 버킷(ms), 종가 시각 − 버킷(ms), 매수량, 매도량]
+// 여러 봉은 **바깥 대괄호 없이** 쉼표로 잇는다 — 그래야 SQL 이 `||` 로 덧붙일 수 있다(§ PACK_FLUSH_SQL). 읽을 땐 `[` `]` 로 감싼다.
+const PACK_SRC = '1m';
+const PACK_SRC_MS = 60_000;
+const PACK_MS = 3_600_000; // 묶음 하나 = 한 시간(1분봉 60개 ≈ 4KB — 상태 행에 얹어 매 커밋 다시 써도 가볍다)
+const PACK_BARS = PACK_MS / PACK_SRC_MS;
+const packBucketOf = (ms: number) => Math.floor(ms / PACK_MS) * PACK_MS;
+
+export function encodePackBar(b: LiveBar): string {
+  return JSON.stringify([b.b / PACK_SRC_MS, b.o, b.h, b.l, b.c, b.v, (b.ot ?? b.b) - b.b, (b.ct ?? b.b) - b.b, b.bv ?? null, b.sv ?? null]);
+}
+
+/** 묶음 텍스트 → 봉 배열. 깨진 항목은 버린다(그 봉만 빈다 — 텍스트 전체가 깨졌으면 빈 배열). */
+export function parsePack(text: string | null | undefined): LiveBar[] {
+  if (!text) return [];
+  let arr: unknown;
+  try {
+    arr = JSON.parse(`[${text}]`);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(arr)) return [];
+  const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  const out: LiveBar[] = [];
+  for (const a of arr) {
+    if (!Array.isArray(a) || !num(a[0]) || !num(a[1]) || !num(a[2]) || !num(a[3]) || !num(a[4])) continue;
+    const b = a[0] * PACK_SRC_MS;
+    const bar: LiveBar = { b, o: a[1], h: a[2], l: a[3], c: a[4], v: num(a[5]) ? a[5] : 0, ot: b + (num(a[6]) ? a[6] : 0), ct: b + (num(a[7]) ? a[7] : 0) };
+    if (num(a[8])) bar.bv = a[8];
+    if (num(a[9])) bar.sv = a[9];
+    out.push(bar);
+  }
+  return out;
+}
+
+/** 대기 묶음에 이번에 닫힌 봉을 붙이고, **다 끝난 시간**의 봉을 시간별로 떼어 낸다(= 테이블로 넘길 것).
+ * "다 끝난 시간" = 진행 중인 1분봉(`liveBucket`)이 속한 시간보다 앞 — 그 시간의 1분봉은 전부 닫혔다. ⚠ 벽시계가 아니라 진행 중
+ * 봉으로 가른다: 봉은 다음 체결이 올 때 닫히므로(한산하면 정각을 넘겨서) 벽시계로 가르면 59분 봉만 뒤늦게 따로 넘어가 그 시간에
+ * 문장이 둘 든다. 맨 앞 봉이 아직 진행 중인 시간이면 텍스트를 풀지 않고 그대로 이어 붙인다(가장 흔한 경로 — 한 시간에 59번). */
+export function advancePack(
+  text: string | null | undefined,
+  closed: LiveBar[],
+  liveBucket: number,
+): { pending: string | null; flush: { bucket: number; bars: string }[] } {
+  const add = closed.map(encodePackBar).join(',');
+  const all = text ? (add ? `${text},${add}` : text) : add;
+  if (!all) return { pending: null, flush: [] };
+  const liveHour = packBucketOf(liveBucket);
+  const first = Number(all.slice(1, all.indexOf(','))) * PACK_SRC_MS; // 맨 앞 봉의 버킷 — 봉은 닫힌 순서(시간순)로 붙는다
+  if (Number.isFinite(first) && packBucketOf(first) >= liveHour) return { pending: all, flush: [] };
+  const groups = new Map<number, string[]>();
+  const keep: string[] = [];
+  for (const b of parsePack(all)) {
+    const hour = packBucketOf(b.b);
+    if (hour >= liveHour) keep.push(encodePackBar(b));
+    else {
+      const g = groups.get(hour);
+      if (g) g.push(encodePackBar(b));
+      else groups.set(hour, [encodePackBar(b)]);
+    }
+  }
+  return {
+    pending: keep.length ? keep.join(',') : null,
+    flush: [...groups.entries()].sort((a, b) => a[0] - b[0]).map(([bucket, bars]) => ({ bucket, bars: bars.join(',') })),
+  };
+}
+
+// ⚠ 같은 시간의 묶음이 이미 있으면 **뒤에 덧붙인다**(봉을 덮지 않는다) — 시계가 뒤로 간 틱이 같은 분을 한 번 더 닫으면 그 시간의
+// 묶음이 두 번 넘어올 수 있고, 두 조각은 서로 다른 체결 묶음이다(§ CANDLE_UPSERT_SQL 이 volume 을 더하는 것과 같은 이유).
+// 같은 분의 조각들은 읽을 때 합쳐진다(§ assembleSourceBars). 가드는 캔들 flush 와 같다 — 커밋 경합에서 진 쪽이 한 번 더 붙이지 않게.
+const PACK_FLUSH_SQL = `INSERT INTO spot_candle_packs (pair, interval, bucket, bars)
+       SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM spot_bot_state WHERE id = ? AND last_run = ? AND ref_price = ? AND book_version = ? AND COALESCE(length(tape_json), 0) = ?)
+       ON CONFLICT(pair, interval, bucket) DO UPDATE SET bars = spot_candle_packs.bars || ',' || excluded.bars`;
+
+function packFlushStmt(env: Env, pair: string, bucket: number, bars: string, guard: BotCommitGuard): D1PreparedStatement {
+  return env.DB.prepare(PACK_FLUSH_SQL).bind(pair, PACK_SRC, bucket, bars, pair, guard.lastRun, guard.ref, guard.version, guard.tapeLen);
+}
+
+/** 한 봉을 버킷 맵에 합친다 — `CANDLE_UPSERT_SQL` 과 **같은 규칙**이어야 한다(시가 = 가장 이른 시각의 값, 종가 = 가장 늦은 시각의 값,
+ * 고저 = 극값, 거래량 = 합). 다르면 봉이 닫혀 자리를 옮기는 순간(진행 중 → 묶음 → 테이블) 시가·종가가 바뀌어 보인다. 진행 중인 봉은
+ * 거의 항상 봇이 먼저 열었으므로(봇 틱은 버킷 맨 앞부터 돈다) 유저가 그 버킷에 시장가를 내도 시가는 그대로다. */
+function mergeBotBar(map: Map<number, CandleRow>, b: LiveBar): void {
+  const ot = b.ot ?? b.b;
+  const ct = b.ct ?? b.b;
+  const cur = map.get(b.b);
+  if (!cur) {
+    map.set(b.b, { bucket: b.b, open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v, open_at: ot, close_at: ct, buy_volume: b.bv ?? null, sell_volume: b.sv ?? null });
+    return;
+  }
+  if (ot < cur.open_at) {
+    cur.open = b.o;
+    cur.open_at = ot;
+  }
+  cur.high = Math.max(cur.high, b.h);
+  cur.low = Math.min(cur.low, b.l);
+  if (ct >= cur.close_at) {
+    cur.close = b.c;
+    cur.close_at = ct;
+  }
+  cur.volume += b.v;
+  cur.buy_volume = addVol(cur.buy_volume, b.bv);
+  cur.sell_volume = addVol(cur.sell_volume, b.sv);
+}
+
+/** 원본 인터벌(1m/1h/1d) 봉을 출처들에서 모아 시간순 한 줄로 만든다. 봉은 `[from, to)` 구간 것만.
+ *  rows   = 분 단위 행(유저 체결 + 옛 봇 봉). 버킷당 한 행(PK).
+ *  packs  = 묶음 테이블 행(§ 닫힌 1분봉 묶음) · pending = 대기 묶음 텍스트 · live = 진행 중 봉.
+ * ⚠ 봇 봉은 **(버킷, 시가 시각)으로 한 번만** 센다 — 묶음 테이블 → 대기 묶음 → 진행 중 봉 순으로(= 더 확정된 쪽 먼저). 통합
+ * 폴링은 대기 묶음·진행 중 봉을 "이 요청의 봇 틱이 쓴 값"으로 받고 테이블은 그 뒤에 읽으므로, 그 사이 다른 요청이 그 시간을
+ * 테이블로 넘기면 같은 봉이 양쪽에 다 보인다(정각 무렵 몇 ms) — 안 걸러 내면 그 시간의 거래량이 통째로 두 배가 된다.
+ * 서로 다른 체결 묶음이 같은 분에 들어온 경우(§ PACK_FLUSH_SQL)는 시가 시각이 달라 둘 다 합쳐진다. */
+export function assembleSourceBars(
+  rows: CandleRow[],
+  packs: { bars: string }[],
+  pending: string | null | undefined,
+  live: LiveBar | undefined,
+  from: number,
+  to: number,
+): CandleRow[] {
+  const map = new Map<number, CandleRow>();
+  for (const r of rows) if (r.bucket >= from && r.bucket < to) map.set(r.bucket, { ...r });
+  const seen = new Set<string>();
+  const add = (b: LiveBar) => {
+    if (b.b < from || b.b >= to) return;
+    const key = `${b.b}:${b.ot ?? b.b}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    mergeBotBar(map, b);
+  };
+  for (const p of packs) for (const b of parsePack(p.bars)) add(b);
+  for (const b of parsePack(pending)) add(b);
+  if (live) add(live);
+  return [...map.values()].sort((a, b) => a.bucket - b.bucket);
 }
 
 /** 단일 가격 체결용 단축(진입/청산 등 개별 체결 — OHLC 가 전부 같은 가격). */
@@ -394,15 +497,22 @@ type SpotCandleOut = {
   sellVolume?: number | null;
 };
 
+/** 캔들 조회가 봇 상태 행에서 물려받는 것(§ TickCtx) — 진행 중 봉들과 대기 묶음(§ 닫힌 1분봉 묶음).
+ * `live` 가 null 이면 "모른다"(봇 틱이 실패했거나 경합에서 졌다) → 조회가 상태 행을 직접 읽는다. */
+export interface CandleCtx {
+  live: LiveBars | null;
+  pack: string | null;
+}
+
 export async function loadSpotCandles(
   env: Env,
   pair: string,
   intervalCode: string,
   limit: number,
   endTimeMs?: number,
-  liveCtx?: LiveBars | null,
+  ctx?: CandleCtx | null,
 ) {
-  return (await loadSpotCandlesPage(env, pair, intervalCode, limit, endTimeMs, liveCtx)).candles;
+  return (await loadSpotCandlesPage(env, pair, intervalCode, limit, endTimeMs, ctx)).candles;
 }
 
 export async function loadSpotCandlesPage(
@@ -411,9 +521,9 @@ export async function loadSpotCandlesPage(
   intervalCode: string,
   limit: number,
   endTimeMs?: number,
-  liveCtx?: LiveBars | null,
+  ctx?: CandleCtx | null,
 ): Promise<{ candles: SpotCandleOut[]; more: boolean }> {
-  const page = await readSpotCandlesPage(env, pair, intervalCode, limit, endTimeMs, liveCtx);
+  const page = await readSpotCandlesPage(env, pair, intervalCode, limit, endTimeMs, ctx);
   // 최신 페이지만 빈 봉을 채운다(§ fillEmptyBars) — 과거 페이지는 지금 시각과 무관하다.
   if (!endTimeMs) page.candles = fillEmptyBars(page.candles, intervalSecFromCode(intervalCode), limit, Date.now());
   return page;
@@ -447,13 +557,15 @@ function fillEmptyBars(candles: SpotCandleOut[], sec: number, limit: number, now
   return out;
 }
 
+const CANDLE_COLS = 'bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume';
+
 async function readSpotCandlesPage(
   env: Env,
   pair: string,
   intervalCode: string,
   limit: number,
   endTimeMs: number | undefined,
-  liveCtx: LiveBars | null | undefined,
+  ctx: CandleCtx | null | undefined,
 ): Promise<{ candles: SpotCandleOut[]; more: boolean }> {
   const sec = intervalSecFromCode(intervalCode);
   const bucketMs = sec * 1000;
@@ -469,31 +581,93 @@ async function readSpotCandlesPage(
   // 원본 행 상한(§ SRC_ROW_CAP) 안에 들어가게 목표 봉 수를 줄인다.
   limit = Math.max(1, Math.min(limit, Math.floor(SRC_ROW_CAP / ratio)));
   const srcLimit = limit * ratio;
-  // ⚠ 최신 페이지는 **요청한 목표 봉들이 걸친 구간만** 읽는다(2026-10-01) — LIMIT 만 걸면 진행 중인 봉이 막 시작했어도 원본 ratio×봉 수를
-  // 다 읽었다(30m 차트를 띄워 두면 1초마다 90행 = 한 사람이 14시간이면 하루 읽기 한도). 구간 하한을 두면 진행 중 봉은 지금까지 닫힌
-  // 원본만큼만 읽는다(평균 절반 이하, 클라는 평소 1봉만 요청한다 — useTradingStore spotTick).
-  const windowStart = (Math.floor(Date.now() / bucketMs) - (limit - 1)) * bucketMs;
+  // 1분봉이 원본이면 묶음도 읽는다(§ 닫힌 1분봉 묶음) — 묶음 한 행 = 한 시간치라 봉 srcLimit 개에 행 srcLimit/60 개면 된다(+여유 2).
+  const packed = srcCode === PACK_SRC;
+  const packLimit = Math.ceil(srcLimit / PACK_BARS) + 2;
+  type PackRow = { bucket: number; bars: string };
+  type StateRow = { live_json?: string | null; pack_json: string | null };
 
-  // endTimeMs 가 오면 그 시각 "이전" 봉만 — 차트에서 왼쪽으로 스크롤할 때 과거 구간을 이어 받는다.
-  // ⚠ 진행 중(아직 안 닫힌) 봉은 테이블이 아니라 봇 상태 행에 있다(§ live_json) → 최신 페이지일 때만
-  // 같이 읽어 뒤에 붙인다. 과거 페이지(endTimeMs)엔 해당 없음.
-  const [rowsRes, liveRow] = await Promise.all([
-    env.DB.prepare(
-      endTimeMs
-        ? 'SELECT bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?'
-        : 'SELECT bucket, open, high, low, close, volume, open_at, close_at, buy_volume, sell_volume FROM spot_candles WHERE pair = ? AND interval = ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?',
-    )
-      .bind(...(endTimeMs ? [pair, srcCode, endTimeMs, srcLimit] : [pair, srcCode, windowStart, srcLimit]))
-      .all<CandleRow>(),
-    // ⚠ 통합 폴링(`?tick=`)에선 봇 틱이 방금 읽고 쓴 값을 그대로 받는다(§ TickCtx) — 같은 요청 안에서
-    // 같은 행을 두 번 읽지 않는다. 과거 페이지(endTimeMs)엔 진행 중 봉이 아예 관계없다.
-    endTimeMs || liveCtx
-      ? Promise.resolve(null)
-      : env.DB.prepare('SELECT live_json FROM spot_bot_state WHERE id = ?').bind(pair).first<{ live_json: string | null }>(),
-  ]);
-  const live = endTimeMs ? undefined : (liveCtx ?? parseLive(liveRow?.live_json))[srcCode];
-  const more = endTimeMs ? rowsRes.results.length >= srcLimit : true;
-  const asc = mergeLiveBar(rowsRes.results.reverse(), live);
+  let asc: CandleRow[];
+  let more: boolean;
+  let cover = -Infinity; // 과거 페이지: 이 시각부터는 원본 봉이 빠짐없이 모였다(그 앞은 읽기 상한에 잘렸을 수 있다)
+  if (!endTimeMs) {
+    // ── 최신 페이지 ── **요청한 목표 봉들이 걸친 구간만** 읽는다(2026-10-01) — LIMIT 만 걸면 진행 중인 봉이 막 시작했어도 원본
+    // ratio×봉 수를 다 읽었다(30m 차트를 띄워 두면 1초마다 90행 = 한 사람이 14시간이면 하루 읽기 한도). 구간 하한을 두면 진행 중 봉은
+    // 지금까지 닫힌 원본만큼만 읽는다(평균 절반 이하, 클라는 평소 1봉만 요청한다 — useTradingStore spotTick).
+    const windowStart = (Math.floor(Date.now() / bucketMs) - (limit - 1)) * bucketMs;
+    // ⚠ 진행 중 봉·대기 묶음은 테이블이 아니라 봇 상태 행에 있다. 통합 폴링(`?tick=`)에선 봇 틱이 방금 읽고 쓴 값을 그대로 받고
+    // (§ TickCtx — 같은 요청에서 같은 행을 두 번 읽지 않는다), 아니면 여기서 **같은 batch 로** 읽는다(한 트랜잭션이라 "넘기는 중간"을
+    // 보지 않는다 — 예전엔 두 조회가 따로라 그 사이 봉이 테이블로 넘어가면 그 봉을 두 번 셌다).
+    const stmts: D1PreparedStatement[] = [
+      env.DB.prepare(`SELECT ${CANDLE_COLS} FROM spot_candles WHERE pair = ? AND interval = ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?`).bind(
+        pair,
+        srcCode,
+        windowStart,
+        srcLimit,
+      ),
+    ];
+    if (packed) {
+      stmts.push(
+        env.DB.prepare('SELECT bucket, bars FROM spot_candle_packs WHERE pair = ? AND interval = ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?').bind(
+          pair,
+          srcCode,
+          packBucketOf(windowStart),
+          packLimit,
+        ),
+      );
+    }
+    const known = ctx?.live ? ctx : null;
+    if (!known) stmts.push(env.DB.prepare('SELECT live_json, pack_json FROM spot_bot_state WHERE id = ?').bind(pair));
+    const res = await env.DB.batch(stmts);
+    const rows = res[0].results as CandleRow[];
+    const packs = packed ? (res[1].results as PackRow[]) : [];
+    const stateRow = known ? null : ((res[res.length - 1].results[0] as StateRow | undefined) ?? null);
+    const live = (known ? known.live! : parseLive(stateRow?.live_json))[srcCode];
+    const pending = packed ? (known ? known.pack : stateRow?.pack_json) : null;
+    asc = assembleSourceBars(rows, packs, pending, live, windowStart, Infinity);
+    more = true;
+  } else {
+    // ── 과거 페이지 ── endTimeMs "이전" 봉만(차트에서 왼쪽으로 스크롤할 때 이어 받는다). 진행 중 봉은 관계없다.
+    // 묶음을 먼저 읽고, 묶음이 상한까지 찼으면 분 단위 행은 **그 묶음들이 덮는 구간만** 읽는다 — 묶음 이후의 분 단위 행은
+    // 유저 체결뿐이라 드문드문한데, 하한 없이 srcLimit 행을 채우려 들면 몇 주 전까지 거슬러 읽는다(쓰지도 않을 행).
+    let packs: PackRow[] = [];
+    let pending: string | null = null;
+    let lower = -Infinity;
+    if (packed) {
+      const res = await env.DB.batch([
+        env.DB.prepare('SELECT bucket, bars FROM spot_candle_packs WHERE pair = ? AND interval = ? AND bucket < ? ORDER BY bucket DESC LIMIT ?').bind(
+          pair,
+          srcCode,
+          endTimeMs,
+          packLimit,
+        ),
+        // 대기 묶음에 endTimeMs 이전 봉이 있을 수 있다(막 만든 코인처럼 차트가 가진 봉이 한 시간도 안 될 때)
+        env.DB.prepare('SELECT pack_json FROM spot_bot_state WHERE id = ?').bind(pair),
+      ]);
+      packs = res[0].results as PackRow[];
+      pending = (res[1].results[0] as StateRow | undefined)?.pack_json ?? null;
+      if (packs.length >= packLimit) lower = packs[packs.length - 1].bucket;
+    }
+    const rows = (
+      await env.DB.prepare(
+        `SELECT ${CANDLE_COLS} FROM spot_candles WHERE pair = ? AND interval = ? AND bucket < ? AND bucket >= ? ORDER BY bucket DESC LIMIT ?`,
+      )
+        .bind(pair, srcCode, endTimeMs, Number.isFinite(lower) ? lower : 0, srcLimit)
+        .all<CandleRow>()
+    ).results;
+    // 어느 쪽이든 읽기 상한에 닿았으면 그 출처의 가장 오래된 봉 앞은 못 본 것이다 → 둘 다 다 본 구간(cover)만 쓴다.
+    if (rows.length >= srcLimit) cover = rows[rows.length - 1].bucket;
+    cover = Math.max(cover, lower);
+    asc = assembleSourceBars(rows, packs, pending, undefined, cover, endTimeMs);
+    more = Number.isFinite(cover);
+  }
+  if (asc.length > srcLimit) {
+    asc = asc.slice(-srcLimit);
+    if (endTimeMs) {
+      more = true;
+      cover = Math.max(cover, asc[0].bucket);
+    }
+  }
   // 과거 페이지 요청인데 결과가 없으면 진짜로 더 없는 것 — 거래 버킷팅 폴백으로 최신 구간을
   // 돌려주면 클라가 "받았다"고 착각해 같은 구간을 무한히 다시 붙인다.
   if (asc.length === 0) return { candles: endTimeMs ? [] : await bucketTradesToCandles(env, pair, bucketMs, limit), more: false };
@@ -529,20 +703,21 @@ async function readSpotCandlesPage(
       cur.sell = addVol(cur.sell, r.sell_volume);
     }
   }
+  const targets = [...merged.entries()].sort((a, b) => a[0] - b[0]);
+  // 과거 페이지에서 원본이 잘린 지점(cover)에 걸친 맨 앞 목표 봉은 반쪽이다 → 뺀다(다음 페이지가 그 봉을 통째로 다시 받는다).
+  // 하나뿐이면 두고 보낸다 — 빈 응답은 클라가 "끝"으로 읽는다.
+  if (endTimeMs && targets.length > 1 && targets[0][0] < cover) targets.shift();
   return {
-    candles: [...merged.entries()]
-      .sort((a, b) => a[0] - b[0])
-      .slice(-limit)
-      .map(([t, c]) => ({
-        time: Math.floor(t / 1000),
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        volume: c.volume,
-        buyVolume: c.buy,
-        sellVolume: c.sell,
-      })),
+    candles: targets.slice(-limit).map(([t, c]) => ({
+      time: Math.floor(t / 1000),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume,
+      buyVolume: c.buy,
+      sellVolume: c.sell,
+    })),
     more,
   };
 }
@@ -858,6 +1033,8 @@ export interface TickCtx {
   // 봇 틱이 방금 읽고 쓴 값을 그대로 넘기면 뒤의 둘이 사라진다(값도 오히려 정확하다 — 재조회는 방금
   // 커밋한 값을 다시 읽는 것뿐이다).
   live: LiveBars | null; // 진행 중(안 닫힌) 캔들 버킷들 — 차트의 마지막 봉
+  /** 대기 묶음(아직 테이블로 안 넘어간 닫힌 1분봉들, § 닫힌 1분봉 묶음) — `live` 와 한 쌍이다(live 가 null 이면 이것도 모른다). */
+  pack: string | null;
   ref: number | null; // 이 틱 뒤의 기준가 = OX 체결가 소스
   /** **표시용** 공정가(헤더 현재가) — `ref` 와 달리 sweep 이 대기 지정가를 건드렸어도 봇이 방금 커밋한 값을
    * 그대로 준다(2026-09-23). ⚠ `ref` 는 트리거 판정의 시드라 조금이라도 낡으면 안 돼서 대기 주문이 **하나라도
@@ -1103,8 +1280,9 @@ function burstTicks(lastRun: number, budget: number): number {
 // (1) 이 배열에 심볼을 넣고 (2) `src/symbols.ts VIRTUAL_SYMBOLS` 에도 같은 심볼을 넣고 (3) D1 에
 // `spot_bot_state` 시작가 행을 하나 만들면 끝이다(§5 마이그레이션). 봇 상태·사다리·캔들·체결·재고가
 // 전부 pair 로 키가 잡혀 있어 그 외에 손댈 곳이 없다.
-// ⚠ 동시에 **cron 틱 예산을 나누는 기준**이기도 하다(cron/index.ts MM_TICK_BUDGET) — 코인마다 틱을
-// 곱하면 D1 쓰기와 invocation당 쿼리 수가 코인 수에 그대로 비례하기 때문.
+// ⚠ 코인 하나가 **아무도 안 볼 때** 드는 D1 쓰기는 하루 ~1,600행(무료 한도의 1.6% — 분마다 상태 행 1, 2026-11-20 전엔
+// 4,800행)이고, cron 실행 하나의 D1 쿼리(무료 50/호출)를 읽기 1 + 커밋 ~3 만큼 쓴다. 4코인까지는 그대로 들어간다
+// (cron/index.ts MM_TICKS_PER_PAIR 주석, _trading.ts CRON_FILL_Q, docs/VIRTUAL_COIN.md "코인을 늘릴 때").
 export const VIRTUAL_PAIRS: readonly string[] = ['OXUSDT', 'EWUSDT'];
 
 // ⚠ `spot_trades` 보존 기간 — 2026-10-17 부터 아무도 이 테이블에 쓰지 않는다(유저 체결도 테이프로, § userTapeStmt).
@@ -2558,7 +2736,7 @@ export function simulateTick(
 // 봇 심리 상태 행 ↔ BotState 변환. 컬럼이 전부 DEFAULT 를 갖고 있어 기존 행/신규 행 모두 안전하게
 // 읽히고, 값이 비었거나(anchor=0=미초기화) 알 수 없는 regime 이면 안전한 기본값으로 떨어진다.
 const BOT_STATE_COLS =
-  'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, book_json, book_version, tape_json, live_json, pend_notional, pend_rows, pend_ticks, interest, hype, fair';
+  'last_run, ref_price, drift, vol, sentiment, anchor, regime, regime_ticks, peak, trough, book_json, book_version, tape_json, live_json, pack_json, pend_notional, pend_rows, pend_ticks, interest, hype, fair';
 const REGIMES: readonly Regime[] = ['calm', 'rally', 'euphoria', 'pullback', 'panic', 'capitulation'];
 
 interface BotStateRow {
@@ -2576,6 +2754,7 @@ interface BotStateRow {
   book_version: number;     // 사다리 낙관적 동시성 — 커밋 가드에도 쓴다(§ runBotTicks 커밋 = 선점)
   tape_json: string | null; // 봇 합성 체결 링 버퍼(§ 봇 합성 체결 테이프) — 틱이 이어받아 append 한다
   live_json: string | null; // 진행 중(안 닫힌) 캔들 버킷들(§ live_json) — 닫힐 때만 spot_candles 로 넘어간다
+  pack_json: string | null; // 닫혔지만 아직 테이블로 안 넘어간 1분봉들(§ 닫힌 1분봉 묶음) — 그 시간이 끝나면 한 행으로 넘어간다
   pend_notional: number;    // 아직 봇 수수료 카운터에 안 넘긴 합성체결 명목금액
   pend_rows: number;        // 아직 usage_meter 에 안 넘긴 예상 쓰기 행 수
   pend_ticks: number;       // 마지막 정산 이후 돈 틱 수
@@ -2616,16 +2795,22 @@ async function resolveRef(env: Env, pair: string, row: BotStateRow | null): Prom
   return lastTrade?.price ?? 1;
 }
 
-/** 봇 정산 주기 — 이 틱 수마다 봇 수수료 카운터·예산 계량기를 **한 번에** 넘긴다(§ pend_* 컬럼).
+/** 봇 정산 주기 — 봇 수수료 카운터·예산 계량기를 **모았다가 한 번에** 넘긴다(§ pend_* 컬럼).
  * 틱마다 쓰면 그 둘만으로 봇 틱이 3행이 된다(상태 1 + 카운터 1 + 계량기 1). 값 자체는 상태 행에
- * 누적되므로(어차피 매번 쓰는 그 1행) **총액은 정확하고 반영이 최대 이 틱 수만큼 늦을 뿐**이다.
- * 120틱 ≈ cron 만 돌 때 5분, 유저가 보고 있을 때 2분. */
-const BOT_ACCRUAL_TICKS = 120;
+ * 누적되므로(어차피 매번 쓰는 그 1행) **총액은 정확하고 반영이 늦을 뿐**이다.
+ * ⚠ 정산 한 번이 3행(계량기 1 + 봇 2명 카운터)이라 주기가 곧 비용이다(2026-11-20). 예전 120틱(cron 만 돌 때 10분)은 코인당
+ * 하루 144번 = 432행으로 **아무도 없는 날 쓰기의 9%** 였다. 지금은 둘 중 먼저 닿는 쪽:
+ *   · 쌓인 행이 `BOT_ACCRUAL_ROWS` — 누가 보고 있을 때(초당 1행) ≈ 4분. 계량기가 늦는 몫은 코인당 이만큼이 상한이다
+ *     (차단선은 수만 행 단위고 계량기 캐시가 이미 60초 낡으니 무해하다).
+ *   · 돈 틱이 `BOT_ACCRUAL_TICKS` — cron 만 돌 때 2시간(코인당 하루 12번 = 36행).
+ * 늦게 반영되는 건 랭킹의 "봇 수수료 수익" 표시와 계량기뿐이다. */
+const BOT_ACCRUAL_TICKS = 1440;
+const BOT_ACCRUAL_ROWS = 240;
 
 /** 봇 한 커밋이 D1 에 남기는 행 수(예산 계량용 보수적 추정, § _budget.ts 과금 모델).
  * ⚠ 단위가 "틱"이 아니라 "커밋"이다 — 버스트는 틱을 몇 개 돌든 상태 행을 한 번만 쓴다. */
 const ROWS_PER_BOT_COMMIT = 1; // 상태 행 UPDATE(사다리·테이프·진행중 캔들·누적분이 전부 여기 들어있다)
-const ROWS_PER_CANDLE_FLUSH = 2; // 닫힌 버킷을 넘길 때 — 새 버킷이면 행 1 + PK 인덱스 1
+const ROWS_PER_CANDLE_FLUSH = 2; // 닫힌 버킷(1h·1d)이나 1분봉 묶음 한 시간치를 넘길 때 — 새 행이면 행 1 + PK 인덱스 1
 const ROWS_PER_BOT_ACCRUAL = 4; // 정산 시 usage_meter 1 + 봇 2명 카운터 2 (+여유 1)
 
 /**
@@ -2660,7 +2845,7 @@ async function runBotTicks(
   wantCtx = true,
   preloaded?: PendingLite[], // 호출자가 이미 읽은 이 페어의 대기 주문(§ runMarketMakerBursts) — 있으면 다시 안 읽는다
 ): Promise<{ path: number[]; ctx: TickCtx }> {
-  const nothing: TickCtx = { book: null, tape: null, pendings: null, live: null, ref: null, mark: null };
+  const nothing: TickCtx = { book: null, tape: null, pendings: null, live: null, pack: null, ref: null, mark: null };
   if (ticks <= 0) return { path: [], ctx: nothing };
   // ⚠ 상태 행이 아직 없으면 먼저 만든다 — 아래 커밋은 `last_run` 가드가 붙은 UPDATE 라 행이 없으면
   // 0행이 되어 봇이 영원히 시작하지 못한다(가상 코인을 새로 개설한 직후가 정확히 그 상태다).
@@ -2746,16 +2931,29 @@ async function runBotTicks(
     px = r.px;
     path.push(roundOx(r.px)); // 트리거는 D1 의 ref_price 와 같은 반올림 값(체결 가능한 가격 — 벽 안)으로 판정한다
   }
-  if (!book) return { path, ctx: { book: null, tape: null, pendings, live: null, ref: null, mark: null } };
+  if (!book) return { path, ctx: { book: null, tape: null, pendings, live: null, pack: null, ref: null, mark: null } };
 
   const stmts: D1PreparedStatement[] = [];
-  // 닫힌 버킷만 테이블로 넘긴다(진행 중 버킷은 아래 상태 행에 그대로 남아 조회 때 병합된다).
-  for (const c of closed) stmts.push(candleFlushStmt(env, pair, c.code, c.bar, guard));
+  // 닫힌 버킷을 넘긴다(진행 중 버킷은 아래 상태 행에 그대로 남아 조회 때 병합된다).
+  // ⚠ **1분봉은 행으로 넘기지 않는다**(2026-11-20, § 닫힌 1분봉 묶음) — 상태 행의 대기 묶음에 붙여 두고, 그 시간이 끝났을 때만
+  // 한 시간치를 한 행으로 넘긴다. 1h·1d 는 예전 그대로 닫힐 때 한 행.
+  const closedMinutes: LiveBar[] = [];
+  let flushed = 0;
+  for (const c of closed) {
+    if (c.code === PACK_SRC) closedMinutes.push(c.bar);
+    else {
+      stmts.push(candleFlushStmt(env, pair, c.code, c.bar, guard));
+      flushed++;
+    }
+  }
+  const pack = advancePack(row?.pack_json, closedMinutes, live[PACK_SRC]?.b ?? lastTs);
+  for (const g of pack.flush) stmts.push(packFlushStmt(env, pair, g.bucket, g.bars, guard));
+  flushed += pack.flush.length;
 
   let pendNotional = (row?.pend_notional ?? 0) + notional;
-  let pendRows = (row?.pend_rows ?? 0) + ROWS_PER_BOT_COMMIT + closed.length * ROWS_PER_CANDLE_FLUSH;
+  let pendRows = (row?.pend_rows ?? 0) + ROWS_PER_BOT_COMMIT + flushed * ROWS_PER_CANDLE_FLUSH;
   let pendTicks = (row?.pend_ticks ?? 0) + ticks;
-  if (pendTicks >= BOT_ACCRUAL_TICKS) {
+  if (pendTicks >= BOT_ACCRUAL_TICKS || pendRows >= BOT_ACCRUAL_ROWS) {
     pendRows += ROWS_PER_BOT_ACCRUAL;
     stmts.push(meterStmt(env, pendRows));
     // 봇도 수수료를 낸다(§ 봇도 거래 수수료를 낸다). ⚠ 명목금액은 두 봇에 **균등 분배** 한다 — 틱마다
@@ -2800,7 +2998,7 @@ async function runBotTicks(
   const tapeJson = appendTape(row?.tape_json, fresh);
   stmts.push(
     env.DB.prepare(
-      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, interest=?, hype=?, fair=?, book_version=book_version+1 WHERE id=? AND last_run=? AND ref_price=? AND book_version=? AND COALESCE(length(tape_json),0)=?',
+      'UPDATE spot_bot_state SET last_run=?, ref_price=?, drift=?, vol=?, sentiment=?, anchor=?, regime=?, regime_ticks=?, peak=?, trough=?, book_json=?, tape_json=?, live_json=?, pack_json=?, pend_notional=?, pend_rows=?, pend_ticks=?, interest=?, hype=?, fair=?, book_version=book_version+1 WHERE id=? AND last_run=? AND ref_price=? AND book_version=? AND COALESCE(length(tape_json),0)=?',
     ).bind(
       lastTs,
       roundOx(px), // 바깥(체결가·마크·트리거)은 틱 격자 위의 **벽 안** 값만 본다(§ BotState.ref, TickResult.px)
@@ -2815,6 +3013,7 @@ async function runBotTicks(
       serializeBook(book),
       tapeJson,
       JSON.stringify(live),
+      pack.pending,
       pendNotional,
       pendRows,
       pendTicks,
@@ -2832,7 +3031,7 @@ async function runBotTicks(
   // 커밋이 0행이면 그 사이 다른 요청(폴링·cron)이 같은 상태에서 먼저 커밋한 것 -> 이번 틱은 없던 일이다.
   // 지나온 가격 경로도 빈 배열로 돌려야 한다: 커밋되지 않은 가격으로 트리거를 판정하면(cron 이 이
   // 반환값을 쓴다) 실제로 존재한 적 없는 딥/스파이크로 조건부·SL/TP 가 체결된다.
-  if (res[res.length - 1]?.meta.changes !== 1) return { path: [], ctx: { book: null, tape: null, pendings, live: null, ref: null, mark: null } };
+  if (res[res.length - 1]?.meta.changes !== 1) return { path: [], ctx: { book: null, tape: null, pendings, live: null, pack: null, ref: null, mark: null } };
 
   // 방금 깐 유동성에 대기 중 유저 지정가를 walking 매칭(호가 역전/크로스 즉시 체결, 벽 소비 포함).
   // ⚠ 틱마다가 아니라 **커밋 뒤 한 번** — 호가창은 이 커밋으로 한 번 바뀌므로 그 이상은 낭비였다
@@ -2844,14 +3043,14 @@ async function runBotTicks(
   const touched = wantCtx && pendings.length > 0 && (await sweepRestingOxPendings(env, pair, pendings, book));
   // sweep 이 실제로 체결을 냈으면 우리가 든 사다리·대기목록은 이미 낡았다 → 호출자가 다시 읽게 한다.
   // ⚠ sweep 이 체결을 냈으면 사다리·대기목록은 이미 낡았고(호출자가 다시 읽는다) 기준가도 그 체결로
-  // 옮겨갔다 → 둘 다 버린다. **진행 중 캔들(live)만은 그대로 유효하다** — 체결은 `spot_candles` 에
-  // 직접 쓰지 이 칸을 건드리지 않고, 그 테이블 쪽은 어차피 조회할 때 새로 읽기 때문이다.
+  // 옮겨갔다 → 둘 다 버린다. **진행 중 캔들(live)과 대기 묶음(pack)만은 그대로 유효하다** — 체결은 `spot_candles` 에
+  // 직접 쓰지 이 칸들을 건드리지 않고, 그 테이블 쪽은 어차피 조회할 때 새로 읽기 때문이다.
   if (!wantCtx) return { path, ctx: nothing }; // cron — 호가창을 그릴 사람이 없다
   return {
     path,
     ctx: touched
-      ? { book: null, tape: null, pendings: null, live, ref: null, mark: roundOx(px) }
-      : { book, tape: displayTape(tapeJson), pendings, live, ref: roundOx(px), mark: roundOx(px) },
+      ? { book: null, tape: null, pendings: null, live, pack: pack.pending, ref: null, mark: roundOx(px) }
+      : { book, tape: displayTape(tapeJson), pendings, live, pack: pack.pending, ref: roundOx(px), mark: roundOx(px) },
   };
 }
 
@@ -2875,6 +3074,7 @@ export async function runMarketMaker(env: Env, pair: string): Promise<TickCtx> {
     tape: displayTape(row?.tape_json), // 체결 목록에 쓰는 만큼만(§ displayTape)
     pendings: null,
     live: parseLive(row?.live_json),
+    pack: row?.pack_json ?? null,
     ref: row?.ref_price ?? null,
     mark: row?.ref_price ?? null,
   });

@@ -52,6 +52,7 @@ import {
   crossingOxPendings,
   recordVirtualFill,
   PARTIAL_FILL_COOLDOWN_MS,
+  VIRTUAL_PAIRS,
 } from './api/spot';
 
 const EPS = 1e-9; // 부동소수점 잔여수량 판정 오차(조건부 주문 부분체결 잔량 등)
@@ -84,11 +85,14 @@ export const POLL_FILL_Q = 30;
 export const HEAVY_TICK_FILL_Q = HEAVY_FILL_Q;
 /** 주문 액션 앞의 평가 몫 — 그 액션 자체가 무거울 수 있어(가상 코인 시장가 ~25) 실제 코인 체결 하나까지만. */
 export const ACTION_FILL_Q = 10;
-/** cron 1회(모든 유저 합계)의 몫 — 봇 버스트(읽기 4 + 페어별 커밋 ~3)와 전체 조회(4)를 뺀 ~36 에서 여유를 둔 값.
- * 가상 코인 체결 하나는 늘 들어가야 한다(안 그러면 앱을 닫아 둔 유저의 OX 지정가·SL 이 영영 안 걸린다).
- * 유저마다 기본 조회(잔고 1)도 여기서 뗀다. */
-const CRON_FILL_Q = 34;
+/** cron 1회(모든 유저 합계)의 몫 = 호출당 한도 50 에서 봇 버스트와 전체 조회(4)를 빼고 여유 2 를 둔 값.
+ * 봇 버스트는 **가상 코인 수에 비례**한다 — 읽기 batch 가 코인 수 + 2 문장, 코인마다 커밋 ~3 문장(상태 1 + 정각의 1분봉 묶음 1 +
+ * 1시간봉 1; 봇 정산이 겹치는 분은 +4) → `50 − (N + 2) − 3N − 4 − 2 = 42 − 4N`. 2코인이면 34(2026-10-01 에 정한 그 값).
+ * ⚠ 가상 코인 체결 하나(25)는 늘 들어가야 한다(안 그러면 앱을 닫아 둔 유저의 OX 지정가·SL 이 영영 안 걸린다) — 그래서 바닥이 26 이고,
+ * **5코인부터는 이 바닥이 한도를 넘는다**(42 − 20 = 22 < 26). 그 전에 cron 의 봇 버스트와 트리거 평가를 DO 요청 둘로 나눌 것
+ * (요청마다 50 을 따로 받는다 — docs/VIRTUAL_COIN.md "코인을 늘릴 때"). 유저마다 기본 조회(잔고 1)도 여기서 뗀다. */
 const CRON_USER_BASE_Q = 1;
+const CRON_FILL_Q = Math.max(HEAVY_FILL_Q + CRON_USER_BASE_Q, 42 - 4 * VIRTUAL_PAIRS.length);
 /** 몫이 남았으면 떼고 true. */
 function spend(b: FillBudget, cost: number): boolean {
   if (b.q < cost) return false;

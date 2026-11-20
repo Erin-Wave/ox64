@@ -198,7 +198,11 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
   -- 차트의 마지막 봉은 예전과 똑같이 실시간으로 움직인다.
   -- 형식: {"1m":{"b":버킷ms,"o":시가,"h":고가,"l":저가,"c":종가,"v":거래량},"1h":{...},"1d":{...}}
   live_json    TEXT,
-  -- ⚠ 봇 수수료·예산계량 누적분(틱마다 쓰지 않고 모았다가 BOT_ACCRUAL_TICKS 마다 한 번에 정산).
+  -- ⚠ **닫혔지만 아직 테이블로 안 넘어간 1분봉들**(2026-11-20, functions/api/spot.ts § 닫힌 1분봉 묶음). 봇이 닫힌 1분봉을
+  -- 분마다 spot_candles 한 행(= 2행 과금)으로 넘기던 것이 아무도 없는 날 쓰기의 60% 였다. 지금은 여기 모았다가 그 시간이
+  -- 끝나면 한 시간치를 spot_candle_packs 한 행으로 넘긴다. 형식은 그 테이블의 bars 와 같다(바깥 대괄호 없는 봉 배열 나열).
+  pack_json    TEXT,
+  -- ⚠ 봇 수수료·예산계량 누적분(틱마다 쓰지 않고 모았다가 한 번에 정산 — spot.ts BOT_ACCRUAL_TICKS/ROWS).
   -- 예전엔 틱마다 users 카운터 1행 + usage_meter 1행이 나가 봇 틱 하나가 3행이었다. 값 자체는 이 상태
   -- 행에 누적되므로(같은 1행 UPDATE) 정확도 손실 없이 쓰기만 사라진다 — 정산이 최대 몇 분 늦을 뿐이다.
   pend_notional REAL NOT NULL DEFAULT 0,      -- 아직 users.total_volume/total_fees 에 안 넘긴 합성체결 명목금액
@@ -272,6 +276,23 @@ CREATE TABLE IF NOT EXISTS spot_candles (
   buy_volume  REAL,
   sell_volume REAL,
   PRIMARY KEY (pair, interval, bucket)   -- (pair,interval) 로 조회 + bucket 정렬을 이 인덱스로 커버
+);
+
+-- ── 가상 코인 1분봉 묶음(2026-11-20) ─────────────────────────────────
+-- 봇이 만든 1분봉을 **한 시간치 한 행**으로 보관한다(functions/api/spot.ts § 닫힌 1분봉 묶음). 분마다 spot_candles 에
+-- 한 행씩 넣으면 코인 하나가 아무도 안 봐도 하루 2,880행을 쓰는데(행 1 + PK 인덱스 1), 묶으면 48행이다. 읽기도 준다
+-- (1분봉 500개 = 500행 → 9행). DB 도 덜 자란다(봉당 ~150B → ~75B — 무료 플랜 500MB 에서 1분봉이 DB 의 거의 전부다).
+-- ⚠ spot_candles 의 1분 행은 그대로 살아 있다 — 유저 체결은 예전처럼 거기에 분 단위로 upsert 하고, 이 테이블이 생기기 전의
+--   봇 봉도 거기 있다. 차트는 둘을 합쳐 읽는다(assembleSourceBars). 1h·1d 는 묶지 않는다(하루 50행).
+-- bars = 봉 배열을 바깥 대괄호 없이 쉼표로 이은 텍스트:
+--   [분 번호(= 버킷 ÷ 60000), 시가, 고가, 저가, 종가, 거래량, 시가 시각 − 버킷(ms), 종가 시각 − 버킷(ms), 매수량, 매도량],[...]
+--   같은 시간의 묶음이 한 번 더 넘어오면 뒤에 덧붙는다(같은 분의 조각은 읽을 때 합친다).
+CREATE TABLE IF NOT EXISTS spot_candle_packs (
+  pair     TEXT NOT NULL,
+  interval TEXT NOT NULL,      -- 묶인 봉의 인터벌 코드(지금은 '1m' 하나)
+  bucket   INTEGER NOT NULL,   -- 묶음 시작 시각(ms) = 그 봉들이 속한 시(hour) 경계
+  bars     TEXT NOT NULL,
+  PRIMARY KEY (pair, interval, bucket)
 );
 
 -- ── 거래 수수료 원장(플랫폼이 벌어들인 수수료) ────────────────────────────
@@ -622,3 +643,12 @@ CREATE TABLE IF NOT EXISTS crate_stats (
 -- cron 워커도 재배포(봇 커밋이 functions/api/spot.ts 를 공유한다).
 -- ALTER TABLE spot_candles ADD COLUMN buy_volume REAL;
 -- ALTER TABLE spot_candles ADD COLUMN sell_volume REAL;
+
+-- ⚠ 일회성 마이그레이션 (2026-11-20 추가, 가상 코인 1분봉 묶음): spot_candle_packs 는 신규 테이블이라 위 CREATE TABLE IF NOT EXISTS
+-- 로 생기지만(`--file=./schema.sql` 재적용), spot_bot_state 의 새 컬럼은 CREATE 가 더해주지 않으므로 최초 1회만 아래를 직접 실행할 것.
+-- ⚠⚠ **둘 다 코드 배포 전에 먼저 적용돼야 한다** — 봇 커밋 UPDATE 가 pack_json 을 쓰고 캔들 조회가 spot_candle_packs 를 읽으므로,
+-- 없으면 봇 틱 batch 가 통째로 롤백돼 가상 코인 시장이 멈추고 차트가 비어 보인다. cron 워커도 재배포(봇 커밋이 spot.ts 를 공유한다).
+-- 옛 코드와 섞여 돌아도 안전하다 — 옛 코드는 pack_json 을 건드리지 않고 닫힌 1분봉을 예전처럼 spot_candles 행으로 넘기며,
+-- 새 조회는 두 곳을 합쳐 읽는다. prod·로컬 적용 완료.
+-- ALTER TABLE spot_bot_state ADD COLUMN pack_json TEXT;
+-- CREATE TABLE IF NOT EXISTS spot_candle_packs (pair TEXT NOT NULL, interval TEXT NOT NULL, bucket INTEGER NOT NULL, bars TEXT NOT NULL, PRIMARY KEY (pair, interval, bucket));

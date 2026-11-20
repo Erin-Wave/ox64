@@ -12,6 +12,8 @@
 // 없으면 **wrangler 로그인 토큰**을 쓴다(먼저 `wrangler d1 info` 를 한 번 불러 만료된 토큰을 갱신시킨다).
 //   사용: npm run d1:budget            (최근 14일)
 //         npm run d1:budget -- 30      (최근 30일)
+//         npm run d1:budget -- hours 12  (최근 12시간을 **시간별로** — 배포 직후 "쓰기가 정말 줄었나"를 다음 날까지 안 기다리고 본다.
+//                                          아무도 없는 시간의 값이 곧 가상 코인의 유휴 비용이다: 코인당 시간 ~66행, CLAUDE.md §6 "5차")
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -60,56 +62,93 @@ async function gql(query, variables) {
   return body?.data?.viewer?.accounts?.[0] ?? {};
 }
 
-const daysBack = Math.max(1, Number(process.argv[2]) || 14);
-const end = new Date();
-const start = new Date(end.getTime() - (daysBack - 1) * 86_400_000);
-const iso = (d) => d.toISOString().slice(0, 10);
-const s = iso(start);
-const e = iso(end);
-
-const days = new Map();
-const day = (k) => {
-  if (!days.has(k)) days.set(k, { write: 0, read: 0, req: 0 });
-  return days.get(k);
-};
-
-const d1 = await gql(
-  `query($account:String!,$s:Date!,$e:Date!){ viewer{ accounts(filter:{accountTag:$account}){
-     d1AnalyticsAdaptiveGroups(filter:{date_geq:$s,date_leq:$e},limit:1000){ dimensions{ date } sum{ rowsWritten rowsRead } }
-   } } }`,
-  { s, e },
-);
-for (const g of d1.d1AnalyticsAdaptiveGroups ?? []) {
-  day(g.dimensions.date).write += g.sum.rowsWritten;
-  day(g.dimensions.date).read += g.sum.rowsRead;
-}
-// 요청 한도는 계정 전체(이 계정의 다른 Worker 포함) — Workers + Pages Functions 를 합친다.
-const req = await gql(
-  `query($account:String!,$s:Time!,$e:Time!){ viewer{ accounts(filter:{accountTag:$account}){
-     workersInvocationsAdaptive(filter:{datetime_geq:$s,datetime_lt:$e},limit:10000){ dimensions{ date } sum{ requests } }
-     pagesFunctionsInvocationsAdaptiveGroups(filter:{datetime_geq:$s,datetime_lt:$e},limit:10000){ dimensions{ date } sum{ requests } }
-   } } }`,
-  { s: `${s}T00:00:00Z`, e: `${e}T23:59:59Z` },
-);
-for (const g of [...(req.workersInvocationsAdaptive ?? []), ...(req.pagesFunctionsInvocationsAdaptiveGroups ?? [])]) {
-  day(g.dimensions.date).req += g.sum.requests;
-}
-
-console.log(`\n  무료 플랜 사용량 — 하루 운영 상한 ${(TARGET * 100).toFixed(2)}% (쓰기 ${fmt(LIMITS.write * TARGET)} · 읽기 ${fmt(LIMITS.read * TARGET)} · 요청 ${fmt(LIMITS.req * TARGET)})`);
-console.log('  날짜(UTC)     D1 쓰기          D1 읽기              요청            ');
-console.log('  ' + '─'.repeat(78));
-let over = false;
-for (const [k, v] of [...days.entries()].sort()) {
-  const flags = [];
-  for (const kind of ['write', 'read', 'req']) if (v[kind] > LIMITS[kind] * TARGET) flags.push(kind);
-  if (flags.length) over = true;
-  console.log(
-    `  ${k}  ${fmt(v.write).padStart(8)} ${pct(v.write, LIMITS.write).padStart(6)}  ${fmt(v.read).padStart(10)} ${pct(v.read, LIMITS.read).padStart(6)}  ${fmt(v.req).padStart(8)} ${pct(v.req, LIMITS.req).padStart(6)}  ${flags.length ? '⚠ 상한 초과: ' + flags.join(',') : ''}`,
+// ── 시간별 보기(`hours N`) ── D1 행 수만(요청 수는 일 단위 한도라 위 표로 충분하다)
+async function hourly() {
+  const hoursBack = Math.min(72, Math.max(1, Number(process.argv[3]) || 12));
+  const to = new Date();
+  const from = new Date(Math.floor(to.getTime() / 3_600_000) * 3_600_000 - (hoursBack - 1) * 3_600_000);
+  const d = await gql(
+    `query($account:String!,$s:Time!,$e:Time!){ viewer{ accounts(filter:{accountTag:$account}){
+       d1AnalyticsAdaptiveGroups(filter:{datetimeHour_geq:$s,datetimeHour_leq:$e},limit:1000,orderBy:[datetimeHour_ASC]){
+         dimensions{ datetimeHour } sum{ rowsWritten rowsRead writeQueries readQueries } }
+     } } }`,
+    { s: from.toISOString(), e: to.toISOString() },
   );
+  const byHour = new Map();
+  for (const g of d.d1AnalyticsAdaptiveGroups ?? []) {
+    const k = g.dimensions.datetimeHour;
+    const cur = byHour.get(k) ?? { w: 0, r: 0, wq: 0, rq: 0 };
+    cur.w += g.sum.rowsWritten;
+    cur.r += g.sum.rowsRead;
+    cur.wq += g.sum.writeQueries;
+    cur.rq += g.sum.readQueries;
+    byHour.set(k, cur);
+  }
+  console.log(`\n  D1 시간별 사용량 — 최근 ${hoursBack}시간 (하루 한도를 24로 나눈 값: 쓰기 ${fmt(LIMITS.write / 24)} · 읽기 ${fmt(LIMITS.read / 24)})`);
+  console.log('  시각(UTC)            쓰기 행   쓰기 문장     읽기 행   읽기 문장');
+  console.log('  ' + '─'.repeat(64));
+  for (const [k, v] of [...byHour.entries()].sort()) {
+    console.log(`  ${k.slice(0, 16).replace('T', ' ')}  ${fmt(v.w).padStart(9)}  ${fmt(v.wq).padStart(9)}  ${fmt(v.r).padStart(10)}  ${fmt(v.rq).padStart(9)}`);
+  }
+  console.log('');
 }
-console.log(
-  over
-    ? `\n  ❌ 상한(${(TARGET * 100).toFixed(2)}%)을 넘은 날이 있다 — \`npx wrangler d1 insights ox64 --sort-by writes|reads --timePeriod 1d --json\` 로 원인 쿼리를 찾을 것(CLAUDE.md §6).\n`
-    : '\n  ✅ 모든 날이 상한 안이다. (코드 쪽 차단선은 functions/_budget.ts — 재체결 → 반복 조건부 → 새 진입 → 봇 순)\n',
-);
-process.exit(over ? 1 : 0);
+
+
+async function daily() {
+  const daysBack = Math.max(1, Number(process.argv[2]) || 14);
+  const end = new Date();
+  const start = new Date(end.getTime() - (daysBack - 1) * 86_400_000);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const s = iso(start);
+  const e = iso(end);
+
+  const days = new Map();
+  const day = (k) => {
+    if (!days.has(k)) days.set(k, { write: 0, read: 0, req: 0 });
+    return days.get(k);
+  };
+
+  const d1 = await gql(
+    `query($account:String!,$s:Date!,$e:Date!){ viewer{ accounts(filter:{accountTag:$account}){
+       d1AnalyticsAdaptiveGroups(filter:{date_geq:$s,date_leq:$e},limit:1000){ dimensions{ date } sum{ rowsWritten rowsRead } }
+     } } }`,
+    { s, e },
+  );
+  for (const g of d1.d1AnalyticsAdaptiveGroups ?? []) {
+    day(g.dimensions.date).write += g.sum.rowsWritten;
+    day(g.dimensions.date).read += g.sum.rowsRead;
+  }
+  // 요청 한도는 계정 전체(이 계정의 다른 Worker 포함) — Workers + Pages Functions 를 합친다.
+  const req = await gql(
+    `query($account:String!,$s:Time!,$e:Time!){ viewer{ accounts(filter:{accountTag:$account}){
+       workersInvocationsAdaptive(filter:{datetime_geq:$s,datetime_lt:$e},limit:10000){ dimensions{ date } sum{ requests } }
+       pagesFunctionsInvocationsAdaptiveGroups(filter:{datetime_geq:$s,datetime_lt:$e},limit:10000){ dimensions{ date } sum{ requests } }
+     } } }`,
+    { s: `${s}T00:00:00Z`, e: `${e}T23:59:59Z` },
+  );
+  for (const g of [...(req.workersInvocationsAdaptive ?? []), ...(req.pagesFunctionsInvocationsAdaptiveGroups ?? [])]) {
+    day(g.dimensions.date).req += g.sum.requests;
+  }
+
+  console.log(`\n  무료 플랜 사용량 — 하루 운영 상한 ${(TARGET * 100).toFixed(2)}% (쓰기 ${fmt(LIMITS.write * TARGET)} · 읽기 ${fmt(LIMITS.read * TARGET)} · 요청 ${fmt(LIMITS.req * TARGET)})`);
+  console.log('  날짜(UTC)     D1 쓰기          D1 읽기              요청            ');
+  console.log('  ' + '─'.repeat(78));
+  let over = false;
+  for (const [k, v] of [...days.entries()].sort()) {
+    const flags = [];
+    for (const kind of ['write', 'read', 'req']) if (v[kind] > LIMITS[kind] * TARGET) flags.push(kind);
+    if (flags.length) over = true;
+    console.log(
+      `  ${k}  ${fmt(v.write).padStart(8)} ${pct(v.write, LIMITS.write).padStart(6)}  ${fmt(v.read).padStart(10)} ${pct(v.read, LIMITS.read).padStart(6)}  ${fmt(v.req).padStart(8)} ${pct(v.req, LIMITS.req).padStart(6)}  ${flags.length ? '⚠ 상한 초과: ' + flags.join(',') : ''}`,
+    );
+  }
+  console.log(
+    over
+      ? `\n  ❌ 상한(${(TARGET * 100).toFixed(2)}%)을 넘은 날이 있다 — \`npx wrangler d1 insights ox64 --sort-by writes|reads --timePeriod 1d --json\` 로 원인 쿼리를 찾을 것(CLAUDE.md §6).\n`
+      : '\n  ✅ 모든 날이 상한 안이다. (코드 쪽 차단선은 functions/_budget.ts — 재체결 → 반복 조건부 → 새 진입 → 봇 순)\n',
+  );
+  process.exitCode = over ? 1 : 0;
+}
+
+// ⚠ process.exit 로 끊지 않는다 — fetch 소켓이 닫히기 전에 끊으면 윈도우에서 libuv 단언(UV_HANDLE_CLOSING)이 찍힌다.
+await (process.argv[2] === 'hours' ? hourly() : daily());

@@ -19,7 +19,7 @@
 // 그대로 따라 ScheduledEvent/ExecutionContext/DO 네임스페이스도 필요한 최소 형태만 직접 선언한다.
 import { sweepTriggers, rangeOfPath } from '../functions/_trading';
 import type { PriceRanges } from '../functions/_trading';
-import { runMarketMakerBursts, VIRTUAL_PAIRS } from '../functions/api/spot';
+import { runMarketMakerBursts } from '../functions/api/spot';
 import type { Env as TradingEnv, D1Database } from '../functions/_shared';
 
 interface DurableObjectStubLike {
@@ -43,22 +43,23 @@ interface MinimalExecutionContext {
 }
 type TickResult = { sweep: { checked: number; liquidated: number }; busy?: boolean };
 
-// ⚠ 마켓메이커 틱 예산은 **가상 코인 수와 무관하게 고정**이다 — 코인마다 12틱씩 돌리면 비용이 코인 수에
-// 그대로 비례한다. 그래서 총량을 정해두고 코인들이 나눠 쓴다.
-// ⚠⚠ 예전엔 이 값의 상한을 **invocation당 D1 쿼리 수**가 정했다(틱 하나가 벽 조회+배치+sweep 으로
-// ~14쿼리라 24틱 ≈ 340쿼리). 지금은 틱이 순수 계산이고 커밋이 페어당 1회라 **틱 수가 쿼리 수를 거의
-// 안 늘린다**(§ spot.ts runBotTicks) → 무료 플랜의 빡빡한 한도(invocation당 50쿼리) 안에서도 틱을 넉넉히
-// 돌릴 수 있다. 이제 이 값을 정하는 기준은 쿼리가 아니라 **CPU 시간(무료 10ms/invocation)** 이다.
-// ⚠⚠⚠ **2026-10-01 사고: cron 이 매번 CPU 초과(exceededCpu)로 죽었다.** 옛 실측 "24틱 ≈ 3.5ms" 는 관심도·호가
-// 지속 모델 이전 값이었고, cron 은 "한가한 머신"에서 돌아 거의 매번 **콜드 isolate(JIT 전)** 라 같은 계산이 몇 배
-// 든다(로컬 Node 콜드 실측: 봇 2페어만 6~7ms). Cloudflare 는 가끔 넘는 건 봐주지만 계속 넘으면 끊는다 —
-// 끊기면 그때까지 커밋된 것만 남아 **뒤에 도는 페어(EW)의 1분봉이 10~30분씩 비고, 마지막에 도는 트리거
-// sweep(강제청산·SL/TP·조건부)이 통째로 증발**했다. 그래서 일을 DO 로 옮겼고(§ 파일 머리), 겸사겸사 버스트의 중간
-// 틱은 사다리를 만들지 않고(§ spot.ts LadderDebt) 테이프를 풀지 않으며(§ spot.ts appendTape) 읽기를 batch 로
-// 묶었다(D1 호출 1회 ≈ CPU 0.45ms). 이 값을 늘리거나 틱 루프에 계산을 더할 땐
-// `cd cron && npx wrangler tail --format json` 으로 scheduled(≈1ms)와 durableObject 이벤트의 `cpuTime` 을 볼 것.
-const MM_TICK_BUDGET = 24;
-const MM_BUDGET_PER_PAIR = Math.max(1, Math.floor(MM_TICK_BUDGET / VIRTUAL_PAIRS.length));
+// ⚠⚠ **봇 틱은 코인마다 고정(12 = 5초 틱)이다**(2026-11-20). 틱은 순수 계산이고 커밋이 코인당 1회라 **틱 수가 D1 쓰기·쿼리를
+// 늘리지 않는다**(§ spot.ts runBotTicks) — 틱 수를 정하는 건 CPU 뿐이고, 이 일은 DO 안에서 돌아 한도가 요청당 30초다(§ 파일 머리).
+// 예전엔 "총량 24 를 코인 수로 나눠" 썼는데 그건 이 일이 cron(CPU 10ms) 안에서 돌던 시절의 제약이었다. 나눠 쓰면 코인을 늘릴수록
+// 틱 하나가 덮는 시간이 길어진다 — 4코인이면 10초, 6코인이면 15초로 틱 상한(`DT_MAX_SEC`)에 닿고 그 너머는 **시장이 벽시계보다
+// 느리게 흐른다**. 봇은 1초·5초 틱에서만 검증했다(`npm run sim:bot`). 2코인인 지금은 예전과 똑같은 24틱이다.
+// ⚠ 코인을 늘리면 DO 의 CPU 가 그만큼 는다(실측: 2코인 × 12틱 = 콜드 5~11ms) — 추가한 뒤 `cd cron && npx wrangler tail --format json`
+// 으로 durableObject 이벤트의 `cpuTime` 을 볼 것(scheduled 는 ≈1ms 여야 한다).
+// ⚠⚠⚠ **2026-10-01 사고: cron 이 매번 CPU 초과(exceededCpu)로 죽었다.** 옛 실측 "24틱 ≈ 3.5ms" 는 관심도·호가 지속 모델 이전
+// 값이었고, cron 은 "한가한 머신"에서 돌아 거의 매번 **콜드 isolate(JIT 전)** 라 같은 계산이 몇 배 든다(로컬 Node 콜드 실측: 봇
+// 2페어만 6~7ms). Cloudflare 는 가끔 넘는 건 봐주지만 계속 넘으면 끊는다 — 끊기면 그때까지 커밋된 것만 남아 **뒤에 도는
+// 페어(EW)의 1분봉이 10~30분씩 비고, 마지막에 도는 트리거 sweep(강제청산·SL/TP·조건부)이 통째로 증발**했다. 그래서 일을 DO 로
+// 옮겼고(§ 파일 머리), 겸사겸사 버스트의 중간 틱은 사다리를 만들지 않고(§ spot.ts LadderDebt) 테이프를 풀지 않으며
+// (§ spot.ts appendTape) 읽기를 batch 로 묶었다(D1 호출 1회 ≈ CPU 0.45ms).
+// ⚠ 코인 수가 실제로 막히는 곳은 틱이 아니라 **이 실행의 D1 쿼리 수(무료 50/호출)** 다 — 코인마다 읽기 1 + 커밋 ~3 이 들고
+// 나머지를 트리거 평가가 쓴다(§ _trading.ts CRON_FILL_Q = 42 − 4×코인 수). 4코인까지는 그대로 들어가고, 5코인부터는 봇 버스트와
+// 트리거 평가를 DO 요청 둘로 나눠야 한다(docs/VIRTUAL_COIN.md "코인을 늘릴 때").
+const MM_TICKS_PER_PAIR = 12;
 
 /** cron 이 깨우는 시계 — 매 분의 일(runTick)을 **DO 요청 안에서** 돈다(§ 파일 머리: CPU 를 따로 받는다). */
 export class MarketClock {
@@ -115,7 +116,7 @@ async function runTick(env: Env): Promise<TickResult> {
   // 그 분의 청산/체결이 통째로 스킵됐다(2026-07-31 에 D1 storage timeout 으로 실제 발생).
   // 한 페어가 터져도 다른 페어는 계속 돈다(runMarketMakerBursts 안의 페어별 try/catch).
   try {
-    const bursts = await runMarketMakerBursts(tradingEnv, MM_BUDGET_PER_PAIR);
+    const bursts = await runMarketMakerBursts(tradingEnv, MM_TICKS_PER_PAIR);
     for (const [p, b] of Object.entries(bursts)) {
       const range = rangeOfPath(b.path);
       if (range) ranges[p] = range;

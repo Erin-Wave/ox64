@@ -45,10 +45,10 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
       const bars = Math.min(1000, Math.max(1, Number(url.searchParams.get('bars')) || 2));
       const wantState = url.searchParams.get('state') === '1';
       // ⚠ 봇 틱이 이미 읽은 것을 아래 셋이 그대로 물려받는다(§ spot.ts TickCtx) — 호가창(사다리·테이프·
-      // 대기주문) · 차트 마지막 봉(live) · OX 체결가(ref). 넘기지 않으면 같은 상태 행을 세 번 읽는다.
+      // 대기주문) · 차트 마지막 봉(live)과 아직 테이블로 안 넘어간 1분봉(pack) · OX 체결가(ref). 넘기지 않으면 같은 상태 행을 세 번 읽는다.
       const [market, candles, state] = await Promise.all([
         loadSpotMarket(env, sess.uid, pair, tickCtx),
-        loadSpotCandles(env, pair, interval, bars, undefined, tickCtx?.live),
+        loadSpotCandles(env, pair, interval, bars, undefined, tickCtx),
         // 계정 상태를 실을 때만 트리거 평가도 함께 돈다 = 이 요청이 체결 클럭이 된다.
         // 안 실을 땐 계정 데이터를 한 행도 읽지 않는다.
         // ⚠ 체결 몫(§ _trading FillBudget): 이 요청은 봇 커밋·호가창·캔들까지 하므로 폴링 몫보다 작게, 방금 sweep 이 체결을
