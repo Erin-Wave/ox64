@@ -811,3 +811,6 @@ RangeError 로 화면이 통째로 죽는다 — `virtualPrecision(1e-12)=15` �
   여전히 ~47~51ms 라 주문 한 건은 서버에서 ~0.2초(예전 ~0.8초, 먼 엣지면 2초+)로 계산된다.
 - 이어서 **Smart Placement** 를 켰다(`wrangler.toml [placement] mode="smart"`) — 함수를 DB 옆(서울)에서 돌려 남은 왕복 지연까지 없애려는 것. 켠 직후
   `cf-placement: local-HKG`(켜졌고 아직 안 옮김) — Cloudflare 가 트래픽을 보고 몇 분~15분 뒤 판단한다.
+  켠 뒤 25분(2분 간격 13회) 동안 계속 `local-HKG`/`local-NRT` — 아직 옮기지 않았다. 문서상 "여러 지역에서 꾸준한 트래픽"이 쌓여야 판단하고,
+  "그 함수가 이미 돌아 본 위치만" 후보로 본다(서울 엣지로 들어온 요청이 없으면 서울로는 못 옮긴다). 켜 둬도 손해는 없다(느려지면 스스로 되돌린다).
+  나중에 `curl -sD - https://ox64.app/api/state -o /dev/null | grep -i cf-placement` 가 `remote-…` 면 옮겨진 것.
