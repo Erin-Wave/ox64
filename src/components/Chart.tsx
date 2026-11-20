@@ -295,6 +295,7 @@ export default function Chart() {
   const drawModeRef = useRef(false);
   drawModeRef.current = drawMode;
   const hLineRefs = useRef<IPriceLine[]>([]);
+  const syncLineLabelsRef = useRef<() => void>(() => {});
   // 과거로 스크롤해 마지막 봉이 화면 밖이면 "최신으로" 버튼
   const [awayFromLatest, setAwayFromLatest] = useState(false);
   const latestQuietUntilRef = useRef(0);
@@ -380,6 +381,7 @@ export default function Chart() {
   // 미체결 주문선의 취소(X) 버튼을 각 지정가 y좌표에 재배치한다. 카운트다운과 같은 트리거(팬/줌·틱·1초)
   // 에서 함께 불리도록 repositionCountdown 안에서 호출한다. opts.pendingLine 이 꺼져 있으면 안 그린다.
   const repositionPendBtns = () => {
+    syncLineLabelsRef.current(); // 화면 밖 가격선의 가격축 라벨 끄기(가격축 폭 — § syncLineLabels)
     const chart = chartRef.current;
     const c = candleRef.current;
     const clear = () => {
@@ -457,6 +459,27 @@ export default function Chart() {
     setPendBtns(next);
   };
   repositionPendBtnsRef.current = repositionPendBtns;
+
+  // ⚠⚠ 화면 밖 가격선은 가격축 라벨을 끈다(2026-11-20, "GN 1분봉만 가격축이 빈 공간으로 엄청 넓다" 제보).
+  // LWC 는 가격축 폭을 정할 때 **그 축의 모든 가격선 라벨**을 잰다 — 화면 밖이라 그려지지도 않는 라벨까지(lightweight-charts
+  // PriceAxisWidget.optimalWidth → _backLabels, 위치를 보지 않는다). 잔고가 큰 계정의 숏 청산가는 진입가 + 평가자산/수량이라
+  // 8×10⁴⁹ 같은 값이 되고(실제 GN 숏 3,650억 개·잔고 2.9e61), 그 50자리 라벨 폭만큼 가격축이 빈 칸으로 넓어졌다. 멀리 걸린
+  // 지정가·조건부·SL/TP·수평선도 같다. 그래서 선은 그대로 두고 **라벨만** 화면 안(가격축 높이 ±8px)에 있을 때 켠다 — 화면 밖
+  // 라벨은 원래 안 보이므로 잃는 것이 없다. 카운트다운·버튼 재배치와 같은 때(팬·줌·새 봉·1초 틱·크로스헤어) 다시 맞춘다.
+  // 끄고 켤 때만 applyOptions(값이 같으면 손대지 않는다 — 라벨을 바꾸면 축 폭이 바뀌어 다시 그려진다).
+  const syncLineLabels = () => {
+    const chart = chartRef.current;
+    const c = candleRef.current;
+    if (!chart || !c) return;
+    const paneH = (containerRef.current?.clientHeight ?? 0) - chart.timeScale().height();
+    for (const pl of [...priceLines.current, ...hLineRefs.current]) {
+      const o = pl.options();
+      const y = c.priceToCoordinate(o.price);
+      const on = y != null && y >= -8 && y <= paneH + 8;
+      if (on !== o.axisLabelVisible) pl.applyOptions({ axisLabelVisible: on });
+    }
+  };
+  syncLineLabelsRef.current = syncLineLabels;
 
   const repositionCountdown = () => {
     repositionPendBtnsRef.current(); // 미체결 취소버튼도 같은 트리거에서 함께 재배치
