@@ -1727,6 +1727,11 @@ function addBotFill(fills: Map<string, BotFill>, botId: string, notional: number
   fills.set(botId, { notional: cur.notional + notional, size: cur.size + size });
 }
 
+/** 봇 계정들의 누적 거래대금(수수료 요율용) — 체결 준비 batch 에 같이 실어 읽는다(§ botFillStmts knownVol). */
+const BOT_VOL_SQL = `SELECT id, total_volume FROM users WHERE id IN (${BOT_USER_IDS.map(() => '?').join(',')})`;
+const botVolMap = (rows: unknown[]) =>
+  new Map((rows as { id: string; total_volume: number | null }[]).map((r) => [r.id, r.total_volume ?? 0]));
+
 /**
  * 봇 체결의 부기 — (1) 수수료 원장 + (2) 재고/현금 정산. 합성 체결(봇끼리)이든 유저 상대 체결이든.
  *
@@ -1751,15 +1756,21 @@ async function botFillStmts(
   fills: Map<string, BotFill>,
   botSide: 'buy' | 'sell' | null,
   now: number,
+  /** 호출자가 이미 읽은 봇 누적 거래대금(§ BOT_VOL_SQL — 체결 준비 batch 에 같이 실어 읽는다). 있으면 다시 안 읽는다. */
+  knownVol?: Map<string, number>,
 ): Promise<D1PreparedStatement[]> {
   const ids = [...fills.keys()].filter((id) => (fills.get(id)?.notional ?? 0) > EPS);
   if (ids.length === 0) return [];
-  const rows = (
-    await env.DB.prepare(`SELECT id, total_volume FROM users WHERE id IN (${ids.map(() => '?').join(',')})`)
-      .bind(...ids)
-      .all<{ id: string; total_volume: number }>()
-  ).results;
-  const volById = new Map(rows.map((r) => [r.id, r.total_volume ?? 0]));
+  const volById =
+    knownVol && ids.every((id) => knownVol.has(id))
+      ? knownVol
+      : new Map(
+          (
+            await env.DB.prepare(`SELECT id, total_volume FROM users WHERE id IN (${ids.map(() => '?').join(',')})`)
+              .bind(...ids)
+              .all<{ id: string; total_volume: number }>()
+          ).results.map((r) => [r.id, r.total_volume ?? 0]),
+        );
   const out: D1PreparedStatement[] = [];
   for (const id of ids) {
     const { notional, size } = fills.get(id)!;
@@ -3627,21 +3638,25 @@ export async function matchMarketOxOrder(
   //        리쿼트와 경합해 정체됐다). 수수료율은 주문 전체에 한 번만 확정(청크마다 등급이 바뀌지 않게). ──
   // ⚠⚠ 원웨이(§ _shared 원웨이 모드): 이 심볼의 포지션을 양방향으로 한 번에 읽는다 — 반대 포지션(opp)이 있으면 walking 의 앞
   // 부분이 그걸 먼저 줄이고(증거금 불필요), 다 닫은 뒤 남는 수량만 연다. 같은 방향(same)은 레버리지만 본다(합치기는 SQL 상대값).
-  const held = await heldPositions(env, uid, pair);
+  // ⚠⚠ 체결 준비에 필요한 읽기 넷(이 심볼 포지션 · 내 잔고·요율 · 봇 사다리 · 봇 거래대금)을 **batch 한 번**에(2026-11-20).
+  // 예전엔 하나씩 차례로 읽어 DB 를 네 번 오갔다 — DB 는 서울(ICN)에 있고 함수는 접속한 엣지(홍콩·도쿄·미국 서부…)에서 돌아서,
+  // 왕복 한 번이 50~150ms 다. 주문 한 건이 15~16번 오가 운영에서 ~2.7초였다("전부 청산이 안 먹힌다" 조사). 읽기끼리는 서로의
+  // 결과가 필요 없으므로 한 번에 보내도 값은 같다. 잔고와 요율은 같은 users 행이라 한 문장이다.
+  const [heldRes, meRes, stRes, botRes] = await env.DB.batch([
+    env.DB.prepare('SELECT * FROM positions WHERE user_id = ? AND symbol = ? ORDER BY opened_at').bind(uid, pair),
+    env.DB.prepare('SELECT balance, total_volume FROM users WHERE id=?').bind(uid),
+    // 기준가·적정가와 **봇 사다리를 같은 한 행에서** 함께 읽는다(예전엔 호가창을 따로 SELECT 했다).
+    env.DB.prepare(`SELECT ref_price, anchor, ${BOOK_COLS} FROM spot_bot_state WHERE id=?`).bind(pair),
+    env.DB.prepare(BOT_VOL_SQL).bind(...BOT_USER_IDS),
+  ]);
+  const held = heldRes.results as PositionRow[];
   const { opp, same } = splitHeld(held, side);
   const effLev = same ? same.leverage : leverage; // 물타기 시 기존 레버리지 고정
-  // ⚠ 잔고와 요율은 **같은 users 행**이라 한 번에 읽는다 — 예전엔 feeRateOf(total_volume) 와 balance 를
-  // 따로 읽어 같은 행을 두 번 조회했다(§6 "같은 걸 한 요청 안에서 두 번 읽지 않는다"). 무료 플랜은
-  // invocation 당 쿼리가 50 뿐이라 이런 한 개가 실제로 체결 성패를 가른다.
-  const me = await env.DB.prepare('SELECT balance, total_volume FROM users WHERE id=?')
-    .bind(uid)
-    .first<{ balance: number; total_volume: number }>();
+  const me = meRes.results[0] as { balance: number; total_volume: number } | undefined;
   const feeRate = vipOf(me?.total_volume ?? 0).rate;
   const bal0 = me?.balance ?? 0;
-  // 기준가·적정가와 **봇 사다리를 같은 한 행에서** 함께 읽는다(예전엔 호가창을 따로 SELECT 했다).
-  const st = await env.DB.prepare(`SELECT ref_price, anchor, ${BOOK_COLS} FROM spot_bot_state WHERE id=?`)
-    .bind(pair)
-    .first<{ ref_price: number; anchor: number } & BookRow>();
+  const st = stRes.results[0] as ({ ref_price: number; anchor: number } & BookRow) | undefined;
+  const botVol = botVolMap(botRes.results);
   const est = st?.ref_price ?? 1;
 
   // 감당 가능 수량으로 목표를 먼저 클램프(부풀린 평단→즉시 강제청산 방지, 기존 로직 유지). 반대 포지션을 줄이는 몫은 증거금이
@@ -3801,7 +3816,7 @@ export async function matchMarketOxOrder(
       ...feeAccrualStmts(env, uid, pair, 'open', oCost, feeRate, oFee, now, prints.length),
     );
   }
-  stmts.push(...(await botFillStmts(env, pair, makerFills, openMakerSide, now)));
+  stmts.push(...(await botFillStmts(env, pair, makerFills, openMakerSide, now, botVol)));
   if (extra) stmts.push(...extra(filled));
   if (!(await guardedBatch(env, stmts))) return none(net ? 'changed' : 'margin');
   return { filled, avgPrice, short, reduced: net?.cut.size ?? 0, opened: oFilled, closedSide: net ? opp!.side : null };
@@ -3836,15 +3851,17 @@ async function closePositionAgainstBook(
   const makerSide: 'buy' | 'sell' = closeTaker === 'long' ? 'sell' : 'buy';
   const dir = pos.side === 'long' ? 1 : -1;
   const marginPerUnit = pos.size > EPS ? pos.margin / pos.size : 0;
-  // 요율은 이 청산 전체에 한 번만 확정(청크마다 다시 읽으면 체결 도중 등급이 바뀔 수 있다).
-  const closeFeeRate = await feeRateOf(env, uid);
-
-  // ── 1) 봇 호가 사다리를 스냅샷으로 한 번에 읽어 메모리에서 walking(청크마다 왕복하지 않는다 —
-  //        예전엔 대량 청산이 청크마다 batch/claim 왕복이라 느리고 리쿼트와 경합해 정체됐다). ──
-  // 기준가·적정가와 봇 사다리를 같은 한 행에서 함께 읽는다(예전엔 호가창을 따로 SELECT 했다).
-  const st = await env.DB.prepare(`SELECT ref_price, anchor, ${BOOK_COLS} FROM spot_bot_state WHERE id=?`)
-    .bind(pair)
-    .first<{ ref_price: number; anchor: number } & BookRow>();
+  // ── 1) 요율(이 청산 전체에 한 번만 확정 — 청크마다 다시 읽으면 체결 도중 등급이 바뀔 수 있다) · 봇 사다리(기준가·적정가와 같은
+  //        한 행) · 봇 거래대금을 **batch 한 번**에 읽는다(2026-11-20, § matchMarketOxOrder 같은 이유 — DB 왕복 셋 → 하나).
+  //        사다리는 스냅샷으로 메모리에서 walking 한다(청크마다 왕복하지 않는다). ──
+  const [meRes, stRes, botRes] = await env.DB.batch([
+    env.DB.prepare('SELECT total_volume FROM users WHERE id = ?').bind(uid),
+    env.DB.prepare(`SELECT ref_price, anchor, ${BOOK_COLS} FROM spot_bot_state WHERE id=?`).bind(pair),
+    env.DB.prepare(BOT_VOL_SQL).bind(...BOT_USER_IDS),
+  ]);
+  const closeFeeRate = vipOf((meRes.results[0] as { total_volume?: number } | undefined)?.total_volume ?? 0).rate;
+  const st = stRes.results[0] as ({ ref_price: number; anchor: number } & BookRow) | undefined;
+  const botVol = botVolMap(botRes.results);
   const est = st?.ref_price ?? pos.entry_price;
   const book = parseBook(st?.book_json);
 
@@ -3942,7 +3959,7 @@ async function closePositionAgainstBook(
     ),
   );
   stmts.push(...feeAccrualStmts(env, uid, pair, 'close', cost, closeFeeRate, closeFeeTotal, now, prints.length));
-  stmts.push(...(await botFillStmts(env, pair, closeMakerFills, makerSide, now))); // 롱 청산이면 유저가 팔고 봇이 산다(makerSide='buy')
+  stmts.push(...(await botFillStmts(env, pair, closeMakerFills, makerSide, now, botVol))); // 롱 청산이면 유저가 팔고 봇이 산다(makerSide='buy')
   if (!(await guardedBatch(env, stmts))) return { filled: 0, avgPrice: 0, changed: true };
   return { filled, avgPrice };
 }

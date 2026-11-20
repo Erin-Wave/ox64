@@ -363,6 +363,15 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
   | 요청 수(Pages Functions 포함) | **10만/일** | 약 1.5~2만/일 |
   | CPU / invocation | **10 ms** ⚠ Paid 는 30초 | ⚠ **실제로 닿은 벽**(아래 2026-10-01) — `wrangler tail` 의 `cpuTime` |
   | DB당 최대 크기 | **500 MB** ⚠ Paid 는 10GB | 18 MB |
+  - **⚠⚠ 지연의 주인 = DB 왕복 횟수(2026-11-20, "전부 청산이 안 먹힌다" 조사).** D1 primary 는 **서울(ICN)** 에 있고(`wrangler d1 execute … --json`
+    의 `meta.served_by_colo`), 함수는 유저가 접속한 엣지에서 돈다 — 무료 플랜의 한국 트래픽은 홍콩·도쿄·미국 서부 엣지로 가는 일이 흔해 **왕복
+    한 번이 50~150ms** 다(실측: HKG 엣지 51ms, 로컬 0.5ms). 그래서 가상 코인 시장가 한 건이 DB 를 15~16번 **차례로** 오가 운영에서 ~2.7초였다.
+    지금은 각 단계의 읽기를 **batch 하나**로 묶는다: 트리거 점검(`scanTriggers` — 대기·포지션·조건부·잔고·그 유저 가상 코인 기준가) → 체결 준비
+    (`matchMarketOxOrder`/`closePositionAgainstBook` — 포지션·잔고·요율·사다리·봇 거래대금) → 체결 쓰기 → 응답(`loadState`) = **주문 4번 · 상태
+    폴링 2번**(예전 15~16번 · 5번). 트리거 점검이 읽은 포지션·기준가는 주문 경로가 그대로 쓴다(`scan.fresh` 가 null 이면 다시 읽는다), 강제청산
+    판정도 그 batch 의 잔고를 쓴다(청산 batch 의 잔고 가드가 그대로 지킨다). **새 경로에 `await env.DB…first()` 를 줄줄이 늘어놓지 말 것** —
+    서로 결과가 필요 없는 읽기는 한 batch 로(batch 는 호출 1회로 센다 — 아래 실측). 계측: 로컬 `_middleware.ts` 에서 env.DB 를 감싸 호출 순서를
+    응답 헤더로 찍어 보면 된다(커밋 금지).
   - **⚠⚠ 2026-11-20 운영 실측(임시 측정 워커, 지금은 삭제) — 아래 "50·문장마다"는 그 전의 믿음이다.** `SELECT 1` 로 잰 결과:
     ① 호출 하나의 한도는 **D1 호출 1,000회**(1,000번째에 "Too many API requests by single Worker invocation" — 워커·DO 똑같이, 이 계정은
     무료 플랜인데도 문서의 무료 50 이 아니었다) ② **`batch()` 하나 = 1회**(문장 10개짜리 batch 200번이 통과 — D1 문서도 "a db.batch() call
@@ -821,7 +830,7 @@ npx wrangler pages dev dist        # wrangler.toml 의 D1 바인딩·.dev.vars �
 
 ## 11. 백로그 (열린 항목)
 
-> 완료된 작업 85건의 배경·수정 내용·검증 기록은 **[docs/HISTORY.md](docs/HISTORY.md)** 로 옮겼다.
+> 완료된 작업 86건의 배경·수정 내용·검증 기록은 **[docs/HISTORY.md](docs/HISTORY.md)** 로 옮겼다.
 > 규칙·불변식의 진실원본은 언제나 이 문서 본문(§2·§4·§6)이고, 이력은 "왜 그렇게 됐는지"를 되짚을 때만 연다.
 > ⚠ **새 작업을 끝내면 완료 기록은 HISTORY.md 에 쓰고, 이 문서에는 앞으로 지켜야 할 규칙만 남긴다** —
 > CLAUDE.md 는 매 세션 통째로 컨텍스트에 실리므로 이력이 쌓이면 그게 곧 매 세션의 고정 비용이 된다.

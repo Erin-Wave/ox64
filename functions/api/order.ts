@@ -47,7 +47,7 @@ import {
   type ConditionalRow,
 } from '../_shared';
 
-import { checkTriggers, POLL_FILL_Q } from '../_trading';
+import { checkTriggers, scanTriggers, POLL_FILL_Q, ACTION_FILL_Q } from '../_trading';
 import { autoWritesBlocked } from '../_budget';
 
 const ENTRY_BLOCKED_MSG =
@@ -453,14 +453,14 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     // 가상 코인 = 봇 호가창 walking(§ spot.ts matchMarketOxOrder), 실제 코인 = 서버가 받은 거래소 호가창 walking(아래, § _shared fetchBook).
     // 예전엔 가상은 사다리 너머를 봇이 합성 유동성으로, 실제는 시세 한 값에 수량 무제한으로 받아 줘서 1e20 개도 즉시 전량 체결됐다.
     if (isVirtualSymbol(symbol)) {
-      const marks = await checkTriggers(env, uid);
-      // ⚠ 트리거 평가가 이미 이 심볼의 기준가를 읽었으면 그걸 쓴다 — 같은 행(spot_bot_state)을 한 요청에서
-      // 두 번 읽던 자리다. 무료 플랜은 invocation 당 D1 쿼리가 50 뿐이라(§6) 대량 시장가에선 이 한 개가
-      // 한도를 넘기는 마지막 한 개가 될 수 있다(§ spot.ts userTradeStmts).
+      // ⚠ 트리거 점검이 batch 한 번으로 읽은 것(포지션·이 심볼 기준가)을 그대로 쓴다(2026-11-20) — 예전엔 기준가·포지션을 따로 다시
+      // 읽어 DB 를 두 번 더 오갔다(DB 는 서울, 함수는 엣지라 왕복 한 번이 50~150ms). 평가가 뭔가 바꿨을 수 있으면(fresh=null) 다시 읽는다.
+      const scan = await scanTriggers(env, uid, undefined, { q: ACTION_FILL_Q }, symbol);
+      const marks = scan.prices;
       const ref = marks[symbol] ?? (await fetchPrice(env, symbol));
       // 크로스: 여유잔고 + 전 포지션 미실현손익까지 증거금으로 walking 체결에 쓸 수 있게 uPnL 을 넘긴다.
       // (가상 코인은 USDT 지갑 — 원화 포지션 손익은 섞지 않는다). 포지션은 한 번만 읽어 SL/TP 판정에도 쓴다.
-      const mine = await userPositions(env, uid);
+      const mine = scan.fresh ? scan.fresh.positions : await userPositions(env, uid);
       const uPnL = unrealizedOf(mine, marks, 'USDT');
       if (!isFinite(uPnL)) return bad(NO_MARK_MSG);
       // SL/TP 는 새로 여는 몫이 있을 때만 의미가 있다(원웨이 — 반대 포지션을 줄이기만 하는 주문이면 무시된다).
@@ -541,11 +541,14 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
   }
 
   if (body.action === 'close') {
-    const marks = await checkTriggers(env, uid);
+    // 트리거 점검이 읽은 포지션을 그대로 쓴다(평가가 뭔가 바꿨을 수 있으면 다시 읽는다 — § scanTriggers fresh)
+    const scan = await scanTriggers(env, uid, undefined, { q: ACTION_FILL_Q });
+    const marks = scan.prices;
     const positionId = typeof body.positionId === 'string' ? body.positionId : '';
-    const pos = await env.DB.prepare('SELECT * FROM positions WHERE id = ? AND user_id = ?')
-      .bind(positionId, uid)
-      .first<PositionRow>();
+    const pos =
+      (scan.fresh
+        ? scan.fresh.positions.find((p) => p.id === positionId)
+        : await env.DB.prepare('SELECT * FROM positions WHERE id = ? AND user_id = ?').bind(positionId, uid).first<PositionRow>()) ?? null;
     if (!pos) return bad('포지션을 찾을 수 없음', 404);
 
     // 부분 청산: size 를 지정하면 그만큼만, 생략하면 전량.

@@ -162,11 +162,14 @@ async function liquidateIfBankrupt(
   positions: PositionRow[],
   pendings: PendingRow[],
   prices: Record<string, number>,
+  /** 같은 요청이 방금 읽은 잔고(§ scanTriggers batch). 없으면 여기서 읽는다(cron 은 유저 차례가 왔을 때 새로 읽는다). */
+  known?: WalletBalances | null,
 ): Promise<boolean> {
   if (positions.length === 0) return false;
-  const user = await env.DB.prepare('SELECT balance, krw_balance FROM users WHERE id = ?')
-    .bind(uid)
-    .first<WalletBalances>();
+  const user =
+    known !== undefined
+      ? known
+      : await env.DB.prepare('SELECT balance, krw_balance FROM users WHERE id = ?').bind(uid).first<WalletBalances>();
   if (!user) return false;
 
   let any = false;
@@ -707,24 +710,48 @@ export async function scanTriggers(
   uid: string,
   seed?: Record<string, number>,
   budget: FillBudget = { q: POLL_FILL_Q }, // 폴링이 기본(§ POLL_FILL_Q)
+  want?: string, // 시세를 같이 받아 둘 심볼(주문하려는 가상 코인 — 아직 안 들고 있어도 기준가를 같은 batch 로)
 ): Promise<TriggerScan> {
-  const pendings = (
-    await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ?').bind(uid).all<PendingRow>()
-  ).results;
-  const positions = (
-    await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()
-  ).results;
-  const conditionals = await loadConditionals(env, uid);
+  // ⚠⚠ 읽기는 **batch 한 번**(2026-11-20) — 대기 주문 · 포지션 · 조건부 · 잔고 · 이 유저가 걸린 가상 코인의 기준가. 예전엔 하나씩
+  // 차례로 4~5번 오갔다(DB 는 서울, 함수는 접속한 엣지라 왕복 한 번이 50~150ms — § spot.ts matchMarketOxOrder). 가상 코인 기준가는
+  // 유저의 포지션·대기·조건부 심볼(+ `want` — 주문하려는 심볼)만 서브쿼리로 고른다. batch 가 깨지면(조건부 테이블이 없는 옛 DB 등)
+  // 예전처럼 하나씩 읽는다.
+  let pendings: PendingRow[];
+  let positions: PositionRow[];
+  let conditionals: ConditionalRow[];
+  let balances: WalletBalances | null | undefined; // undefined = 못 읽음(강제청산 판정이 직접 읽는다)
+  const refSeed: Record<string, number> = {};
+  try {
+    const [pend, pos, cond, bal, refs] = await env.DB.batch([
+      env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ?').bind(uid),
+      env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid),
+      env.DB.prepare('SELECT * FROM conditional_orders WHERE user_id = ?').bind(uid),
+      env.DB.prepare('SELECT balance, krw_balance FROM users WHERE id = ?').bind(uid),
+      env.DB.prepare(
+        'SELECT id, ref_price FROM spot_bot_state WHERE id IN (SELECT symbol FROM positions WHERE user_id = ? UNION SELECT symbol FROM pending_orders WHERE user_id = ? UNION SELECT symbol FROM conditional_orders WHERE user_id = ? UNION SELECT ?)',
+      ).bind(uid, uid, uid, want ?? ''),
+    ]);
+    pendings = pend.results as PendingRow[];
+    positions = pos.results as PositionRow[];
+    conditionals = cond.results as ConditionalRow[];
+    balances = (bal.results[0] as WalletBalances | undefined) ?? null;
+    for (const r of refs.results as { id: string; ref_price: number }[]) if (r.ref_price > 0) refSeed[r.id] = r.ref_price;
+  } catch {
+    pendings = (await env.DB.prepare('SELECT * FROM pending_orders WHERE user_id = ?').bind(uid).all<PendingRow>()).results;
+    positions = (await env.DB.prepare('SELECT * FROM positions WHERE user_id = ?').bind(uid).all<PositionRow>()).results;
+    conditionals = await loadConditionals(env, uid);
+  }
   const fresh = { positions, pendings, conditionals };
   if (pendings.length === 0 && positions.length === 0 && conditionals.length === 0) {
-    return { prices: { ...seed }, fresh };
+    return { prices: { ...refSeed, ...seed }, fresh };
   }
 
   const symbols = [
     ...new Set([...pendings.map((p) => p.symbol), ...positions.map((p) => p.symbol), ...conditionals.map((c) => c.symbol)]),
   ];
-  const prices = await fetchPrices(env, symbols, seed);
-  const liquidated = await runTriggers(env, uid, pendings, positions, conditionals, prices, undefined, budget);
+  // 호출자가 준 시세(seed — 통합 폴링의 방금 커밋한 기준가)가 batch 로 읽은 기준가보다 우선한다(더 새 값이다)
+  const prices = await fetchPrices(env, symbols, { ...refSeed, ...seed });
+  const liquidated = await runTriggers(env, uid, pendings, positions, conditionals, prices, undefined, budget, balances);
   const canWrite =
     liquidated ||
     pendings.length > 0 ||
@@ -745,6 +772,7 @@ async function runTriggers(
   prices: Record<string, number>,
   ranges?: PriceRanges,
   budget: FillBudget = { q: POLL_FILL_Q },
+  balances?: WalletBalances | null, // 같은 요청이 방금 읽은 잔고(§ scanTriggers) — 강제청산 판정이 다시 안 읽는다
 ): Promise<boolean> {
   // ⚠ 트리거 "발동 여부"는 현재가 한 점이 아니라 **직전 평가 이후 지나온 가격 범위**로 판정한다
   // (2026-08-14). 실제 거래소도 구간의 고가/저가로 스탑을 판정한다. 이게 필요한 이유: OX 가격은
@@ -758,7 +786,7 @@ async function runTriggers(
   const highOf = (sym: string) => ranges?.[sym]?.high ?? prices[sym];
   // ⚠ 강제청산만은 현재가로 본다 — 순간적으로 스쳐간 저가로 계좌를 파산시키면 되돌릴 방법이 없다
   // (스탑 체결은 유저가 예약한 것이지만 강제청산은 아니다). 보수적인 쪽을 택한다.
-  if (await liquidateIfBankrupt(env, uid, positions, pendings, prices)) return true; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
+  if (await liquidateIfBankrupt(env, uid, positions, pendings, prices, balances)) return true; // 방금 지운 대상으로 아래 로직 더 돌릴 필요 없음
 
   // ── 지정가 체결 ── long: 저가<=limit(싸게 매수), short: 고가>=limit(비싸게 매도)
   // ⚠ OX 는 **지금 호가창과 크로스하는 주문만** 매칭을 시도한다(2026-10-01). 매칭 함수는 주문·포지션·요율·사다리를
