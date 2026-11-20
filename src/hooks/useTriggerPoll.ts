@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { useTradingStore } from '@/store/useTradingStore';
 import { useMarketStore } from '@/store/useMarketStore';
-import { isVirtualSymbol } from '@/symbols';
+import { isListedNow, isVirtualSymbol } from '@/symbols';
 
 const BASE_MS = 2500;
 // 가상 코인을 볼 땐 통합 폴링(useSpotPoll)이 3틱(≈3초+왕복)마다 계정 상태를 싣는다 — 그보다 조금 넉넉히 기다린다. 2.5초로 보면
@@ -38,7 +38,9 @@ export function useTriggerPoll() {
       if (inFlight || document.hidden) return; // 직전 폴링이 아직 안 끝났으면(중첩 방지)·탭이 숨어 있으면 건너뜀
       // ⚠ OX 를 보고 있으면 통합 폴링(§ useSpotPoll)이 계정 상태도 함께 받아온다 → 여기서 또 요청하면
       // 그게 곧 예전의 "폴링 3개" 로 되돌아간다. 방금 갱신됐으면 이번 차례는 건너뛴다.
-      const fresh = isVirtualSymbol(useMarketStore.getState().symbol) ? VIRTUAL_STATE_MS : BASE_MS;
+      // 상장 전 가상 코인은 통합 폴링이 쉬므로(§ useSpotPoll) 실제 코인처럼 여기서 받는다.
+      const sym = useMarketStore.getState().symbol;
+      const fresh = isVirtualSymbol(sym) && isListedNow(sym) ? VIRTUAL_STATE_MS : BASE_MS;
       if (Date.now() - useTradingStore.getState().stateAt < fresh) return;
       inFlight = true;
       try {

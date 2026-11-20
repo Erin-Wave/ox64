@@ -6,12 +6,15 @@ import {
   KRW_SYMBOLS,
   KRW_NAMES,
   isVirtualSymbol,
+  isListedNow,
+  VIRTUAL_LISTINGS,
   quoteOf,
   pairLabel,
   categoryOf,
   CATEGORY_ORDER,
   type SymbolCategory,
 } from '@/symbols';
+import { ListingCountdownText } from '@/components/Listing';
 import { api } from '@/services/api';
 import { fetchBithumb24h } from '@/services/bithumb';
 
@@ -186,7 +189,8 @@ export default function SymbolSelect() {
       if (document.hidden) return; // 이건 Cloudflare 요청이다 — 숨은 탭에선 쓰지 않는다(위 둘은 거래소 직결이라 무관)
       try {
         const entries = await Promise.all(
-          VIRTUAL_SYMBOLS.map(async (sym) => {
+          // 상장 전 코인은 봉이 없다 — 받지 않는다(서버도 빈 값을 준다)
+          VIRTUAL_SYMBOLS.filter((sym) => isListedNow(sym)).map(async (sym) => {
             // ⚠ 현재가는 `spotState`(=/api/spot 호가창)가 아니라 **마지막 1시간봉의 종가**로 구한다
             // (2026-08-14, 무료 플랜 전환 ②). 그 엔드포인트는 캔들 조회와 달리 **봇 틱을 굴린다** —
             // 드롭다운을 열어둔 것만으로 코인 수 × 5초마다 봇이 돌아 쓰기가 나갔다(= cron 과 맞먹는 양).
@@ -357,12 +361,20 @@ export default function SymbolSelect() {
                         {virtual && <span className="rounded bg-accent/20 px-1 py-0.5 text-[9px] font-bold text-accent">가상</span>}
                         {krw && KRW_NAMES[s] && <span className="truncate text-[10px] font-normal text-muted">{KRW_NAMES[s]}</span>}
                       </span>
-                      <span className="flex shrink-0 items-center gap-2.5">
-                        <span className="text-text">{st ? fmtAdaptive(st.price, krw) : '—'}</span>
-                        <span className={`w-14 text-right ${up ? 'text-up' : 'text-down'}`}>
-                          {st ? `${up ? '+' : ''}${st.changePct.toFixed(2)}%` : '—'}
+                      {VIRTUAL_LISTINGS[s] && !isListedNow(s) ? (
+                        // 상장 예정 — 가격 대신 남은 시간(OKX 식). 줄이 다시 그려질 때 시각이 지났으면 평소 표시로 바뀐다.
+                        <span className="flex shrink-0 items-center gap-2.5">
+                          <span className="rounded bg-[#f0b90b]/15 px-1 py-0.5 text-[9px] font-bold text-[#f0b90b]">상장 예정</span>
+                          <ListingCountdownText symbol={s} className="w-14 text-right text-text" />
                         </span>
-                      </span>
+                      ) : (
+                        <span className="flex shrink-0 items-center gap-2.5">
+                          <span className="text-text">{st ? fmtAdaptive(st.price, krw) : '—'}</span>
+                          <span className={`w-14 text-right ${up ? 'text-up' : 'text-down'}`}>
+                            {st ? `${up ? '+' : ''}${st.changePct.toFixed(2)}%` : '—'}
+                          </span>
+                        </span>
+                      )}
                     </button>
                   </div>
                 );

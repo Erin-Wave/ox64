@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useMarketStore } from '@/store/useMarketStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { isVirtualSymbol } from '@/symbols';
+import { useListing } from '@/components/Listing';
 
 /**
  * 가상 코인을 보고 있을 때만 1초마다 **통합 폴링**(§ useTradingStore.spotTick)을 돌린다 —
@@ -29,7 +30,9 @@ export function useSpotPoll() {
   const authed = useTradingStore((s) => s.authed);
   const spotTick = useTradingStore((s) => s.spotTick);
   const spotClear = useTradingStore((s) => s.spotClear);
-  const active = authed && isVirtualSymbol(symbol);
+  // 상장 전(카운트다운 중)엔 폴링하지 않는다 — 시장이 없고 요청만 나간다. 시각이 되면 useListing 이 다시 그려 여기서 시작한다.
+  const { pending } = useListing(symbol);
+  const active = authed && isVirtualSymbol(symbol) && !pending;
 
   useEffect(() => {
     if (!active) return;

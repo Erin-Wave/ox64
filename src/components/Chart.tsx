@@ -37,6 +37,7 @@ import { useChartStore, type IndicatorConfig, type ChartColorScheme } from '@/st
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { intervalSec, KST_OFFSET, isVirtualSymbol, quoteOf, pairLabel } from '@/symbols';
+import { ListingOverlay } from '@/components/Listing';
 import { bithumbKlineStream, bithumbSupports, fetchBithumbKlines } from '@/services/bithumb';
 import { fmtPrice, fmtPriceShort, fmtQtyShort, virtualPrecision } from '@/format';
 import Clock from '@/components/Clock';
@@ -1948,6 +1949,8 @@ export default function Chart() {
           </button>
         )}
         <div ref={containerRef} className="absolute inset-0" />
+        {/* 상장 예정 코인 — 차트 자리에 카운트다운(§ components/Listing.tsx). 상장 전엔 봉이 없다. */}
+        <ListingOverlay symbol={symbol} />
       </div>
     </div>
   );

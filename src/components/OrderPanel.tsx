@@ -7,6 +7,7 @@ import { useSettingsStore } from '@/store/useSettingsStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { fmtMoney, fmtMoneyShort, fmtNumInput, unfmtNum, fmtFeeRate, fmtQtyShort, fmtQty } from '@/format';
 import { baseOf, isVirtualSymbol, quoteOf, USDT_KRW } from '@/symbols';
+import { ListingCountdownText, useListing } from '@/components/Listing';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit' | 'conditional';
@@ -180,6 +181,7 @@ export default function OrderPanel() {
   const pendingCount = useTradingStore((s) => s.pendingOrders.length);
   const precisions = useMarketStore((s) => s.precisions);
   const virtual = isVirtualSymbol(symbol);
+  const listing = useListing(symbol); // 상장 예정 코인이면 주문을 막는다(§ submit)
   const tickDp = precisionOf(precisions, symbol); // 이 코인의 호가 소수 자릿수(실제 코인은 바이낸스 tickSize, 가상은 가격에서 파생)
   // 남은 대기 주문 자리 — 보유 포지션이 있으면 반대 주문 다리 하나가 청산 줄 + 진입 줄로 쪼개질 수 있어 1자리 남긴다(서버와 같은 규칙).
   const slots = MAX_OPEN - pendingCount - (positions.some((p) => p.symbol === symbol) ? 1 : 0);
@@ -206,6 +208,7 @@ export default function OrderPanel() {
   // ⚠ 앞 주문이 처리 중이어도(`busy`) 버리지 않는다 — 스토어가 줄을 세워 차례로 보낸다(§ useTradingStore enqueue).
   // 예전엔 여기서 `busy` 면 return 해서 F9·버튼 연타가 두세 번에 한 번씩 씹혔다. 인자는 **지금** 값으로 만든다.
   const submit = (side: Side) => {
+    if (listing.pending) return; // 상장 전(§ components/Listing.tsx) — 서버도 거부한다. F9/F10 도 여기서 멈춘다
     const sz = orderSize; // ⚠ Easy 모드는 슬라이더 비중에서 바로(§ orderSize)
     if (!sz || sz <= 0) return;
     if (effectiveTab === 'conditional') {
@@ -823,7 +826,13 @@ export default function OrderPanel() {
         <TradeToasts error={error} notice={notice} />
       )}
 
-      {/* 롱/숏 — 처리 중에도 눌린다(누른 만큼 차례로 나간다, § submit) */}
+      {/* 상장 예정 코인 — 롱/숏 대신 남은 시간(§ components/Listing.tsx) */}
+      {listing.pending ? (
+        <div className="mt-auto rounded-md border border-border bg-panel2 py-2 text-center text-sm font-bold text-muted">
+          상장까지 <ListingCountdownText symbol={symbol} className="text-text" />
+          <div className="mt-0.5 text-[10px] font-normal">상장 후 주문할 수 있습니다</div>
+        </div>
+      ) : (
       <div className="mt-auto grid grid-cols-2 gap-2">
         <button
           onClick={() => submit('long')}
@@ -840,6 +849,7 @@ export default function OrderPanel() {
           숏 · Sell <span className="ml-1 hidden text-[10px] font-semibold opacity-70 md:inline">F10</span>
         </button>
       </div>
+      )}
     </div>
   );
 }

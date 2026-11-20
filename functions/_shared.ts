@@ -67,9 +67,31 @@ export const BOT_USER_IDS = ['bot-mm-1', 'bot-mm-2'] as const;
 // 외부 시세 없는 가상 심볼(서버측 사본 — functions/ 는 src/symbols.ts 를 import 할 수 없어
 // intervalSecFromCode 와 같은 이유로 값만 독립 보관). OXUSDT 는 레버리지 롱/숏도 다른 38종과
 // 완전히 동일하게 order.ts 를 타지만, 체결가만 OKX/Coinbase 대신 봇이 만든 내부가격을 쓴다.
-const VIRTUAL_SYMBOLS = ['OXUSDT', 'EWUSDT'] as const;
+const VIRTUAL_SYMBOLS = ['OXUSDT', 'EWUSDT', 'GNUSDT', 'GOUSDT'] as const;
 export function isVirtualSymbol(s: string): boolean {
   return (VIRTUAL_SYMBOLS as readonly string[]).includes(s);
+}
+
+// ── 가상 코인 상장 예정(2026-11-20) ─────────────────────────────────────────────
+// 목록엔 미리 보이고 이 시각이 되면 저절로 거래가 열린다(OKX 식 상장 카운트다운 — 클라 src/symbols.ts VIRTUAL_LISTINGS 와
+// **같은 값**이어야 한다). 상장 전엔: 주문 접수 거부(order.ts), 봇·캔들·호가 조회는 아무것도 하지 않는다(spot.ts·state.ts·cron) —
+// D1 쓰기·쿼리 0. 시각이 되면 첫 폴링(보는 사람이 있으면 1초 안)이나 다음 cron(1분 안)이 상장가에서 시장을 시작한다.
+// 상장가는 D1 `spot_bot_state` 시작가 행(ref_price·anchor, last_run = 상장 시각)에 들어간다 — 여기의 price 는 표시·확인용.
+// 여기 없는 가상 코인은 이미 상장된 것이다. 상장이 끝난 항목은 지워도 된다(지우면 그냥 "상장됨").
+export const VIRTUAL_LISTINGS: Record<string, { at: number; price: number }> = {
+  GNUSDT: { at: Date.parse('2026-11-20T13:00:00+09:00'), price: 10 },
+  GOUSDT: { at: Date.parse('2026-11-20T14:00:00+09:00'), price: 361 },
+};
+/** 지금 거래할 수 있는가 — 상장 예정이 없거나 그 시각이 지났으면 true. */
+export function isListed(symbol: string, now = Date.now()): boolean {
+  const l = VIRTUAL_LISTINGS[symbol];
+  return !l || now >= l.at;
+}
+/** 상장 전 주문 거부 문구(한국 시간 표기). */
+export function notListedMsg(symbol: string): string {
+  const l = VIRTUAL_LISTINGS[symbol];
+  const kst = l ? new Date(l.at + 9 * 3600_000).toISOString().slice(0, 16).replace('T', ' ') : '';
+  return `상장 전입니다 — ${kst} (한국 시간)에 거래가 열립니다`;
 }
 
 // ── 원화(KRW) 마켓 — 빗썸(2026-09-24) ─────────────────────────────────────────

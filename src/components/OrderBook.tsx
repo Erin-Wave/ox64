@@ -4,6 +4,7 @@ import { useMarketStore, precisionOf, selectLastPrice, selectLastTakerSide } fro
 import { useChartStore } from '@/store/useChartStore';
 import { useTradingStore } from '@/store/useTradingStore';
 import { baseOf, isVirtualSymbol, quoteOf } from '@/symbols';
+import { ListingCountdownText, useListing } from '@/components/Listing';
 import { bithumbOrderbookStream } from '@/services/bithumb';
 import { fmtMoney, fmtMoneyShort, fmtPct, fmtPrice, fmtPriceShort, fmtQtyShort, fmtUsd, fmtUsdShort, precisionFromTick } from '@/format';
 import type { TickerTrade } from '@/types';
@@ -173,6 +174,7 @@ export default function OrderBook() {
   const precisions = useMarketStore((s) => s.precisions);
   const trades = useMarketStore((s) => s.recentTrades[s.symbol] ?? EMPTY_TRADES);
   const virtual = isVirtualSymbol(symbol);
+  const listing = useListing(symbol); // 상장 예정 코인은 호가·체결이 아직 없다(§ components/Listing.tsx)
   const spotBook = useTradingStore((s) => s.spotBook);
   const spotPair = useTradingStore((s) => s.spotPair);
   // 한 화면에 보여줄 행 수(설정 → 5~50). 호가는 각 열마다, 체결은 목록 전체에 같은 값을 쓴다.
@@ -582,6 +584,14 @@ ${
 
   // PC 에서 "같이 보기" 를 켰으면 탭 없이 위(호가)·아래(체결)로 나란히 그린다. 사이드바(18rem)가 좁아
   // 좌우로 나누면 세 칸이 되어 가격/수량이 뭉개지므로 세로로 쌓는다 — 넘치면 사이드바가 스크롤된다.
+  // 상장 예정 코인(§ components/Listing.tsx) — 어느 배치(함께 보기·탭)든 안내 한 줄. ⚠ 훅을 다 부른 뒤에 둘 것
+  if (listing.pending)
+    return (
+      <div className="border-b border-border bg-panel px-3 py-6 text-center text-[11px] text-muted md:border-b-0 md:border-t">
+        상장 전이라 호가·체결이 없습니다 — 상장까지 <ListingCountdownText symbol={symbol} className="font-semibold text-text" />
+      </div>
+    );
+
   if (together)
     return (
       <div className="border-b border-border bg-panel p-1.5 text-[11px] md:border-b-0 md:border-t">

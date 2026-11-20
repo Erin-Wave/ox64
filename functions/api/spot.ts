@@ -14,6 +14,7 @@ import {
   feeRateOf,
   feeAccrualStmts,
   isVirtualSymbol,
+  isListed,
   vipOf,
   sizeEps,
   roundVirtual,
@@ -70,6 +71,10 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     // 유령 페어를 만들 수 있다. 파라미터가 없으면 기본값(첫 가상 코인)으로 떨어져 구버전 클라와도 호환된다.
     const reqPair = url.searchParams.get('pair') || VIRTUAL_PAIRS[0];
     if (!VIRTUAL_PAIRS.includes(reqPair)) return bad('알 수 없는 페어');
+    // 상장 전(§ _shared VIRTUAL_LISTINGS)엔 시장이 없다 — 봇도 D1 도 건드리지 않고 빈 값만(심볼 선택기가 열려 있어도 비용 0).
+    if (!isListed(reqPair)) {
+      return json(url.searchParams.get('candles') ? { candles: [], more: false } : { book: { bids: [], asks: [] }, trades: [] });
+    }
 
     // ⚠ **캔들 조회는 마켓메이커를 굴리지 않는다**(2026-07-31). 예전엔 이 핸들러에 들어오면 종류 구분 없이
     // 봇을 한 틱 돌렸는데, 캔들은 차트가 읽어가는 조회일 뿐 시장을 움직일 이유가 없다. 그리고 가상 코인이
@@ -1283,7 +1288,7 @@ function burstTicks(lastRun: number, budget: number): number {
 // ⚠ 코인 하나가 **아무도 안 볼 때** 드는 D1 쓰기는 하루 ~1,600행(무료 한도의 1.6% — 분마다 상태 행 1, 2026-11-20 전엔
 // 4,800행)이고, cron 실행 하나의 D1 쿼리(무료 50/호출)를 읽기 1 + 커밋 ~3 만큼 쓴다. 4코인까지는 그대로 들어간다
 // (cron/index.ts MM_TICKS_PER_PAIR 주석, _trading.ts CRON_FILL_Q, docs/VIRTUAL_COIN.md "코인을 늘릴 때").
-export const VIRTUAL_PAIRS: readonly string[] = ['OXUSDT', 'EWUSDT'];
+export const VIRTUAL_PAIRS: readonly string[] = ['OXUSDT', 'EWUSDT', 'GNUSDT', 'GOUSDT'];
 
 // ⚠ `spot_trades` 보존 기간 — 2026-10-17 부터 아무도 이 테이블에 쓰지 않는다(유저 체결도 테이프로, § userTapeStmt).
 // 남은 옛 행을 치우는 DELETE 만 봇 커밋에 가끔 얹혀 있고, 다 지워진 뒤엔 지울 게 없어 비용 0 이다. 읽는 곳은 기준가 폴백
@@ -3060,6 +3065,8 @@ async function runBotTicks(
  * 이걸 `loadSpotMarket` 에 그대로 넘겨 상태 행과 대기 주문을 다시 읽지 않게 한다 — 게이트에 막힌
  * 폴링(가장 흔한 경로)도 여기서 읽은 행 하나로 호가창까지 그려진다. */
 export async function runMarketMaker(env: Env, pair: string): Promise<TickCtx> {
+  // 상장 전(§ _shared VIRTUAL_LISTINGS)엔 시장이 없다 — 상태 행도 읽지 않는다(호출자는 null 을 "모른다"로 받아 빈 호가창을 그린다).
+  if (!isListed(pair)) return { book: null, tape: null, pendings: null, live: null, pack: null, ref: null, mark: null };
   const row = await env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`)
     .bind(pair)
     .first<BotStateRow>();
@@ -3104,6 +3111,7 @@ export async function runMarketMaker(env: Env, pair: string): Promise<TickCtx> {
  * `budget` = 이 페어에 쓸 수 있는 틱 수(cron 이 코인 수로 나눈 몫). 유저가 보고 있으면 그보다 적게 돈다(§ burstTicks).
  */
 export async function runMarketMakerBurst(env: Env, pair: string, budget: number = BOT_BURST_TICKS): Promise<number[]> {
+  if (!isListed(pair)) return []; // 상장 전(§ _shared VIRTUAL_LISTINGS)
   // 예산 초과면 이번 버스트는 통째로 건너뛴다(§ _budget.ts) — 버스트당 1회만 판정하면 되므로
   // 틱마다 조회가 붙지 않는다. 트리거 sweep(강제청산·지정가·SL/TP)은 **막지 않는다**: 그건 돈이 걸린
   // 기능이라 멈추면 유저 손실로 이어지고, 애초에 폭주하지도 않는다.
@@ -3133,22 +3141,25 @@ export interface BurstResult {
  */
 export async function runMarketMakerBursts(env: Env, budgetPerPair: number): Promise<Record<string, BurstResult>> {
   const out: Record<string, BurstResult> = {};
+  // 상장 전 코인(§ _shared VIRTUAL_LISTINGS)은 읽지도 돌리지도 않는다 — 상장 시각이 지난 첫 실행이 상장가 행에서 시장을 연다.
+  const PAIRS = VIRTUAL_PAIRS.filter((p) => isListed(p));
+  if (PAIRS.length === 0) return out;
   let rows: (BotStateRow | null)[];
   let pendings: (PendingLite & { symbol: string })[];
   try {
     const res = await env.DB.batch([
       meterReadStmt(env),
-      ...VIRTUAL_PAIRS.map((p) => env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(p)),
+      ...PAIRS.map((p) => env.DB.prepare(`SELECT ${BOT_STATE_COLS} FROM spot_bot_state WHERE id = ?`).bind(p)),
       env.DB.prepare(
-        `SELECT symbol, id, user_id, side, limit_price AS price, size, reduce_only, last_fill_at FROM pending_orders WHERE symbol IN (${VIRTUAL_PAIRS.map(() => '?').join(',')})`,
-      ).bind(...VIRTUAL_PAIRS),
+        `SELECT symbol, id, user_id, side, limit_price AS price, size, reduce_only, last_fill_at FROM pending_orders WHERE symbol IN (${PAIRS.map(() => '?').join(',')})`,
+      ).bind(...PAIRS),
     ]);
     primeMeter((res[0].results[0] as { rows_est?: number } | undefined)?.rows_est);
-    rows = VIRTUAL_PAIRS.map((_, i) => (res[1 + i].results[0] as BotStateRow | undefined) ?? null);
-    pendings = res[1 + VIRTUAL_PAIRS.length].results as (PendingLite & { symbol: string })[];
+    rows = PAIRS.map((_, i) => (res[1 + i].results[0] as BotStateRow | undefined) ?? null);
+    pendings = res[1 + PAIRS.length].results as (PendingLite & { symbol: string })[];
   } catch (e) {
     console.error('[ox64] runMarketMakerBursts batch read failed — 페어별 경로로:', e instanceof Error ? e.message : e);
-    for (const p of VIRTUAL_PAIRS) {
+    for (const p of PAIRS) {
       try {
         const path = await runMarketMakerBurst(env, p, budgetPerPair);
         out[p] = { path, ref: null }; // 이 경로는 대기 주문 유무를 모른다 — 시세는 호출자가 다시 읽는다
@@ -3160,8 +3171,8 @@ export async function runMarketMakerBursts(env: Env, budgetPerPair: number): Pro
   }
   // 예산 초과면 버스트를 통째로 건너뛴다(§ runMarketMakerBurst) — 계량값은 위 batch 가 이미 캐시에 넣었다.
   if (await autoWritesBlocked(env, 'bot')) return out;
-  for (let i = 0; i < VIRTUAL_PAIRS.length; i++) {
-    const pair = VIRTUAL_PAIRS[i];
+  for (let i = 0; i < PAIRS.length; i++) {
+    const pair = PAIRS[i];
     const row = rows[i];
     try {
       const ticks = burstTicks(row?.last_run ?? 0, budgetPerPair);

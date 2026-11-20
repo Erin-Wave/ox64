@@ -224,6 +224,11 @@ CREATE TABLE IF NOT EXISTS spot_bot_state (
 INSERT OR IGNORE INTO spot_bot_state (id, last_run, ref_price, anchor) VALUES
   ('OXUSDT', 0, 1, 1),
   ('EWUSDT', 0, 1, 1);
+-- ⚠ 상장 예정 코인(2026-11-20, functions/_shared.ts VIRTUAL_LISTINGS)은 last_run = **상장 시각**(ms)으로 넣는다 — 상장 전엔 봇이
+-- 이 행을 건드리지 않고, 상장 뒤 첫 실행이 "상장 시각부터 흐른 시간"만큼 시장을 돌린다. ref_price·anchor = 상장가.
+INSERT OR IGNORE INTO spot_bot_state (id, last_run, ref_price, anchor) VALUES
+  ('GNUSDT', 1795147200000, 10, 10),     -- 2026-11-20 13:00 KST, 10 USDT
+  ('GOUSDT', 1795150800000, 361, 361);   -- 2026-11-20 14:00 KST, 361 USDT
 
 -- ── 봇 재고(가상 코인별) ──────────────────────────────────────────────
 -- 봇이 유저 상대로 체결하면 현금(users.balance)과 함께 이 재고가 움직인다(functions/api/spot.ts

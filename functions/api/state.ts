@@ -1,4 +1,4 @@
-import { type Ctx, bad, json, safe, missingEnv, getSession, loadState } from '../_shared';
+import { type Ctx, bad, json, safe, missingEnv, getSession, loadState, isListed } from '../_shared';
 import { scanTriggers, HEAVY_TICK_FILL_Q } from '../_trading';
 import { loadSpotMarket, loadSpotCandles, runMarketMaker, VIRTUAL_PAIRS, type TickCtx } from './spot';
 
@@ -31,6 +31,13 @@ export function onRequestGet({ request, env }: Ctx): Promise<Response> {
     if (pair) {
       // ⚠ 페어는 화이트리스트 검증(§ spot.ts) — 검증 없이 쓰면 임의 문자열로 유령 페어를 만들 수 있다.
       if (!VIRTUAL_PAIRS.includes(pair)) return bad('알 수 없는 페어');
+      // 상장 전(§ _shared VIRTUAL_LISTINGS) — 클라는 카운트다운 동안 이 폴링을 돌리지 않지만(useSpotPoll), 시계가 몇 초 어긋난
+      // 클라가 일찍 보내면 시장 없이 빈 값을 준다(봇·캔들 D1 0). 계정 상태를 원하면 그건 평소처럼.
+      if (!isListed(pair)) {
+        const wantState = url.searchParams.get('state') === '1';
+        const state = wantState ? await scanTriggers(env, sess.uid).then((scan) => loadState(env, sess.uid, scan.prices, since, scan.fresh)) : null;
+        return json({ market: { book: { bids: [], asks: [] }, trades: [] }, candles: [], state, mark: null });
+      }
       // 이 폴링이 곧 봇 마켓메이커 클럭이다(예전 /api/spot 폴링이 하던 역할). 봇 실패가 유저 요청을
       // 막으면 안 되지만 조용히 삼키지도 않는다 — 봇이 죽어도 화면은 멀쩡해 보여 원인 추적이 어렵다.
       // ⚠ 반환된 컨텍스트(§ TickCtx)를 아래 loadSpotMarket 에 넘긴다 — 봇 틱이 이미 읽은 상태 행과

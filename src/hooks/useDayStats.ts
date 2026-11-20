@@ -3,6 +3,7 @@ import { api } from '@/services/api';
 import { fetchDaySince } from '@/services/binanceRest';
 import { bithumbDayStream } from '@/services/bithumb';
 import { isVirtualSymbol, KST_OFFSET, quoteOf } from '@/symbols';
+import { useListing } from '@/components/Listing';
 import type { TickerTrade } from '@/types';
 
 /**
@@ -89,8 +90,11 @@ function loadBaseShared(symbol: string): Promise<Base> {
 }
 
 /** `active` 일 때만(호가·체결이 화면에 있을 때) 받는다. */
-export function useDayStats(symbol: string, trades: TickerTrade[] = EMPTY, active = true): DayStats {
+export function useDayStats(symbol: string, trades: TickerTrade[] = EMPTY, activeIn = true): DayStats {
   const [base, setBase] = useState<Base | null>(null);
+  // 상장 전 가상 코인은 받을 봉이 없다 — 받지 않는다(상장되면 다시 그려 그때부터).
+  const { pending } = useListing(symbol);
+  const active = activeIn && !pending;
 
   useEffect(() => {
     if (!active) return;

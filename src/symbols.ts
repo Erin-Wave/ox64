@@ -12,8 +12,16 @@ export const SYMBOLS = [
 // 콤보박스(SymbolSelect)에서 선택하지만 차트/호가/주문 데이터소스가 완전히 다르다.
 // ⚠ 여기에 심볼을 추가하면 `functions/api/spot.ts VIRTUAL_PAIRS` 와 D1 `spot_bot_state` 시작가 행도
 // 같이 추가해야 한다(셋 중 하나라도 빠지면 목록엔 뜨는데 시세가 안 도는 유령 코인이 된다).
-export const VIRTUAL_SYMBOLS = ['OXUSDT', 'EWUSDT'] as const;
+export const VIRTUAL_SYMBOLS = ['OXUSDT', 'EWUSDT', 'GNUSDT', 'GOUSDT'] as const;
 export const isVirtualSymbol = (s: string): boolean => (VIRTUAL_SYMBOLS as readonly string[]).includes(s);
+/** 상장 예정 가상 코인(2026-11-20) — 목록엔 미리 뜨고 이 시각에 저절로 거래가 열린다(components/Listing.tsx 카운트다운).
+ * ⚠ 서버 사본 functions/_shared.ts VIRTUAL_LISTINGS 와 **같은 값**이어야 한다(서버가 그 전 주문을 거부한다). 여기 없으면 이미 상장된 코인. */
+export const VIRTUAL_LISTINGS: Record<string, { at: number; price: number }> = {
+  GNUSDT: { at: Date.parse('2026-11-20T13:00:00+09:00'), price: 10 },
+  GOUSDT: { at: Date.parse('2026-11-20T14:00:00+09:00'), price: 361 },
+};
+/** 지금 거래할 수 있는가(이 기기 시계 기준) — 화면을 다시 그려야 하는 곳은 components/Listing.tsx useListing 을 쓸 것. */
+export const isListedNow = (s: string, now = Date.now()): boolean => !VIRTUAL_LISTINGS[s] || now >= VIRTUAL_LISTINGS[s].at;
 
 // ── 원화(KRW) 마켓 — 빗썸(2026-09-24) ──
 // 차트·호가·체결은 브라우저가 빗썸에 직접 붙고(services/bithumb.ts, CORS 허용 — Cloudflare 요청·D1 0),
