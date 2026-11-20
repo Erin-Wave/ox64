@@ -81,6 +81,8 @@ interface TradingState {
     takeProfit?: number | null;
   }) => Promise<void>;
   closePosition: (id: string, size?: number) => Promise<void>;
+  /** 전부 청산 — 아직 안 보낸 진입 주문을 버리고, 지금 처리 중인 요청이 끝나는 대로 **그때의** 포지션을 전부 시장가로(§ closeAllPositions). */
+  closeAllPositions: () => Promise<void>;
   limitClose: (positionId: string, size: number, limitPrice: number) => Promise<void>;
   limitOpen: (p: {
     symbol: string;
@@ -272,6 +274,16 @@ let lastLogoutAt = 0;
 let lastStateSentAt = 0;
 let actionChain: Promise<unknown> = Promise.resolve();
 let actionsQueued = 0;
+// ── "전부 청산"은 줄 맨 뒤에서 기다리지 않는다(2026-11-20, 제보 "전부 청산이 안 먹힌다") ─────────────────────────────
+// 주문은 줄을 서서 하나씩 나가는데(위) 운영에선 가상 코인 주문 하나가 ~2.7초다. 롱을 15번 빠르게 누르고 전부 청산을 누르면 청산이
+// 그 15건 뒤에 서서 **40초 동안 포지션이 오히려 커지다가** 그제야 닫혔다(운영 기록: 9,313 × 15 롱이 2.7초 간격으로 들어가고 마지막
+// 롱 2.5초 뒤 139,700 청산). 그래서 전부 청산은 **아직 차례가 안 온 진입 주문**(시장가·지정가·분할·조건부)을 보내지 않게 하고
+// (`entryEpoch` 를 올리면 줄에 선 진입 주문이 차례가 와도 그냥 넘어간다), 지금 처리 중인 한 건이 끝나는 대로 청산한다.
+// 청산·취소·수정 같은 다른 액션은 그대로 간다(위험을 줄이는 쪽이다).
+let entryEpoch = 0;
+let entriesWaiting = 0; // 줄에 서서 아직 차례가 안 온 진입 주문 수
+/** 아직 서버로 안 보낸 진입 주문 수 — 전부 청산 확인창 문구용. */
+export const queuedEntryCount = () => entriesWaiting;
 function enqueue<T>(set: (s: Partial<TradingState>) => void, run: () => Promise<T>): Promise<T> {
   actionsQueued++;
   set({ busy: true });
@@ -282,7 +294,7 @@ function enqueue<T>(set: (s: Partial<TradingState>) => void, run: () => Promise<
   });
 }
 /** 서버에 상태를 바꾸는 요청 하나 — 응답(새 계정 상태)을 반영하고, 실패하면 사유를 `error` 에 남긴다. */
-function action(set: (s: Partial<TradingState>) => void, call: () => Promise<AppState>): Promise<void> {
+function action(set: (s: Partial<TradingState>) => void, call: () => Promise<AppState>, entry = false): Promise<void> {
   // ⚠ 에러는 **줄이 비어 있을 때 새로 시작한 액션**만 지운다(2026-10-01) — F9 세 번 중 두 번째가 실패했는데 세 번째가 성공하면서
   // 그 사유를 지워, 한 건이 안 들어간 걸 알 수 없었다.
   const fresh = actionsQueued === 0;
@@ -290,8 +302,12 @@ function action(set: (s: Partial<TradingState>) => void, call: () => Promise<App
   //   (지나간 로그아웃 시각보다 지금이 항상 늦다). 앞 요청이 멈춘 사이 로그아웃하면 줄에 남은 주문이 그대로 나갔다(다른 이름으로
   //   다시 로그인했으면 그 계정으로).
   const queuedAt = Date.now();
+  const epoch = entryEpoch;
+  if (entry) entriesWaiting++;
   return enqueue(set, async () => {
+    if (entry) entriesWaiting--;
     if (queuedAt < lastLogoutAt) return; // 로그아웃 전에 줄 선 액션 — 보내지 않는다
+    if (entry && epoch !== entryEpoch) return; // 이 주문 뒤에 전부 청산이 눌렸다 — 보내지 않는다(§ entryEpoch)
     if (fresh) set({ error: null, notice: null });
     try {
       const st = await call();
@@ -336,7 +352,7 @@ function applySpot(set: (s: Partial<TradingState>) => void, st: SpotState, pair:
   dripTrades(set, st.trades);
 }
 
-export const useTradingStore = create<TradingState>((set) => ({
+export const useTradingStore = create<TradingState>((set, get) => ({
   ready: false,
   authed: false,
   name: null,
@@ -461,16 +477,50 @@ export const useTradingStore = create<TradingState>((set) => ({
   // ⚠ 아래 거래 액션은 전부 한 줄(§ enqueue)로 차례로 나간다 — 눌린 건 버리지 않고, 서버엔 동시에 도착하지 않는다.
   // 가격은 보내지 않는다 — 서버가 체결가를 직접 받아 쓴다.
   openMarket: ({ symbol, side, size, leverage, stopLoss, takeProfit }) =>
-    action(set, () => api.open({ symbol, side, size, leverage, stopLoss, takeProfit })),
+    action(set, () => api.open({ symbol, side, size, leverage, stopLoss, takeProfit }), true),
 
   closePosition: (id, size) => action(set, () => api.close(id, size)),
+
+  // 전부 청산(§ entryEpoch) — ① 줄에 선 진입 주문을 버린다 ② 차례가 오면(= 지금 처리 중인 한 건 뒤) **그 순간의** 포지션 목록을 읽어
+  // 하나씩 시장가 전량 청산 — 누른 순간의 목록이 아니다(처리 중이던 주문이 새로 연 포지션까지 닫는다). 호가 물량이 모자라면 서버가
+  // 있는 만큼만 청산하고 나머지는 남긴다(§4 시장가 = 호가창에 있는 물량만) — 결과를 한 줄로 알린다.
+  closeAllPositions: () => {
+    const dropped = entriesWaiting;
+    entryEpoch++;
+    const queuedAt = Date.now();
+    return enqueue(set, async () => {
+      if (queuedAt < lastLogoutAt) return;
+      set({ error: null, notice: null });
+      const ids = get().positions.map((p) => p.id);
+      let failed = 0;
+      let lastErr = '';
+      let partial = '';
+      for (const id of ids) {
+        try {
+          const st = await api.close(id);
+          if (queuedAt < lastLogoutAt) return;
+          apply(set, st);
+          lastActionAt = Date.now();
+          if (st.notice) partial = st.notice;
+        } catch (e) {
+          failed++;
+          lastErr = (e as Error).message;
+        }
+      }
+      const left = get().positions.length;
+      const head = `전부 청산 — 포지션 ${ids.length}개${dropped ? ` · 아직 안 보낸 주문 ${dropped}건은 취소` : ''}`;
+      if (failed) showError(set, `${head} · ${failed}개 실패: ${lastErr}`);
+      else if (left) showNotice(set, `${head} · ${left}개는 호가 물량이 모자라 일부만 청산됐습니다${partial ? ` (${partial})` : ''}`);
+      else showNotice(set, `${head} 청산 완료`);
+    });
+  },
 
   limitClose: (positionId, size, limitPrice) => action(set, () => api.limitClose(positionId, size, limitPrice)),
 
   limitOpen: ({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit }) =>
-    action(set, () => api.limitOpen({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit })),
+    action(set, () => api.limitOpen({ symbol, side, size, leverage, limitPrice, stopLoss, takeProfit }), true),
 
-  limitRange: (p) => action(set, () => api.limitRange(p)),
+  limitRange: (p) => action(set, () => api.limitRange(p), true),
 
   cancelLimit: (pendingId) => action(set, () => api.cancelLimit(pendingId)),
 
@@ -480,7 +530,7 @@ export const useTradingStore = create<TradingState>((set) => ({
 
   setSlTp: (positionId, p) => action(set, () => api.setSlTp(positionId, p)),
 
-  conditionalOpen: (p) => action(set, () => api.conditionalOpen(p)),
+  conditionalOpen: (p) => action(set, () => api.conditionalOpen(p), true),
 
   editConditional: (conditionalId, p) => action(set, () => api.editConditional(conditionalId, p)),
 

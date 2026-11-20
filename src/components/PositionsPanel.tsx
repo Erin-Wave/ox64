@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useMarketStore, precisionOf } from '@/store/useMarketStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
-import { useTradingStore } from '@/store/useTradingStore';
+import { useTradingStore, queuedEntryCount } from '@/store/useTradingStore';
 import { fmtPrice, fmtPriceShort, fmtQty, fmtQtyShort, fmtMoney, fmtMoneyShort, fmtPct, fmtNumInput, unfmtNum, fmtKrw } from '@/format';
 import { baseOf, pairLabel, quoteOf } from '@/symbols';
 import type { ApiOrder } from '@/services/api';
@@ -60,6 +60,7 @@ export default function PositionsPanel() {
   const balance = useTradingStore((s) => s.balance);
   const krwBalance = useTradingStore((s) => s.krwBalance);
   const closePosition = useTradingStore((s) => s.closePosition);
+  const closeAllPositions = useTradingStore((s) => s.closeAllPositions);
   const limitClose = useTradingStore((s) => s.limitClose);
   const cancelLimit = useTradingStore((s) => s.cancelLimit);
   const cancelAllLimits = useTradingStore((s) => s.cancelAllLimits);
@@ -777,9 +778,13 @@ export default function PositionsPanel() {
           </span>
           <button
             onClick={() => {
-              if (window.confirm(`포지션 ${positions.length}개를 모두 시장가로 청산할까요?\n(호가 물량이 모자라면 일부만 청산되고 나머지는 남습니다)`)) {
-                for (const p of positions) closeAll(p.id);
-              }
+              // ⚠ 줄에 선 진입 주문 뒤에서 기다리지 않는다 — 아직 안 보낸 주문은 버리고 바로 청산한다(§ useTradingStore closeAllPositions)
+              const waiting = queuedEntryCount();
+              const msg =
+                `포지션 ${positions.length}개를 모두 시장가로 청산할까요?` +
+                (waiting ? `\n아직 서버로 안 보낸 주문 ${waiting}건은 취소합니다.` : '') +
+                `\n(호가 물량이 모자라면 일부만 청산되고 나머지는 남습니다)`;
+              if (window.confirm(msg)) void closeAllPositions();
             }}
             className="shrink-0 rounded border border-border px-2 py-1 text-muted transition hover:border-down hover:text-down"
           >
