@@ -72,7 +72,7 @@ export default function OrderPanel() {
   // 상태로 두고 USDT 표시를 (코인×가격)으로 매번 재계산했는데, 그 왕복(coin→toFixed(6)→usdt)에서 정밀도가
   // 깨져 USDT 로 입력하면 타이핑이 엉뚱한 값으로 튀었다(예: BTC 에 "1 USDT" → 0.98 로 표시). 이제 입력칸엔
   // 사용자가 친 값을 그대로 두고 sizeCoin 만 파생하므로 USDT 입력이 정상 동작한다.
-  const [amtInput, setAmtInput] = useState('0.01');
+  const [amtInput, setAmtInput] = useState('1');
   const [unit, setUnit] = useState<Unit>('coin');
   const [pct, setPct] = useState(0); // 수량 슬라이더(가용 잔고*레버리지 대비 비중, 0~100)
   const [leverage, setLeverage] = useState(10);
@@ -287,7 +287,7 @@ export default function OrderPanel() {
   // 슬라이더 100% 가 그대로 거부된다(200배면 수수료가 증거금의 ~6% 라 0.1% 여유로는 못 덮는다).
   const SAFETY = 0.999;
   // 주문에 실제로 쓰는 코인 수량. ⚠ Easy 모드엔 수량 칸이 없으므로 **슬라이더 비중에서만** 정한다(2026-10-01) — 예전엔 숨은
-  // 입력칸 값(기본 0.01 코인, 또는 Standard 에서 친 값)이 그대로 나가서 0% 인데도 주문이 들어갔다. 0% 면 주문하지 않는다.
+  // 입력칸 값(기본 1 코인, 또는 Standard 에서 친 값)이 그대로 나가서 0% 인데도 주문이 들어갔다. 0% 면 주문하지 않는다.
   const orderSize = standard
     ? sizeCoin
     : pct > 0 && refPrice
