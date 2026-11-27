@@ -8,6 +8,7 @@ import { useTradingStore } from '@/store/useTradingStore';
 import { fmtMoney, fmtMoneyShort, fmtNumInput, unfmtNum, fmtFeeRate, fmtQtyShort, fmtQty } from '@/format';
 import { baseOf, isVirtualSymbol, quoteOf, USDT_KRW } from '@/symbols';
 import { ListingCountdownText, useListing } from '@/components/Listing';
+import { confirmFarLimit } from '@/limitGuard';
 import type { Side } from '@/types';
 
 type Tab = 'market' | 'limit' | 'conditional';
@@ -231,14 +232,18 @@ export default function OrderPanel() {
       return;
     }
     const { stopLoss: sl, takeProfit: tp } = parseSlTp();
+    // ⚠ 현재가와 2배 넘게 벗어난 지정가는 확인을 받는다(§ limitGuard — 자릿수를 잘못 친 가격 방지). 취소하면 아무것도 안 나간다.
+    const dir = side === 'long' ? 'buy' : 'sell';
     if (splitOn) {
       if (!(startNum > 0) || !(endNum > 0)) return;
+      if (!confirmFarLimit([startNum, endNum], dir, lastPrice, tickDp, quote)) return;
       limitRange({ symbol, side, size: sz, leverage, startPrice: startNum, endPrice: endNum, tickDp: virtual ? undefined : tickDp, stopLoss: sl, takeProfit: tp });
       return;
     }
     if (effectiveTab === 'limit') {
       const lp = Number(limitPrice);
       if (!lp || lp <= 0) return;
+      if (!confirmFarLimit([lp], dir, lastPrice, tickDp, quote)) return;
       limitOpen({ symbol, side, size: sz, leverage, limitPrice: lp, stopLoss: sl, takeProfit: tp });
     } else {
       openMarket({ symbol, side, size: sz, leverage, stopLoss: sl, takeProfit: tp });

@@ -40,7 +40,7 @@ export default function RefillModal({ onClose }: { onClose: () => void }) {
           <div className="min-w-0">
             <h2 className="text-base font-extrabold text-text">자산이 모두 소진되었습니다</h2>
             <p className="mt-0.5 text-xs text-muted">
-              {positions.length > 0 ? '평가자산이 0 이하입니다' : '강제청산으로 잔고가 0 이 되었습니다'}
+              {positions.length > 0 ? '평가자산이 0 이하입니다' : '잔고가 바닥났습니다 (1 USDT 미만)'}
             </p>
           </div>
           <button onClick={onClose} className="shrink-0 rounded-lg px-2 py-1 text-lg leading-none text-muted hover:bg-bg" title="닫기">

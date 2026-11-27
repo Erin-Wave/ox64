@@ -8,6 +8,7 @@ import type { ApiOrder } from '@/services/api';
 import { lockedMargin, positionMargin } from '@/hooks/useEquity';
 import { useIsDesktop } from '@/hooks/useIsDesktop';
 import { tradeHotkeyAllowed } from '@/hotkeys';
+import { confirmFarLimit } from '@/limitGuard';
 
 type Tab = 'positions' | 'pending' | 'conditional' | 'history';
 
@@ -104,13 +105,18 @@ export default function PositionsPanel() {
     void closePosition(id).finally(() => fullClosing.current.delete(id));
   };
   const doClose = (id: string, closable: number) => {
+    const pos = positions.find((p) => p.id === id);
     const raw = (closeAmt[id] ?? '').trim();
     const amt = raw ? Number(raw) : NaN;
     // ⚠⚠ 비어 있지 않은데 양수가 아니면("0"·"."·"0.") **아무것도 하지 않는다**(2026-10-01) — 예전엔 아래 `closeAll` 로 떨어져
     // 전량 청산됐다("0.05" 를 치다 "0" 에서 F8 을 누르면 포지션 전체가 닫혔다). 전량 청산은 칸을 비웠을 때뿐이다.
     if (raw && !(amt > 0)) return;
     const px = closePx[id] ? Number(closePx[id]) : NaN;
-    if (px > 0) void limitClose(id, amt > 0 ? amt : closable, px);
+    if (px > 0) {
+      // 지정가 청산도 현재가와 2배 넘게 벗어나면 확인(§ limitGuard) — 롱 청산 = 매도, 숏 청산 = 매수.
+      if (pos && !confirmFarLimit([px], pos.side === 'long' ? 'sell' : 'buy', prices[pos.symbol], precisionOf(precisions, pos.symbol), quoteOf(pos.symbol))) return;
+      void limitClose(id, amt > 0 ? amt : closable, px);
+    }
     else if (amt > 0) void closePosition(id, amt);
     else closeAll(id);
   };
@@ -192,6 +198,9 @@ export default function PositionsPanel() {
   const saveEditPend = (id: string) => {
     const px = editPendPx ? Number(editPendPx) : NaN;
     const size = editPendSize ? Number(editPendSize) : NaN;
+    // 가격을 바꿀 때만 확인(§ limitGuard) — 이미 멀리 걸린 주문의 수량만 고치는데 매번 묻지 않게. 대기 주문의 side 가 곧 매수/매도다.
+    const o = pendingOrders.find((x) => x.id === id);
+    if (o && px > 0 && px !== o.limitPrice && !confirmFarLimit([px], o.side === 'long' ? 'buy' : 'sell', prices[o.symbol], precisionOf(precisions, o.symbol), quoteOf(o.symbol))) return;
     editLimit(id, { limitPrice: px > 0 ? px : undefined, size: size > 0 ? size : undefined });
     setEditPendId(null);
   };

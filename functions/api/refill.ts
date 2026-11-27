@@ -10,6 +10,7 @@ import {
   fetchPrices,
   REFILL_AMOUNT,
   REFILL_DAILY_LIMIT,
+  REFILL_DUST_USDT,
   quoteOf,
   USDT_KRW,
   type Quote,
@@ -20,7 +21,8 @@ import { checkTriggers } from '../_trading';
 
 /**
  * POST /api/refill — 강제청산 등으로 자산이 완전히 바닥났을 때를 대비한 안전망.
- * 평가자산(두 지갑 합산, 원화는 USDT 환산)이 0(이하)일 때만 지급 — 자산이 남아있으면 거부.
+ * 평가자산(두 지갑 합산, 원화는 USDT 환산)이 0(이하)일 때만 지급 — 자산이 남아있으면 거부. 포지션이 없으면 1 USDT 미만의 먼지는
+ * 0 으로 본다(`REFILL_DUST_USDT`).
  * 하루(KST 기준) 최대 3회, 1회당 10,000 USDT. 날짜가 바뀌면 자동으로 리셋(별도 cron 불필요 —
  * refill_date 가 오늘과 다르면 지금까지 쓴 횟수를 0으로 취급하고 이번 호출로 refill_date 를 오늘로 갱신).
  */
@@ -70,14 +72,15 @@ async function handle(request: Request, env: Ctx['env']): Promise<Response> {
     const rate = prices[USDT_KRW];
     if (needRate && !rate) return bad('환율 조회에 실패했습니다. 잠시 후 다시 시도해주세요');
     const total = eq.USDT + (needRate ? eq.KRW / rate : 0);
-    if (total > 0) {
+    // 포지션이 없으면 먼지(1 USDT 미만)는 바닥난 것으로 본다(§ REFILL_DUST_USDT) — 원화 지갑의 0.015625원 때문에 리필이 영영 막혔다.
+    if (positions.length > 0 ? total > 0 : total >= REFILL_DUST_USDT) {
       return bad(
         eq.KRW > 0 && eq.USDT <= 0
           ? '원화 자산이 남아있습니다 — 환전해서 사용하세요'
           : '평가자산이 남아있는 동안에는 리필할 수 없습니다',
       );
     }
-  } else if (user.balance + locked.USDT > 0) {
+  } else if (user.balance + locked.USDT >= REFILL_DUST_USDT) {
     return bad('잔고가 남아있는 동안에는 리필할 수 없습니다');
   }
 

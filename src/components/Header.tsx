@@ -126,7 +126,7 @@ export default function Header({
         <button
           onClick={() => refill()}
           disabled={busy || refillsLeft <= 0 || !canRefill}
-          title={`평가자산이 0일 때만 가능 — 강제청산 등으로 자산이 바닥났을 때를 위한 안전망, 1일 최대 3회 (${refillsLeft}/3)`}
+          title={`평가자산이 0일 때만 가능(포지션이 없으면 1 USDT 미만) — 강제청산 등으로 자산이 바닥났을 때를 위한 안전망, 1일 최대 3회 (${refillsLeft}/3)`}
           className="rounded-md bg-panel2 px-2 py-1.5 text-xs font-semibold text-accent ring-1 ring-border transition hover:bg-elevated disabled:opacity-40"
         >
           <span className="sm:hidden">🔄{refillsLeft}</span>

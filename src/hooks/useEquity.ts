@@ -3,6 +3,10 @@ import { useTradingStore } from '@/store/useTradingStore';
 import { quoteOf, USDT_KRW, type Quote } from '@/symbols';
 import type { ApiPendingOrder, ApiPosition } from '@/services/api';
 
+/** **포지션이 없으면** 평가자산이 이 값(USDT) 미만일 때 바닥난 것으로 본다 — 서버 `_shared.ts REFILL_DUST_USDT` 와 같은 값(2026-11-28).
+ * 원화 지갑에 남은 0.015625원 같은 먼지 때문에 화면엔 0.00 인데 리필 버튼이 꺼져 있었다. 포지션이 있으면 0 이하만(서버와 같다). */
+export const REFILL_DUST_USDT = 1;
+
 /** 포지션에 실제로 잠긴 증거금(서버 값). 옛 응답이면 진입가×수량÷레버리지로 근사. */
 export function positionMargin(p: ApiPosition): number {
   return p.margin ?? (p.entryPrice * p.size) / p.leverage;
@@ -66,5 +70,6 @@ export function useEquity(): {
   if (hasKrw && !rate) known = false;
   const equity = wallets.USDT + (hasKrw && rate ? wallets.KRW / rate : 0);
 
-  return { equity, wallets, rate, known, broke: known && equity <= 0 };
+  const broke = known && (positions.length > 0 ? equity <= 0 : equity < REFILL_DUST_USDT);
+  return { equity, wallets, rate, known, broke };
 }
